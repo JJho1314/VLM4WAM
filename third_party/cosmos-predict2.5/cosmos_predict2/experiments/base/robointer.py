@@ -846,6 +846,23 @@ predict2_video2world_training_2b_droid_success_v21_instructsam_feature_context =
     predict2_video2world_training_2b_droid_success_v21_instructsam_implicit_mask
 )
 
+predict2_video2world_training_2b_droid_success_v21_instructsam_feature_target_branch = copy.deepcopy(
+    predict2_video2world_training_2b_droid_success_v21_instructsam_feature_context
+)
+predict2_video2world_training_2b_droid_success_v21_instructsam_feature_target_branch["job"]["name"] = (
+    "2b_droid_success_v21_instructsam_feature_target_branch_480_lr_split_val1k_49f"
+)
+predict2_video2world_training_2b_droid_success_v21_instructsam_feature_target_branch["model"]["config"]["net"].update(
+    dict(
+        target_feature_context_append_to_text=False,
+        target_feature_cross_attention=True,
+        target_feature_cross_attention_init_gate=0.0,
+        tavid_attn_alignment_blocks=[8, 12, 16, 20],
+        tavid_attn_alignment_token_source="feature",
+        tavid_attn_query_chunk_size=1024,
+    )
+)
+
 predict2_video2world_training_2b_droid_success_v21_baseline_nomask_noloss = dict(
     defaults=[
         f"/experiment/{DEFAULT_CHECKPOINT_2B.experiment}",
@@ -993,4 +1010,11 @@ cs.store(
     package="_global_",
     name="predict2_video2world_training_2b_droid_success_v21_instructsam_feature_context",
     node=predict2_video2world_training_2b_droid_success_v21_instructsam_feature_context,
+)
+
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="predict2_video2world_training_2b_droid_success_v21_instructsam_feature_target_branch",
+    node=predict2_video2world_training_2b_droid_success_v21_instructsam_feature_target_branch,
 )

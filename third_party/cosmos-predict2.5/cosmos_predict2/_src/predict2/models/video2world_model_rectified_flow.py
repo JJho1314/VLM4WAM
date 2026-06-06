@@ -98,6 +98,7 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
         if self.config.target_attention_loss_weight <= 0:
             return {}, torch.zeros((), **self.tensor_kwargs_fp32)
         target_attn_maps = getattr(self.net, "tavid_target_attn_maps", [])
+        target_attn_source = getattr(self.net, "tavid_target_attn_source", "none")
         target_mask = getattr(self.net, "tavid_target_mask_B_T_H_W", None)
         if not target_attn_maps or target_mask is None:
             return {}, torch.zeros((), **self.tensor_kwargs_fp32)
@@ -176,6 +177,9 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
             ).detach(),
             "target_attention_num_maps": torch.tensor(
                 float(len(target_attn_maps)), device=align_loss.device, dtype=align_loss.dtype
+            ),
+            "target_attention_source_is_target_branch": torch.tensor(
+                float(target_attn_source == "target_branch"), device=align_loss.device, dtype=align_loss.dtype
             ),
         }, weighted_loss
 

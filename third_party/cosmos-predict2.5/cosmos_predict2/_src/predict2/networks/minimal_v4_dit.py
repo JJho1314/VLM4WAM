@@ -1372,6 +1372,8 @@ class Block(nn.Module):
         backend: str = "transformer_engine",
         image_context_dim: Optional[int] = None,
         use_wan_fp32_strategy: bool = False,
+        target_cross_attention: bool = False,
+        target_cross_attention_init_gate: float = 0.0,
     ):
         super().__init__()
         self.x_dim = x_dim
@@ -1402,6 +1404,18 @@ class Block(nn.Module):
                 qkv_format="bshd",
                 backend=backend,
             )
+
+        self.target_cross_attention = bool(target_cross_attention)
+        if self.target_cross_attention:
+            self.layer_norm_target_cross_attn = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
+            self.target_cross_attn = Attention(
+                x_dim, context_dim, num_heads, x_dim // num_heads, qkv_format="bshd", backend=backend
+            )
+            self.target_cross_attn_gate = nn.Parameter(torch.tensor(float(target_cross_attention_init_gate)))
+        else:
+            self.layer_norm_target_cross_attn = None
+            self.target_cross_attn = None
+            self.target_cross_attn_gate = None
 
         self.layer_norm_mlp = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
         self.mlp = GPT2FeedForward(x_dim, int(x_dim * mlp_ratio))
@@ -1443,6 +1457,8 @@ class Block(nn.Module):
     def reset_parameters(self) -> None:
         self.layer_norm_self_attn.reset_parameters()
         self.layer_norm_cross_attn.reset_parameters()
+        if self.layer_norm_target_cross_attn is not None:
+            self.layer_norm_target_cross_attn.reset_parameters()
         self.layer_norm_mlp.reset_parameters()
 
         if self.use_adaln_lora:
@@ -1462,6 +1478,8 @@ class Block(nn.Module):
         self.reset_parameters()
         self.self_attn.init_weights()
         self.cross_attn.init_weights()
+        if self.target_cross_attn is not None:
+            self.target_cross_attn.init_weights()
         self.mlp.init_weights()
 
     def forward(
@@ -1475,6 +1493,8 @@ class Block(nn.Module):
         kv_cache_cfg: Optional[KVCacheConfig] = None,
         capture_target_cross_attn: bool = False,
         target_token_indices_B: Optional[torch.Tensor] = None,
+        target_crossattn_emb: Optional[torch.Tensor] = None,
+        target_crossattn_token_indices_B: Optional[torch.Tensor] = None,
         target_attention_query_chunk_size: int = 2048,
     ) -> torch.Tensor:
         if extra_per_block_pos_emb is not None:
@@ -1566,7 +1586,7 @@ class Block(nn.Module):
                     rearrange(_normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
                     crossattn_emb,
                     rope_emb=rope_emb_L_1_1_D,
-                    capture_target_attention=capture_target_cross_attn,
+                    capture_target_attention=capture_target_cross_attn and target_crossattn_emb is None,
                     target_token_indices_B=target_token_indices_B,
                     target_attention_query_chunk_size=target_attention_query_chunk_size,
                 ),
@@ -1586,6 +1606,25 @@ class Block(nn.Module):
             gate_cross_attn_B_T_1_1_D,
         )
         x_B_T_H_W_D = result_B_T_H_W_D * gate_cross_attn_B_T_1_1_D + x_B_T_H_W_D
+
+        if self.target_cross_attn is not None and target_crossattn_emb is not None:
+            normalized_target_x_B_T_H_W_D = self.layer_norm_target_cross_attn(x_B_T_H_W_D)
+            target_result_B_T_H_W_D = rearrange(
+                self.target_cross_attn(
+                    rearrange(normalized_target_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
+                    target_crossattn_emb,
+                    rope_emb=None,
+                    capture_target_attention=capture_target_cross_attn,
+                    target_token_indices_B=target_crossattn_token_indices_B,
+                    target_attention_query_chunk_size=target_attention_query_chunk_size,
+                ),
+                "b (t h w) d -> b t h w d",
+                t=T,
+                h=H,
+                w=W,
+            )
+            gate = self.target_cross_attn_gate.to(device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype)
+            x_B_T_H_W_D = x_B_T_H_W_D + gate * target_result_B_T_H_W_D
 
         normalized_x_B_T_H_W_D = _fn(
             x_B_T_H_W_D,
@@ -1715,6 +1754,10 @@ class MiniTrainDIT(WeightTrainingStat):
         target_feature_context_in_dim: int = 256,
         target_feature_context_hidden_dim: int = 0,
         target_feature_context_max_tokens: int = 64,
+        target_feature_context_append_to_text: bool = True,
+        target_feature_cross_attention: bool = False,
+        target_feature_cross_attention_blocks: Optional[List[int]] = None,
+        target_feature_cross_attention_init_gate: float = 0.0,
     ) -> None:
         super().__init__()
         self.max_img_h = max_img_h
@@ -1764,12 +1807,18 @@ class MiniTrainDIT(WeightTrainingStat):
             )
         self.tavid_attn_query_chunk_size = tavid_attn_query_chunk_size
         self.tavid_target_attn_maps: list[torch.Tensor] = []
+        self.tavid_target_attn_source: str = "none"
         self.tavid_target_mask_B_T_H_W: Optional[torch.Tensor] = None
         self.target_mask_concat_input = bool(target_mask_concat_input)
         self.target_mask_context_tokens = bool(target_mask_context_tokens)
         self.target_mask_context_token_start: Optional[int] = None
         self.target_mask_context_tokens_B_L_D: Optional[torch.Tensor] = None
         self.target_feature_context_tokens = bool(target_feature_context_tokens)
+        self.target_feature_context_append_to_text = bool(target_feature_context_append_to_text)
+        self.target_feature_cross_attention = bool(target_feature_cross_attention)
+        if target_feature_cross_attention_blocks is None:
+            target_feature_cross_attention_blocks = tavid_attn_alignment_blocks
+        self.target_feature_cross_attention_blocks = set(target_feature_cross_attention_blocks or [])
         self.target_feature_context_token_start: Optional[int] = None
         self.target_feature_context_tokens_B_L_D: Optional[torch.Tensor] = None
         self.target_feature_context_valid_B_L: Optional[torch.Tensor] = None
@@ -1807,8 +1856,12 @@ class MiniTrainDIT(WeightTrainingStat):
                     backend=atten_backend,
                     image_context_dim=None if extra_image_context_dim is None else model_channels,
                     use_wan_fp32_strategy=use_wan_fp32_strategy,
+                    target_cross_attention=(
+                        self.target_feature_cross_attention and i in self.target_feature_cross_attention_blocks
+                    ),
+                    target_cross_attention_init_gate=target_feature_cross_attention_init_gate,
                 )
-                for _ in range(num_blocks)
+                for i in range(num_blocks)
             ]
         )
 
@@ -2055,7 +2108,22 @@ class MiniTrainDIT(WeightTrainingStat):
         feature_tokens = torch.where(feature_valid_B_L.unsqueeze(-1), feature_tokens, torch.zeros_like(feature_tokens))
         self.target_feature_context_tokens_B_L_D = feature_tokens
         self.target_feature_context_valid_B_L = feature_valid_B_L
+        if not self.target_feature_context_append_to_text:
+            return crossattn_emb
         return torch.cat([feature_tokens, crossattn_emb], dim=1)
+
+    def make_target_branch_attention_token_indices(self) -> Optional[torch.Tensor]:
+        """Build token indices for the dedicated target cross-attention branch."""
+        feature_tokens = self.target_feature_context_tokens_B_L_D
+        if feature_tokens is None:
+            return None
+        feature_len = feature_tokens.shape[1]
+        feature_indices = torch.arange(feature_len, device=feature_tokens.device, dtype=torch.long)
+        feature_indices = feature_indices.view(1, -1).expand(feature_tokens.shape[0], -1)
+        if self.target_feature_context_valid_B_L is None:
+            return feature_indices
+        feature_valid = self.target_feature_context_valid_B_L.to(device=feature_indices.device)
+        return torch.where(feature_valid, feature_indices, torch.full_like(feature_indices, -1))
 
     def make_tavid_attention_token_indices(
         self,
@@ -2122,6 +2190,7 @@ class MiniTrainDIT(WeightTrainingStat):
             f"Expected DataType, got {type(data_type)}. We need discuss this flag later."
         )
         self.tavid_target_attn_maps = []
+        self.tavid_target_attn_source = "none"
         self.tavid_target_mask_B_T_H_W = self.make_target_mask_tokens(target_mask_B_C_T_H_W)
         self.target_mask_context_token_start = None
         self.target_mask_context_tokens_B_L_D = None
@@ -2138,6 +2207,12 @@ class MiniTrainDIT(WeightTrainingStat):
         if self.use_crossattn_projection:
             crossattn_emb = self.crossattn_proj(crossattn_emb)
         crossattn_emb = self.append_target_feature_context(crossattn_emb, target_feature_B_L_D)
+        target_branch_tokens_B_L_D = self.target_feature_context_tokens_B_L_D
+        target_branch_token_indices_B = self.make_target_branch_attention_token_indices()
+        use_target_branch_for_loss = bool(
+            self.target_feature_cross_attention and target_branch_token_indices_B is not None
+        )
+        self.tavid_target_attn_source = "target_branch" if use_target_branch_for_loss else "mixed_context"
         crossattn_emb = self.append_target_mask_context(crossattn_emb, target_mask_B_C_T_H_W)
         target_token_indices_for_attn_B = self.make_tavid_attention_token_indices(tgt_token_indices_B)
 
@@ -2173,9 +2248,14 @@ class MiniTrainDIT(WeightTrainingStat):
 
         intermediate_features_outputs = []
         for i, block in enumerate(self.blocks):
+            target_indices_available = (
+                target_branch_token_indices_B is not None
+                if use_target_branch_for_loss
+                else target_token_indices_for_attn_B is not None
+            )
             capture_target_cross_attn = (
                 i in self.tavid_attn_alignment_blocks
-                and target_token_indices_for_attn_B is not None
+                and target_indices_available
                 and self.tavid_target_mask_B_T_H_W is not None
             )
             x_B_T_H_W_D = block(
@@ -2186,13 +2266,24 @@ class MiniTrainDIT(WeightTrainingStat):
                 adaln_lora_B_T_3D=adaln_lora_B_T_3D,
                 extra_per_block_pos_emb=extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
                 capture_target_cross_attn=capture_target_cross_attn,
-                target_token_indices_B=target_token_indices_for_attn_B,
+                target_token_indices_B=None if use_target_branch_for_loss else target_token_indices_for_attn_B,
+                target_crossattn_emb=target_branch_tokens_B_L_D,
+                target_crossattn_token_indices_B=target_branch_token_indices_B,
                 target_attention_query_chunk_size=self.tavid_attn_query_chunk_size,
             )
-            if capture_target_cross_attn and self.blocks[i].cross_attn.last_target_attn_map_B_S is not None:
+            target_attn_map_B_S = None
+            if (
+                use_target_branch_for_loss
+                and self.blocks[i].target_cross_attn is not None
+                and self.blocks[i].target_cross_attn.last_target_attn_map_B_S is not None
+            ):
+                target_attn_map_B_S = self.blocks[i].target_cross_attn.last_target_attn_map_B_S
+            elif self.blocks[i].cross_attn.last_target_attn_map_B_S is not None:
+                target_attn_map_B_S = self.blocks[i].cross_attn.last_target_attn_map_B_S
+            if capture_target_cross_attn and target_attn_map_B_S is not None:
                 self.tavid_target_attn_maps.append(
                     rearrange(
-                        self.blocks[i].cross_attn.last_target_attn_map_B_S,
+                        target_attn_map_B_S,
                         "b (t h w) -> b t h w",
                         t=T,
                         h=H,
