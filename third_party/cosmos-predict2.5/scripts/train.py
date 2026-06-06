@@ -14,6 +14,11 @@
 # limitations under the License.
 
 if __name__ == "__main__":
+    # Megatron accesses transformer_engine.pytorch via the top-level module.
+    # Import it explicitly so TE versions that do not eagerly attach the
+    # pytorch submodule still expose the expected attribute.
+    import transformer_engine.pytorch  # noqa: F401
+
     from cosmos_oss.scripts.train import main
 
     main()

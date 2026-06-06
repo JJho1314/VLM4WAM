@@ -1411,7 +1411,7 @@ class Block(nn.Module):
             self.target_cross_attn = Attention(
                 x_dim, context_dim, num_heads, x_dim // num_heads, qkv_format="bshd", backend=backend
             )
-            self.target_cross_attn_gate = nn.Parameter(torch.tensor(float(target_cross_attention_init_gate)))
+            self.target_cross_attn_gate = nn.Parameter(torch.tensor([float(target_cross_attention_init_gate)]))
         else:
             self.layer_norm_target_cross_attn = None
             self.target_cross_attn = None

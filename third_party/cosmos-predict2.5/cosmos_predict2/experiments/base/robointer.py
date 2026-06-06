@@ -864,7 +864,7 @@ predict2_video2world_training_2b_droid_success_v21_instructsam_feature_target_br
 )
 predict2_video2world_training_2b_droid_success_v21_instructsam_feature_target_branch["model"]["config"].update(
     dict(
-        target_feature_contrastive_loss_weight=0.05,
+        target_feature_contrastive_loss_weight=0.0,
         target_feature_contrastive_temperature=0.07,
         target_feature_contrastive_margin=0.2,
         target_feature_contrastive_margin_loss_weight=0.5,
