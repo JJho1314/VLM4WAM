@@ -17,6 +17,15 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageOps
+
+try:
+    import huggingface_hub
+
+    if not hasattr(huggingface_hub, "is_offline_mode"):
+        huggingface_hub.is_offline_mode = lambda: os.environ.get("HF_HUB_OFFLINE", "0") == "1"
+except Exception:
+    pass
+
 from transformers import AutoProcessor
 
 
