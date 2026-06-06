@@ -140,6 +140,34 @@ def read_video_frame(video_path: Path, frame_idx: int) -> Image.Image:
     return Image.fromarray(frame).convert("RGB")
 
 
+def prepare_sam_pixel_values(pixel_values: Any, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    if isinstance(pixel_values, torch.Tensor):
+        tensor = pixel_values
+    elif isinstance(pixel_values, np.ndarray):
+        tensor = torch.from_numpy(pixel_values)
+    elif isinstance(pixel_values, (list, tuple)):
+        tensors = [
+            item if isinstance(item, torch.Tensor) else torch.as_tensor(item)
+            for item in pixel_values
+        ]
+        if not tensors:
+            raise ValueError("SAM processor returned empty pixel_values")
+        if len(tensors) == 1:
+            tensor = tensors[0]
+        elif all(item.ndim == tensors[0].ndim for item in tensors):
+            tensor = torch.cat(tensors, dim=0) if tensors[0].ndim == 4 else torch.stack(tensors, dim=0)
+        else:
+            raise ValueError(f"Unsupported mixed SAM pixel_values shapes: {[tuple(item.shape) for item in tensors]}")
+    else:
+        raise TypeError(f"Unsupported SAM pixel_values type: {type(pixel_values)}")
+
+    if tensor.ndim == 3:
+        tensor = tensor.unsqueeze(0)
+    if tensor.ndim != 4:
+        raise ValueError(f"Unsupported SAM pixel_values shape: {tuple(tensor.shape)}")
+    return tensor.to(device=device, dtype=dtype)
+
+
 def extract_vision_tensor(vision_outputs: Any) -> torch.Tensor:
     if isinstance(vision_outputs, dict):
         candidates = [vision_outputs.get("last_hidden_state"), vision_outputs.get("pooler_output")]
@@ -349,7 +377,7 @@ def main() -> int:
             image = read_video_frame(video_path, frame_idx)
             image = ImageOps.exif_transpose(image).convert("RGB")
             sam_inputs = seg_processor(image)
-            pixel_values = sam_inputs["pixel_values"].to(device=device, dtype=dtype)
+            pixel_values = prepare_sam_pixel_values(sam_inputs["pixel_values"], device=device, dtype=dtype)
             with torch.inference_mode():
                 vision_outputs = model.model.grounding_model.encoder(pixel_values)
             vision_tensor = extract_vision_tensor(vision_outputs)
