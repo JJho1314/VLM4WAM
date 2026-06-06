@@ -199,30 +199,46 @@ def build_gt_mask_tokens(
     mask_2d: np.ndarray,
     *,
     out_dim: int,
+    max_tokens: int,
     seed: int,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     if grid_h is None or grid_w is None:
         pooled = grid_features_N_C.mean(dim=0, keepdim=True)
-        zeros = torch.zeros_like(pooled)
-        tokens = torch.cat([pooled, zeros, pooled, zeros], dim=0)
+        tokens = pooled.repeat(max(1, int(max_tokens)), 1)
         return deterministic_project(tokens, out_dim, seed), {"mask_grid_shape": None, "mask_grid_area": None}
 
     mask = torch.from_numpy(mask_2d.astype(np.float32))[None, None]
     mask = F.interpolate(mask, size=(grid_h, grid_w), mode="nearest")[0, 0].reshape(-1)
     mask = (mask > 0.5).float()
     area = float(mask.sum().item())
+    token_count = max(1, int(max_tokens))
     if area <= 0:
         pooled = torch.zeros(1, grid_features_N_C.shape[-1], dtype=torch.float32)
-        tokens = pooled.repeat(4, 1)
+        tokens = pooled.repeat(token_count, 1)
         return deterministic_project(tokens, out_dim, seed), {"mask_grid_shape": [grid_h, grid_w], "mask_grid_area": 0.0}
 
-    fg_mean = (grid_features_N_C * mask[:, None]).sum(dim=0, keepdim=True) / mask.sum().clamp_min(1.0)
-    bg_weight = 1.0 - mask
-    bg_mean = (grid_features_N_C * bg_weight[:, None]).sum(dim=0, keepdim=True) / bg_weight.sum().clamp_min(1.0)
-    fg_max = grid_features_N_C.masked_fill(mask[:, None] <= 0, -1e4).max(dim=0, keepdim=True).values
-    diff = fg_mean - bg_mean
-    tokens = torch.cat([fg_mean, fg_max, bg_mean, diff], dim=0)
-    return deterministic_project(tokens, out_dim, seed), {"mask_grid_shape": [grid_h, grid_w], "mask_grid_area": area}
+    fg_indices = torch.nonzero(mask > 0, as_tuple=False).flatten()
+    if fg_indices.numel() > token_count:
+        sample_positions = torch.linspace(0, fg_indices.numel() - 1, token_count).round().long()
+        fg_indices = fg_indices[sample_positions]
+    selected = grid_features_N_C[fg_indices]
+    y = (fg_indices // grid_w).float()
+    x = (fg_indices % grid_w).float()
+    y_norm = (y / max(grid_h - 1, 1)) * 2.0 - 1.0
+    x_norm = (x / max(grid_w - 1, 1)) * 2.0 - 1.0
+    cy = y_norm.mean()
+    cx = x_norm.mean()
+    coord_features = torch.stack([y_norm, x_norm, y_norm - cy, x_norm - cx], dim=1)
+    selected = torch.cat([selected, coord_features], dim=1)
+    if selected.shape[0] < token_count:
+        pad = torch.zeros(token_count - selected.shape[0], selected.shape[1], dtype=selected.dtype)
+        selected = torch.cat([selected, pad], dim=0)
+    return deterministic_project(selected, out_dim, seed), {
+        "mask_grid_shape": [grid_h, grid_w],
+        "mask_grid_area": area,
+        "num_fg_patch_tokens": int(min(area, token_count)),
+        "max_tokens": token_count,
+    }
 
 
 def write_jsonl(path: Path, record: dict[str, Any]) -> None:
@@ -236,10 +252,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", type=Path, default=_default_model_path())
     parser.add_argument("--source-root", type=Path, default=_default_source_root())
     parser.add_argument("--mask-dir-name", default="masks")
-    parser.add_argument("--output-dir-name", default="target_features_gt_mask")
+    parser.add_argument("--output-dir-name", default="target_features_gt_mask_spatial64")
     parser.add_argument("--exclude-video-stems-file", default="auto")
     parser.add_argument("--mask-frame-policy", choices=["first", "first_nonempty", "middle"], default="first")
     parser.add_argument("--expected-feature-dim", type=int, default=256)
+    parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--projection-seed", type=int, default=20260606)
     parser.add_argument("--attn-implementation", default="sdpa")
     parser.add_argument("--torch-dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
@@ -334,11 +351,12 @@ def main() -> int:
                 grid_w,
                 mask_video[frame_idx],
                 out_dim=args.expected_feature_dim,
+                max_tokens=args.max_tokens,
                 seed=args.projection_seed,
             )
             payload = {
                 "target_feature": target_feature,
-                "feature_mode": "gt_mask_sam3_masked_pool",
+                "feature_mode": "gt_mask_sam3_spatial_tokens",
                 "source": "gt_mask",
                 "video": str(video_path),
                 "mask_path": str(mask_path),

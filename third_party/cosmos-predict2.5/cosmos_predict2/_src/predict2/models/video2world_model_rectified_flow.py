@@ -57,6 +57,10 @@ class Video2WorldModelRectifiedFlowConfig(Text2WorldModelRectifiedFlowConfig):
     target_attention_loss_eps: float = 1e-6
     target_attention_background_loss_weight: float = 0.25
     target_attention_mass_loss_weight: float = 0.1
+    target_feature_contrastive_loss_weight: float = 0.0
+    target_feature_contrastive_temperature: float = 0.07
+    target_feature_contrastive_margin: float = 0.2
+    target_feature_contrastive_margin_loss_weight: float = 0.5
 
     def __attrs_post_init__(self):
         super().__attrs_post_init__()
@@ -95,12 +99,12 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
         return raw_state, latent_state, condition
 
     def compute_extra_training_loss(self, condition: Video2WorldCondition) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        if self.config.target_attention_loss_weight <= 0:
+        if self.config.target_attention_loss_weight <= 0 and self.config.target_feature_contrastive_loss_weight <= 0:
             return {}, torch.zeros((), **self.tensor_kwargs_fp32)
         target_attn_maps = getattr(self.net, "tavid_target_attn_maps", [])
         target_attn_source = getattr(self.net, "tavid_target_attn_source", "none")
         target_mask = getattr(self.net, "tavid_target_mask_B_T_H_W", None)
-        if not target_attn_maps or target_mask is None:
+        if target_mask is None:
             return {}, torch.zeros((), **self.tensor_kwargs_fp32)
         target_mask = target_mask.float().clamp(0, 1)
         frame_valid = target_mask.flatten(2).sum(dim=2) > 0
@@ -118,70 +122,122 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
         eps = self.config.target_attention_loss_eps
         supervised_area = token_valid_flat.float().sum(dim=1).clamp_min(1.0)
         mask_area_ratio = pos_sum / supervised_area
+        metrics: dict[str, torch.Tensor] = {}
+        total_loss = torch.zeros((), device=target_mask.device, dtype=target_mask.dtype)
+        zero = torch.zeros((), device=target_mask.device, dtype=target_mask.dtype)
 
         # Target-aware loss on supervised frames only. Foreground and background
         # are averaged separately so small target masks are not diluted by the
         # much larger non-target region. The mass term directly rewards putting
         # cross-attention probability inside the target mask.
-        attn_map = torch.stack([attn_map.float() for attn_map in target_attn_maps], dim=0).mean(dim=0)
-        attn_flat = rearrange(attn_map, "b t h w -> b (t h w)").clamp(min=0.0)
-        attn_min = torch.where(token_valid_flat, attn_flat, torch.full_like(attn_flat, float("inf"))).amin(
-            dim=1, keepdim=True
-        )
-        attn_max = torch.where(token_valid_flat, attn_flat, torch.full_like(attn_flat, float("-inf"))).amax(
-            dim=1, keepdim=True
-        )
-        attn_map_01 = (attn_flat - attn_min) / (attn_max - attn_min + eps)
-        attn_map_01 = torch.where(token_valid_flat, attn_map_01, torch.zeros_like(attn_map_01))
+        if self.config.target_attention_loss_weight > 0 and target_attn_maps:
+            attn_map = torch.stack([attn_map.float() for attn_map in target_attn_maps], dim=0).mean(dim=0)
+            attn_flat = rearrange(attn_map, "b t h w -> b (t h w)").clamp(min=0.0)
+            attn_min = torch.where(token_valid_flat, attn_flat, torch.full_like(attn_flat, float("inf"))).amin(
+                dim=1, keepdim=True
+            )
+            attn_max = torch.where(token_valid_flat, attn_flat, torch.full_like(attn_flat, float("-inf"))).amax(
+                dim=1, keepdim=True
+            )
+            attn_map_01 = (attn_flat - attn_min) / (attn_max - attn_min + eps)
+            attn_map_01 = torch.where(token_valid_flat, attn_map_01, torch.zeros_like(attn_map_01))
 
-        pos_mse = (((1.0 - attn_map_01) ** 2) * pos_weight).sum(dim=1) / (pos_sum + eps)
-        neg_mse = ((attn_map_01**2) * neg_weight).sum(dim=1) / (neg_sum + eps)
+            pos_mse = (((1.0 - attn_map_01) ** 2) * pos_weight).sum(dim=1) / (pos_sum + eps)
+            neg_mse = ((attn_map_01**2) * neg_weight).sum(dim=1) / (neg_sum + eps)
 
-        supervised_attn = attn_flat * token_valid_flat.type_as(attn_flat)
-        attn_dist = supervised_attn / (supervised_attn.sum(dim=1, keepdim=True) + eps)
-        target_mass = (attn_dist * pos_weight).sum(dim=1)
-        mass_loss = -torch.log(target_mass.clamp_min(eps))
+            supervised_attn = attn_flat * token_valid_flat.type_as(attn_flat)
+            attn_dist = supervised_attn / (supervised_attn.sum(dim=1, keepdim=True) + eps)
+            target_mass = (attn_dist * pos_weight).sum(dim=1)
+            mass_loss = -torch.log(target_mass.clamp_min(eps))
 
-        per_sample = (
-            pos_mse
-            + self.config.target_attention_background_loss_weight * neg_mse
-            + self.config.target_attention_mass_loss_weight * mass_loss
-        )
-        align_loss = per_sample[valid].mean()
+            per_sample = (
+                pos_mse
+                + self.config.target_attention_background_loss_weight * neg_mse
+                + self.config.target_attention_mass_loss_weight * mass_loss
+            )
+            align_loss = per_sample[valid].mean()
+            weighted_loss = align_loss * self.config.target_attention_loss_weight
+            total_loss = total_loss + weighted_loss
 
-        weighted_loss = align_loss * self.config.target_attention_loss_weight
-        zero = torch.zeros((), device=align_loss.device, dtype=align_loss.dtype)
+            outside_valid = valid & (neg_sum > 0)
+            inside_mean = (attn_flat * pos_weight).sum(dim=1) / (pos_sum + eps)
+            outside_mean = (attn_flat * neg_weight).sum(dim=1) / (neg_sum + eps)
+            inside_outside_ratio = inside_mean / (outside_mean + eps)
+            mask_area = mask_area_ratio[valid].mean()
+            metrics.update(
+                {
+                    "target_attention_loss": align_loss.detach(),
+                    "target_attention_loss_weighted": weighted_loss.detach(),
+                    "target_attention_pos_mse": pos_mse[valid].mean().detach(),
+                    "target_attention_neg_mse": neg_mse[valid].mean().detach(),
+                    "target_attention_mass_loss": mass_loss[valid].mean().detach(),
+                    "target_attention_mask_valid_ratio": valid.float().mean().detach(),
+                    "target_attention_mask_area_ratio": mask_area.detach(),
+                    "target_attention_mass_in_mask": target_mass[valid].mean().detach(),
+                    "target_attention_mass_lift": (target_mass / (mask_area_ratio + eps))[valid].mean().detach(),
+                    "target_attention_inside_mean": inside_mean[valid].mean().detach(),
+                    "target_attention_outside_mean": (
+                        outside_mean[outside_valid].mean() if bool(outside_valid.any()) else zero
+                    ).detach(),
+                    "target_attention_inside_outside_ratio": (
+                        inside_outside_ratio[outside_valid].mean() if bool(outside_valid.any()) else zero
+                    ).detach(),
+                    "target_attention_num_maps": torch.tensor(
+                        float(len(target_attn_maps)), device=align_loss.device, dtype=align_loss.dtype
+                    ),
+                    "target_attention_source_is_target_branch": torch.tensor(
+                        float(target_attn_source == "target_branch"), device=align_loss.device, dtype=align_loss.dtype
+                    ),
+                }
+            )
 
-        outside_valid = valid & (neg_sum > 0)
-        inside_mean = (attn_flat * pos_weight).sum(dim=1) / (pos_sum + eps)
-        outside_mean = (attn_flat * neg_weight).sum(dim=1) / (neg_sum + eps)
-        inside_outside_ratio = inside_mean / (outside_mean + eps)
+        if self.config.target_feature_contrastive_loss_weight > 0:
+            video_tokens = getattr(self.net, "target_feature_contrastive_video_tokens_B_T_H_W_D", None)
+            target_tokens = getattr(self.net, "target_feature_contrastive_tokens_B_L_D", None)
+            target_valid = getattr(self.net, "target_feature_contrastive_valid_B_L", None)
+            if video_tokens is not None and target_tokens is not None:
+                video_tokens = video_tokens.float()
+                target_tokens = target_tokens.float()
+                if target_valid is None:
+                    target_valid = target_tokens.abs().sum(dim=-1) > 0
+                target_valid = target_valid.to(device=target_tokens.device)
+                valid_count = target_valid.float().sum(dim=1, keepdim=True).clamp_min(1.0)
+                target_pooled = (target_tokens * target_valid.unsqueeze(-1).float()).sum(dim=1) / valid_count
+                video_flat = rearrange(video_tokens, "b t h w d -> b (t h w) d")
+                target_pooled = F.normalize(target_pooled, dim=-1)
+                video_flat = F.normalize(video_flat, dim=-1)
+                temperature = max(float(self.config.target_feature_contrastive_temperature), eps)
+                sim = torch.einsum("bd,bsd->bs", target_pooled, video_flat) / temperature
+                sim_supervised = torch.where(token_valid_flat, sim, torch.full_like(sim, -1e4))
+                pos_sim = torch.where(pos_weight > 0, sim, torch.full_like(sim, -1e4))
+                denom = torch.logsumexp(sim_supervised, dim=1)
+                numer = torch.logsumexp(pos_sim, dim=1)
+                nce_loss = denom - numer
+                pos_mean = (sim * pos_weight).sum(dim=1) / (pos_sum + eps)
+                neg_mean = (sim * neg_weight).sum(dim=1) / (neg_sum + eps)
+                margin_loss = F.relu(float(self.config.target_feature_contrastive_margin) + neg_mean - pos_mean)
+                contrastive_per_sample = (
+                    nce_loss + self.config.target_feature_contrastive_margin_loss_weight * margin_loss
+                )
+                contrastive_loss = contrastive_per_sample[valid].mean()
+                contrastive_weighted = contrastive_loss * self.config.target_feature_contrastive_loss_weight
+                total_loss = total_loss + contrastive_weighted
+                metrics.update(
+                    {
+                        "target_feature_contrastive_loss": contrastive_loss.detach(),
+                        "target_feature_contrastive_loss_weighted": contrastive_weighted.detach(),
+                        "target_feature_contrastive_nce": nce_loss[valid].mean().detach(),
+                        "target_feature_contrastive_margin": margin_loss[valid].mean().detach(),
+                        "target_feature_contrastive_pos_sim": pos_mean[valid].mean().detach(),
+                        "target_feature_contrastive_neg_sim": neg_mean[valid].mean().detach(),
+                        "target_feature_contrastive_sim_gap": (pos_mean - neg_mean)[valid].mean().detach(),
+                        "target_feature_contrastive_valid_tokens": target_valid.float().sum(dim=1).mean().detach(),
+                    }
+                )
 
-        mask_area = mask_area_ratio[valid].mean()
-        return {
-            "target_attention_loss": align_loss.detach(),
-            "target_attention_loss_weighted": weighted_loss.detach(),
-            "target_attention_pos_mse": pos_mse[valid].mean().detach(),
-            "target_attention_neg_mse": neg_mse[valid].mean().detach(),
-            "target_attention_mass_loss": mass_loss[valid].mean().detach(),
-            "target_attention_mask_valid_ratio": valid.float().mean().detach(),
-            "target_attention_mask_area_ratio": mask_area.detach(),
-            "target_attention_mass_in_mask": target_mass[valid].mean().detach(),
-            "target_attention_mass_lift": (target_mass / (mask_area_ratio + eps))[valid].mean().detach(),
-            "target_attention_inside_mean": inside_mean[valid].mean().detach(),
-            "target_attention_outside_mean": (
-                outside_mean[outside_valid].mean() if bool(outside_valid.any()) else zero
-            ).detach(),
-            "target_attention_inside_outside_ratio": (
-                inside_outside_ratio[outside_valid].mean() if bool(outside_valid.any()) else zero
-            ).detach(),
-            "target_attention_num_maps": torch.tensor(
-                float(len(target_attn_maps)), device=align_loss.device, dtype=align_loss.dtype
-            ),
-            "target_attention_source_is_target_branch": torch.tensor(
-                float(target_attn_source == "target_branch"), device=align_loss.device, dtype=align_loss.dtype
-            ),
-        }, weighted_loss
+        if not metrics:
+            return {}, torch.zeros((), **self.tensor_kwargs_fp32)
+        return metrics, total_loss
 
     def denoise(
         self,

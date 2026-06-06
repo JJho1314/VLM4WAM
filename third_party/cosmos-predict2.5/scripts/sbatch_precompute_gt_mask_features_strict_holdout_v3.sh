@@ -39,7 +39,7 @@ export INSTRUCTSAM_TRANSFORMERS_ROOT=${INSTRUCTSAM_TRANSFORMERS_ROOT:-/data/user
 export PYTHONPATH="$INSTRUCTSAM_TRANSFORMERS_ROOT/src:$INSTRUCTSAM_SOURCE_ROOT:${PYTHONPATH:-}"
 export DROID_SUCCESS_V21_TAVID_DIR=${DROID_SUCCESS_V21_TAVID_DIR:-/data/user/jhe724/workspace/datasets/droid_success_v21_target_aware_left_right_480x864_train_strict_holdout_v3}
 export DROID_SUCCESS_V21_TAVID_VAL_DIR=${DROID_SUCCESS_V21_TAVID_VAL_DIR:-/data/user/jhe724/workspace/datasets/droid_success_v21_target_aware_left_right_480x864_val_strict_holdout_v3}
-export TARGET_FEATURE_DIR_NAME=${TARGET_FEATURE_DIR_NAME:-target_features_gt_mask}
+export TARGET_FEATURE_DIR_NAME=${TARGET_FEATURE_DIR_NAME:-target_features_gt_mask_spatial64}
 export TOKENIZERS_PARALLELISM=false
 export NCCL_DEBUG=WARN
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
@@ -70,6 +70,7 @@ torchrun --standalone --nproc_per_node=8 scripts/precompute_gt_mask_target_featu
   --model-path "$INSTRUCTSAM_MODEL_PATH" \
   --output-dir-name "$TARGET_FEATURE_DIR_NAME" \
   --expected-feature-dim 256 \
+  --max-tokens 64 \
   --mask-frame-policy first \
   --skip-existing \
   --log-every 25

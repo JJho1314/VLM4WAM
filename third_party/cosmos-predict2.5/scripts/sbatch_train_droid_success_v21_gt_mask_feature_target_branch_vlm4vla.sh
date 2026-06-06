@@ -19,10 +19,10 @@ TARGET_BRANCH_SCRIPT=${TARGET_BRANCH_SCRIPT:-$REPO_ROOT/scripts/sbatch_train_dro
 
 export VLM4VLA_ROOT
 export REPO_ROOT
-export TARGET_FEATURE_DIR_NAME=${TARGET_FEATURE_DIR_NAME:-target_features_gt_mask}
-export IMAGINAIRE_OUTPUT_ROOT=${IMAGINAIRE_OUTPUT_ROOT:-$VLM4VLA_ROOT/outputs/droid_success_v21_gt_mask_feature_target_branch_strict_holdout_v3}
+export TARGET_FEATURE_DIR_NAME=${TARGET_FEATURE_DIR_NAME:-target_features_gt_mask_spatial64}
+export IMAGINAIRE_OUTPUT_ROOT=${IMAGINAIRE_OUTPUT_ROOT:-$VLM4VLA_ROOT/outputs/droid_success_v21_gt_mask_spatial64_feature_target_branch_strict_holdout_v3}
 export EXPERIMENT=${EXPERIMENT:-predict2_video2world_training_2b_droid_success_v21_instructsam_feature_target_branch}
-export JOB_NAME=${JOB_NAME:-2b_droid_success_v21_gt_mask_feature_target_branch_strict_v3_49f_s234_bs2accum4_14k_val1000_from_base}
+export JOB_NAME=${JOB_NAME:-2b_droid_success_v21_gt_mask_spatial64_feature_target_branch_strict_v3_49f_s234_bs2accum4_14k_val1000_from_base}
 
 if [ ! -f "$TARGET_BRANCH_SCRIPT" ]; then
   echo "Invalid TARGET_BRANCH_SCRIPT=${TARGET_BRANCH_SCRIPT}; target branch training script not found." >&2

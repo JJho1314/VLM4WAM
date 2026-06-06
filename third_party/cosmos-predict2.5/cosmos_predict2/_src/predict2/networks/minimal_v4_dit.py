@@ -1809,6 +1809,9 @@ class MiniTrainDIT(WeightTrainingStat):
         self.tavid_target_attn_maps: list[torch.Tensor] = []
         self.tavid_target_attn_source: str = "none"
         self.tavid_target_mask_B_T_H_W: Optional[torch.Tensor] = None
+        self.target_feature_contrastive_video_tokens_B_T_H_W_D: Optional[torch.Tensor] = None
+        self.target_feature_contrastive_tokens_B_L_D: Optional[torch.Tensor] = None
+        self.target_feature_contrastive_valid_B_L: Optional[torch.Tensor] = None
         self.target_mask_concat_input = bool(target_mask_concat_input)
         self.target_mask_context_tokens = bool(target_mask_context_tokens)
         self.target_mask_context_token_start: Optional[int] = None
@@ -2192,6 +2195,9 @@ class MiniTrainDIT(WeightTrainingStat):
         self.tavid_target_attn_maps = []
         self.tavid_target_attn_source = "none"
         self.tavid_target_mask_B_T_H_W = self.make_target_mask_tokens(target_mask_B_C_T_H_W)
+        self.target_feature_contrastive_video_tokens_B_T_H_W_D = None
+        self.target_feature_contrastive_tokens_B_L_D = None
+        self.target_feature_contrastive_valid_B_L = None
         self.target_mask_context_token_start = None
         self.target_mask_context_tokens_B_L_D = None
         self.target_feature_context_token_start = None
@@ -2209,6 +2215,8 @@ class MiniTrainDIT(WeightTrainingStat):
         crossattn_emb = self.append_target_feature_context(crossattn_emb, target_feature_B_L_D)
         target_branch_tokens_B_L_D = self.target_feature_context_tokens_B_L_D
         target_branch_token_indices_B = self.make_target_branch_attention_token_indices()
+        self.target_feature_contrastive_tokens_B_L_D = target_branch_tokens_B_L_D
+        self.target_feature_contrastive_valid_B_L = self.target_feature_context_valid_B_L
         use_target_branch_for_loss = bool(
             self.target_feature_cross_attention and target_branch_token_indices_B is not None
         )
@@ -2296,6 +2304,8 @@ class MiniTrainDIT(WeightTrainingStat):
 
         # x_B_T_H_W_D = rearrange(x_B_THW_D, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
         # O = out_channels * spatial_patch_size * spatial_patch_size * temporal_patch_size
+        if target_branch_tokens_B_L_D is not None and self.tavid_target_mask_B_T_H_W is not None:
+            self.target_feature_contrastive_video_tokens_B_T_H_W_D = x_B_T_H_W_D
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
         if intermediate_feature_ids:
