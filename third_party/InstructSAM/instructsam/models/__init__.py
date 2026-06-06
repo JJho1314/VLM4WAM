@@ -16,7 +16,10 @@ from transformers import (
     MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING,
     PROCESSOR_MAPPING,
 )
-from peft import PeftConfig
+try:
+    from peft import PeftConfig
+except Exception:
+    PeftConfig = None
 from safetensors.torch import load_file
 from .attention_ import *
 
@@ -68,6 +71,8 @@ def load_pretrained_model(model_path, model_base, load_8bit=False, load_4bit=Fal
     # NOTE: lora/qlora model loading
     if 'lora' in model_name.lower() or 'qlora' in model_name.lower():
     # if True:
+        if PeftConfig is None:
+            raise RuntimeError("PEFT is required for loading LoRA/QLoRA InstructSAM checkpoints.")
         cfg_pretrained = PeftConfig.from_pretrained(model_path, token=token)
         # NOTE: AutoConfig will modify `_name_or_path` property to `model_path` if `model_path` is not None.
         # cfg_pretrained = AutoConfig.from_pretrained(model_path, token=token)
