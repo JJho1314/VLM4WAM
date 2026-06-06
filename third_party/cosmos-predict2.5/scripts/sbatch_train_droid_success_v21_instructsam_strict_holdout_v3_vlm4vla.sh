@@ -51,6 +51,7 @@ export DROID_SUCCESS_V21_TAVID_VAL_DIR=${DROID_SUCCESS_V21_TAVID_VAL_DIR:-/data/
 export DROID_SUCCESS_V21_TAVID_NUM_FRAMES=${DROID_SUCCESS_V21_TAVID_NUM_FRAMES:-49}
 export DROID_SUCCESS_V21_TAVID_FRAME_STRIDES=${DROID_SUCCESS_V21_TAVID_FRAME_STRIDES:-2,3,4}
 export DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY=${DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY:-range_start}
+export TARGET_FEATURE_DIR_NAME=${TARGET_FEATURE_DIR_NAME:-target_features}
 export IMAGINAIRE_OUTPUT_ROOT=${IMAGINAIRE_OUTPUT_ROOT:-$VLM4VLA_ROOT/outputs/droid_success_v21_instructsam_feature_context_strict_holdout_v3}
 export TOKENIZERS_PARALLELISM=false
 export NCCL_DEBUG=WARN
@@ -85,8 +86,9 @@ def count_active(dataset_dir):
     excluded = set(exclude_path.read_text().split()) if exclude_path.exists() else set()
     active = [path for path in videos if path.stem not in excluded]
     masks = sorted((dataset_dir / "masks").glob("*"))
-    features = sorted((dataset_dir / "target_features").glob("*.pt"))
-    missing = [path.stem for path in active if not (dataset_dir / "target_features" / f"{path.stem}.pt").exists()]
+    feature_dir = dataset_dir / os.environ.get("TARGET_FEATURE_DIR_NAME", "target_features")
+    features = sorted(feature_dir.glob("*.pt"))
+    missing = [path.stem for path in active if not (feature_dir / f"{path.stem}.pt").exists()]
     return len(videos), len(excluded), len(active), len(masks), len(features), missing
 
 
@@ -123,7 +125,7 @@ TAVID_ATTN_QUERY_CHUNK_SIZE=${TAVID_ATTN_QUERY_CHUNK_SIZE:-1024}
 EXPERIMENT=${EXPERIMENT:-predict2_video2world_training_2b_droid_success_v21_instructsam_feature_context}
 JOB_NAME=${JOB_NAME:-2b_droid_success_v21_instructsam_feature_context_strict_v3_49f_s234_bs2accum4_14k_val1000_from_base_balancedmass}
 
-echo "=== TRAIN DROID success v21 InstructSAM feature context strict_holdout_v3; repo=${REPO_ROOT}; experiment=${EXPERIMENT}; per_gpu_batch=${BATCH_SIZE}; grad_accum=${GRAD_ACCUM_ITER}; global_batch=$((BATCH_SIZE * 8 * GRAD_ACCUM_ITER)); max_iter=${MAX_ITER}; validation=${RUN_VALIDATION}; validation_iter=${VALIDATION_ITER}; max_val_iter=${MAX_VAL_ITER}; save_iter=${SAVE_ITER}; sample_iter=${SAMPLE_ITER}; train_workers=${TRAIN_NUM_WORKERS}; val_workers=${VAL_NUM_WORKERS}; attn_query_chunk=${TAVID_ATTN_QUERY_CHUNK_SIZE}; job_name=${JOB_NAME}; output_root=${IMAGINAIRE_OUTPUT_ROOT}; wandb_base=${WANDB_BASE_URL} ==="
+echo "=== TRAIN DROID success v21 InstructSAM feature context strict_holdout_v3; repo=${REPO_ROOT}; experiment=${EXPERIMENT}; target_feature_dir=${TARGET_FEATURE_DIR_NAME}; per_gpu_batch=${BATCH_SIZE}; grad_accum=${GRAD_ACCUM_ITER}; global_batch=$((BATCH_SIZE * 8 * GRAD_ACCUM_ITER)); max_iter=${MAX_ITER}; validation=${RUN_VALIDATION}; validation_iter=${VALIDATION_ITER}; max_val_iter=${MAX_VAL_ITER}; save_iter=${SAVE_ITER}; sample_iter=${SAMPLE_ITER}; train_workers=${TRAIN_NUM_WORKERS}; val_workers=${VAL_NUM_WORKERS}; attn_query_chunk=${TAVID_ATTN_QUERY_CHUNK_SIZE}; job_name=${JOB_NAME}; output_root=${IMAGINAIRE_OUTPUT_ROOT}; wandb_base=${WANDB_BASE_URL} ==="
 torchrun --standalone --nproc_per_node=8 -m scripts.train \
   --config=cosmos_predict2/_src/predict2/configs/video2world/config.py \
   -- experiment="$EXPERIMENT" \
@@ -140,7 +142,9 @@ torchrun --standalone --nproc_per_node=8 -m scripts.train \
   trainer.run_validation_on_start="$RUN_VALIDATION_ON_START" \
   trainer.callbacks.every_n_sample_reg.every_n="$SAMPLE_ITER" \
   trainer.callbacks.every_n_sample_ema.every_n="$SAMPLE_ITER" \
-  model.config.net.tavid_attn_query_chunk_size="$TAVID_ATTN_QUERY_CHUNK_SIZE"
+  model.config.net.tavid_attn_query_chunk_size="$TAVID_ATTN_QUERY_CHUNK_SIZE" \
+  dataloader_train.dataset.target_feature_dir="$DROID_SUCCESS_V21_TAVID_DIR/$TARGET_FEATURE_DIR_NAME" \
+  dataloader_val.dataset.target_feature_dir="$DROID_SUCCESS_V21_TAVID_VAL_DIR/$TARGET_FEATURE_DIR_NAME"
 status=$?
 echo "train_exit=$status"
 exit "$status"
