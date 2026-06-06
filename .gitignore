@@ -1,0 +1,65 @@
+# Python/runtime cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.cache/
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Generated outputs
+*.log
+outputs/
+checkpoints/
+logs/
+work_dirs/
+wandb/
+slurm-*.out
+slurm-*.err
+
+# Large ML artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.distcp
+*.onnx
+*.engine
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.parquet
+*.tar
+*.tar.gz
+*.zip
+
+# Local datasets and generated media
+data/
+datasets/
+visualizations/
+third_party/cosmos-predict2.5/assets/
+third_party/cosmos-predict2.5/docs/media/
+
+# Visualization artifacts
+vis/
+vis_demo/
+vis_droid/
+vis_droid_all/
+vis_droid_scenes/
+
+# Local agent/editor metadata
+.agent/
+.agents/
+.codex/
+.claude/
+.vscode/
+.idea/
