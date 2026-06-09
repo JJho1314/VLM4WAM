@@ -25,6 +25,8 @@ from cosmos_oss.init import init_environment
 from cosmos_predict2._src.imaginaire.lazy_config import instantiate
 from cosmos_predict2._src.imaginaire.utils import distributed, misc
 from cosmos_predict2._src.imaginaire.utils.config_helper import get_config_module, override
+from cosmos_predict2._src.predict2.inference.utils import write_video
+from scripts.generate_tavid_mask_samples import generate_samples_from_preencoded_batch
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,8 +38,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-steps", type=int, default=20)
     parser.add_argument("--guidance", type=float, default=3.0)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--fps", type=int, default=8)
     parser.add_argument("--num-conditional-frames", type=int, default=1)
     parser.add_argument("--max-batches", type=int, default=200)
+    parser.add_argument(
+        "--include-feature-ablation",
+        action="store_true",
+        help="Also compare the normal target feature against an all-zero target feature.",
+    )
+    parser.add_argument(
+        "--reuse-encoded-latent",
+        action="store_true",
+        help="Reuse the initial VAE latent for all generation variants to reduce peak memory.",
+    )
+    parser.add_argument(
+        "--offload-denoiser-before-decode",
+        action="store_true",
+        help="Move the denoising network to CPU before VAE decode to reduce peak GPU memory.",
+    )
     parser.add_argument("opts", nargs=argparse.REMAINDER)
     return parser.parse_args()
 
@@ -69,6 +87,11 @@ def to_01(video: torch.Tensor) -> torch.Tensor:
     return ((video.detach().float().cpu().clamp(-1, 1) + 1.0) / 2.0).clamp(0, 1)
 
 
+def video_to_uint8(video: torch.Tensor):
+    video = video.detach().float().cpu().clamp(0, 1)
+    return (video.permute(1, 2, 3, 0).numpy() * 255.0).round().astype("uint8")
+
+
 def mask_to_rgb(mask: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
     # mask: [1, T, H, W] or [T, H, W]
     if mask.ndim == 4:
@@ -84,6 +107,7 @@ def save_contact_sheet(
     zero: torch.Tensor,
     true: torch.Tensor,
     shifted: torch.Tensor,
+    zero_feature: torch.Tensor | None = None,
 ) -> None:
     raw = to_01(raw[0])
     zero = to_01(zero[0])
@@ -95,6 +119,10 @@ def save_contact_sheet(
 
     frames = sorted(set([0, raw.shape[1] // 4, raw.shape[1] // 2, raw.shape[1] * 3 // 4, raw.shape[1] - 1]))
     rows = [raw, overlay, zero, true, shifted, diff]
+    if zero_feature is not None:
+        zero_feature = to_01(zero_feature[0])
+        feature_diff = (true - zero_feature).abs().mul(3.0).clamp(0, 1)
+        rows.extend([zero_feature, feature_diff])
     tiles = []
     for row in rows:
         tiles.extend([row[:, idx] for idx in frames])
@@ -137,6 +165,7 @@ def main() -> None:
         f"checkpoint.load_path={args.checkpoint}",
         "checkpoint.save_to_object_store.enabled=False",
         "checkpoint.load_from_object_store.enabled=False",
+        "checkpoint.load_training_state=False",
         "trainer.run_validation=False",
     ]
     config = override(config, opts)
@@ -181,35 +210,100 @@ def main() -> None:
             zero_batch["target_mask"] = torch.zeros_like(data_batch["target_mask"])
             shifted_batch = clone_batch(data_batch)
             shifted_batch["target_mask"] = make_shifted_mask(data_batch["target_mask"])
+            zero_feature_batch = None
+            if args.include_feature_ablation:
+                if "target_feature" not in data_batch:
+                    raise ValueError("--include-feature-ablation requires target_feature in the batch")
+                zero_feature_batch = clone_batch(data_batch)
+                zero_feature_batch["target_feature"] = torch.zeros_like(data_batch["target_feature"])
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                true_latent = model.generate_samples_from_batch(
-                    data_batch,
-                    guidance=args.guidance,
-                    seed=args.seed,
-                    state_shape=state_shape,
-                    n_sample=x0.shape[0],
-                    num_steps=args.num_steps,
-                )
-                zero_latent = model.generate_samples_from_batch(
-                    zero_batch,
-                    guidance=args.guidance,
-                    seed=args.seed,
-                    state_shape=state_shape,
-                    n_sample=x0.shape[0],
-                    num_steps=args.num_steps,
-                )
-                shifted_latent = model.generate_samples_from_batch(
-                    shifted_batch,
-                    guidance=args.guidance,
-                    seed=args.seed,
-                    state_shape=state_shape,
-                    n_sample=x0.shape[0],
-                    num_steps=args.num_steps,
-                )
+                generate_fn = generate_samples_from_preencoded_batch if args.reuse_encoded_latent else None
+                if generate_fn is None:
+                    true_latent = model.generate_samples_from_batch(
+                        data_batch,
+                        guidance=args.guidance,
+                        seed=args.seed,
+                        state_shape=state_shape,
+                        n_sample=x0.shape[0],
+                        num_steps=args.num_steps,
+                    )
+                    zero_latent = model.generate_samples_from_batch(
+                        zero_batch,
+                        guidance=args.guidance,
+                        seed=args.seed,
+                        state_shape=state_shape,
+                        n_sample=x0.shape[0],
+                        num_steps=args.num_steps,
+                    )
+                    shifted_latent = model.generate_samples_from_batch(
+                        shifted_batch,
+                        guidance=args.guidance,
+                        seed=args.seed,
+                        state_shape=state_shape,
+                        n_sample=x0.shape[0],
+                        num_steps=args.num_steps,
+                    )
+                else:
+                    true_latent = generate_fn(
+                        model,
+                        data_batch=data_batch,
+                        x0=x0,
+                        guidance=args.guidance,
+                        seed=args.seed,
+                        state_shape=state_shape,
+                        n_sample=x0.shape[0],
+                        num_steps=args.num_steps,
+                    )
+                    zero_latent = generate_fn(
+                        model,
+                        data_batch=zero_batch,
+                        x0=x0,
+                        guidance=args.guidance,
+                        seed=args.seed,
+                        state_shape=state_shape,
+                        n_sample=x0.shape[0],
+                        num_steps=args.num_steps,
+                    )
+                    shifted_latent = generate_fn(
+                        model,
+                        data_batch=shifted_batch,
+                        x0=x0,
+                        guidance=args.guidance,
+                        seed=args.seed,
+                        state_shape=state_shape,
+                        n_sample=x0.shape[0],
+                        num_steps=args.num_steps,
+                    )
+                zero_feature_latent = None
+                if zero_feature_batch is not None:
+                    if generate_fn is None:
+                        zero_feature_latent = model.generate_samples_from_batch(
+                            zero_feature_batch,
+                            guidance=args.guidance,
+                            seed=args.seed,
+                            state_shape=state_shape,
+                            n_sample=x0.shape[0],
+                            num_steps=args.num_steps,
+                        )
+                    else:
+                        zero_feature_latent = generate_fn(
+                            model,
+                            data_batch=zero_feature_batch,
+                            x0=x0,
+                            guidance=args.guidance,
+                            seed=args.seed,
+                            state_shape=state_shape,
+                            n_sample=x0.shape[0],
+                            num_steps=args.num_steps,
+                        )
+                if args.offload_denoiser_before_decode:
+                    model.net.to("cpu")
+                    torch.cuda.empty_cache()
                 true_video = model.decode(true_latent)
                 zero_video = model.decode(zero_latent)
                 shifted_video = model.decode(shifted_latent)
+                zero_feature_video = model.decode(zero_feature_latent) if zero_feature_latent is not None else None
 
             sample_metrics = {
                 "sample_index": saved,
@@ -218,8 +312,30 @@ def main() -> None:
                 "true_vs_zero": diff_metrics(data_batch["target_mask"], true_video, zero_video),
                 "true_vs_shifted": diff_metrics(data_batch["target_mask"], true_video, shifted_video),
             }
+            if zero_feature_video is not None:
+                sample_metrics["true_vs_zero_feature"] = diff_metrics(
+                    data_batch["target_mask"], true_video, zero_feature_video
+                )
             if distributed.is_rank0():
                 sheet_path = output_dir / f"mask_guidance_sample_{saved:03d}.jpg"
+                stem = f"mask_guidance_sample_{saved:03d}"
+                video_paths = {
+                    "true_feature_video": output_dir / f"{stem}_true_feature.mp4",
+                    "zero_mask_video": output_dir / f"{stem}_zero_mask.mp4",
+                    "shifted_mask_video": output_dir / f"{stem}_shifted_mask.mp4",
+                }
+                write_video(str(video_paths["true_feature_video"]), video_to_uint8(to_01(true_video[0])), fps=args.fps)
+                write_video(str(video_paths["zero_mask_video"]), video_to_uint8(to_01(zero_video[0])), fps=args.fps)
+                write_video(
+                    str(video_paths["shifted_mask_video"]), video_to_uint8(to_01(shifted_video[0])), fps=args.fps
+                )
+                if zero_feature_video is not None:
+                    video_paths["zero_feature_video"] = output_dir / f"{stem}_zero_feature.mp4"
+                    write_video(
+                        str(video_paths["zero_feature_video"]),
+                        video_to_uint8(to_01(zero_feature_video[0])),
+                        fps=args.fps,
+                    )
                 save_contact_sheet(
                     sheet_path,
                     raw,
@@ -227,8 +343,10 @@ def main() -> None:
                     zero_video,
                     true_video,
                     shifted_video,
+                    zero_feature_video,
                 )
                 sample_metrics["contact_sheet"] = str(sheet_path)
+                sample_metrics.update({key: str(value) for key, value in video_paths.items()})
                 print(json.dumps(sample_metrics, ensure_ascii=False), flush=True)
             results.append(sample_metrics)
             saved += 1
@@ -241,12 +359,16 @@ def main() -> None:
             "num_steps": args.num_steps,
             "guidance": args.guidance,
             "seed": args.seed,
+            "include_feature_ablation": args.include_feature_ablation,
             "samples": results,
         }
         if results:
-            for pair_name in ("true_vs_zero", "true_vs_shifted"):
+            pair_names = ["true_vs_zero", "true_vs_shifted"]
+            if args.include_feature_ablation:
+                pair_names.append("true_vs_zero_feature")
+            for pair_name in pair_names:
                 for metric_name in ("mean_abs_diff", "inside_mask_abs_diff", "outside_mask_abs_diff", "inside_outside_ratio"):
-                    values = [sample[pair_name][metric_name] for sample in results]
+                    values = [sample[pair_name][metric_name] for sample in results if pair_name in sample]
                     summary[f"{pair_name}_{metric_name}_mean"] = float(sum(values) / len(values))
         with open(output_dir / "mask_guidance_eval_summary.json", "w") as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
