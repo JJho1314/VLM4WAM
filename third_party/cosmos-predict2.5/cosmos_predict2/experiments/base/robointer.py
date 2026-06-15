@@ -459,6 +459,40 @@ _video_dataset_droid_success_v21_val_instructsam_feature = L(VideoDataset)(
     frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
     frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
 )
+# Text-free multi-source: fused mask+detect+vtext InstructSAM feature (one [L,256]
+# tensor) loaded from target_features_multisource. Budgets 16/16/32 -> 64 tokens.
+_DROID_SUCCESS_V21_MULTISOURCE_SEGMENTS = [16, 16, 32]
+_DROID_SUCCESS_V21_MULTISOURCE_MAX_TOKENS = sum(_DROID_SUCCESS_V21_MULTISOURCE_SEGMENTS)
+_video_dataset_droid_success_v21_instructsam_multisource = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_480,
+    target_mask_dir="auto",
+    target_mask_default_to_zero=False,
+    target_feature_dir="target_features_multisource",
+    target_feature_default_to_zero=False,
+    target_feature_dim=256,
+    target_feature_max_tokens=_DROID_SUCCESS_V21_MULTISOURCE_MAX_TOKENS,
+    target_prompt_suffix="The robot interacts with the [TGT] target object.",
+    exclude_video_stems_file="auto",
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
+_video_dataset_droid_success_v21_val_instructsam_multisource = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID_VAL,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_480,
+    target_mask_dir="auto",
+    target_mask_default_to_zero=False,
+    target_feature_dir="target_features_multisource",
+    target_feature_default_to_zero=False,
+    target_feature_dim=256,
+    target_feature_max_tokens=_DROID_SUCCESS_V21_MULTISOURCE_MAX_TOKENS,
+    target_prompt_suffix="The robot interacts with the [TGT] target object.",
+    exclude_video_stems_file="auto",
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
 _video_dataset_droid_success_v21_baseline = L(VideoDataset)(
     dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID,
     num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
@@ -512,6 +546,304 @@ _dataloader_train_droid_success_v21_instructsam_feature = L(get_generic_dataload
 _dataloader_val_droid_success_v21_instructsam_feature = L(get_generic_dataloader)(
     dataset=_video_dataset_droid_success_v21_val_instructsam_feature,
     sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_val_instructsam_feature),
+    batch_size=1,
+    drop_last=False,
+    num_workers=4,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=2,
+)
+_dataloader_train_droid_success_v21_instructsam_multisource = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_instructsam_multisource,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_instructsam_multisource),
+    batch_size=1,
+    drop_last=True,
+    num_workers=12,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=4,
+)
+_dataloader_val_droid_success_v21_instructsam_multisource = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_val_instructsam_multisource,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_val_instructsam_multisource),
+    batch_size=1,
+    drop_last=False,
+    num_workers=4,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=2,
+)
+# Dense feature-map tokens: SAM dense vision grid features selected by GT target
+# mask and projected to [64,256]. The model consumes them as an 8x8 feature map
+# instead of mean-pooling to one target vector.
+_video_dataset_droid_success_v21_gt_mask_spatial_feature = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_480,
+    target_mask_dir="auto",
+    target_mask_default_to_zero=False,
+    target_feature_dir="target_features_gt_mask_spatial64",
+    target_feature_default_to_zero=False,
+    target_feature_dim=256,
+    target_feature_max_tokens=64,
+    target_prompt_suffix="The robot interacts with the [TGT] target object.",
+    exclude_video_stems_file="auto",
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
+_video_dataset_droid_success_v21_val_gt_mask_spatial_feature = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID_VAL,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_480,
+    target_mask_dir="auto",
+    target_mask_default_to_zero=False,
+    target_feature_dir="target_features_gt_mask_spatial64",
+    target_feature_default_to_zero=False,
+    target_feature_dim=256,
+    target_feature_max_tokens=64,
+    target_prompt_suffix="The robot interacts with the [TGT] target object.",
+    exclude_video_stems_file="auto",
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
+_dataloader_train_droid_success_v21_gt_mask_spatial_feature = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_gt_mask_spatial_feature,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_gt_mask_spatial_feature),
+    batch_size=1,
+    drop_last=True,
+    num_workers=12,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=4,
+)
+_dataloader_val_droid_success_v21_gt_mask_spatial_feature = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_val_gt_mask_spatial_feature,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_val_gt_mask_spatial_feature),
+    batch_size=1,
+    drop_last=False,
+    num_workers=4,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=2,
+)
+# Hybrid: preserve the old successful mask_query target_feature path, and add a
+# second dense spatial feature map from the fine-tuned InstructSAM stage2 LoRA.
+_video_dataset_droid_success_v21_hybrid_stage2_lora_feature = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_480,
+    target_mask_dir="auto",
+    target_mask_default_to_zero=False,
+    target_feature_dir="target_features",
+    target_feature_default_to_zero=False,
+    target_feature_dim=256,
+    target_feature_max_tokens=64,
+    target_dense_feature_dir="target_features_gt_mask_spatial64_instructsam_stage2_lora",
+    target_dense_feature_default_to_zero=False,
+    target_dense_feature_dim=256,
+    target_dense_feature_max_tokens=64,
+    target_prompt_suffix="The robot interacts with the [TGT] target object.",
+    exclude_video_stems_file="auto",
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
+_video_dataset_droid_success_v21_val_hybrid_stage2_lora_feature = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID_VAL,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_480,
+    target_mask_dir="auto",
+    target_mask_default_to_zero=False,
+    target_feature_dir="target_features",
+    target_feature_default_to_zero=False,
+    target_feature_dim=256,
+    target_feature_max_tokens=64,
+    target_dense_feature_dir="target_features_gt_mask_spatial64_instructsam_stage2_lora",
+    target_dense_feature_default_to_zero=False,
+    target_dense_feature_dim=256,
+    target_dense_feature_max_tokens=64,
+    target_prompt_suffix="The robot interacts with the [TGT] target object.",
+    exclude_video_stems_file="auto",
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
+_dataloader_train_droid_success_v21_hybrid_stage2_lora_feature = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_hybrid_stage2_lora_feature,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_hybrid_stage2_lora_feature),
+    batch_size=1,
+    drop_last=True,
+    num_workers=12,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=4,
+)
+_dataloader_val_droid_success_v21_hybrid_stage2_lora_feature = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_val_hybrid_stage2_lora_feature,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_val_hybrid_stage2_lora_feature),
+    batch_size=1,
+    drop_last=False,
+    num_workers=4,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=2,
+)
+# Mask-free dense InstructSAM decoder features. These are text/query-conditioned
+# mask-decoder continuous maps exported as full spatial grids; Cosmos receives
+# only target_feature, not target_mask.
+_video_dataset_droid_success_v21_decoder_dense_maskfree_feature = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_480,
+    target_mask_dir="none",
+    target_feature_dir="target_features_instructsam_decoder_dense_stage2_lora",
+    target_feature_default_to_zero=False,
+    target_feature_dim=256,
+    target_feature_max_tokens=0,
+    target_prompt_suffix="The robot interacts with the [TGT] target object.",
+    exclude_video_stems_file="auto",
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
+_video_dataset_droid_success_v21_val_decoder_dense_maskfree_feature = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID_VAL,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_480,
+    target_mask_dir="none",
+    target_feature_dir="target_features_instructsam_decoder_dense_stage2_lora",
+    target_feature_default_to_zero=False,
+    target_feature_dim=256,
+    target_feature_max_tokens=0,
+    target_prompt_suffix="The robot interacts with the [TGT] target object.",
+    exclude_video_stems_file="auto",
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
+_dataloader_train_droid_success_v21_decoder_dense_maskfree_feature = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_decoder_dense_maskfree_feature,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_decoder_dense_maskfree_feature),
+    batch_size=1,
+    drop_last=True,
+    num_workers=12,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=4,
+)
+_dataloader_val_droid_success_v21_decoder_dense_maskfree_feature = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_val_decoder_dense_maskfree_feature,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_val_decoder_dense_maskfree_feature),
+    batch_size=1,
+    drop_last=False,
+    num_workers=4,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=2,
+)
+# raw_seg ablation data: same videos/masks, but the target feature is the RAW
+# 2048-d Qwen3VL hidden state at [SEG] positions (feature_mode=raw_seg), not the
+# 256-d mask_hidden_fcs projection. Precomputed into target_features_rawseg/.
+_video_dataset_droid_success_v21_rawseg_feature = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_480,
+    target_mask_dir="auto",
+    target_mask_default_to_zero=False,
+    target_feature_dir="target_features_rawseg",
+    target_feature_default_to_zero=False,
+    target_feature_dim=2048,
+    target_feature_max_tokens=64,
+    target_prompt_suffix="The robot interacts with the [TGT] target object.",
+    exclude_video_stems_file="auto",
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
+_video_dataset_droid_success_v21_val_rawseg_feature = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID_VAL,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_480,
+    target_mask_dir="auto",
+    target_mask_default_to_zero=False,
+    target_feature_dir="target_features_rawseg",
+    target_feature_default_to_zero=False,
+    target_feature_dim=2048,
+    target_feature_max_tokens=64,
+    target_prompt_suffix="The robot interacts with the [TGT] target object.",
+    exclude_video_stems_file="auto",
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
+_dataloader_train_droid_success_v21_rawseg_feature = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_rawseg_feature,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_rawseg_feature),
+    batch_size=1,
+    drop_last=True,
+    num_workers=12,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=4,
+)
+_dataloader_val_droid_success_v21_rawseg_feature = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_val_rawseg_feature,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_val_rawseg_feature),
+    batch_size=1,
+    drop_last=False,
+    num_workers=4,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=2,
+)
+# Match-ground data: GT masks (matching supervision only) + raw [SEG] 2048 as
+# `target_feature` (grounding WHAT) + [SEG] projection 256 as
+# `target_dense_feature` (matching query WHERE). Both FT-extractor features.
+_video_dataset_droid_success_v21_match_ground = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_480,
+    target_mask_dir="auto",
+    target_mask_default_to_zero=False,
+    target_feature_dir="target_features_rawseg_ft",
+    target_feature_default_to_zero=False,
+    target_feature_dim=2048,
+    target_feature_max_tokens=16,
+    target_dense_feature_dir="target_features_ft",
+    target_dense_feature_default_to_zero=False,
+    target_dense_feature_dim=256,
+    target_dense_feature_max_tokens=16,
+    target_prompt_suffix="The robot interacts with the [TGT] target object.",
+    exclude_video_stems_file="auto",
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
+_video_dataset_droid_success_v21_val_match_ground = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID_VAL,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_480,
+    target_mask_dir="auto",
+    target_mask_default_to_zero=False,
+    target_feature_dir="target_features_rawseg_ft",
+    target_feature_default_to_zero=False,
+    target_feature_dim=2048,
+    target_feature_max_tokens=16,
+    target_dense_feature_dir="target_features_ft",
+    target_dense_feature_default_to_zero=False,
+    target_dense_feature_dim=256,
+    target_dense_feature_max_tokens=16,
+    target_prompt_suffix="The robot interacts with the [TGT] target object.",
+    exclude_video_stems_file="auto",
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
+_dataloader_train_droid_success_v21_match_ground = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_match_ground,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_match_ground),
+    batch_size=1,
+    drop_last=True,
+    num_workers=12,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=4,
+)
+_dataloader_val_droid_success_v21_match_ground = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_val_match_ground,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_val_match_ground),
     batch_size=1,
     drop_last=False,
     num_workers=4,
@@ -871,6 +1203,317 @@ predict2_video2world_training_2b_droid_success_v21_instructsam_feature_target_br
     )
 )
 
+predict2_video2world_training_2b_droid_success_v21_dense_spatial_target = copy.deepcopy(
+    predict2_video2world_training_2b_droid_success_v21_instructsam_feature_context
+)
+predict2_video2world_training_2b_droid_success_v21_dense_spatial_target["job"]["name"] = (
+    "2b_droid_success_v21_dense_spatial_target_480_49f"
+)
+predict2_video2world_training_2b_droid_success_v21_dense_spatial_target["model"]["config"]["net"].update(
+    dict(
+        concat_target_mask=False,
+        target_mask_context_tokens=False,
+        target_feature_context_tokens=False,
+        target_feature_context_append_to_text=False,
+        target_feature_cross_attention=False,
+        target_dense_spatial_tokens=True,
+        target_dense_spatial_feature_dim=256,
+        target_dense_spatial_hidden_dim=512,
+        target_dense_spatial_init_gate=0.01,
+        tavid_attn_alignment_blocks=[8, 12, 16, 20],
+        tavid_attn_alignment_token_source="text",
+        tavid_attn_query_chunk_size=1024,
+    )
+)
+
+# Ablation: identical dense spatial injection, but the painted WHAT vector is the
+# RAW 2048-d Qwen3VL [SEG] hidden state (full task semantics) instead of the
+# 256-d mask_hidden_fcs projection (segmentation-specialized). Same extractor
+# (original InstructSAM-2B), same budget — the only variable is the feature type.
+predict2_video2world_training_2b_droid_success_v21_dense_spatial_rawseg = copy.deepcopy(
+    predict2_video2world_training_2b_droid_success_v21_dense_spatial_target
+)
+predict2_video2world_training_2b_droid_success_v21_dense_spatial_rawseg["dataloader_train"] = (
+    _dataloader_train_droid_success_v21_rawseg_feature
+)
+predict2_video2world_training_2b_droid_success_v21_dense_spatial_rawseg["dataloader_val"] = (
+    _dataloader_val_droid_success_v21_rawseg_feature
+)
+predict2_video2world_training_2b_droid_success_v21_dense_spatial_rawseg["job"]["name"] = (
+    "2b_droid_success_v21_dense_spatial_rawseg2048_480_49f"
+)
+predict2_video2world_training_2b_droid_success_v21_dense_spatial_rawseg["model"]["config"]["net"].update(
+    dict(
+        target_dense_spatial_feature_dim=2048,
+    )
+)
+
+# Mask-free match-ground: WHERE is learned (matching head over the [SEG]
+# projection query, GT-mask supervised on ALL frames -> temporal tracking),
+# WHAT is the raw [SEG] hidden read via gated attention. NO mask at inference.
+predict2_video2world_training_2b_droid_success_v21_match_ground = copy.deepcopy(
+    predict2_video2world_training_2b_droid_success_v21_tavid_mask
+)
+predict2_video2world_training_2b_droid_success_v21_match_ground["dataloader_train"] = (
+    _dataloader_train_droid_success_v21_match_ground
+)
+predict2_video2world_training_2b_droid_success_v21_match_ground["dataloader_val"] = (
+    _dataloader_val_droid_success_v21_match_ground
+)
+predict2_video2world_training_2b_droid_success_v21_match_ground["job"]["name"] = (
+    "2b_droid_success_v21_match_ground_480_49f"
+)
+predict2_video2world_training_2b_droid_success_v21_match_ground["model"]["config"].update(
+    dict(
+        # Full tracked masks as supervision (mask is NOT an input anywhere in
+        # this experiment, so no train/inference mismatch).
+        target_mask_condition_frames_only=False,
+        target_matching_loss_weight=1.0,
+    )
+)
+predict2_video2world_training_2b_droid_success_v21_match_ground["model"]["config"]["net"].update(
+    dict(
+        concat_target_mask=False,
+        target_mask_concat_input=False,
+        target_mask_context_tokens=False,
+        target_feature_context_tokens=False,
+        target_dense_spatial_tokens=False,
+        target_match_ground=True,
+        target_match_ground_query_dim=256,
+        target_match_ground_dim=2048,
+        target_match_ground_match_dim=256,
+        target_match_ground_num_heads=8,
+        target_match_ground_gate_init=0.0,
+        target_match_ground_dropout=0.1,
+        tavid_attn_alignment_blocks=[8, 12, 16, 20],
+        tavid_attn_alignment_token_source="text",
+        tavid_attn_query_chunk_size=1024,
+    )
+)
+
+# Match-ground v2: the ONLY change from v1 is a NONLINEAR (MLP) WHERE head.
+# Probes A/B/C established v1's failure was a LINEAR match_q/match_k that could
+# only read the features' dominant common-mode (-> query-independent foreground
+# predictor); an MLP recovers query-specific localization (+0.125 AUC gap), and
+# block-0 (the current match point) is the best depth. Centering / contrastive /
+# noise-weighting / depth-change were each tested and add ~0, so they are NOT
+# used. Captions untouched; inference stays fully mask-free.
+predict2_video2world_training_2b_droid_success_v21_match_ground_v2 = copy.deepcopy(
+    predict2_video2world_training_2b_droid_success_v21_match_ground
+)
+predict2_video2world_training_2b_droid_success_v21_match_ground_v2["job"]["name"] = (
+    "2b_droid_success_v21_match_ground_v2_480_49f"
+)
+predict2_video2world_training_2b_droid_success_v21_match_ground_v2["model"]["config"]["net"].update(
+    dict(
+        target_match_ground_mlp_hidden=512,
+    )
+)
+
+# Match-ground v3: v2 (MLP WHERE head) + GT-MASK GATE CURRICULUM to break the gate
+# deadlock. v2 trained cleanly but the gate stayed ~0 (tanh 1e-4): the gate's
+# gradient is diffusion-loss-only, and early on the predicted soft mask is too
+# weak for the injection to help -> gate never opens. The curriculum gates the
+# WHAT injection with the GT mask early (the dense recipe that provably drove the
+# gate 0.01->1.0), then anneals to the predicted soft mask: gt_blend=1 until
+# hold_iters (500), linear to 0 by gate_iters (1200), pure-predicted after. The
+# matching BCE always supervises the PREDICTED logits, so the predicted mask
+# keeps improving to take over the handoff. Inference uses gt_blend=0 + no GT
+# mask -> still fully mask-free. (~10 epochs = 1470 iters.)
+predict2_video2world_training_2b_droid_success_v21_match_ground_v3 = copy.deepcopy(
+    predict2_video2world_training_2b_droid_success_v21_match_ground_v2
+)
+predict2_video2world_training_2b_droid_success_v21_match_ground_v3["job"]["name"] = (
+    "2b_droid_success_v21_match_ground_v3_480_49f"
+)
+predict2_video2world_training_2b_droid_success_v21_match_ground_v3["model"]["config"].update(
+    dict(
+        target_match_ground_gt_gate_hold_iters=500,
+        target_match_ground_gt_gate_iters=1200,
+    )
+)
+
+predict2_video2world_training_2b_droid_success_v21_dense_feature_map_target = copy.deepcopy(
+    predict2_video2world_training_2b_droid_success_v21_dense_spatial_target
+)
+predict2_video2world_training_2b_droid_success_v21_dense_feature_map_target["dataloader_train"] = (
+    _dataloader_train_droid_success_v21_gt_mask_spatial_feature
+)
+predict2_video2world_training_2b_droid_success_v21_dense_feature_map_target["dataloader_val"] = (
+    _dataloader_val_droid_success_v21_gt_mask_spatial_feature
+)
+predict2_video2world_training_2b_droid_success_v21_dense_feature_map_target["job"]["name"] = (
+    "2b_droid_success_v21_dense_feature_map_target_480_49f"
+)
+predict2_video2world_training_2b_droid_success_v21_dense_feature_map_target["model"]["config"]["net"].update(
+    dict(
+        target_dense_spatial_use_feature_map=True,
+    )
+)
+
+predict2_video2world_training_2b_droid_success_v21_maskfree_decoder_dense_target = copy.deepcopy(
+    predict2_video2world_training_2b_droid_success_v21_dense_spatial_target
+)
+predict2_video2world_training_2b_droid_success_v21_maskfree_decoder_dense_target["dataloader_train"] = (
+    _dataloader_train_droid_success_v21_decoder_dense_maskfree_feature
+)
+predict2_video2world_training_2b_droid_success_v21_maskfree_decoder_dense_target["dataloader_val"] = (
+    _dataloader_val_droid_success_v21_decoder_dense_maskfree_feature
+)
+predict2_video2world_training_2b_droid_success_v21_maskfree_decoder_dense_target["job"]["name"] = (
+    "2b_droid_success_v21_maskfree_decoder_dense_target_480_49f"
+)
+predict2_video2world_training_2b_droid_success_v21_maskfree_decoder_dense_target["model"]["config"]["net"].update(
+    dict(
+        concat_target_mask=False,
+        target_mask_context_tokens=False,
+        target_feature_context_tokens=False,
+        target_feature_context_append_to_text=False,
+        target_feature_cross_attention=False,
+        target_dense_spatial_tokens=True,
+        target_dense_spatial_feature_dim=256,
+        target_dense_spatial_hidden_dim=512,
+        target_dense_spatial_init_gate=0.01,
+        target_dense_spatial_use_feature_map=True,
+        target_dense_spatial_mask_free=True,
+        tavid_attn_alignment_blocks=[],
+        tavid_attn_query_chunk_size=1024,
+    )
+)
+
+predict2_video2world_training_2b_droid_success_v21_feature_input_channel_target = copy.deepcopy(
+    predict2_video2world_training_2b_droid_success_v21_maskfree_decoder_dense_target
+)
+predict2_video2world_training_2b_droid_success_v21_feature_input_channel_target["job"]["name"] = (
+    "2b_droid_success_v21_feature_input_channel_target_480_49f"
+)
+predict2_video2world_training_2b_droid_success_v21_feature_input_channel_target["model"]["config"]["net"].update(
+    dict(
+        concat_target_mask=False,
+        target_mask_concat_input=False,
+        target_mask_context_tokens=False,
+        target_feature_context_tokens=False,
+        target_feature_context_append_to_text=False,
+        target_feature_cross_attention=False,
+        target_dense_spatial_tokens=False,
+        target_dense_spatial_mask_free=False,
+        target_feature_concat_input=True,
+        target_feature_concat_input_dim=256,
+        target_feature_concat_input_hidden_dim=128,
+        target_feature_concat_input_channels=8,
+        tavid_attn_alignment_blocks=[],
+        tavid_attn_query_chunk_size=1024,
+    )
+)
+
+predict2_video2world_training_2b_droid_success_v21_feature_control_map_channel_target = copy.deepcopy(
+    predict2_video2world_training_2b_droid_success_v21_feature_input_channel_target
+)
+predict2_video2world_training_2b_droid_success_v21_feature_control_map_channel_target["job"]["name"] = (
+    "2b_droid_success_v21_feature_control_map_channel_target_480_49f"
+)
+predict2_video2world_training_2b_droid_success_v21_feature_control_map_channel_target["model"]["config"]["net"].update(
+    dict(
+        target_feature_concat_input=True,
+        target_feature_concat_input_dim=256,
+        target_feature_concat_input_hidden_dim=64,
+        target_feature_concat_input_channels=1,
+        target_feature_concat_input_mode="control_map",
+        target_feature_concat_input_output_scale=1.0,
+    )
+)
+
+# Mask-free latent-space grounding: InstructSAM decoder dense hidden features are
+# projected into a Cosmos latent target field and injected only inside selected
+# DiT blocks through gated residual modulation. No target mask logits or binary
+# mask are consumed by this path at inference.
+predict2_video2world_training_2b_droid_success_v21_latent_grounding_decoder_dense_target = copy.deepcopy(
+    predict2_video2world_training_2b_droid_success_v21_maskfree_decoder_dense_target
+)
+predict2_video2world_training_2b_droid_success_v21_latent_grounding_decoder_dense_target["job"]["name"] = (
+    "2b_droid_success_v21_latent_grounding_decoder_dense_target_480_49f"
+)
+predict2_video2world_training_2b_droid_success_v21_latent_grounding_decoder_dense_target["model"]["config"]["net"].update(
+    dict(
+        concat_target_mask=False,
+        target_mask_concat_input=False,
+        target_mask_context_tokens=False,
+        target_feature_context_tokens=False,
+        target_feature_context_append_to_text=False,
+        target_feature_cross_attention=False,
+        target_feature_concat_input=False,
+        target_dense_spatial_tokens=False,
+        target_dense_spatial_mask_free=False,
+        target_latent_grounding=True,
+        target_latent_grounding_feature_dim=256,
+        target_latent_grounding_hidden_dim=512,
+        target_latent_grounding_blocks=[8, 12, 16, 20],
+        target_latent_grounding_init_gate=0.01,
+        tavid_attn_alignment_blocks=[],
+        tavid_attn_query_chunk_size=1024,
+    )
+)
+
+# TAViD-style target-aware, WITHOUT the explicit mask-in-latent channel: text +
+# [TGT] conditioning and the TAVID attention loss as in tavid_mask, plus the mask
+# entering generation as SPATIAL context tokens (TargetMaskContextAdapter:
+# patchified mask + coords appended after text in cross-attention). The latent
+# input is untouched (concat_target_mask=False). At inference the mask can come
+# from InstructSAM (target_mask_path / target_query).
+predict2_video2world_training_2b_droid_success_v21_tavid_mask_context = copy.deepcopy(
+    predict2_video2world_training_2b_droid_success_v21_tavid_mask
+)
+predict2_video2world_training_2b_droid_success_v21_tavid_mask_context["job"]["name"] = (
+    "2b_droid_success_v21_tavid_mask_context_480_49f"
+)
+predict2_video2world_training_2b_droid_success_v21_tavid_mask_context["model"]["config"]["net"].update(
+    dict(
+        concat_target_mask=False,             # mask stays OUT of the latent input
+        target_mask_concat_input=False,
+        target_mask_context_tokens=True,      # mask -> spatial context tokens
+        target_mask_context_patch_size=(1, 2, 2),
+        target_mask_context_hidden_dim=512,
+        target_mask_context_max_tokens=256,
+        target_mask_context_include_coords=True,
+        tavid_attn_alignment_blocks=[8, 12, 16, 20],
+        tavid_attn_alignment_token_source="text",
+        tavid_attn_query_chunk_size=1024,
+    )
+)
+
+# Text-free multi-source: drop the T5 text stream and condition Cosmos ONLY on the
+# fused InstructSAM mask+detect+vtext feature (replace_text=True). A learned
+# per-source segment embedding (segments=[16,16,32]) marks each representation.
+predict2_video2world_training_2b_droid_success_v21_instructsam_textfree_multisource = copy.deepcopy(
+    predict2_video2world_training_2b_droid_success_v21_instructsam_feature_context
+)
+predict2_video2world_training_2b_droid_success_v21_instructsam_textfree_multisource["dataloader_train"] = (
+    _dataloader_train_droid_success_v21_instructsam_multisource
+)
+predict2_video2world_training_2b_droid_success_v21_instructsam_textfree_multisource["dataloader_val"] = (
+    _dataloader_val_droid_success_v21_instructsam_multisource
+)
+predict2_video2world_training_2b_droid_success_v21_instructsam_textfree_multisource["job"]["name"] = (
+    "2b_droid_success_v21_instructsam_textfree_multisource_480_lr_split_val1k_49f"
+)
+predict2_video2world_training_2b_droid_success_v21_instructsam_textfree_multisource["model"]["config"]["net"].update(
+    dict(
+        concat_target_mask=False,
+        target_mask_context_tokens=False,
+        target_feature_context_tokens=True,
+        target_feature_context_in_dim=256,
+        target_feature_context_hidden_dim=512,
+        target_feature_context_max_tokens=_DROID_SUCCESS_V21_MULTISOURCE_MAX_TOKENS,
+        target_feature_context_replace_text=True,
+        target_feature_context_append_to_text=False,
+        target_feature_context_source_segments=_DROID_SUCCESS_V21_MULTISOURCE_SEGMENTS,
+        # Text is gone, so the target-attention loss must align FEATURE tokens.
+        tavid_attn_alignment_blocks=[8, 12, 16, 20],
+        tavid_attn_alignment_token_source="feature",
+        tavid_attn_query_chunk_size=1024,
+    )
+)
+
 predict2_video2world_training_2b_droid_success_v21_baseline_nomask_noloss = dict(
     defaults=[
         f"/experiment/{DEFAULT_CHECKPOINT_2B.experiment}",
@@ -1025,4 +1668,88 @@ cs.store(
     package="_global_",
     name="predict2_video2world_training_2b_droid_success_v21_instructsam_feature_target_branch",
     node=predict2_video2world_training_2b_droid_success_v21_instructsam_feature_target_branch,
+)
+
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="predict2_video2world_training_2b_droid_success_v21_dense_spatial_target",
+    node=predict2_video2world_training_2b_droid_success_v21_dense_spatial_target,
+)
+
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="predict2_video2world_training_2b_droid_success_v21_instructsam_textfree_multisource",
+    node=predict2_video2world_training_2b_droid_success_v21_instructsam_textfree_multisource,
+)
+
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="predict2_video2world_training_2b_droid_success_v21_tavid_mask_context",
+    node=predict2_video2world_training_2b_droid_success_v21_tavid_mask_context,
+)
+
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="predict2_video2world_training_2b_droid_success_v21_dense_spatial_rawseg",
+    node=predict2_video2world_training_2b_droid_success_v21_dense_spatial_rawseg,
+)
+
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="predict2_video2world_training_2b_droid_success_v21_match_ground",
+    node=predict2_video2world_training_2b_droid_success_v21_match_ground,
+)
+
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="predict2_video2world_training_2b_droid_success_v21_match_ground_v2",
+    node=predict2_video2world_training_2b_droid_success_v21_match_ground_v2,
+)
+
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="predict2_video2world_training_2b_droid_success_v21_match_ground_v3",
+    node=predict2_video2world_training_2b_droid_success_v21_match_ground_v3,
+)
+
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="predict2_video2world_training_2b_droid_success_v21_dense_feature_map_target",
+    node=predict2_video2world_training_2b_droid_success_v21_dense_feature_map_target,
+)
+
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="predict2_video2world_training_2b_droid_success_v21_maskfree_decoder_dense_target",
+    node=predict2_video2world_training_2b_droid_success_v21_maskfree_decoder_dense_target,
+)
+
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="predict2_video2world_training_2b_droid_success_v21_feature_input_channel_target",
+    node=predict2_video2world_training_2b_droid_success_v21_feature_input_channel_target,
+)
+
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="predict2_video2world_training_2b_droid_success_v21_feature_control_map_channel_target",
+    node=predict2_video2world_training_2b_droid_success_v21_feature_control_map_channel_target,
+)
+
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="predict2_video2world_training_2b_droid_success_v21_latent_grounding_decoder_dense_target",
+    node=predict2_video2world_training_2b_droid_success_v21_latent_grounding_decoder_dense_target,
 )

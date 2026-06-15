@@ -23,6 +23,7 @@ from einops import rearrange
 from megatron.core import parallel_state
 from torch import Tensor
 
+from cosmos_predict2._src.imaginaire.utils import log
 from cosmos_predict2._src.predict2.conditioner import DataType
 from cosmos_predict2._src.predict2.configs.video2world.defaults.conditioner import Video2WorldCondition
 from cosmos_predict2._src.predict2.models.denoise_prediction import DenoisePrediction
@@ -61,6 +62,18 @@ class Video2WorldModelRectifiedFlowConfig(Text2WorldModelRectifiedFlowConfig):
     target_feature_contrastive_temperature: float = 0.07
     target_feature_contrastive_margin: float = 0.2
     target_feature_contrastive_margin_loss_weight: float = 0.5
+    # Supervision for the mask-free match-ground head (BCE of matching logits vs
+    # the GT mask on the token grid; fg/bg averaged separately).
+    target_matching_loss_weight: float = 0.0
+    # Down-weight matching BCE on heavily-noised samples: at high sigma the latent
+    # is undiscriminable and the optimum is a constant 0.5, which dilutes the
+    # gradient of learnable (low-noise) samples.
+    target_matching_noise_weighting: bool = False
+    # GT-gate curriculum for the match-ground injection: gt_blend stays 1.0 until
+    # hold_iters, anneals linearly to 0.0 at gate_iters, then the predicted soft
+    # mask gates alone. 0 disables (v1 behavior). Inference is always mask-free.
+    target_match_ground_gt_gate_hold_iters: int = 0
+    target_match_ground_gt_gate_iters: int = 0
 
     def __attrs_post_init__(self):
         super().__attrs_post_init__()
@@ -93,13 +106,52 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
         if target_feature is not None:
             target_feature = target_feature.to(device=latent_state.device, dtype=latent_state.dtype)
             condition = condition.set_target_feature(target_feature)
+        target_dense_feature = data_batch.get("target_dense_feature", None)
+        if target_dense_feature is not None:
+            target_dense_feature = target_dense_feature.to(device=latent_state.device, dtype=latent_state.dtype)
+            condition = condition.set_target_dense_feature(target_dense_feature)
+        if not getattr(self, "_target_batch_diag_logged", False):
+            self._target_batch_diag_logged = True
+            log.info(
+                "target conditioning batch diag: "
+                f"mask={'ok' if target_mask is not None else 'None'} "
+                f"feature={'ok' if target_feature is not None else 'None'} "
+                f"dense={'ok' if target_dense_feature is not None else 'None'}"
+            )
         tgt_token_indices = data_batch.get("tgt_token_indices", None)
         if tgt_token_indices is not None:
             condition = condition.set_tgt_token_indices(tgt_token_indices.to(device=latent_state.device, dtype=torch.long))
         return raw_state, latent_state, condition
 
+    def training_step(
+        self, data_batch: dict[str, torch.Tensor], iteration: int
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        self._update_match_ground_curriculum(iteration)
+        return super().training_step(data_batch, iteration)
+
+    def _update_match_ground_curriculum(self, iteration: int) -> None:
+        gate_iters = int(getattr(self.config, "target_match_ground_gt_gate_iters", 0) or 0)
+        module = getattr(self.net, "target_match_ground_module", None)
+        if module is None:
+            return
+        if gate_iters <= 0:
+            module.gt_blend = 0.0
+            self._match_ground_gt_blend = 0.0
+            return
+        hold = int(getattr(self.config, "target_match_ground_gt_gate_hold_iters", 0) or 0)
+        if iteration <= hold:
+            blend = 1.0
+        else:
+            blend = max(0.0, 1.0 - (iteration - hold) / max(1, gate_iters - hold))
+        module.gt_blend = blend
+        self._match_ground_gt_blend = blend
+
     def compute_extra_training_loss(self, condition: Video2WorldCondition) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        if self.config.target_attention_loss_weight <= 0 and self.config.target_feature_contrastive_loss_weight <= 0:
+        if (
+            self.config.target_attention_loss_weight <= 0
+            and self.config.target_feature_contrastive_loss_weight <= 0
+            and self.config.target_matching_loss_weight <= 0
+        ):
             return {}, torch.zeros((), **self.tensor_kwargs_fp32)
         target_attn_maps = getattr(self.net, "tavid_target_attn_maps", [])
         target_attn_source = getattr(self.net, "tavid_target_attn_source", "none")
@@ -191,6 +243,58 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
                 }
             )
 
+        # Match-ground supervision: BCE of the matching head's logits against the
+        # token-grid GT mask, fg/bg averaged separately so tiny targets are not
+        # drowned by background.
+        matching_logits = getattr(self.net, "target_matching_logits_B_T_H_W", None)
+        if (
+            self.config.target_matching_loss_weight > 0
+            and matching_logits is None
+            and not getattr(self, "_match_loss_diag_logged", False)
+        ):
+            self._match_loss_diag_logged = True
+            log.warning(
+                "target_matching loss skipped: logits=None | "
+                f"cond_feat={'ok' if condition.target_feature_B_L_D is not None else 'None'} | "
+                f"cond_dense={'ok' if condition.target_dense_feature_B_L_D is not None else 'None'} | "
+                f"net_module={'ok' if getattr(self.net, 'target_match_ground_module', None) is not None else 'None'}"
+            )
+        if self.config.target_matching_loss_weight > 0 and matching_logits is not None:
+            logits_flat = rearrange(matching_logits.float(), "b t h w -> b (t h w)")
+            bce = F.binary_cross_entropy_with_logits(logits_flat, mask_flat, reduction="none")
+            pos_bce = (bce * pos_weight).sum(dim=1) / (pos_sum + eps)
+            neg_bce = (bce * neg_weight).sum(dim=1) / (neg_sum + eps)
+            match_per_sample = pos_bce + neg_bce
+            sample_w = torch.ones_like(match_per_sample)
+            if self.config.target_matching_noise_weighting:
+                t_stash = getattr(self, "_last_denoise_timesteps_B_T", None)
+                if t_stash is not None and t_stash.shape[0] == match_per_sample.shape[0]:
+                    t_B = t_stash.reshape(t_stash.shape[0], -1).mean(dim=1).to(match_per_sample.device)
+                    t_norm = (t_B / 1000.0) if float(t_B.max()) > 1.5 else t_B
+                    sample_w = (1.0 - t_norm).clamp(0.05, 1.0).to(match_per_sample.dtype)
+            wv = sample_w[valid]
+            match_loss = (match_per_sample[valid] * wv).sum() / (wv.sum() + eps)
+            match_weighted = match_loss * self.config.target_matching_loss_weight
+            total_loss = total_loss + match_weighted
+
+            with torch.no_grad():
+                probs = torch.sigmoid(logits_flat)
+                match_in = (probs * pos_weight).sum(dim=1) / (pos_sum + eps)
+                match_out = (probs * neg_weight).sum(dim=1) / (neg_sum + eps)
+            metrics.update(
+                {
+                    "target_matching_loss": match_loss.detach(),
+                    "target_matching_loss_weighted": match_weighted.detach(),
+                    "target_matching_loss_unweighted": match_per_sample[valid].mean().detach(),
+                    "target_matching_prob_inside": match_in[valid].mean().detach(),
+                    "target_matching_prob_outside": match_out[valid].mean().detach(),
+                    "target_matching_noise_weight_mean": wv.mean().detach(),
+                    "target_match_ground_gt_blend": torch.tensor(
+                        float(getattr(self, "_match_ground_gt_blend", 0.0)), device=match_loss.device
+                    ),
+                }
+            )
+
         if self.config.target_feature_contrastive_loss_weight > 0:
             video_tokens = getattr(self.net, "target_feature_contrastive_video_tokens_B_T_H_W_D", None)
             target_tokens = getattr(self.net, "target_feature_contrastive_tokens_B_L_D", None)
@@ -255,6 +359,11 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
         Returns:
             velocity prediction
         """
+        # Per-sample noise level for the matching-loss noise weighting; stashed
+        # before the conditional-frame timestep rewrite below.
+        if self.net.training:
+            self._last_denoise_timesteps_B_T = timesteps_B_T.detach().float()
+
         if condition.is_video:
             condition_state_in_B_C_T_H_W = condition.gt_frames.type_as(xt_B_C_T_H_W)
             if not condition.use_video_condition:
@@ -283,6 +392,23 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
                 )
                 timesteps_B_T = timesteps_B_1_T_1_1.squeeze(dim=(1, 3, 4))
 
+        if not getattr(self, "_denoise_diag_logged", False):
+            self._denoise_diag_logged = True
+            import dataclasses as _dc
+
+            _d = condition.to_dict()
+            _dict_state = (
+                "present_ok"
+                if _d.get("target_dense_feature_B_L_D") is not None
+                else ("present_None" if "target_dense_feature_B_L_D" in _d else "MISSING")
+            )
+            log.warning(
+                "denoise diag: "
+                f"type={type(condition).__module__}.{type(condition).__name__} | "
+                f"target_fields={[f.name for f in _dc.fields(condition) if 'target' in f.name]} | "
+                f"dict_dense={_dict_state} | "
+                f"attr_dense={'ok' if condition.target_dense_feature_B_L_D is not None else 'None'}"
+            )
         # forward pass through the network
         net_output_B_C_T_H_W = self.net(
             x_B_C_T_H_W=xt_B_C_T_H_W.to(**self.tensor_kwargs),  # Eq. 7 of https://arxiv.org/pdf/2206.00364.pdf
@@ -367,6 +493,10 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
         if target_feature is not None:
             target_feature = target_feature.to(device=x0.device, dtype=x0.dtype)
             condition = condition.set_target_feature(target_feature)
+        target_dense_feature = data_batch.get("target_dense_feature", None)
+        if target_dense_feature is not None:
+            target_dense_feature = target_dense_feature.to(device=x0.device, dtype=x0.dtype)
+            condition = condition.set_target_dense_feature(target_dense_feature)
 
         tgt_token_indices = data_batch.get("tgt_token_indices", None)
         if tgt_token_indices is not None:

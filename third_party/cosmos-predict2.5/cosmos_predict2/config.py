@@ -470,6 +470,15 @@ class InferenceArguments(CommonInferenceArguments):
     """Optional source checkout for importing InstructSAM. Defaults to this repo's third_party/InstructSAM copy."""
     target_mask_path: Path | None = None
     """Optional precomputed target mask path. Used instead of InstructSAM when provided."""
+    target_feature_path: Path | None = None
+    """Optional precomputed target-feature .pt (e.g. fused multi-source InstructSAM
+    feature). Loaded as target_feature, bypassing on-the-fly InstructSAM — needed
+    for the text-free multisource model since InstructSAM can't run in the cosmos
+    venv. The .pt may be a raw [L,D] tensor or a dict with a 'target_feature' key."""
+    target_dense_feature_path: Path | None = None
+    """Optional second precomputed feature .pt fed as `target_dense_feature` (e.g.
+    the [SEG] projection used as the match-ground WHERE query). Same format as
+    target_feature_path."""
     target_mask_combine_mode: Literal["best", "union"] = "best"
     """How to reduce multiple InstructSAM masks: best-scoring mask or union."""
     target_mask_threshold: float = 0.0

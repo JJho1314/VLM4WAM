@@ -185,7 +185,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fallback-query", default="Please segment the target object in the image.")
     parser.add_argument("--combine-mode", choices=["best", "union"], default="best")
     parser.add_argument("--mask-threshold", type=float, default=0.0)
-    parser.add_argument("--feature-mode", choices=["mask_query", "raw_seg"], default="mask_query")
+    parser.add_argument("--feature-mode", choices=["mask_query", "raw_seg", "decoder_dense"], default="mask_query")
     parser.add_argument("--expected-feature-dim", type=int, default=256)
     parser.add_argument("--attn-implementation", default="sdpa")
     parser.add_argument("--torch-dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")

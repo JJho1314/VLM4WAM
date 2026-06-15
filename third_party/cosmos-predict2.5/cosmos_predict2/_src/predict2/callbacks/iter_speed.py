@@ -33,6 +33,9 @@ _TARGET_ATTENTION_CONSOLE_KEYS = (
     "target_attention_mass_in_mask",
     "target_attention_mass_lift",
     "target_attention_inside_outside_ratio",
+    "target_matching_loss",
+    "target_matching_prob_inside",
+    "target_matching_prob_outside",
 )
 
 

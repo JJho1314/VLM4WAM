@@ -46,6 +46,7 @@ class Video2WorldCondition(Text2WorldCondition):
     num_conditional_frames_B: Optional[torch.Tensor] = None
     target_mask_B_C_T_H_W: Optional[torch.Tensor] = None
     target_feature_B_L_D: Optional[torch.Tensor] = None
+    target_dense_feature_B_L_D: Optional[torch.Tensor] = None
     tgt_token_indices_B: Optional[torch.Tensor] = None
 
     def set_target_mask(self, target_mask: Optional[torch.Tensor]) -> "Video2WorldCondition":
@@ -56,6 +57,11 @@ class Video2WorldCondition(Text2WorldCondition):
     def set_target_feature(self, target_feature: Optional[torch.Tensor]) -> "Video2WorldCondition":
         kwargs = self.to_dict(skip_underscore=False)
         kwargs["target_feature_B_L_D"] = target_feature
+        return type(self)(**kwargs)
+
+    def set_target_dense_feature(self, target_dense_feature: Optional[torch.Tensor]) -> "Video2WorldCondition":
+        kwargs = self.to_dict(skip_underscore=False)
+        kwargs["target_dense_feature_B_L_D"] = target_dense_feature
         return type(self)(**kwargs)
 
     def set_tgt_token_indices(self, tgt_token_indices: Optional[torch.Tensor]) -> "Video2WorldCondition":

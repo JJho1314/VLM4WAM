@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from PIL import Image, ImageOps
 
 MaskCombineMode = Literal["best", "union"]
-TargetFeatureMode = Literal["mask_query", "raw_seg"]
+TargetFeatureMode = Literal["mask_query", "raw_seg", "decoder_dense"]
 
 
 @dataclass(slots=True)
@@ -197,6 +197,24 @@ class InstructSAMTargetMaskGenerator:
         )
         self.model.to(dtype=torch_dtype)
         self.model.eval()
+        self._decoder_dense_capture: list[torch.Tensor] = []
+        self._hook_handles: list = []
+        self._register_decoder_dense_hooks()
+
+    def _register_decoder_dense_hooks(self) -> None:
+        """Capture text-conditioned dense mask-decoder features without editing InstructSAM."""
+        try:
+            instance_projection = self.model.model.grounding_model.model.mask_decoder.instance_projection
+        except AttributeError:
+            instance_projection = None
+        if instance_projection is None:
+            return
+
+        def _capture_decoder_dense(_module, _inputs, output):
+            if isinstance(output, torch.Tensor):
+                self._decoder_dense_capture.append(output.detach())
+
+        self._hook_handles.append(instance_projection.register_forward_hook(_capture_decoder_dense))
 
     def _extract_target_feature(self, feature_mode: TargetFeatureMode = "mask_query") -> torch.Tensor | None:
         """Return InstructSAM target embeddings as [1, L, D] CPU float tokens.
@@ -207,6 +225,23 @@ class InstructSAMTargetMaskGenerator:
         which makes the exported target token dimension 256 in the released
         model and keeps the Cosmos bridge small.
         """
+        if feature_mode == "decoder_dense":
+            if not self._decoder_dense_capture:
+                return None
+            dense = torch.nan_to_num(self._decoder_dense_capture[-1].detach().float())
+            if dense.ndim != 4:
+                return None
+            # instance_projection returns [num_objects, C, H, W]. Keep the full
+            # spatial layout, downsample it to a compact square grid, and average
+            # multiple generated object queries into one target-aware dense map.
+            # Cosmos receives only this feature map, not the predicted mask/logits.
+            dense = dense.mean(dim=0, keepdim=True)
+            grid_size = int(os.environ.get("INSTRUCTSAM_DECODER_DENSE_SIZE", "32"))
+            if grid_size > 0 and tuple(dense.shape[-2:]) != (grid_size, grid_size):
+                dense = F.interpolate(dense, size=(grid_size, grid_size), mode="bilinear", align_corners=False)
+            dense = dense.permute(0, 2, 3, 1).reshape(1, -1, dense.shape[1])
+            return dense.cpu().contiguous()
+
         seg_embeddings = getattr(self.model, "seg_output_embeddings", None)
         if not seg_embeddings:
             return None
@@ -254,6 +289,7 @@ class InstructSAMTargetMaskGenerator:
         _ensure_instructsam_importable()
         from instructsam import mm_infer_segmentation
 
+        self._decoder_dense_capture = []
         with _as_image_path(image) as image_path:
             contents = [
                 {"type": "image", "image": image_path},

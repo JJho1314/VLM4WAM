@@ -91,6 +91,10 @@ class Video2WorldModel(Text2WorldModel):
         if target_feature is not None:
             target_feature = target_feature.to(device=latent_state.device, dtype=latent_state.dtype)
             condition = condition.set_target_feature(target_feature)
+        target_dense_feature = data_batch.get("target_dense_feature", None)
+        if target_dense_feature is not None:
+            target_dense_feature = target_dense_feature.to(device=latent_state.device, dtype=latent_state.dtype)
+            condition = condition.set_target_dense_feature(target_dense_feature)
         return raw_state, latent_state, condition
 
     def draw_training_sigma_and_epsilon(self, x0_size: int, condition: Any) -> torch.Tensor:
@@ -313,6 +317,10 @@ class Video2WorldModel(Text2WorldModel):
         if target_feature is not None:
             target_feature = target_feature.to(device=x0.device, dtype=x0.dtype)
             condition = condition.set_target_feature(target_feature)
+        target_dense_feature = data_batch.get("target_dense_feature", None)
+        if target_dense_feature is not None:
+            target_dense_feature = target_dense_feature.to(device=x0.device, dtype=x0.dtype)
+            condition = condition.set_target_dense_feature(target_dense_feature)
 
         _, condition, _, _ = self.broadcast_split_for_model_parallelsim(x0, condition, None, None)
         _, uncondition, _, _ = self.broadcast_split_for_model_parallelsim(x0, uncondition, None, None)

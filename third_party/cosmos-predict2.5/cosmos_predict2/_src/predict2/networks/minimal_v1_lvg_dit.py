@@ -67,6 +67,7 @@ class MinimalV1LVGDiT(MiniTrainDIT):
         img_context_emb: Optional[torch.Tensor] = None,
         target_mask_B_C_T_H_W: Optional[torch.Tensor] = None,
         target_feature_B_L_D: Optional[torch.Tensor] = None,
+        target_dense_feature_B_L_D: Optional[torch.Tensor] = None,
         tgt_token_indices_B: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
@@ -101,5 +102,6 @@ class MinimalV1LVGDiT(MiniTrainDIT):
             img_context_emb=img_context_emb,
             target_mask_B_C_T_H_W=target_mask_for_super,
             target_feature_B_L_D=target_feature_B_L_D,
+            target_dense_feature_B_L_D=target_dense_feature_B_L_D,
             tgt_token_indices_B=tgt_token_indices_B,
         )

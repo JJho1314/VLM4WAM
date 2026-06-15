@@ -67,6 +67,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Feature .pt to use when --target-feature-mode=path.",
     )
+    parser.add_argument(
+        "--allow-empty-target-mask",
+        action="store_true",
+        help="Do not skip samples when target_mask is missing or empty. Useful for mask-free feature ablations.",
+    )
+    parser.add_argument(
+        "--remove-target-mask",
+        action="store_true",
+        help="Remove target_mask from the batch before conditioning so Cosmos receives no explicit mask.",
+    )
     parser.add_argument("opts", nargs=argparse.REMAINDER)
     return parser.parse_args()
 
@@ -388,7 +398,8 @@ def main() -> None:
         for batch_idx, data_batch in enumerate(dataloader):
             if batch_idx >= args.max_batches or saved >= args.num_samples:
                 break
-            if "target_mask" not in data_batch or float(data_batch["target_mask"].sum()) <= 0:
+            has_nonempty_mask = "target_mask" in data_batch and float(data_batch["target_mask"].sum()) > 0
+            if not args.allow_empty_target_mask and not has_nonempty_mask:
                 continue
             if skipped < args.skip_samples:
                 skipped += 1
@@ -396,6 +407,8 @@ def main() -> None:
 
             data_batch = misc.to(data_batch, device="cuda")
             feature_override = apply_target_feature_override(args, data_batch)
+            if args.remove_target_mask:
+                data_batch.pop("target_mask", None)
             data_batch["num_conditional_frames"] = torch.full(
                 (data_batch[model.input_data_key].shape[0],),
                 args.num_conditional_frames,
@@ -415,7 +428,13 @@ def main() -> None:
             n_sample = x0.shape[0]
             caption = data_batch.get(model.input_caption_key, [""])[0]
             raw_for_save = raw[0].detach().cpu()
-            mask_for_save = data_batch["target_mask"][0].detach().cpu()
+            if "target_mask" in data_batch:
+                mask_for_save = data_batch["target_mask"][0].detach().cpu()
+            else:
+                mask_for_save = torch.zeros(
+                    (1, raw_for_save.shape[1], raw_for_save.shape[2], raw_for_save.shape[3]),
+                    dtype=raw_for_save.dtype,
+                )
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 if args.reuse_encoded_latent:

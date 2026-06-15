@@ -95,6 +95,21 @@ class Inference:
         return self._instructsam_generators[cache_key]
 
     def _get_target_condition(self, sample: InferenceArguments) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        self._last_target_feature_payload: dict | None = None
+        if sample.target_feature_path is not None:
+            log.info(f"Loading precomputed target feature from {sample.target_feature_path}")
+            payload = torch.load(str(sample.target_feature_path), map_location="cpu", weights_only=False)
+            if isinstance(payload, dict):
+                self._last_target_feature_payload = payload
+            feat = payload["target_feature"] if isinstance(payload, dict) else payload
+            feat = torch.as_tensor(feat).float()
+            if feat.ndim == 2:
+                feat = feat.unsqueeze(0)  # [L, D] -> [1, L, D]
+            log.info(f"Precomputed target feature shape: {tuple(feat.shape)}")
+            mask = None
+            if sample.target_mask_path is not None:
+                mask = load_target_mask_file(sample.target_mask_path, mask_threshold=sample.target_mask_threshold)
+            return mask, feat
         if sample.target_mask_path is not None:
             log.info(f"Loading precomputed target mask from {sample.target_mask_path}")
             return load_target_mask_file(
@@ -165,6 +180,15 @@ class Inference:
         # Choose generation mode based on autoregressive flag
         video: torch.Tensor
         target_mask, target_feature = self._get_target_condition(sample)
+        target_dense_feature = None
+        if sample.target_dense_feature_path is not None:
+            log.info(f"Loading precomputed dense (match-query) feature from {sample.target_dense_feature_path}")
+            payload = torch.load(str(sample.target_dense_feature_path), map_location="cpu", weights_only=False)
+            feat = payload["target_feature"] if isinstance(payload, dict) else payload
+            feat = torch.as_tensor(feat).float()
+            if feat.ndim == 2:
+                feat = feat.unsqueeze(0)
+            target_dense_feature = feat
         if sample.enable_autoregressive:
             log.info(f"Generating video with autoregressive mode...")
             video = self.pipe.generate_autoregressive_from_batch(
@@ -181,6 +205,7 @@ class Inference:
                 num_steps=sample.num_steps,
                 target_mask=target_mask,
                 target_feature=target_feature,
+                target_dense_feature=target_dense_feature,
             )
         else:
             log.info(f"Generating video with standard mode...")
@@ -196,6 +221,7 @@ class Inference:
                 num_steps=sample.num_steps,
                 target_mask=target_mask,
                 target_feature=target_feature,
+                target_dense_feature=target_dense_feature,
             )
 
         if self.rank0:
@@ -226,4 +252,43 @@ class Inference:
 
             save_img_or_video(video, str(output_path), fps=16)
             log.success(f"Saved video to {output_path}.mp4")
+            self._save_instructsam_mask_visualization(sample, output_path)
         return f"{output_path}.mp4"
+
+    def _save_instructsam_mask_visualization(self, sample: InferenceArguments, output_path: Path) -> None:
+        """Save the InstructSAM mask overlaid on the conditioning frame next to the video.
+
+        The precomputed feature payload records `mask_png` (written by the
+        multisource extraction); this renders conditioning-frame + mask + query
+        as `<name>_instructsam_mask.png` so every generated video carries a
+        visualization of what InstructSAM pointed the model at. Best-effort:
+        never fails the generation.
+        """
+        try:
+            payload = getattr(self, "_last_target_feature_payload", None)
+            if not payload:
+                return
+            mask_png = payload.get("mask_png")
+            if not mask_png or not Path(str(mask_png)).exists():
+                return
+            from PIL import Image, ImageDraw
+
+            from cosmos_predict2._src.predict2.target_aware.instructsam_mask import read_first_frame_image
+
+            base = read_first_frame_image(str(sample.input_path)).convert("RGB")
+            mask = Image.open(str(mask_png)).convert("L")
+            if mask.size != base.size:
+                mask = mask.resize(base.size, Image.NEAREST)
+            arr = np.array(base)
+            mb = np.array(mask) > 127
+            arr[mb] = (0.35 * arr[mb] + 0.65 * np.array([255, 140, 0])).astype(np.uint8)
+            im = Image.fromarray(arr)
+            draw = ImageDraw.Draw(im)
+            query = str(payload.get("query", ""))
+            draw.rectangle([0, 0, im.width, 22], fill=(0, 0, 0))
+            draw.text((5, 4), f"InstructSAM mask | {query}"[:120], fill=(255, 200, 0))
+            out = f"{output_path}_instructsam_mask.png"
+            im.save(out)
+            log.info(f"Saved InstructSAM mask visualization to {out}")
+        except Exception as exc:  # visualization must never break generation
+            log.warning(f"Skipping InstructSAM mask visualization: {exc}")

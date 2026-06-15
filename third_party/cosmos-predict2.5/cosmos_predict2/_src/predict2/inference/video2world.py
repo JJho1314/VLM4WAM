@@ -432,6 +432,7 @@ class Video2WorldInference:
         action: torch.Tensor | None = None,
         target_mask: torch.Tensor | None = None,
         target_feature: torch.Tensor | None = None,
+        target_dense_feature: torch.Tensor | None = None,
     ):
         """
         Prepares the input data batch for the diffusion model.
@@ -468,6 +469,8 @@ class Video2WorldInference:
         if target_feature is not None:
             # Expected shape [B, L, D]. These become Cosmos cross-attention context tokens.
             data_batch["target_feature"] = target_feature
+        if target_dense_feature is not None:
+            data_batch["target_dense_feature"] = target_dense_feature
         if camera is not None:
             image_size = camera.image_size
             if image_size is None:
@@ -524,6 +527,7 @@ class Video2WorldInference:
         num_steps: int = 35,
         target_mask: torch.Tensor | None = None,
         target_feature: torch.Tensor | None = None,
+        target_dense_feature: torch.Tensor | None = None,
     ):
         """
         Generates a video based on an input image or video and text prompt.
@@ -611,6 +615,7 @@ class Video2WorldInference:
             use_neg_prompt=True,
             target_mask=target_mask,
             target_feature=target_feature,
+            target_dense_feature=target_dense_feature,
         )
 
         mem_bytes = torch.cuda.memory_allocated(device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
@@ -735,6 +740,7 @@ class Video2WorldInference:
         num_steps: int = 35,
         target_mask: torch.Tensor | None = None,
         target_feature: torch.Tensor | None = None,
+        target_dense_feature: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Generate video using autoregressive sliding window approach.
@@ -945,6 +951,7 @@ class Video2WorldInference:
                 num_steps=num_steps,
                 target_mask=chunk_target_mask,
                 target_feature=target_feature,
+            target_dense_feature=target_dense_feature,
             )  # Returns (1, C, T, H, W)
 
             # Extract only the actual generated frames (remove padding)
