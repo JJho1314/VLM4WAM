@@ -94,7 +94,10 @@ class Inference:
             )
         return self._instructsam_generators[cache_key]
 
-    def _get_target_condition(self, sample: InferenceArguments) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    def _get_target_condition(
+        self,
+        sample: InferenceArguments,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         self._last_target_feature_payload: dict | None = None
         if sample.target_feature_path is not None:
             log.info(f"Loading precomputed target feature from {sample.target_feature_path}")
@@ -106,18 +109,24 @@ class Inference:
             if feat.ndim == 2:
                 feat = feat.unsqueeze(0)  # [L, D] -> [1, L, D]
             log.info(f"Precomputed target feature shape: {tuple(feat.shape)}")
+            dense_feat = None
+            if isinstance(payload, dict) and payload.get("target_dense_feature") is not None:
+                dense_feat = torch.as_tensor(payload["target_dense_feature"]).float()
+                if dense_feat.ndim == 2:
+                    dense_feat = dense_feat.unsqueeze(0)
+                log.info(f"Precomputed target dense feature shape: {tuple(dense_feat.shape)}")
             mask = None
             if sample.target_mask_path is not None:
                 mask = load_target_mask_file(sample.target_mask_path, mask_threshold=sample.target_mask_threshold)
-            return mask, feat
+            return mask, feat, dense_feat
         if sample.target_mask_path is not None:
             log.info(f"Loading precomputed target mask from {sample.target_mask_path}")
             return load_target_mask_file(
                 sample.target_mask_path,
                 mask_threshold=sample.target_mask_threshold,
-            ), None
+            ), None, None
         if sample.target_query is None:
-            return None, None
+            return None, None, None
         if sample.input_path is None:
             raise ValueError("target_query requires an image/video input_path")
 
@@ -129,13 +138,25 @@ class Inference:
             mask_threshold=sample.target_mask_threshold,
             feature_mode=sample.instructsam_feature_mode,
         )
+        target_feature = result.feature_B_L_D
+        target_dense_feature = None
+        if sample.route_decoder_dense_to_target_dense_feature:
+            if sample.instructsam_feature_mode != "decoder_dense":
+                raise ValueError("route_decoder_dense_to_target_dense_feature requires instructsam_feature_mode='decoder_dense'")
+            target_dense_feature = result.feature_B_L_D
+            target_feature = generator._extract_target_feature(feature_mode="raw_seg")
+            if target_feature is None:
+                raise RuntimeError("InstructSAM did not expose raw_seg target feature after decoder_dense extraction")
         if result.score is None:
             log.info(f"InstructSAM target query produced mask: {result.text}")
         else:
             log.info(f"InstructSAM target query score={result.score:.4f}: {result.text}")
-        if result.feature_B_L_D is not None:
-            log.info(f"InstructSAM target feature shape: {tuple(result.feature_B_L_D.shape)}")
-        return result.mask_B_C_T_H_W, result.feature_B_L_D
+        if target_feature is not None:
+            log.info(f"InstructSAM target feature shape: {tuple(target_feature.shape)}")
+        if target_dense_feature is not None:
+            log.info(f"InstructSAM target dense feature shape: {tuple(target_dense_feature.shape)}")
+        mask = result.mask_B_C_T_H_W if sample.pass_instructsam_mask_to_cosmos else None
+        return mask, target_feature, target_dense_feature
 
     def generate(self, samples: list[InferenceArguments], output_dir: Path) -> list[str]:
         if SMOKE:
@@ -179,8 +200,7 @@ class Inference:
 
         # Choose generation mode based on autoregressive flag
         video: torch.Tensor
-        target_mask, target_feature = self._get_target_condition(sample)
-        target_dense_feature = None
+        target_mask, target_feature, target_dense_feature = self._get_target_condition(sample)
         if sample.target_dense_feature_path is not None:
             log.info(f"Loading precomputed dense (match-query) feature from {sample.target_dense_feature_path}")
             payload = torch.load(str(sample.target_dense_feature_path), map_location="cpu", weights_only=False)

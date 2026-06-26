@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
         help="Feature .pt to use when --target-feature-mode=path.",
     )
     parser.add_argument(
+        "--target-dense-feature-path",
+        type=Path,
+        default=None,
+        help="Dense feature .pt to use when --target-feature-mode=path.",
+    )
+    parser.add_argument(
         "--allow-empty-target-mask",
         action="store_true",
         help="Do not skip samples when target_mask is missing or empty. Useful for mask-free feature ablations.",
@@ -188,7 +194,15 @@ def save_sample_outputs(
 
 def _extract_feature_from_payload(payload) -> torch.Tensor:
     if isinstance(payload, dict):
-        for key in ("target_feature", "features", "feature_B_L_D", "feature", "seg_output_embeddings"):
+        for key in (
+            "semantic_plan",
+            "target_feature",
+            "target_dense_weighted",
+            "features",
+            "feature_B_L_D",
+            "feature",
+            "seg_output_embeddings",
+        ):
             if key in payload:
                 payload = payload[key]
                 break
@@ -197,6 +211,8 @@ def _extract_feature_from_payload(payload) -> torch.Tensor:
         feature = feature.view(1, -1)
     if feature.ndim == 3 and feature.shape[0] == 1:
         feature = feature[0]
+    elif feature.ndim > 2:
+        feature = feature.reshape(-1, feature.shape[-1])
     if feature.ndim != 2:
         raise ValueError(f"Expected override target feature [L,D] or [1,L,D], got {tuple(feature.shape)}")
     return torch.nan_to_num(feature).contiguous()
@@ -222,26 +238,44 @@ def _match_feature_shape(feature: torch.Tensor, reference: torch.Tensor) -> torc
     return feature.to(device=reference.device, dtype=reference.dtype)
 
 
+def _override_one_feature_from_path(data_batch: dict, key: str, path: Path) -> str:
+    reference = data_batch.get(key, None)
+    if reference is None:
+        return f"{key}:missing"
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    feature = _extract_feature_from_payload(payload)
+    data_batch[key] = _match_feature_shape(feature, reference)
+    return f"{key}:path:{path}"
+
+
 def apply_target_feature_override(args: argparse.Namespace, data_batch: dict) -> str:
     mode = args.target_feature_mode
     if mode == "keep":
         return "keep"
     if mode == "drop":
         data_batch.pop("target_feature", None)
+        data_batch.pop("target_dense_feature", None)
         return "drop"
     reference = data_batch.get("target_feature", None)
     if reference is None:
         raise ValueError(f"--target-feature-mode={mode} requires a target_feature in the batch")
     if mode == "zero":
         data_batch["target_feature"] = torch.zeros_like(reference)
+        dense_reference = data_batch.get("target_dense_feature", None)
+        if dense_reference is not None:
+            data_batch["target_dense_feature"] = torch.zeros_like(dense_reference)
         return "zero"
     if mode == "path":
         if args.target_feature_path is None:
             raise ValueError("--target-feature-mode=path requires --target-feature-path")
-        payload = torch.load(args.target_feature_path, map_location="cpu", weights_only=False)
-        feature = _extract_feature_from_payload(payload)
-        data_batch["target_feature"] = _match_feature_shape(feature, reference)
-        return f"path:{args.target_feature_path}"
+        status = [_override_one_feature_from_path(data_batch, "target_feature", args.target_feature_path)]
+        dense_reference = data_batch.get("target_dense_feature", None)
+        dense_path = getattr(args, "target_dense_feature_path", None)
+        if dense_reference is not None and dense_path is not None:
+            status.append(_override_one_feature_from_path(data_batch, "target_dense_feature", dense_path))
+        elif dense_reference is not None:
+            status.append("target_dense_feature:kept")
+        return ",".join(status)
     raise ValueError(mode)
 
 
@@ -294,6 +328,11 @@ def get_velocity_fn_from_preencoded_batch(
     if target_feature is not None:
         target_feature = target_feature.to(device=x0.device, dtype=x0.dtype)
         condition = condition.set_target_feature(target_feature)
+
+    target_dense_feature = data_batch.get("target_dense_feature", None)
+    if target_dense_feature is not None:
+        target_dense_feature = target_dense_feature.to(device=x0.device, dtype=x0.dtype)
+        condition = condition.set_target_dense_feature(target_dense_feature)
 
     tgt_token_indices = data_batch.get("tgt_token_indices", None)
     if tgt_token_indices is not None:

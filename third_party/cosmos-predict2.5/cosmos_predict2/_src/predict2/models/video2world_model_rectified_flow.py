@@ -58,6 +58,9 @@ class Video2WorldModelRectifiedFlowConfig(Text2WorldModelRectifiedFlowConfig):
     target_attention_loss_eps: float = 1e-6
     target_attention_background_loss_weight: float = 0.25
     target_attention_mass_loss_weight: float = 0.1
+    target_where_prior_loss_weight: float = 0.0
+    target_where_prior_background_loss_weight: float = 0.25
+    target_where_prior_dice_loss_weight: float = 0.5
     target_feature_contrastive_loss_weight: float = 0.0
     target_feature_contrastive_temperature: float = 0.07
     target_feature_contrastive_margin: float = 0.2
@@ -149,6 +152,7 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
     def compute_extra_training_loss(self, condition: Video2WorldCondition) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         if (
             self.config.target_attention_loss_weight <= 0
+            and self.config.target_where_prior_loss_weight <= 0
             and self.config.target_feature_contrastive_loss_weight <= 0
             and self.config.target_matching_loss_weight <= 0
         ):
@@ -182,31 +186,65 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
         # are averaged separately so small target masks are not diluted by the
         # much larger non-target region. The mass term directly rewards putting
         # cross-attention probability inside the target mask.
+        prior_logits = getattr(self.net, "target_where_prior_logits_B_T_H_W", None)
+        if self.config.target_where_prior_loss_weight > 0 and prior_logits is not None:
+            prior_logits_flat = rearrange(prior_logits.float(), "b t h w -> b (t h w)")
+            if prior_logits_flat.shape != mask_flat.shape:
+                prior_logits = F.interpolate(
+                    prior_logits.unsqueeze(1).float(),
+                    size=target_mask.shape[1:],
+                    mode="trilinear",
+                    align_corners=False,
+                ).squeeze(1)
+                prior_logits_flat = rearrange(prior_logits.float(), "b t h w -> b (t h w)")
+            prior_bce = F.binary_cross_entropy_with_logits(prior_logits_flat, mask_flat, reduction="none")
+            prior_pos_bce = (prior_bce * pos_weight).sum(dim=1) / (pos_sum + eps)
+            prior_neg_bce = (prior_bce * neg_weight).sum(dim=1) / (neg_sum + eps)
+            prior_prob = torch.sigmoid(prior_logits_flat)
+            valid_weight = token_valid_flat.type_as(mask_flat)
+            dice_inter = (prior_prob * mask_flat * valid_weight).sum(dim=1)
+            dice_denom = ((prior_prob + mask_flat) * valid_weight).sum(dim=1).clamp_min(eps)
+            prior_dice = 1.0 - (2.0 * dice_inter + eps) / (dice_denom + eps)
+            prior_per_sample = (
+                prior_pos_bce
+                + self.config.target_where_prior_background_loss_weight * prior_neg_bce
+                + self.config.target_where_prior_dice_loss_weight * prior_dice
+            )
+            prior_loss = prior_per_sample[valid].mean()
+            prior_weighted = prior_loss * self.config.target_where_prior_loss_weight
+            total_loss = total_loss + prior_weighted
+            prior_inside = (prior_prob * pos_weight).sum(dim=1) / (pos_sum + eps)
+            prior_outside = (prior_prob * neg_weight).sum(dim=1) / (neg_sum + eps)
+            metrics.update(
+                {
+                    "target_where_prior_loss": prior_loss.detach(),
+                    "target_where_prior_loss_weighted": prior_weighted.detach(),
+                    "target_where_prior_pos_bce": prior_pos_bce[valid].mean().detach(),
+                    "target_where_prior_neg_bce": prior_neg_bce[valid].mean().detach(),
+                    "target_where_prior_dice": prior_dice[valid].mean().detach(),
+                    "target_where_prior_prob_inside": prior_inside[valid].mean().detach(),
+                    "target_where_prior_prob_outside": prior_outside[valid].mean().detach(),
+                    "target_where_prior_inside_outside_ratio": (prior_inside / (prior_outside + eps))[
+                        valid
+                    ].mean().detach(),
+                }
+            )
+
         if self.config.target_attention_loss_weight > 0 and target_attn_maps:
             attn_map = torch.stack([attn_map.float() for attn_map in target_attn_maps], dim=0).mean(dim=0)
             attn_flat = rearrange(attn_map, "b t h w -> b (t h w)").clamp(min=0.0)
-            attn_min = torch.where(token_valid_flat, attn_flat, torch.full_like(attn_flat, float("inf"))).amin(
-                dim=1, keepdim=True
-            )
-            attn_max = torch.where(token_valid_flat, attn_flat, torch.full_like(attn_flat, float("-inf"))).amax(
-                dim=1, keepdim=True
-            )
-            attn_map_01 = (attn_flat - attn_min) / (attn_max - attn_min + eps)
-            attn_map_01 = torch.where(token_valid_flat, attn_map_01, torch.zeros_like(attn_map_01))
-
-            pos_mse = (((1.0 - attn_map_01) ** 2) * pos_weight).sum(dim=1) / (pos_sum + eps)
-            neg_mse = ((attn_map_01**2) * neg_weight).sum(dim=1) / (neg_sum + eps)
-
+            # Concentrate the attention DISTRIBUTION mass inside the target mask. The
+            # previous min-max-normalized pos/neg MSE was scale-free -- uniform attention
+            # normalizes to a full 0-1 range and scored low loss WITHOUT concentrating, so
+            # the alignment objective was inert (inside/outside ratio pinned at 1.0).
+            # -log(mass_inside) on the sum-normalized attention is a proper concentration
+            # loss (mass_in + mass_out = 1 over valid tokens), so pushing it down forces
+            # attention probability onto the target region.
             supervised_attn = attn_flat * token_valid_flat.type_as(attn_flat)
             attn_dist = supervised_attn / (supervised_attn.sum(dim=1, keepdim=True) + eps)
             target_mass = (attn_dist * pos_weight).sum(dim=1)
             mass_loss = -torch.log(target_mass.clamp_min(eps))
-
-            per_sample = (
-                pos_mse
-                + self.config.target_attention_background_loss_weight * neg_mse
-                + self.config.target_attention_mass_loss_weight * mass_loss
-            )
+            per_sample = mass_loss
             align_loss = per_sample[valid].mean()
             weighted_loss = align_loss * self.config.target_attention_loss_weight
             total_loss = total_loss + weighted_loss
@@ -220,8 +258,6 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
                 {
                     "target_attention_loss": align_loss.detach(),
                     "target_attention_loss_weighted": weighted_loss.detach(),
-                    "target_attention_pos_mse": pos_mse[valid].mean().detach(),
-                    "target_attention_neg_mse": neg_mse[valid].mean().detach(),
                     "target_attention_mass_loss": mass_loss[valid].mean().detach(),
                     "target_attention_mask_valid_ratio": valid.float().mean().detach(),
                     "target_attention_mask_area_ratio": mask_area.detach(),

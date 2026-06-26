@@ -44,6 +44,14 @@ _TARGET_ATTENTION_LOG_KEYS = (
     "target_attention_outside_mean",
     "target_attention_inside_outside_ratio",
     "target_attention_num_maps",
+    "target_where_prior_loss",
+    "target_where_prior_loss_weighted",
+    "target_where_prior_pos_bce",
+    "target_where_prior_neg_bce",
+    "target_where_prior_dice",
+    "target_where_prior_prob_inside",
+    "target_where_prior_prob_outside",
+    "target_where_prior_inside_outside_ratio",
 )
 
 

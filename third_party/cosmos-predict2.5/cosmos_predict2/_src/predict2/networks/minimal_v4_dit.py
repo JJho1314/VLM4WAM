@@ -873,6 +873,279 @@ class MultiSourceTargetFeatureContextAdapter(TargetFeatureContextAdapter):
         return tokens + source_tokens
 
 
+class TargetWhatWhereContextAdapter(nn.Module):
+    """Fuse target-query tokens (what) with dense spatial tokens (where).
+
+    `target_feature` carries the text-conditioned target selector, e.g. raw
+    InstructSAM [SEG]/[TGT] hidden states. `target_dense_feature` carries the
+    decoder-dense spatial feature map. The output is still plain context tokens
+    for Cosmos cross-attention; no mask or residual is written to video latents.
+    """
+
+    def __init__(
+        self,
+        what_dim: int = 2048,
+        where_dim: int = 256,
+        hidden_dim: int = 512,
+        out_dim: int = 1024,
+        max_tokens: int = 256,
+        init_gate: float = 1.0,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.what_dim = int(what_dim)
+        self.where_dim = int(where_dim)
+        self.max_tokens = int(max_tokens)
+        self.init_gate = float(init_gate)
+        hidden_dim = int(hidden_dim) if int(hidden_dim) > 0 else out_dim
+
+        self.what_norm = nn.LayerNorm(self.what_dim, eps=eps, elementwise_affine=False)
+        self.where_norm = nn.LayerNorm(self.where_dim, eps=eps, elementwise_affine=False)
+        self.what_proj = nn.Sequential(
+            nn.Linear(self.what_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+        self.where_proj = nn.Sequential(
+            nn.Linear(self.where_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+        self.where_gate = nn.Linear(out_dim, out_dim)
+        self.coord_proj = nn.Linear(2, out_dim)
+        self.out_norm = nn.LayerNorm(out_dim, eps=eps, elementwise_affine=False)
+        self.type_token = nn.Parameter(torch.zeros(out_dim))
+        self.context_gate = nn.Parameter(torch.tensor([self.init_gate], dtype=torch.float32))
+
+    def reset_parameters(self) -> None:
+        for module in (self.what_proj, self.where_proj):
+            for submodule in module.modules():
+                if isinstance(submodule, nn.Linear):
+                    nn.init.xavier_uniform_(submodule.weight)
+                    if submodule.bias is not None:
+                        nn.init.zeros_(submodule.bias)
+        nn.init.zeros_(self.where_gate.weight)
+        nn.init.zeros_(self.where_gate.bias)
+        nn.init.xavier_uniform_(self.coord_proj.weight)
+        nn.init.zeros_(self.coord_proj.bias)
+        nn.init.zeros_(self.type_token)
+        with torch.no_grad():
+            self.context_gate.fill_(self.init_gate)
+
+    @staticmethod
+    def _ensure_3d(name: str, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim == 2:
+            tensor = tensor.unsqueeze(0)
+        if tensor.ndim != 3:
+            raise ValueError(f"Expected {name} shape [B,L,D], got {tuple(tensor.shape)}")
+        return tensor
+
+    @staticmethod
+    def _repeat_to_batch(tensor: torch.Tensor, batch_size: int, name: str) -> torch.Tensor:
+        if tensor.shape[0] == 1 and batch_size != 1:
+            return tensor.repeat(batch_size, 1, 1)
+        if tensor.shape[0] != batch_size:
+            raise ValueError(f"{name} batch {tensor.shape[0]} does not match batch {batch_size}")
+        return tensor
+
+    def _resize_square_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        if self.max_tokens <= 0 or tokens.shape[1] <= self.max_tokens:
+            return tokens
+        length = tokens.shape[1]
+        side = int(math.isqrt(length))
+        target_side = int(math.isqrt(self.max_tokens))
+        if side * side == length and target_side > 0:
+            target_tokens = target_side * target_side
+            if target_tokens <= self.max_tokens:
+                grid = rearrange(tokens, "b (h w) d -> b d h w", h=side, w=side)
+                grid = F.interpolate(grid.float(), size=(target_side, target_side), mode="bilinear", align_corners=False)
+                grid = grid.to(dtype=tokens.dtype)
+                return rearrange(grid, "b d h w -> b (h w) d")
+        return tokens[:, : self.max_tokens]
+
+    def _coords(self, batch_size: int, length: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        side = int(math.isqrt(length))
+        if side * side == length:
+            y = torch.linspace(-1.0, 1.0, side, device=device, dtype=dtype)
+            x = torch.linspace(-1.0, 1.0, side, device=device, dtype=dtype)
+            yy, xx = torch.meshgrid(y, x, indexing="ij")
+            coords = torch.stack([xx, yy], dim=-1).view(1, length, 2)
+        else:
+            x = torch.linspace(-1.0, 1.0, length, device=device, dtype=dtype)
+            coords = torch.stack([x, torch.zeros_like(x)], dim=-1).view(1, length, 2)
+        return coords.expand(batch_size, -1, -1)
+
+    def forward(
+        self,
+        target_feature_B_L_D: torch.Tensor,
+        target_dense_feature_B_L_D: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        what = self._ensure_3d("target_feature", target_feature_B_L_D)
+        where = self._ensure_3d("target_dense_feature", target_dense_feature_B_L_D)
+        batch_size = max(what.shape[0], where.shape[0])
+        what = self._repeat_to_batch(what, batch_size, "target_feature")
+        where = self._repeat_to_batch(where, batch_size, "target_dense_feature")
+        if what.shape[-1] != self.what_dim:
+            raise ValueError(f"Expected target_feature dim {self.what_dim}, got {what.shape[-1]}")
+        if where.shape[-1] != self.where_dim:
+            raise ValueError(f"Expected target_dense_feature dim {self.where_dim}, got {where.shape[-1]}")
+
+        param = self.type_token
+        what = torch.nan_to_num(what.to(device=param.device, dtype=param.dtype))
+        where = torch.nan_to_num(where.to(device=param.device, dtype=param.dtype))
+        where = self._resize_square_tokens(where)
+
+        what_valid = what.float().abs().sum(dim=-1) > 0
+        where_valid = where.float().abs().sum(dim=-1) > 0
+        denom = what_valid.to(dtype=what.dtype).sum(dim=1, keepdim=True).clamp_min(1.0)
+        what_context = self.what_proj(self.what_norm(what))
+        what_context = (what_context * what_valid.unsqueeze(-1)).sum(dim=1) / denom
+
+        where_context = self.where_proj(self.where_norm(where))
+        coords = self._coords(where.shape[0], where.shape[1], where.device, where.dtype)
+        coord_context = self.coord_proj(coords)
+        gate = torch.sigmoid(self.where_gate(what_context)).unsqueeze(1)
+        tokens = where_context * gate + what_context.unsqueeze(1) + coord_context
+        tokens = self.out_norm(tokens)
+        tokens = tokens + self.type_token.to(device=tokens.device, dtype=tokens.dtype)
+        tokens = torch.where(where_valid.unsqueeze(-1), tokens, torch.zeros_like(tokens))
+        gate = self.context_gate.tanh().to(device=tokens.device, dtype=tokens.dtype)
+        return gate * tokens, where_valid
+
+
+class DenseTargetWherePriorHead(nn.Module):
+    """Decode an internal soft target-location prior from InstructSAM dense tokens.
+
+    The head is used only as an internal latent-space prior.  At inference,
+    Cosmos still receives no explicit mask; it predicts this soft objectness
+    map from InstructSAM features and uses it to gate the target branch.
+    """
+
+    def __init__(
+        self,
+        what_dim: int = 2048,
+        where_dim: int = 256,
+        hidden_dim: int = 128,
+        max_tokens: int = 1024,
+        init_bias: float = -2.0,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.what_dim = int(what_dim)
+        self.where_dim = int(where_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.max_tokens = int(max_tokens)
+        self.init_bias = float(init_bias)
+        self.what_norm = nn.LayerNorm(self.what_dim, eps=eps, elementwise_affine=False)
+        self.where_norm = nn.LayerNorm(self.where_dim, eps=eps, elementwise_affine=False)
+        self.what_proj = nn.Sequential(
+            nn.Linear(self.what_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        self.where_proj = nn.Linear(self.where_dim, self.hidden_dim)
+        self.coord_proj = nn.Linear(2, self.hidden_dim)
+        self.film = nn.Linear(self.hidden_dim, 2 * self.hidden_dim)
+        self.in_proj = nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=1)
+        self.dw1 = nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=3, padding=1, groups=self.hidden_dim)
+        self.pw1 = nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=1)
+        self.dw2 = nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=3, padding=1, groups=self.hidden_dim)
+        self.pw2 = nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=1)
+        self.logit_head = nn.Conv2d(self.hidden_dim, 1, kernel_size=1)
+
+    def reset_parameters(self) -> None:
+        for module in self.modules():
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        nn.init.zeros_(self.film.weight)
+        nn.init.zeros_(self.film.bias)
+        nn.init.zeros_(self.logit_head.weight)
+        nn.init.constant_(self.logit_head.bias, self.init_bias)
+
+    @staticmethod
+    def _ensure_3d(name: str, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim == 2:
+            tensor = tensor.unsqueeze(0)
+        if tensor.ndim != 3:
+            raise ValueError(f"Expected {name} shape [B,L,D], got {tuple(tensor.shape)}")
+        return tensor
+
+    @staticmethod
+    def _repeat_to_batch(tensor: torch.Tensor, batch_size: int, name: str) -> torch.Tensor:
+        if tensor.shape[0] == 1 and batch_size != 1:
+            return tensor.repeat(batch_size, 1, 1)
+        if tensor.shape[0] != batch_size:
+            raise ValueError(f"{name} batch {tensor.shape[0]} does not match batch {batch_size}")
+        return tensor
+
+    def _resize_square_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        if self.max_tokens <= 0 or tokens.shape[1] <= self.max_tokens:
+            return tokens
+        length = tokens.shape[1]
+        side = int(math.isqrt(length))
+        target_side = int(math.isqrt(self.max_tokens))
+        if side * side == length and target_side > 0:
+            target_tokens = target_side * target_side
+            if target_tokens <= self.max_tokens:
+                grid = rearrange(tokens, "b (h w) d -> b d h w", h=side, w=side)
+                grid = F.interpolate(grid.float(), size=(target_side, target_side), mode="bilinear", align_corners=False)
+                return rearrange(grid.to(dtype=tokens.dtype), "b d h w -> b (h w) d")
+        return tokens[:, : self.max_tokens]
+
+    def _coords(self, batch_size: int, length: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        side = int(math.isqrt(length))
+        if side * side != length:
+            raise ValueError(f"Dense where prior expects square tokens, got length={length}")
+        y = torch.linspace(-1.0, 1.0, side, device=device, dtype=dtype)
+        x = torch.linspace(-1.0, 1.0, side, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        coords = torch.stack([xx, yy], dim=-1).view(1, length, 2)
+        return coords.expand(batch_size, -1, -1)
+
+    def forward(
+        self,
+        target_feature_B_L_D: torch.Tensor,
+        target_dense_feature_B_L_D: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        what = self._ensure_3d("target_feature", target_feature_B_L_D)
+        where = self._ensure_3d("target_dense_feature", target_dense_feature_B_L_D)
+        batch_size = max(what.shape[0], where.shape[0])
+        what = self._repeat_to_batch(what, batch_size, "target_feature")
+        where = self._repeat_to_batch(where, batch_size, "target_dense_feature")
+        if what.shape[-1] != self.what_dim:
+            raise ValueError(f"Expected target_feature dim {self.what_dim}, got {what.shape[-1]}")
+        if where.shape[-1] != self.where_dim:
+            raise ValueError(f"Expected target_dense_feature dim {self.where_dim}, got {where.shape[-1]}")
+
+        param = self.logit_head.weight
+        what = torch.nan_to_num(what.to(device=param.device, dtype=param.dtype))
+        where = torch.nan_to_num(where.to(device=param.device, dtype=param.dtype))
+        where = self._resize_square_tokens(where)
+        side = int(math.isqrt(where.shape[1]))
+        if side * side != where.shape[1]:
+            raise ValueError(f"Dense where prior expects square tokens, got length={where.shape[1]}")
+
+        what_valid = what.float().abs().sum(dim=-1) > 0
+        where_valid = where.float().abs().sum(dim=-1) > 0
+        denom = what_valid.to(dtype=what.dtype).sum(dim=1, keepdim=True).clamp_min(1.0)
+        what_hidden = self.what_proj(self.what_norm(what))
+        what_hidden = (what_hidden * what_valid.unsqueeze(-1)).sum(dim=1) / denom
+
+        coords = self._coords(where.shape[0], where.shape[1], where.device, where.dtype)
+        h = self.where_proj(self.where_norm(where)) + self.coord_proj(coords)
+        gamma, beta = self.film(what_hidden).chunk(2, dim=-1)
+        h = h * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+        h = torch.where(where_valid.unsqueeze(-1), h, torch.zeros_like(h))
+        h = rearrange(h, "b (h w) d -> b d h w", h=side, w=side)
+        h = self.in_proj(h)
+        h = h + self.pw1(F.gelu(self.dw1(h)))
+        h = h + self.pw2(F.gelu(self.dw2(h)))
+        logits = self.logit_head(h).squeeze(1)
+        return logits, rearrange(where_valid, "b (h w) -> b h w", h=side, w=side)
+
+
 class DenseTargetSpatialAdapter(nn.Module):
     """Project target feature + mask grid into video-token-aligned residuals."""
 
@@ -2109,6 +2382,7 @@ class Block(nn.Module):
         target_token_indices_B: Optional[torch.Tensor] = None,
         target_crossattn_emb: Optional[torch.Tensor] = None,
         target_crossattn_token_indices_B: Optional[torch.Tensor] = None,
+        target_spatial_gate_B_T_H_W: Optional[torch.Tensor] = None,
         target_latent_field_B_T_H_W_D: Optional[torch.Tensor] = None,
         target_attention_query_chunk_size: int = 2048,
     ) -> torch.Tensor:
@@ -2238,6 +2512,18 @@ class Block(nn.Module):
                 h=H,
                 w=W,
             )
+            if target_spatial_gate_B_T_H_W is not None:
+                spatial_gate = target_spatial_gate_B_T_H_W.to(
+                    device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype
+                )
+                if spatial_gate.shape != (B, T, H, W):
+                    spatial_gate = F.interpolate(
+                        spatial_gate.unsqueeze(1).float(),
+                        size=(T, H, W),
+                        mode="trilinear",
+                        align_corners=False,
+                    ).squeeze(1).to(dtype=x_B_T_H_W_D.dtype)
+                target_result_B_T_H_W_D = target_result_B_T_H_W_D * spatial_gate.unsqueeze(-1)
             gate = self.target_cross_attn_gate.to(device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype)
             x_B_T_H_W_D = x_B_T_H_W_D + gate * target_result_B_T_H_W_D
 
@@ -2383,6 +2669,14 @@ class MiniTrainDIT(WeightTrainingStat):
         target_feature_context_append_to_text: bool = True,
         target_feature_context_replace_text: bool = False,
         target_feature_context_source_segments: Optional[List[int]] = None,
+        target_what_where_context_tokens: bool = False,
+        target_what_where_where_dim: int = 256,
+        target_what_where_hidden_dim: int = 512,
+        target_what_where_max_tokens: int = 256,
+        target_what_where_context_init_gate: float = 1.0,
+        target_what_where_spatial_prior: bool = False,
+        target_what_where_prior_hidden_dim: int = 128,
+        target_what_where_prior_init_bias: float = -2.0,
         target_feature_cross_attention: bool = False,
         target_feature_cross_attention_blocks: Optional[List[int]] = None,
         target_feature_cross_attention_init_gate: float = 0.0,
@@ -2490,6 +2784,10 @@ class MiniTrainDIT(WeightTrainingStat):
         self.target_feature_context_token_start: Optional[int] = None
         self.target_feature_context_tokens_B_L_D: Optional[torch.Tensor] = None
         self.target_feature_context_valid_B_L: Optional[torch.Tensor] = None
+        self.target_what_where_context_tokens = bool(target_what_where_context_tokens)
+        self.target_what_where_spatial_prior = bool(target_what_where_spatial_prior)
+        self.target_where_prior_logits_B_T_H_W: Optional[torch.Tensor] = None
+        self.target_where_prior_prob_B_T_H_W: Optional[torch.Tensor] = None
         if self.target_feature_concat_input:
             self.target_feature_input_adapter = TargetFeatureInputChannelAdapter(
                 feature_dim=target_feature_concat_input_dim,
@@ -2549,9 +2847,6 @@ class MiniTrainDIT(WeightTrainingStat):
         else:
             self.target_latent_grounding_adapter = None
 
-        # Mask-free match-ground path: WHERE learned from the [SEG] projection
-        # query (via target_dense_feature channel), WHAT read from raw [SEG]
-        # hidden states (via target_feature channel). No mask at inference.
         self.target_match_ground = bool(target_match_ground)
         self.target_matching_logits_B_T_H_W: Optional[torch.Tensor] = None
         if self.target_match_ground:
@@ -2579,7 +2874,27 @@ class MiniTrainDIT(WeightTrainingStat):
             )
         else:
             self.target_mask_context_adapter = None
-        if self.target_feature_context_tokens:
+        if self.target_what_where_context_tokens:
+            self.target_feature_context_adapter = TargetWhatWhereContextAdapter(
+                what_dim=target_feature_context_in_dim,
+                where_dim=target_what_where_where_dim,
+                hidden_dim=target_what_where_hidden_dim,
+                out_dim=crossattn_emb_channels,
+                max_tokens=target_what_where_max_tokens,
+                init_gate=target_what_where_context_init_gate,
+            )
+            if self.target_what_where_spatial_prior:
+                self.target_where_prior_head = DenseTargetWherePriorHead(
+                    what_dim=target_feature_context_in_dim,
+                    where_dim=target_what_where_where_dim,
+                    hidden_dim=target_what_where_prior_hidden_dim,
+                    max_tokens=target_what_where_max_tokens,
+                    init_bias=target_what_where_prior_init_bias,
+                )
+            else:
+                self.target_where_prior_head = None
+        elif self.target_feature_context_tokens:
+            self.target_where_prior_head = None
             if self.target_feature_context_source_segments:
                 self.target_feature_context_adapter = MultiSourceTargetFeatureContextAdapter(
                     source_segments=self.target_feature_context_source_segments,
@@ -2596,6 +2911,7 @@ class MiniTrainDIT(WeightTrainingStat):
                 )
         else:
             self.target_feature_context_adapter = None
+            self.target_where_prior_head = None
 
         self.blocks = nn.ModuleList(
             [
@@ -2677,6 +2993,8 @@ class MiniTrainDIT(WeightTrainingStat):
             self.target_mask_context_adapter.reset_parameters()
         if self.target_feature_context_adapter is not None:
             self.target_feature_context_adapter.reset_parameters()
+        if self.target_where_prior_head is not None:
+            self.target_where_prior_head.reset_parameters()
         if self.target_feature_input_adapter is not None:
             self.target_feature_input_adapter.reset_parameters()
         if self.target_dense_spatial_adapter is not None:
@@ -2870,6 +3188,7 @@ class MiniTrainDIT(WeightTrainingStat):
         self,
         crossattn_emb: torch.Tensor,
         target_feature_B_L_D: Optional[torch.Tensor],
+        target_dense_feature_B_L_D: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         self.target_feature_context_token_start = None
         self.target_feature_context_tokens_B_L_D = None
@@ -2877,16 +3196,23 @@ class MiniTrainDIT(WeightTrainingStat):
         if self.target_feature_context_adapter is None or target_feature_B_L_D is None:
             return crossattn_emb
 
-        feature_valid_B_L = target_feature_B_L_D
-        if feature_valid_B_L.ndim == 2:
-            feature_valid_B_L = feature_valid_B_L.unsqueeze(0)
-        if feature_valid_B_L.ndim != 3:
-            raise ValueError(f"Expected target feature shape [B,L,D], got {tuple(feature_valid_B_L.shape)}")
-        if self.target_feature_context_adapter.max_tokens > 0:
-            feature_valid_B_L = feature_valid_B_L[:, : self.target_feature_context_adapter.max_tokens]
-        feature_valid_B_L = feature_valid_B_L.float().abs().sum(dim=-1) > 0
-
-        feature_tokens = self.target_feature_context_adapter(target_feature_B_L_D)
+        if self.target_what_where_context_tokens:
+            if target_dense_feature_B_L_D is None:
+                return crossattn_emb
+            feature_tokens, feature_valid_B_L = self.target_feature_context_adapter(
+                target_feature_B_L_D,
+                target_dense_feature_B_L_D,
+            )
+        else:
+            feature_valid_B_L = target_feature_B_L_D
+            if feature_valid_B_L.ndim == 2:
+                feature_valid_B_L = feature_valid_B_L.unsqueeze(0)
+            if feature_valid_B_L.ndim != 3:
+                raise ValueError(f"Expected target feature shape [B,L,D], got {tuple(feature_valid_B_L.shape)}")
+            if self.target_feature_context_adapter.max_tokens > 0:
+                feature_valid_B_L = feature_valid_B_L[:, : self.target_feature_context_adapter.max_tokens]
+            feature_valid_B_L = feature_valid_B_L.float().abs().sum(dim=-1) > 0
+            feature_tokens = self.target_feature_context_adapter(target_feature_B_L_D)
         feature_tokens = feature_tokens.to(device=crossattn_emb.device, dtype=crossattn_emb.dtype)
         if feature_tokens.shape[0] == 1 and crossattn_emb.shape[0] != 1:
             feature_tokens = feature_tokens.repeat(crossattn_emb.shape[0], 1, 1)
@@ -2999,6 +3325,8 @@ class MiniTrainDIT(WeightTrainingStat):
         self.target_feature_context_token_start = None
         self.target_feature_context_tokens_B_L_D = None
         self.target_feature_context_valid_B_L = None
+        self.target_where_prior_logits_B_T_H_W = None
+        self.target_where_prior_prob_B_T_H_W = None
         x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = self.prepare_embedded_sequence(
             x_B_C_T_H_W,
             fps=fps,
@@ -3040,8 +3368,6 @@ class MiniTrainDIT(WeightTrainingStat):
                 device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype
             ) * dense_target
 
-        # Mask-free match-ground: ③ (target_dense_feature channel) locates, ②
-        # (target_feature channel) grounds. Logits stored for the matching loss.
         self.target_matching_logits_B_T_H_W = None
         if self.target_match_ground_module is not None:
             if (target_feature_B_L_D is None or target_dense_feature_B_L_D is None) and not getattr(
@@ -3069,9 +3395,42 @@ class MiniTrainDIT(WeightTrainingStat):
                 token_shape=(B, T, H, W),
             ).to(device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype)
 
+        target_spatial_gate_B_T_H_W = None
+        if (
+            self.target_where_prior_head is not None
+            and target_feature_B_L_D is not None
+            and target_dense_feature_B_L_D is not None
+        ):
+            B, T, H, W, _ = x_B_T_H_W_D.shape
+            prior_logits_2d, prior_valid_2d = self.target_where_prior_head(
+                target_feature_B_L_D,
+                target_dense_feature_B_L_D,
+            )
+            prior_logits_2d = prior_logits_2d.to(device=x_B_T_H_W_D.device)
+            prior_valid_2d = prior_valid_2d.to(device=x_B_T_H_W_D.device)
+            prior_logits = F.interpolate(
+                prior_logits_2d.unsqueeze(1).unsqueeze(2).float(),
+                size=(T, H, W),
+                mode="trilinear",
+                align_corners=False,
+            ).squeeze(1).to(dtype=x_B_T_H_W_D.dtype)
+            prior_valid = F.interpolate(
+                prior_valid_2d.unsqueeze(1).unsqueeze(2).float(),
+                size=(T, H, W),
+                mode="nearest",
+            ).squeeze(1).to(dtype=x_B_T_H_W_D.dtype)
+            prior_logits = torch.where(prior_valid > 0.5, prior_logits, torch.full_like(prior_logits, -20.0))
+            self.target_where_prior_logits_B_T_H_W = prior_logits
+            target_spatial_gate_B_T_H_W = torch.sigmoid(prior_logits)
+            self.target_where_prior_prob_B_T_H_W = target_spatial_gate_B_T_H_W
+
         if self.use_crossattn_projection:
             crossattn_emb = self.crossattn_proj(crossattn_emb)
-        crossattn_emb = self.append_target_feature_context(crossattn_emb, target_feature_B_L_D)
+        crossattn_emb = self.append_target_feature_context(
+            crossattn_emb,
+            target_feature_B_L_D,
+            target_dense_feature_B_L_D,
+        )
         target_branch_tokens_B_L_D = self.target_feature_context_tokens_B_L_D
         target_branch_token_indices_B = self.make_target_branch_attention_token_indices()
         self.target_feature_contrastive_tokens_B_L_D = target_branch_tokens_B_L_D
@@ -3136,6 +3495,7 @@ class MiniTrainDIT(WeightTrainingStat):
                 target_token_indices_B=None if use_target_branch_for_loss else target_token_indices_for_attn_B,
                 target_crossattn_emb=target_branch_tokens_B_L_D,
                 target_crossattn_token_indices_B=target_branch_token_indices_B,
+                target_spatial_gate_B_T_H_W=target_spatial_gate_B_T_H_W,
                 target_latent_field_B_T_H_W_D=target_latent_field_B_T_H_W_D,
                 target_attention_query_chunk_size=self.tavid_attn_query_chunk_size,
             )

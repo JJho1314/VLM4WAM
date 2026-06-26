@@ -483,8 +483,12 @@ class InferenceArguments(CommonInferenceArguments):
     """How to reduce multiple InstructSAM masks: best-scoring mask or union."""
     target_mask_threshold: float = 0.0
     """Threshold applied to InstructSAM mask logits or precomputed mask values."""
-    instructsam_feature_mode: Literal["mask_query", "raw_seg"] = "mask_query"
+    instructsam_feature_mode: Literal["mask_query", "raw_seg", "decoder_dense"] = "mask_query"
     """Which InstructSAM target embedding to pass into Cosmos. mask_query is the default 256-d projected token."""
+    route_decoder_dense_to_target_dense_feature: bool = False
+    """When instructsam_feature_mode='decoder_dense', route decoder_dense to target_dense_feature and raw_seg to target_feature."""
+    pass_instructsam_mask_to_cosmos: bool = False
+    """Whether the InstructSAM mask is passed to Cosmos. Set false for mask-free inference."""
 
     # Override defaults
     # pyrefly: ignore  # bad-override
@@ -512,11 +516,6 @@ class InferenceArguments(CommonInferenceArguments):
             raise ValueError("instructsam_model_path is required when target_query is provided")
         if self.target_query is not None and self.inference_type == InferenceType.TEXT2WORLD:
             raise ValueError("target_query requires IMAGE2WORLD or VIDEO2WORLD input_path")
-        if self.target_query is not None and self.instructsam_feature_mode == "raw_seg":
-            raise ValueError(
-                "instructsam_feature_mode='raw_seg' requires a custom Cosmos adapter dimension. "
-                "Use 'mask_query' with the provided target_feature_context_in_dim=256 configs."
-            )
         return self
 
     @cached_property

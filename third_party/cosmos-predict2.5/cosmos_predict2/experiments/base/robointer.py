@@ -55,6 +55,7 @@ _DATASET_DIR_DROID_FAILURE_ALL = "/data/user/jhe724/workspace/datasets/droid_fai
 _DATASET_DIR_DROID_FAILURE_CLEAN = "/data/user/jhe724/workspace/datasets/droid_failure_left_all_clean"
 _DATASET_DIR_DROID_FAILURE_CLEAN_480 = "/data/user/jhe724/workspace/datasets/droid_failure_left_all_clean_480x864"
 _DROID_VIDEO_SIZE_480 = (480, 864)
+_DROID_VIDEO_SIZE_320 = (320, 576)
 _DROID_SUCCESS_V21_TAVID_NUM_FRAMES = int(os.environ.get("DROID_SUCCESS_V21_TAVID_NUM_FRAMES", "49"))
 _DROID_SUCCESS_V21_TAVID_FRAME_STRIDES = [
     int(item)
@@ -65,6 +66,8 @@ _DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY = os.environ.get(
     "DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY",
     "range_start",
 )
+_DROID_SUCCESS_V21_SIGLIP2_SEMANTIC_PLAN_TOKENS = 6 * 81
+_DROID_SUCCESS_V21_SIGLIP2_SEMANTIC_PLAN_DIM = 1152
 _DROID_SUCCESS_ITER_10000 = (
     "/data/user/jhe724/workspace/cosmos-predict2.5/outputs/droid_success/cosmos_predict_v2p5/"
     "video2world/2b_droid_success_560/checkpoints/iter_000010000"
@@ -737,6 +740,107 @@ _dataloader_val_droid_success_v21_decoder_dense_maskfree_feature = L(get_generic
     persistent_workers=True,
     prefetch_factor=2,
 )
+
+# Baton/Plan-X oracle data: GT future semantic blueprints from frozen SigLIP2.
+# These are full-frame future semantic tokens, not target masks. The loader maps
+# payload["semantic_plan"] -> data["target_feature"] as [6*81, 1152].
+_video_dataset_droid_success_v21_siglip2_semantic_oracle = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_480,
+    target_mask_dir="none",
+    target_feature_dir="siglip2_semantic_plan_k6_g9_full",
+    target_feature_default_to_zero=False,
+    target_feature_dim=_DROID_SUCCESS_V21_SIGLIP2_SEMANTIC_PLAN_DIM,
+    target_feature_max_tokens=_DROID_SUCCESS_V21_SIGLIP2_SEMANTIC_PLAN_TOKENS,
+    exclude_video_stems_file="auto",
+    require_frame_range=True,
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
+_video_dataset_droid_success_v21_val_siglip2_semantic_oracle = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID_VAL,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_480,
+    target_mask_dir="none",
+    target_feature_dir="siglip2_semantic_plan_k6_g9_full",
+    target_feature_default_to_zero=False,
+    target_feature_dim=_DROID_SUCCESS_V21_SIGLIP2_SEMANTIC_PLAN_DIM,
+    target_feature_max_tokens=_DROID_SUCCESS_V21_SIGLIP2_SEMANTIC_PLAN_TOKENS,
+    exclude_video_stems_file="auto",
+    require_frame_range=True,
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
+_dataloader_train_droid_success_v21_siglip2_semantic_oracle = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_siglip2_semantic_oracle,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_siglip2_semantic_oracle),
+    batch_size=1,
+    drop_last=True,
+    num_workers=12,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=4,
+)
+_dataloader_val_droid_success_v21_siglip2_semantic_oracle = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_val_siglip2_semantic_oracle,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_val_siglip2_semantic_oracle),
+    batch_size=1,
+    drop_last=False,
+    num_workers=4,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=2,
+)
+
+_video_dataset_droid_success_v21_siglip2_semantic_oracle_320 = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_320,
+    target_mask_dir="none",
+    target_feature_dir="siglip2_semantic_plan_k6_g9_full",
+    target_feature_default_to_zero=False,
+    target_feature_dim=_DROID_SUCCESS_V21_SIGLIP2_SEMANTIC_PLAN_DIM,
+    target_feature_max_tokens=_DROID_SUCCESS_V21_SIGLIP2_SEMANTIC_PLAN_TOKENS,
+    exclude_video_stems_file="auto",
+    require_frame_range=True,
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
+_video_dataset_droid_success_v21_val_siglip2_semantic_oracle_320 = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID_VAL,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_320,
+    target_mask_dir="none",
+    target_feature_dir="siglip2_semantic_plan_k6_g9_full",
+    target_feature_default_to_zero=False,
+    target_feature_dim=_DROID_SUCCESS_V21_SIGLIP2_SEMANTIC_PLAN_DIM,
+    target_feature_max_tokens=_DROID_SUCCESS_V21_SIGLIP2_SEMANTIC_PLAN_TOKENS,
+    exclude_video_stems_file="auto",
+    require_frame_range=True,
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
+_dataloader_train_droid_success_v21_siglip2_semantic_oracle_320 = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_siglip2_semantic_oracle_320,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_siglip2_semantic_oracle_320),
+    batch_size=1,
+    drop_last=True,
+    num_workers=12,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=4,
+)
+_dataloader_val_droid_success_v21_siglip2_semantic_oracle_320 = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_val_siglip2_semantic_oracle_320,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_val_siglip2_semantic_oracle_320),
+    batch_size=1,
+    drop_last=False,
+    num_workers=4,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=2,
+)
 # raw_seg ablation data: same videos/masks, but the target feature is the RAW
 # 2048-d Qwen3VL hidden state at [SEG] positions (feature_mode=raw_seg), not the
 # 256-d mask_hidden_fcs projection. Precomputed into target_features_rawseg/.
@@ -844,6 +948,68 @@ _dataloader_train_droid_success_v21_match_ground = L(get_generic_dataloader)(
 _dataloader_val_droid_success_v21_match_ground = L(get_generic_dataloader)(
     dataset=_video_dataset_droid_success_v21_val_match_ground,
     sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_val_match_ground),
+    batch_size=1,
+    drop_last=False,
+    num_workers=4,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=2,
+)
+
+# Mask-free what/where context data: raw [SEG]/[TGT] hidden state gives the
+# target selector (what), while decoder_dense gives the spatial feature field
+# (where). The GT mask remains available only for losses/diagnostics.
+_video_dataset_droid_success_v21_what_where = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_480,
+    target_mask_dir="auto",
+    target_mask_default_to_zero=False,
+    target_feature_dir="target_features_rawseg_ft",
+    target_feature_default_to_zero=False,
+    target_feature_dim=2048,
+    target_feature_max_tokens=16,
+    target_dense_feature_dir="target_features_instructsam_decoder_dense_stage2_lora",
+    target_dense_feature_default_to_zero=False,
+    target_dense_feature_dim=256,
+    target_dense_feature_max_tokens=1024,
+    target_prompt_suffix="The robot interacts with the [TGT] target object.",
+    exclude_video_stems_file="auto",
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
+_video_dataset_droid_success_v21_val_what_where = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID_VAL,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_480,
+    target_mask_dir="auto",
+    target_mask_default_to_zero=False,
+    target_feature_dir="target_features_rawseg_ft",
+    target_feature_default_to_zero=False,
+    target_feature_dim=2048,
+    target_feature_max_tokens=16,
+    target_dense_feature_dir="target_features_instructsam_decoder_dense_stage2_lora",
+    target_dense_feature_default_to_zero=False,
+    target_dense_feature_dim=256,
+    target_dense_feature_max_tokens=1024,
+    target_prompt_suffix="The robot interacts with the [TGT] target object.",
+    exclude_video_stems_file="auto",
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
+_dataloader_train_droid_success_v21_what_where = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_what_where,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_what_where),
+    batch_size=1,
+    drop_last=True,
+    num_workers=12,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=4,
+)
+_dataloader_val_droid_success_v21_what_where = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_val_what_where,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_val_what_where),
     batch_size=1,
     drop_last=False,
     num_workers=4,
@@ -1333,6 +1499,165 @@ predict2_video2world_training_2b_droid_success_v21_match_ground_v3["model"]["con
     )
 )
 
+predict2_video2world_training_2b_droid_success_v21_what_where_context = copy.deepcopy(
+    predict2_video2world_training_2b_droid_success_v21_match_ground_v3
+)
+predict2_video2world_training_2b_droid_success_v21_what_where_context["dataloader_train"] = (
+    _dataloader_train_droid_success_v21_what_where
+)
+predict2_video2world_training_2b_droid_success_v21_what_where_context["dataloader_val"] = (
+    _dataloader_val_droid_success_v21_what_where
+)
+predict2_video2world_training_2b_droid_success_v21_what_where_context["job"]["name"] = (
+    "2b_droid_success_v21_what_where_context_480_49f"
+)
+predict2_video2world_training_2b_droid_success_v21_what_where_context["model"]["config"].update(
+    dict(
+        target_mask_condition_frames_only=False,
+        target_attention_loss_weight=0.05,
+        target_matching_loss_weight=0.0,
+        target_match_ground_gt_gate_hold_iters=0,
+        target_match_ground_gt_gate_iters=0,
+    )
+)
+predict2_video2world_training_2b_droid_success_v21_what_where_context["model"]["config"]["net"].update(
+    dict(
+        concat_target_mask=False,
+        target_mask_concat_input=False,
+        target_mask_context_tokens=False,
+        target_feature_context_tokens=False,
+        target_what_where_context_tokens=True,
+        target_feature_context_in_dim=2048,
+        target_what_where_where_dim=256,
+        target_what_where_hidden_dim=512,
+        target_what_where_max_tokens=1024,
+        target_what_where_context_init_gate=1.0,
+        target_feature_context_append_to_text=False,
+        target_feature_context_replace_text=False,
+        target_feature_cross_attention=True,
+        target_feature_cross_attention_blocks=list(range(28)),
+        target_feature_cross_attention_init_gate=0.001,
+        target_feature_concat_input=False,
+        target_dense_spatial_tokens=False,
+        target_latent_grounding=False,
+        target_match_ground=False,
+        tavid_attn_alignment_blocks=[8, 12, 16, 20],
+        tavid_attn_alignment_token_source="feature",
+        tavid_attn_query_chunk_size=1024,
+    )
+)
+
+predict2_video2world_training_2b_droid_success_v21_what_where_prior_context = copy.deepcopy(
+    predict2_video2world_training_2b_droid_success_v21_what_where_context
+)
+predict2_video2world_training_2b_droid_success_v21_what_where_prior_context["job"]["name"] = (
+    "2b_droid_success_v21_what_where_prior_context_480_49f"
+)
+predict2_video2world_training_2b_droid_success_v21_what_where_prior_context["model"]["config"].update(
+    dict(
+        target_attention_loss_weight=0.005,
+        target_where_prior_loss_weight=0.1,
+        target_where_prior_background_loss_weight=0.25,
+        target_where_prior_dice_loss_weight=0.5,
+        target_matching_loss_weight=0.0,
+    )
+)
+predict2_video2world_training_2b_droid_success_v21_what_where_prior_context["model"]["config"]["net"].update(
+    dict(
+        target_what_where_spatial_prior=True,
+        target_what_where_prior_hidden_dim=128,
+        target_what_where_prior_init_bias=-2.0,
+        target_feature_cross_attention=True,
+        target_feature_cross_attention_blocks=list(range(28)),
+        target_feature_cross_attention_init_gate=0.0,
+        tavid_attn_alignment_blocks=[8, 12, 16, 20],
+        tavid_attn_alignment_token_source="feature",
+    )
+)
+
+# --- what/where with a DISCRIMINATIVE InstructSAM soft-logit "where" + caption/feature dropout ---
+# Uses target_features_where_softlogit_stage2_lora, whose `target_dense_weighted` ([SEG]-dense match)
+# actually distinguishes targets (the old query-averaged decoder_dense did not, cosine 0.994). Caption
+# dropout genericizes the prompt so target identity must come from the feature (text+feature
+# complementary); mask dropout supplies a CFG null. Trained fresh from base.
+_WHERE_SOFTLOGIT_DIR = "target_features_where_softlogit_stage2_lora"
+_video_dataset_droid_success_v21_what_where_softlogit = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_480,
+    target_mask_dir="auto",
+    target_mask_default_to_zero=False,
+    target_feature_dir="target_features_rawseg_ft",
+    target_feature_default_to_zero=False,
+    target_feature_dim=2048,
+    target_feature_max_tokens=16,
+    target_dense_feature_dir=_WHERE_SOFTLOGIT_DIR,
+    target_dense_feature_default_to_zero=False,
+    target_dense_feature_dim=256,
+    target_dense_feature_max_tokens=1024,
+    target_prompt_suffix="The robot interacts with the [TGT] target object.",
+    target_mask_dropout_prob=0.1,
+    caption_dropout_prob=0.4,
+    exclude_video_stems_file="auto",
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
+_video_dataset_droid_success_v21_val_what_where_softlogit = L(VideoDataset)(
+    dataset_dir=_DATASET_DIR_DROID_SUCCESS_V21_TAVID_VAL,
+    num_frames=_DROID_SUCCESS_V21_TAVID_NUM_FRAMES,
+    video_size=_DROID_VIDEO_SIZE_480,
+    target_mask_dir="auto",
+    target_mask_default_to_zero=False,
+    target_feature_dir="target_features_rawseg_ft",
+    target_feature_default_to_zero=False,
+    target_feature_dim=2048,
+    target_feature_max_tokens=16,
+    target_dense_feature_dir=_WHERE_SOFTLOGIT_DIR,
+    target_dense_feature_default_to_zero=False,
+    target_dense_feature_dim=256,
+    target_dense_feature_max_tokens=1024,
+    target_prompt_suffix="The robot interacts with the [TGT] target object.",
+    exclude_video_stems_file="auto",
+    frame_stride_choices=_DROID_SUCCESS_V21_TAVID_FRAME_STRIDES,
+    frame_start_policy=_DROID_SUCCESS_V21_TAVID_FRAME_START_POLICY,
+)
+_dataloader_train_droid_success_v21_what_where_softlogit = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_what_where_softlogit,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_what_where_softlogit),
+    batch_size=1,
+    drop_last=True,
+    num_workers=12,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=4,
+)
+_dataloader_val_droid_success_v21_what_where_softlogit = L(get_generic_dataloader)(
+    dataset=_video_dataset_droid_success_v21_val_what_where_softlogit,
+    sampler=L(get_sampler)(dataset=_video_dataset_droid_success_v21_val_what_where_softlogit),
+    batch_size=1,
+    drop_last=False,
+    num_workers=4,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=2,
+)
+predict2_video2world_training_2b_droid_success_v21_what_where_softlogit = copy.deepcopy(
+    predict2_video2world_training_2b_droid_success_v21_what_where_prior_context
+)
+predict2_video2world_training_2b_droid_success_v21_what_where_softlogit["dataloader_train"] = (
+    _dataloader_train_droid_success_v21_what_where_softlogit
+)
+predict2_video2world_training_2b_droid_success_v21_what_where_softlogit["dataloader_val"] = (
+    _dataloader_val_droid_success_v21_what_where_softlogit
+)
+predict2_video2world_training_2b_droid_success_v21_what_where_softlogit["job"]["name"] = (
+    "2b_droid_success_v21_what_where_softlogit_480_49f"
+)
+# Now that "where" is discriminative, let the attention-alignment objective matter (was inert 0.005).
+predict2_video2world_training_2b_droid_success_v21_what_where_softlogit["model"]["config"].update(
+    dict(target_attention_loss_weight=0.05)
+)
+
 predict2_video2world_training_2b_droid_success_v21_dense_feature_map_target = copy.deepcopy(
     predict2_video2world_training_2b_droid_success_v21_dense_spatial_target
 )
@@ -1379,6 +1704,61 @@ predict2_video2world_training_2b_droid_success_v21_maskfree_decoder_dense_target
         tavid_attn_alignment_blocks=[],
         tavid_attn_query_chunk_size=1024,
     )
+)
+
+predict2_video2world_training_2b_droid_success_v21_siglip2_semantic_oracle_context = copy.deepcopy(
+    predict2_video2world_training_2b_droid_success_v21_tavid_mask
+)
+predict2_video2world_training_2b_droid_success_v21_siglip2_semantic_oracle_context["dataloader_train"] = (
+    _dataloader_train_droid_success_v21_siglip2_semantic_oracle
+)
+predict2_video2world_training_2b_droid_success_v21_siglip2_semantic_oracle_context["dataloader_val"] = (
+    _dataloader_val_droid_success_v21_siglip2_semantic_oracle
+)
+predict2_video2world_training_2b_droid_success_v21_siglip2_semantic_oracle_context["job"]["name"] = (
+    "2b_droid_success_v21_siglip2_semantic_oracle_context_480_49f"
+)
+predict2_video2world_training_2b_droid_success_v21_siglip2_semantic_oracle_context["model"]["config"].update(
+    dict(
+        target_mask_condition_frames_only=False,
+        target_attention_loss_weight=0.0,
+        target_where_prior_loss_weight=0.0,
+        target_feature_contrastive_loss_weight=0.0,
+        target_matching_loss_weight=0.0,
+    )
+)
+predict2_video2world_training_2b_droid_success_v21_siglip2_semantic_oracle_context["model"]["config"]["net"].update(
+    dict(
+        concat_target_mask=False,
+        target_mask_concat_input=False,
+        target_mask_context_tokens=False,
+        target_feature_context_tokens=True,
+        target_feature_context_in_dim=_DROID_SUCCESS_V21_SIGLIP2_SEMANTIC_PLAN_DIM,
+        target_feature_context_hidden_dim=2048,
+        target_feature_context_max_tokens=_DROID_SUCCESS_V21_SIGLIP2_SEMANTIC_PLAN_TOKENS,
+        target_feature_context_append_to_text=True,
+        target_feature_context_replace_text=False,
+        target_feature_cross_attention=False,
+        target_dense_spatial_tokens=False,
+        target_latent_grounding=False,
+        target_match_ground=False,
+        tavid_attn_alignment_blocks=[],
+        tavid_attn_alignment_token_source="feature",
+        tavid_attn_query_chunk_size=1024,
+    )
+)
+
+predict2_video2world_training_2b_droid_success_v21_siglip2_semantic_oracle_context_320 = copy.deepcopy(
+    predict2_video2world_training_2b_droid_success_v21_siglip2_semantic_oracle_context
+)
+predict2_video2world_training_2b_droid_success_v21_siglip2_semantic_oracle_context_320["dataloader_train"] = (
+    _dataloader_train_droid_success_v21_siglip2_semantic_oracle_320
+)
+predict2_video2world_training_2b_droid_success_v21_siglip2_semantic_oracle_context_320["dataloader_val"] = (
+    _dataloader_val_droid_success_v21_siglip2_semantic_oracle_320
+)
+predict2_video2world_training_2b_droid_success_v21_siglip2_semantic_oracle_context_320["job"]["name"] = (
+    "2b_droid_success_v21_siglip2_semantic_oracle_context_320_49f"
 )
 
 predict2_video2world_training_2b_droid_success_v21_feature_input_channel_target = copy.deepcopy(
@@ -1722,6 +2102,27 @@ cs.store(
 cs.store(
     group="experiment",
     package="_global_",
+    name="predict2_video2world_training_2b_droid_success_v21_what_where_context",
+    node=predict2_video2world_training_2b_droid_success_v21_what_where_context,
+)
+
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="predict2_video2world_training_2b_droid_success_v21_what_where_prior_context",
+    node=predict2_video2world_training_2b_droid_success_v21_what_where_prior_context,
+)
+
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="predict2_video2world_training_2b_droid_success_v21_what_where_softlogit",
+    node=predict2_video2world_training_2b_droid_success_v21_what_where_softlogit,
+)
+
+cs.store(
+    group="experiment",
+    package="_global_",
     name="predict2_video2world_training_2b_droid_success_v21_dense_feature_map_target",
     node=predict2_video2world_training_2b_droid_success_v21_dense_feature_map_target,
 )
@@ -1731,6 +2132,20 @@ cs.store(
     package="_global_",
     name="predict2_video2world_training_2b_droid_success_v21_maskfree_decoder_dense_target",
     node=predict2_video2world_training_2b_droid_success_v21_maskfree_decoder_dense_target,
+)
+
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="predict2_video2world_training_2b_droid_success_v21_siglip2_semantic_oracle_context",
+    node=predict2_video2world_training_2b_droid_success_v21_siglip2_semantic_oracle_context,
+)
+
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="predict2_video2world_training_2b_droid_success_v21_siglip2_semantic_oracle_context_320",
+    node=predict2_video2world_training_2b_droid_success_v21_siglip2_semantic_oracle_context_320,
 )
 
 cs.store(

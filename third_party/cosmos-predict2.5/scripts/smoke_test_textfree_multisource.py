@@ -12,6 +12,7 @@ Cosmos training stack:
 from __future__ import annotations
 
 import importlib.util
+import math
 import os
 import re
 import sys
@@ -22,6 +23,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F  # noqa: F401  (used by exec'd adapter source)
+from einops import rearrange  # noqa: F401  (used by exec'd adapter source)
 from torch import nn  # noqa: F401
 
 REPO = Path(__file__).resolve().parents[1]
@@ -126,13 +128,14 @@ def _exec_adapter_classes():
     end = src.index("class VideoPositionEmb")
     classes_src = src[start:end]
     ns: dict = {"nn": nn, "torch": torch, "F": F, "Sequence": Sequence,
+                "math": math, "rearrange": rearrange,
                 "Optional": object, "Tuple": tuple}
     exec(compile(classes_src, "minimal_v4_dit_adapters", "exec"), ns)
-    return ns["MultiSourceTargetFeatureContextAdapter"]
+    return ns["MultiSourceTargetFeatureContextAdapter"], ns["TargetWhatWhereContextAdapter"]
 
 
 def test_adapter() -> None:
-    MultiSourceTargetFeatureContextAdapter = _exec_adapter_classes()
+    MultiSourceTargetFeatureContextAdapter, TargetWhatWhereContextAdapter = _exec_adapter_classes()
 
     segments = [16, 16, 32]
     adapter = MultiSourceTargetFeatureContextAdapter(
@@ -159,7 +162,20 @@ def test_adapter() -> None:
     assert seg_means[0] < seg_means[1] < seg_means[2], seg_means
     # Buffer not persisted in state_dict (deterministic).
     assert "segment_ids" not in adapter.state_dict()
-    print(f"[ok] multi-source adapter forward + per-source embedding (seg means {seg_means})")
+
+    what_where = TargetWhatWhereContextAdapter(
+        what_dim=2048,
+        where_dim=256,
+        hidden_dim=128,
+        out_dim=1024,
+        max_tokens=256,
+    )
+    what_where.reset_parameters()
+    ww_tokens, ww_valid = what_where(torch.randn(2, 16, 2048), torch.randn(2, 1024, 256))
+    assert ww_tokens.shape == (2, 256, 1024), ww_tokens.shape
+    assert ww_valid.shape == (2, 256), ww_valid.shape
+    assert torch.isfinite(ww_tokens).all()
+    print(f"[ok] multi-source + what/where adapters (seg means {seg_means})")
 
 
 def test_replace_text_branch() -> None:

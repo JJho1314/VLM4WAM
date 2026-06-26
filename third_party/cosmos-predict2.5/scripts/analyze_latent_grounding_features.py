@@ -74,6 +74,16 @@ def _load_mask(path: Path, mode: str) -> np.ndarray | None:
         masks = payload[key].astype(np.float32)
         if masks.ndim == 2:
             masks = masks[None]
+    if masks.ndim == 5:
+        # Common dataset layout: [B, T, C, H, W]. This diagnostic operates on
+        # one sample, so take the first batch item and first channel.
+        masks = masks[0, :, 0]
+    elif masks.ndim == 4:
+        # Accept either [T, C, H, W] or [B, T, H, W].
+        if masks.shape[1] == 1:
+            masks = masks[:, 0]
+        else:
+            masks = masks[0]
     if masks.ndim != 3:
         raise ValueError(f"Expected mask [T,H,W], got {masks.shape} in {path}")
     masks = (masks > 0).astype(np.float32)
