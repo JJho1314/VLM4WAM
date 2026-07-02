@@ -1,0 +1,25 @@
+{
+  "checkpoint": "/data/user/jhe724/workspace/cosmos-predict2.5/outputs/droid_v21_what_where_softlogit_320x576_49f_s123_vlm4wam/cosmos_predict_v2p5/video2world/2b_what_where_softlogit_iou50_320x576_49f_s123_bs4accum4_gbs128_3000/checkpoints/iter_000003000",
+  "checkpoint_iter_from_path": 3000,
+  "loaded_iter_returned_by_checkpointer": 0,
+  "num_samples": 1,
+  "skip_samples": 0,
+  "sample_index_offset": 0,
+  "num_steps": 35,
+  "guidance": 3.0,
+  "seed": 20260613,
+  "fps": 8,
+  "layout": "standalone generated/GT videos",
+  "target_feature_mode": "drop",
+  "target_feature_path": null,
+  "samples": [
+    {
+      "sample_index": 0,
+      "caption": "A Franka robotic arm with a parallel-jaw gripper grasps the [TGT] object and places it.",
+      "generated": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_yellow_carrot/drop/sample_000_generated.mp4",
+      "gt": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_yellow_carrot/drop/sample_000_gt.mp4",
+      "caption_file": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_yellow_carrot/drop/sample_000_caption.txt",
+      "target_feature_override": "drop"
+    }
+  ]
+}

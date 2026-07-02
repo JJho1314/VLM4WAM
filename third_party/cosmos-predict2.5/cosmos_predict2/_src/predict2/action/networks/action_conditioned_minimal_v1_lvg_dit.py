@@ -92,9 +92,6 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
         img_context_emb: Optional[torch.Tensor] = None,
         action: Optional[torch.Tensor] = None,
         intermediate_feature_ids: Optional[List[int]] = None,
-        target_mask_B_C_T_H_W: Optional[torch.Tensor] = None,
-        target_feature_B_L_D: Optional[torch.Tensor] = None,
-        tgt_token_indices_B: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         del kwargs
@@ -109,13 +106,6 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
 
         # NOTE: we need to scale the timesteps, which is added for rectified flow model
         timesteps_B_T = timesteps_B_T * self.timestep_scale
-        self.tavid_target_attn_maps = []
-        self.tavid_target_mask_B_T_H_W = self.make_target_mask_tokens(target_mask_B_C_T_H_W)
-        self.target_mask_context_token_start = None
-        self.target_mask_context_tokens_B_L_D = None
-        self.target_feature_context_token_start = None
-        self.target_feature_context_tokens_B_L_D = None
-        self.target_feature_context_valid_B_L = None
 
         assert action is not None, "action must be provided"
         action = rearrange(action, "b t d -> b 1 (t d)")
@@ -133,9 +123,6 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
 
         if self.use_crossattn_projection:
             crossattn_emb = self.crossattn_proj(crossattn_emb)
-        crossattn_emb = self.append_target_feature_context(crossattn_emb, target_feature_B_L_D)
-        crossattn_emb = self.append_target_mask_context(crossattn_emb, target_mask_B_C_T_H_W)
-        target_token_indices_for_attn_B = self.make_tavid_attention_token_indices(tgt_token_indices_B)
 
         if img_context_emb is not None:
             assert self.extra_image_context_dim is not None, (
@@ -173,11 +160,6 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
 
         intermediate_features_outputs = []
         for i, block in enumerate(self.blocks):
-            capture_target_cross_attn = (
-                i in self.tavid_attn_alignment_blocks
-                and target_token_indices_for_attn_B is not None
-                and self.tavid_target_mask_B_T_H_W is not None
-            )
             x_B_T_H_W_D = block(
                 x_B_T_H_W_D,
                 t_embedding_B_T_D,
@@ -185,20 +167,7 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
                 rope_emb_L_1_1_D=rope_emb_L_1_1_D,
                 adaln_lora_B_T_3D=adaln_lora_B_T_3D,
                 extra_per_block_pos_emb=extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
-                capture_target_cross_attn=capture_target_cross_attn,
-                target_token_indices_B=target_token_indices_for_attn_B,
-                target_attention_query_chunk_size=self.tavid_attn_query_chunk_size,
             )
-            if capture_target_cross_attn and self.blocks[i].cross_attn.last_target_attn_map_B_S is not None:
-                self.tavid_target_attn_maps.append(
-                    rearrange(
-                        self.blocks[i].cross_attn.last_target_attn_map_B_S,
-                        "b (t h w) -> b t h w",
-                        t=T,
-                        h=H,
-                        w=W,
-                    )
-                )
             if intermediate_feature_ids and i in intermediate_feature_ids:
                 x_reshaped_for_disc = rearrange(x_B_T_H_W_D, "b tp hp wp d -> b (tp hp wp) d")
                 intermediate_features_outputs.append(x_reshaped_for_disc)
@@ -275,9 +244,6 @@ class ActionChunkConditionedMinimalV1LVGDiT(MiniTrainDIT):
         img_context_emb: Optional[torch.Tensor] = None,
         action: Optional[torch.Tensor] = None,
         intermediate_feature_ids: Optional[List[int]] = None,
-        target_mask_B_C_T_H_W: Optional[torch.Tensor] = None,
-        target_feature_B_L_D: Optional[torch.Tensor] = None,
-        tgt_token_indices_B: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         del kwargs
@@ -291,17 +257,10 @@ class ActionChunkConditionedMinimalV1LVGDiT(MiniTrainDIT):
             )
 
         timesteps_B_T = timesteps_B_T * self.timestep_scale
-        self.tavid_target_attn_maps = []
-        self.tavid_target_mask_B_T_H_W = self.make_target_mask_tokens(target_mask_B_C_T_H_W)
-        self.target_mask_context_token_start = None
-        self.target_mask_context_tokens_B_L_D = None
-        self.target_feature_context_token_start = None
-        self.target_feature_context_tokens_B_L_D = None
-        self.target_feature_context_valid_B_L = None
 
         # calculate action embedding
-        assert action is not None, "action must be provided"
         num_actions = action.shape[1]
+        assert action is not None, "action must be provided"
         action = rearrange(action, "b t d -> b 1 (t d)")
         action = rearrange(action, "b 1 (t d) -> b t d", t=num_actions // self._num_action_per_latent_frame)
         action_emb_B_D = self.action_embedder_B_D(action)
@@ -331,9 +290,6 @@ class ActionChunkConditionedMinimalV1LVGDiT(MiniTrainDIT):
 
         if self.use_crossattn_projection:
             crossattn_emb = self.crossattn_proj(crossattn_emb)
-        crossattn_emb = self.append_target_feature_context(crossattn_emb, target_feature_B_L_D)
-        crossattn_emb = self.append_target_mask_context(crossattn_emb, target_mask_B_C_T_H_W)
-        target_token_indices_for_attn_B = self.make_tavid_attention_token_indices(tgt_token_indices_B)
 
         if img_context_emb is not None:
             assert self.extra_image_context_dim is not None, (
@@ -370,11 +326,6 @@ class ActionChunkConditionedMinimalV1LVGDiT(MiniTrainDIT):
 
         intermediate_features_outputs = []
         for i, block in enumerate(self.blocks):
-            capture_target_cross_attn = (
-                i in self.tavid_attn_alignment_blocks
-                and target_token_indices_for_attn_B is not None
-                and self.tavid_target_mask_B_T_H_W is not None
-            )
             x_B_T_H_W_D = block(
                 x_B_T_H_W_D,
                 t_embedding_B_T_D,
@@ -382,20 +333,7 @@ class ActionChunkConditionedMinimalV1LVGDiT(MiniTrainDIT):
                 rope_emb_L_1_1_D=rope_emb_L_1_1_D,
                 adaln_lora_B_T_3D=adaln_lora_B_T_3D,
                 extra_per_block_pos_emb=extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
-                capture_target_cross_attn=capture_target_cross_attn,
-                target_token_indices_B=target_token_indices_for_attn_B,
-                target_attention_query_chunk_size=self.tavid_attn_query_chunk_size,
             )
-            if capture_target_cross_attn and self.blocks[i].cross_attn.last_target_attn_map_B_S is not None:
-                self.tavid_target_attn_maps.append(
-                    rearrange(
-                        self.blocks[i].cross_attn.last_target_attn_map_B_S,
-                        "b (t h w) -> b t h w",
-                        t=T,
-                        h=H,
-                        w=W,
-                    )
-                )
             if intermediate_feature_ids and i in intermediate_feature_ids:
                 x_reshaped_for_disc = rearrange(x_B_T_H_W_D, "b tp hp wp d -> b (tp hp wp) d")
                 intermediate_features_outputs.append(x_reshaped_for_disc)

@@ -40,6 +40,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plan-label-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--max-samples", type=int, default=0)
+    parser.add_argument("--sample-one-window-per-stem", action="store_true")
+    parser.add_argument("--episode-window-sampling", choices=["random", "round_robin"], default="random")
+    parser.add_argument("--episode-window-seed", type=int, default=-1)
     parser.add_argument("--num-keyframes", type=int, default=6)
     parser.add_argument("--grid-size", type=int, default=9)
     parser.add_argument("--semantic-dim", type=int, default=0)
@@ -48,15 +51,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--head-lr", type=float, default=1e-4)
+    parser.add_argument("--plan-head-type", choices=["mlp", "baton_crossattn"], default="mlp")
+    parser.add_argument("--plan-head-num-heads", type=int, default=16)
+    parser.add_argument("--plan-head-dropout", type=float, default=0.0)
+    parser.add_argument("--sem-mlp-hidden-size", type=int, default=0)
+    # Loss recipe: plain per-token MSE regresses multimodal futures to their mean (norm
+    # shrinkage + spatially blurred, non-discriminative plans). Direction (cosine) and
+    # magnitude (relative norm) are supervised separately, InfoNCE supervises token-level
+    # discriminativeness (the quantity sample_retrieval_top1 measures), and the dispersion
+    # term penalizes predicting the per-sample mean at every token. The pre-fix recipe is
+    # `--mse-loss-weight 1 --cosine-loss-weight 0.1` with the other weights at 0.
+    parser.add_argument("--mse-loss-weight", type=float, default=1.0)
+    parser.add_argument("--cosine-loss-weight", type=float, default=1.0)
+    parser.add_argument("--norm-loss-weight", type=float, default=0.2)
+    parser.add_argument("--variance-loss-weight", type=float, default=0.1)
+    parser.add_argument("--infonce-loss-weight", type=float, default=0.1)
+    parser.add_argument("--infonce-temperature", type=float, default=0.07)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--warmup-steps", type=int, default=50)
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument("--full-finetune", action="store_true")
     parser.add_argument("--freeze-vision", action="store_true", default=True)
     parser.add_argument("--no-freeze-vision", action="store_false", dest="freeze_vision")
+    parser.add_argument("--freeze-lm-head", action="store_true", default=True)
+    parser.add_argument("--no-freeze-lm-head", action="store_false", dest="freeze_lm_head")
     parser.add_argument("--train-plan-token-embedding", action="store_true", default=True)
     parser.add_argument("--no-train-plan-token-embedding", action="store_false", dest="train_plan_token_embedding")
+    parser.add_argument("--ddp-find-unused-parameters", action="store_true")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--save-steps", type=int, default=500)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -96,30 +119,79 @@ class SemanticPlanDataset(Dataset):
         num_keyframes: int,
         grid_size: int,
         max_samples: int = 0,
+        sample_one_window_per_stem: bool = False,
+        episode_window_sampling: str = "random",
+        episode_window_seed: int = 0,
     ) -> None:
         self.dataset_root = dataset_root
         self.label_dir = label_dir
         self.num_keyframes = num_keyframes
         self.grid_size = grid_size
-        if (label_dir / "manifest.jsonl").exists():
-            entries = []
-            for line in (label_dir / "manifest.jsonl").read_text().splitlines():
-                if line.strip():
-                    entries.append(json.loads(line))
-            paths = [Path(x["path"]) for x in entries]
+        self.sample_one_window_per_stem = sample_one_window_per_stem
+        self.episode_window_sampling = episode_window_sampling
+        self.episode_window_seed = int(episode_window_seed)
+        self.epoch = 0
+        manifest_paths = [label_dir / "manifest.jsonl"] if (label_dir / "manifest.jsonl").exists() else sorted(label_dir.glob("manifest*.jsonl"))
+        entries = []
+        if manifest_paths:
+            for manifest_path in manifest_paths:
+                for line in manifest_path.read_text().splitlines():
+                    if line.strip():
+                        entries.append(json.loads(line))
+            entry_paths = [(entry, Path(entry["path"])) for entry in entries]
+            entry_paths = [(entry, path) for entry, path in entry_paths if path.exists()]
+            paths = [path for _, path in entry_paths]
         else:
             paths = sorted(label_dir.glob("*.pt"))
-        self.paths = [p for p in paths if p.exists()]
-        if max_samples > 0:
-            self.paths = self.paths[:max_samples]
-        if not self.paths:
+            entry_paths = []
+        paths = [p for p in paths if p.exists()]
+        if sample_one_window_per_stem:
+            grouped: dict[str, list[Path]] = {}
+            if entry_paths:
+                for entry, path in entry_paths:
+                    stem = str(entry.get("stem") or Path(entry.get("path", path)).stem.split("__r", 1)[0])
+                    grouped.setdefault(stem, []).append(path)
+            else:
+                for path in paths:
+                    stem = path.stem.split("__r", 1)[0]
+                    grouped.setdefault(stem, []).append(path)
+            self.groups = [sorted(grouped[k], key=lambda p: str(p)) for k in sorted(grouped)]
+            if max_samples > 0:
+                self.groups = self.groups[:max_samples]
+            self.paths = []
+        else:
+            self.paths = paths
+            if max_samples > 0:
+                self.paths = self.paths[:max_samples]
+            self.groups = []
+        if sample_one_window_per_stem:
+            if not self.groups:
+                raise RuntimeError(f"No semantic plan label groups found under {label_dir}")
+        elif not self.paths:
             raise RuntimeError(f"No semantic plan labels found under {label_dir}")
 
     def __len__(self) -> int:
-        return len(self.paths)
+        return len(self.groups) if self.sample_one_window_per_stem else len(self.paths)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def _choose_window_path(self, index: int) -> Path:
+        group = self.groups[index]
+        if len(group) == 1:
+            return group[0]
+        if self.episode_window_sampling == "round_robin":
+            return group[self.epoch % len(group)]
+        seed = (self.episode_window_seed + 1_000_003 * self.epoch + 9_176 * index) & 0xFFFFFFFF
+        rng = random.Random(seed)
+        return group[rng.randrange(len(group))]
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        payload = torch.load(self.paths[index], map_location="cpu", weights_only=False)
+        if self.sample_one_window_per_stem:
+            path = self._choose_window_path(index)
+        else:
+            path = self.paths[index]
+        payload = torch.load(path, map_location="cpu", weights_only=False)
         stem = payload["stem"]
         video_path = Path(payload.get("video_path") or self.dataset_root / "videos" / f"{stem}.mp4")
         prompt = payload.get("prompt") or "A robot manipulates the target object."
@@ -129,12 +201,14 @@ class SemanticPlanDataset(Dataset):
         expected = self.num_keyframes * self.grid_size * self.grid_size
         plan = plan.reshape(-1, plan.shape[-1])
         if plan.shape[0] != expected:
-            raise RuntimeError(f"{self.paths[index]} has {plan.shape[0]} plan tokens, expected {expected}")
+            raise RuntimeError(f"{path} has {plan.shape[0]} plan tokens, expected {expected}")
         return {
             "stem": stem,
+            "sample_id": payload.get("sample_id", path.stem),
             "image": image,
             "prompt": prompt,
             "semantic_plan": plan,
+            "feature_type": payload.get("feature_type", "unknown"),
         }
 
 
@@ -172,36 +246,212 @@ class Collator:
         return inputs
 
 
-class PlannerWrapper(nn.Module):
-    def __init__(self, model: nn.Module, hidden_size: int, semantic_dim: int, plan_token_id: int) -> None:
+class MLPPlanHead(nn.Module):
+    def __init__(self, hidden_size: int, semantic_dim: int, sem_mlp_hidden_size: int) -> None:
         super().__init__()
-        self.model = model
-        self.plan_head = nn.Sequential(
-            nn.LayerNorm(hidden_size),
-            nn.Linear(hidden_size, semantic_dim),
-        )
-        self.plan_token_id = int(plan_token_id)
+        if sem_mlp_hidden_size > 0:
+            self.net = nn.Sequential(
+                nn.LayerNorm(hidden_size),
+                nn.Linear(hidden_size, sem_mlp_hidden_size),
+                nn.GELU(),
+                nn.Linear(sem_mlp_hidden_size, semantic_dim),
+            )
+        else:
+            self.net = nn.Sequential(
+                nn.LayerNorm(hidden_size),
+                nn.Linear(hidden_size, semantic_dim),
+            )
 
-    def forward(self, semantic_plan_labels: torch.Tensor, **inputs: Any) -> dict[str, torch.Tensor]:
-        outputs = self.model(**inputs, output_hidden_states=True, use_cache=False)
-        hidden = outputs.hidden_states[-1]
-        input_ids = inputs["input_ids"]
+    def forward(self, plan_hidden: torch.Tensor) -> torch.Tensor:
+        return self.net(plan_hidden)
+
+
+class BatonCrossAttentionPlanHead(nn.Module):
+    """Video-only Baton-style semantic alignment tower.
+
+    Baton uses learnable queries that cross-attend to MLLM planning hidden
+    states, then a Sem-MLP projects to the perceptual feature space.  We keep
+    the same video tower idea and omit the audio cross-modal tower.
+    """
+
+    def __init__(
+        self,
+        *,
+        plan_len: int,
+        hidden_size: int,
+        semantic_dim: int,
+        sem_mlp_hidden_size: int,
+        num_heads: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        if hidden_size % num_heads != 0:
+            raise ValueError(f"hidden_size={hidden_size} must be divisible by num_heads={num_heads}")
+        self.query = nn.Parameter(torch.empty(plan_len, hidden_size))
+        nn.init.normal_(self.query, mean=0.0, std=0.02)
+        self.query_norm = nn.LayerNorm(hidden_size)
+        self.context_norm = nn.LayerNorm(hidden_size)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ffn_norm = nn.LayerNorm(hidden_size)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.GELU(),
+            nn.Linear(hidden_size * 4, hidden_size),
+        )
+        self.sem_mlp = MLPPlanHead(hidden_size, semantic_dim, sem_mlp_hidden_size)
+
+    def forward(self, plan_hidden: torch.Tensor) -> torch.Tensor:
+        batch = plan_hidden.shape[0]
+        query = self.query.unsqueeze(0).expand(batch, -1, -1)
+        context = self.context_norm(plan_hidden)
+        attn_out, _ = self.cross_attn(
+            self.query_norm(query),
+            context,
+            context,
+            need_weights=False,
+        )
+        query = query + attn_out
+        query = query + self.ffn(self.ffn_norm(query))
+        return self.sem_mlp(query)
+
+
+class PlannerWrapper(nn.Module):
+    def __init__(
+        self,
+        model: nn.Module,
+        hidden_size: int,
+        semantic_dim: int,
+        plan_token_id: int,
+        plan_len: int,
+        plan_head_type: str = "mlp",
+        plan_head_num_heads: int = 16,
+        plan_head_dropout: float = 0.0,
+        sem_mlp_hidden_size: int = 0,
+        mse_loss_weight: float = 1.0,
+        cosine_loss_weight: float = 1.0,
+        norm_loss_weight: float = 0.2,
+        variance_loss_weight: float = 0.1,
+        infonce_loss_weight: float = 0.1,
+        infonce_temperature: float = 0.07,
+    ) -> None:
+        super().__init__()
+        if sem_mlp_hidden_size < 0:
+            sem_mlp_hidden_size = hidden_size
+        self.mse_loss_weight = float(mse_loss_weight)
+        self.cosine_loss_weight = float(cosine_loss_weight)
+        self.norm_loss_weight = float(norm_loss_weight)
+        self.variance_loss_weight = float(variance_loss_weight)
+        self.infonce_loss_weight = float(infonce_loss_weight)
+        self.infonce_temperature = float(infonce_temperature)
+        self.sem_mlp_hidden_size = int(sem_mlp_hidden_size)
+        self.plan_head_type = plan_head_type
+        self.plan_head_num_heads = int(plan_head_num_heads)
+        self.plan_head_dropout = float(plan_head_dropout)
+        self.plan_len = int(plan_len)
+        if plan_head_type == "mlp":
+            self.plan_head = MLPPlanHead(hidden_size, semantic_dim, sem_mlp_hidden_size)
+        elif plan_head_type == "baton_crossattn":
+            self.plan_head = BatonCrossAttentionPlanHead(
+                plan_len=plan_len,
+                hidden_size=hidden_size,
+                semantic_dim=semantic_dim,
+                sem_mlp_hidden_size=sem_mlp_hidden_size,
+                num_heads=plan_head_num_heads,
+                dropout=plan_head_dropout,
+            )
+        else:
+            raise ValueError(f"Unsupported plan_head_type: {plan_head_type}")
+        self.plan_token_id = int(plan_token_id)
+        self.model = model
+
+    def collect_plan_hidden(self, hidden: torch.Tensor, input_ids: torch.Tensor, plan_len: int) -> torch.Tensor:
         plan_mask = input_ids == self.plan_token_id
-        batch, plan_len, sem_dim = semantic_plan_labels.shape
-        pred = hidden.new_zeros((batch, plan_len, sem_dim), dtype=torch.float32)
-        valid = []
-        for b in range(batch):
+        plan_hidden = []
+        for b in range(input_ids.shape[0]):
             h = hidden[b, plan_mask[b]]
             if h.shape[0] != plan_len:
                 raise RuntimeError(f"Found {h.shape[0]} plan tokens, expected {plan_len}")
-            head_dtype = next(self.plan_head.parameters()).dtype
-            pred[b] = self.plan_head(h.to(dtype=head_dtype)).float()
-            valid.append(h.shape[0])
-        target = semantic_plan_labels.to(device=pred.device, dtype=torch.float32)
+            plan_hidden.append(h)
+        return torch.stack(plan_hidden, dim=0)
+
+    def predict_semantic_plan(self, **inputs: Any) -> torch.Tensor:
+        outputs = self.model(**inputs, output_hidden_states=True, use_cache=False)
+        hidden = outputs.hidden_states[-1]
+        input_ids = inputs["input_ids"]
+        plan_hidden = self.collect_plan_hidden(hidden, input_ids, self.plan_len)
+        head_dtype = next(self.plan_head.parameters()).dtype
+        return self.plan_head(plan_hidden.to(dtype=head_dtype)).float()
+
+    def compute_plan_losses(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+        eps = 1e-6
         mse = F.mse_loss(pred, target)
         cosine = 1.0 - F.cosine_similarity(pred.flatten(0, 1), target.flatten(0, 1), dim=-1).mean()
-        loss = mse + 0.1 * cosine
-        return {"loss": loss, "mse": mse.detach(), "cosine_loss": cosine.detach()}
+
+        pred_norm_B_L = pred.norm(dim=-1)
+        target_norm_B_L = target.norm(dim=-1)
+        norm_loss = ((pred_norm_B_L - target_norm_B_L) / (target_norm_B_L + eps)).pow(2).mean()
+
+        # Per-sample dispersion of tokens around their mean: collapses to 0 when the head
+        # predicts the (conditional) mean at every token.
+        pred_disp_B = (pred - pred.mean(dim=1, keepdim=True)).norm(dim=-1).mean(dim=1)
+        target_disp_B = (target - target.mean(dim=1, keepdim=True)).norm(dim=-1).mean(dim=1)
+        variance_loss = ((pred_disp_B - target_disp_B) / (target_disp_B + eps)).pow(2).mean()
+
+        infonce = pred.new_zeros(())
+        if self.infonce_loss_weight > 0:
+            pred_dir = F.normalize(pred, dim=-1)
+            target_dir = F.normalize(target, dim=-1)
+            logits_B_L_L = torch.bmm(pred_dir, target_dir.transpose(1, 2)) / self.infonce_temperature
+            labels_L = torch.arange(pred.shape[1], device=pred.device)
+            labels = labels_L.unsqueeze(0).expand(pred.shape[0], -1).reshape(-1)
+            infonce = 0.5 * (
+                F.cross_entropy(logits_B_L_L.flatten(0, 1), labels)
+                + F.cross_entropy(logits_B_L_L.transpose(1, 2).flatten(0, 1), labels)
+            )
+
+        loss = (
+            self.mse_loss_weight * mse
+            + self.cosine_loss_weight * cosine
+            + self.norm_loss_weight * norm_loss
+            + self.variance_loss_weight * variance_loss
+            + self.infonce_loss_weight * infonce
+        )
+
+        with torch.no_grad():
+            pred_dir = F.normalize(pred, dim=-1)
+            target_dir = F.normalize(target, dim=-1)
+            sims_B_L_L = torch.bmm(pred_dir, target_dir.transpose(1, 2))
+            hits = sims_B_L_L.argmax(dim=-1) == torch.arange(pred.shape[1], device=pred.device)
+            token_retrieval = hits.float().mean()
+
+        return {
+            "loss": loss,
+            "mse": mse.detach(),
+            "cosine_loss": cosine.detach(),
+            "norm_loss": norm_loss.detach(),
+            "variance_loss": variance_loss.detach(),
+            "infonce_loss": infonce.detach(),
+            "pred_norm": pred_norm_B_L.mean().detach(),
+            "target_norm": target_norm_B_L.mean().detach(),
+            "norm_ratio": (pred_norm_B_L.mean() / target_norm_B_L.mean().clamp_min(eps)).detach(),
+            "token_disp_ratio": (pred_disp_B.mean() / target_disp_B.mean().clamp_min(eps)).detach(),
+            "token_retrieval_top1": token_retrieval,
+        }
+
+    def forward(self, semantic_plan_labels: torch.Tensor, **inputs: Any) -> dict[str, torch.Tensor]:
+        batch, plan_len, _ = semantic_plan_labels.shape
+        if plan_len != self.plan_len:
+            raise RuntimeError(f"Batch has {plan_len} plan tokens, wrapper expects {self.plan_len}")
+        pred = self.predict_semantic_plan(**inputs)
+        if pred.shape[0] != batch:
+            raise RuntimeError(f"Prediction batch {pred.shape[0]} does not match labels batch {batch}")
+        target = semantic_plan_labels.to(device=pred.device, dtype=torch.float32)
+        return self.compute_plan_losses(pred, target)
 
 
 def apply_lora(model: nn.Module, args: argparse.Namespace) -> nn.Module:
@@ -220,11 +470,14 @@ def apply_lora(model: nn.Module, args: argparse.Namespace) -> nn.Module:
     return get_peft_model(model, config)
 
 
-def set_trainable(model: nn.Module, freeze_vision: bool) -> None:
+def set_trainable(model: nn.Module, *, freeze_vision: bool, freeze_lm_head: bool, full_finetune: bool) -> None:
     for p in model.parameters():
-        p.requires_grad_(False)
+        p.requires_grad_(full_finetune)
     if freeze_vision and hasattr(model, "visual"):
         for p in model.visual.parameters():
+            p.requires_grad_(False)
+    if freeze_lm_head and hasattr(model, "lm_head"):
+        for p in model.lm_head.parameters():
             p.requires_grad_(False)
 
 
@@ -258,6 +511,17 @@ def build_optimizer(wrapper: PlannerWrapper, args: argparse.Namespace) -> torch.
     return torch.optim.AdamW(groups)
 
 
+def count_trainable_parameters(module: nn.Module) -> tuple[int, int]:
+    total = 0
+    trainable = 0
+    for param in module.parameters():
+        numel = param.numel()
+        total += numel
+        if param.requires_grad:
+            trainable += numel
+    return trainable, total
+
+
 def save_checkpoint(
     output_dir: Path,
     step: int,
@@ -276,6 +540,13 @@ def save_checkpoint(
     torch.save(module.plan_head.state_dict(), ckpt / "plan_head.pt")
     plan_embedding = module.model.get_input_embeddings().weight[module.plan_token_id].detach().cpu()
     torch.save(plan_embedding, ckpt / "plan_token_embedding.pt")
+    feature_type = "unknown"
+    summary_path = args.plan_label_dir / "summary.json"
+    if summary_path.exists():
+        try:
+            feature_type = json.loads(summary_path.read_text()).get("feature_type", feature_type)
+        except Exception:
+            feature_type = feature_type
     meta = {
         "step": step,
         "plan_token": PLAN_TOKEN,
@@ -285,8 +556,23 @@ def save_checkpoint(
         "semantic_dim": args.semantic_dim,
         "model_path": str(args.model_path),
         "objective": "continuous_semantic_blueprint_regression",
-        "feature_type": "qwen3vl_last_hidden_image_tokens_pooled",
+        "feature_type": feature_type,
+        "plan_label_dir": str(args.plan_label_dir),
+        "sample_one_window_per_stem": bool(args.sample_one_window_per_stem),
+        "plan_head_type": module.plan_head_type,
+        "plan_head_num_heads": int(module.plan_head_num_heads),
+        "plan_head_dropout": float(module.plan_head_dropout),
+        "sem_mlp_hidden_size": int(module.sem_mlp_hidden_size),
+        "mse_loss_weight": float(module.mse_loss_weight),
+        "cosine_loss_weight": float(module.cosine_loss_weight),
+        "norm_loss_weight": float(module.norm_loss_weight),
+        "variance_loss_weight": float(module.variance_loss_weight),
+        "infonce_loss_weight": float(module.infonce_loss_weight),
+        "infonce_temperature": float(module.infonce_temperature),
         "train_plan_token_embedding": bool(args.train_plan_token_embedding),
+        "full_finetune": bool(args.full_finetune),
+        "freeze_vision": bool(args.freeze_vision),
+        "freeze_lm_head": bool(args.freeze_lm_head),
     }
     (ckpt / "planner_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     (output_dir / "latest_checkpoint.txt").write_text(str(ckpt), encoding="utf-8")
@@ -294,6 +580,8 @@ def save_checkpoint(
 
 def main() -> None:
     args = parse_args()
+    if args.full_finetune and args.lora_r > 0:
+        raise ValueError("--full-finetune is mutually exclusive with LoRA; set --lora-r 0.")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -322,8 +610,13 @@ def main() -> None:
             model.gradient_checkpointing_enable()
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
-    set_trainable(model, freeze_vision=args.freeze_vision)
-    if args.train_plan_token_embedding:
+    set_trainable(
+        model,
+        freeze_vision=args.freeze_vision,
+        freeze_lm_head=args.freeze_lm_head,
+        full_finetune=args.full_finetune,
+    )
+    if args.train_plan_token_embedding and not args.full_finetune:
         register_single_row_hook(model.get_input_embeddings().weight, plan_token_id)
     model = apply_lora(model, args)
 
@@ -336,11 +629,51 @@ def main() -> None:
         args.semantic_dim = int(payload["semantic_plan"].shape[-1])
 
     hidden_size = int(model.config.text_config.hidden_size)
-    wrapper = PlannerWrapper(model=model, hidden_size=hidden_size, semantic_dim=args.semantic_dim, plan_token_id=plan_token_id)
+    wrapper = PlannerWrapper(
+        model=model,
+        hidden_size=hidden_size,
+        semantic_dim=args.semantic_dim,
+        plan_token_id=plan_token_id,
+        plan_len=args.num_keyframes * args.grid_size * args.grid_size,
+        plan_head_type=args.plan_head_type,
+        plan_head_num_heads=args.plan_head_num_heads,
+        plan_head_dropout=args.plan_head_dropout,
+        sem_mlp_hidden_size=args.sem_mlp_hidden_size,
+        mse_loss_weight=args.mse_loss_weight,
+        cosine_loss_weight=args.cosine_loss_weight,
+        norm_loss_weight=args.norm_loss_weight,
+        variance_loss_weight=args.variance_loss_weight,
+        infonce_loss_weight=args.infonce_loss_weight,
+        infonce_temperature=args.infonce_temperature,
+    )
     wrapper.to(device)
     wrapper.train()
+    if is_main(rank):
+        trainable, total = count_trainable_parameters(wrapper)
+        print(
+            json.dumps(
+                {
+                    "full_finetune": bool(args.full_finetune),
+                    "lora_r": int(args.lora_r),
+                    "freeze_vision": bool(args.freeze_vision),
+                    "freeze_lm_head": bool(args.freeze_lm_head),
+                    "plan_head_type": args.plan_head_type,
+                    "plan_head_num_heads": int(args.plan_head_num_heads),
+                    "sample_one_window_per_stem": bool(args.sample_one_window_per_stem),
+                    "trainable_params": trainable,
+                    "total_params": total,
+                    "trainable_ratio": trainable / max(total, 1),
+                }
+            ),
+            flush=True,
+        )
     if world > 1:
-        wrapper = DDP(wrapper, device_ids=[local_rank], find_unused_parameters=False, static_graph=True)
+        wrapper = DDP(
+            wrapper,
+            device_ids=[local_rank],
+            find_unused_parameters=args.ddp_find_unused_parameters,
+            static_graph=not args.ddp_find_unused_parameters,
+        )
 
     dataset = SemanticPlanDataset(
         dataset_root=args.dataset_root,
@@ -348,6 +681,7 @@ def main() -> None:
         num_keyframes=args.num_keyframes,
         grid_size=args.grid_size,
         max_samples=args.max_samples,
+        sample_one_window_per_stem=args.sample_one_window_per_stem,
     )
     sampler = DistributedSampler(dataset, num_replicas=world, rank=rank, shuffle=True) if world > 1 else None
     loader = DataLoader(
@@ -391,7 +725,11 @@ def main() -> None:
                     pbar.update(1)
                     if step % args.log_steps == 0:
                         avg = running_loss / max(args.log_steps * args.grad_accum, 1)
-                        print(json.dumps({"step": step, "loss": avg, "mse": float(out["mse"]), "cosine_loss": float(out["cosine_loss"])}), flush=True)
+                        log_entry = {"step": step, "loss": avg}
+                        log_entry.update(
+                            {key: float(value) for key, value in out.items() if key != "loss"}
+                        )
+                        print(json.dumps(log_entry), flush=True)
                         running_loss = 0.0
                     if step % args.save_steps == 0:
                         save_checkpoint(args.output_dir, step, wrapper, processor, args, rank)

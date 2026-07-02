@@ -1,0 +1,25 @@
+{
+  "checkpoint": "/data/user/jhe724/workspace/cosmos-predict2.5/outputs/droid_v21_what_where_prior_context_49f_s123_vlm4wam/cosmos_predict_v2p5/video2world/2b_what_where_prior_context_iou50_49f_s123_bs2accum8_gbs128_1600_restart_manifest_20260621_1844/checkpoints/iter_000001600",
+  "checkpoint_iter_from_path": 1600,
+  "loaded_iter_returned_by_checkpointer": 1600,
+  "num_samples": 1,
+  "skip_samples": 0,
+  "sample_index_offset": 0,
+  "num_steps": 35,
+  "guidance": 3.0,
+  "seed": 20260613,
+  "fps": 8,
+  "layout": "standalone generated/GT videos",
+  "target_feature_mode": "zero",
+  "target_feature_path": null,
+  "samples": [
+    {
+      "sample_index": 0,
+      "caption": "A Franka robotic arm with a parallel-jaw gripper carefully grasp only the [TGT] yellow carrot in the sink basin and place it into the black pot next to the banana, without moving the banana.",
+      "generated": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_prior_context_iter1600_restart_manifest_yellow_carrot_20260622_165159/zero/sample_000_generated.mp4",
+      "gt": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_prior_context_iter1600_restart_manifest_yellow_carrot_20260622_165159/zero/sample_000_gt.mp4",
+      "caption_file": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_prior_context_iter1600_restart_manifest_yellow_carrot_20260622_165159/zero/sample_000_caption.txt",
+      "target_feature_override": "zero"
+    }
+  ]
+}

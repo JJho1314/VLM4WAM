@@ -1,0 +1,28 @@
+{
+  "run_root": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_yellow_carrot",
+  "checkpoint": "/data/user/jhe724/workspace/cosmos-predict2.5/outputs/droid_v21_what_where_softlogit_320x576_49f_s123_vlm4wam/cosmos_predict_v2p5/video2world/2b_what_where_softlogit_iou50_320x576_49f_s123_bs4accum4_gbs128_3000/checkpoints/iter_000003000",
+  "experiment": "predict2_video2world_training_2b_droid_success_v21_what_where_softlogit",
+  "job_name": "2b_what_where_context_iou50_49f_s123_bs1accum16_gbs128_1600",
+  "video_size": [
+    320,
+    576
+  ],
+  "explicit_mask_used_for_generation": false,
+  "generation_variants": [
+    "keep",
+    "wrong_banana",
+    "zero",
+    "drop"
+  ],
+  "feature_ablation_applies_to": [
+    "target_feature",
+    "target_dense_feature"
+  ],
+  "intermediate_note": "GT mask is used only inside the intermediate analysis script to compute metrics and overlays.",
+  "generation_contact_sheet": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_yellow_carrot/what_where_softlogit_iter3000_yellow_carrot_contact_sheet.jpg",
+  "generation_diff_sheet": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_yellow_carrot/what_where_softlogit_iter3000_yellow_carrot_diff_vs_keep.jpg",
+  "generation_metrics": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_yellow_carrot/what_where_softlogit_iter3000_yellow_carrot_metrics.json",
+  "intermediate_summary": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_yellow_carrot/intermediate/vlm_feature_guidance_intermediate_summary.json",
+  "intermediate_figure": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_yellow_carrot/intermediate/sample_000_vlm_guidance_intermediate.jpg",
+  "overall_exit": 0
+}

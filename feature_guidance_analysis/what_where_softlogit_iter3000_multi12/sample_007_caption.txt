@@ -1,0 +1,1 @@
+A Franka robotic arm with a parallel-jaw gripper remove the [TGT] yellow bowl from the cabinet.

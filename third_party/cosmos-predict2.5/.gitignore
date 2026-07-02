@@ -204,4 +204,4 @@ cython_debug/
 
 !assets/**/*.png
 !assets/**/*.jpg
-*.mp4
+!assets/**/*.mp4

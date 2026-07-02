@@ -32,6 +32,7 @@ from cosmos_predict2._src.predict2.models.text2world_model import (
     Text2WorldModelConfig,
 )
 from cosmos_predict2._src.predict2.models.text2world_model import DiffusionModel as Text2WorldModel
+from cosmos_predict2._src.predict2.networks.semantic_plan_conditioning import sample_semantic_plan_dropout
 
 NUM_CONDITIONAL_FRAMES_KEY: str = "num_conditional_frames"
 
@@ -54,6 +55,9 @@ class Video2WorldConfig(Text2WorldModelConfig):
     high_sigma_ratio: float = 0.05  # Ratio of high sigma frames
     low_sigma_ratio: float = 0.05  # Ratio of low sigma frames
     conditional_frames_probs: Optional[Dict[int, float]] = None  # Probability distribution for conditional frames
+    # Training-time probability of dropping the semantic-plan conditioning so the CFG
+    # unconditional branch (semantic_plan=None) is a trained configuration.
+    semantic_plan_dropout_prob: float = 0.0
 
     def __attrs_post_init__(self):
         super().__attrs_post_init__()
@@ -87,14 +91,19 @@ class Video2WorldModel(Text2WorldModel):
             num_conditional_frames=data_batch.get(NUM_CONDITIONAL_FRAMES_KEY, None),
             conditional_frames_probs=self.config.conditional_frames_probs,
         )
-        target_feature = data_batch.get("target_feature", None)
-        if target_feature is not None:
-            target_feature = target_feature.to(device=latent_state.device, dtype=latent_state.dtype)
-            condition = condition.set_target_feature(target_feature)
-        target_dense_feature = data_batch.get("target_dense_feature", None)
-        if target_dense_feature is not None:
-            target_dense_feature = target_dense_feature.to(device=latent_state.device, dtype=latent_state.dtype)
-            condition = condition.set_target_dense_feature(target_dense_feature)
+        semantic_plan = data_batch.get("semantic_plan", None)
+        if (
+            semantic_plan is not None
+            and self.training
+            and sample_semantic_plan_dropout(self.config.semantic_plan_dropout_prob, latent_state.device)
+        ):
+            semantic_plan = None
+        if semantic_plan is not None:
+            semantic_plan = semantic_plan.to(device=latent_state.device, dtype=latent_state.dtype)
+            semantic_plan_times = data_batch.get("semantic_plan_times", None)
+            if semantic_plan_times is not None:
+                semantic_plan_times = semantic_plan_times.to(device=latent_state.device, dtype=torch.float32)
+            condition = condition.set_semantic_plan(semantic_plan, semantic_plan_times=semantic_plan_times)
         return raw_state, latent_state, condition
 
     def draw_training_sigma_and_epsilon(self, x0_size: int, condition: Any) -> torch.Tensor:
@@ -308,19 +317,18 @@ class Video2WorldModel(Text2WorldModel):
             num_conditional_frames=num_conditional_frames,
             conditional_frames_probs=self.config.conditional_frames_probs,
         )
+        semantic_plan = data_batch.get("semantic_plan", None)
+        if semantic_plan is not None:
+            semantic_plan = semantic_plan.to(device=x0.device, dtype=x0.dtype)
+            semantic_plan_times = data_batch.get("semantic_plan_times", None)
+            if semantic_plan_times is not None:
+                semantic_plan_times = semantic_plan_times.to(device=x0.device, dtype=torch.float32)
+            condition = condition.set_semantic_plan(semantic_plan, semantic_plan_times=semantic_plan_times)
+            uncondition = uncondition.set_semantic_plan(None)
         condition = condition.edit_for_inference(is_cfg_conditional=True, num_conditional_frames=num_conditional_frames)
         uncondition = uncondition.edit_for_inference(
             is_cfg_conditional=False, num_conditional_frames=num_conditional_frames
         )
-
-        target_feature = data_batch.get("target_feature", None)
-        if target_feature is not None:
-            target_feature = target_feature.to(device=x0.device, dtype=x0.dtype)
-            condition = condition.set_target_feature(target_feature)
-        target_dense_feature = data_batch.get("target_dense_feature", None)
-        if target_dense_feature is not None:
-            target_dense_feature = target_dense_feature.to(device=x0.device, dtype=x0.dtype)
-            condition = condition.set_target_dense_feature(target_dense_feature)
 
         _, condition, _, _ = self.broadcast_split_for_model_parallelsim(x0, condition, None, None)
         _, uncondition, _, _ = self.broadcast_split_for_model_parallelsim(x0, uncondition, None, None)

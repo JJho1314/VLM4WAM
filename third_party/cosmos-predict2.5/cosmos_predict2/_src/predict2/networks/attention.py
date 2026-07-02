@@ -58,10 +58,15 @@
 # |----------------|-------|
 #
 
+import os
 from functools import partial
 
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
+
+DISABLE_CUDNN_SDPA = os.environ.get("COSMOS_DISABLE_CUDNN_SDPA", "0").lower() in {"1", "true", "yes", "on"}
+if DISABLE_CUDNN_SDPA and hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+    torch.backends.cuda.enable_cudnn_sdp(False)
 
 try:
     from flash_attn_3.flash_attn_interface import flash_attn_func
@@ -147,6 +152,10 @@ def attention(
             assert dtype == torch.float32, f"Unrecognized {dtype=}."
             SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION]
             BEST_SDPA_BACKEND = SDPBackend.EFFICIENT_ATTENTION
+        if DISABLE_CUDNN_SDPA:
+            SDPA_BACKENDS = [backend for backend in SDPA_BACKENDS if backend != SDPBackend.CUDNN_ATTENTION]
+            if BEST_SDPA_BACKEND == SDPBackend.CUDNN_ATTENTION:
+                BEST_SDPA_BACKEND = SDPA_BACKENDS[0]
 
         if deterministic:
             raise NotImplementedError(

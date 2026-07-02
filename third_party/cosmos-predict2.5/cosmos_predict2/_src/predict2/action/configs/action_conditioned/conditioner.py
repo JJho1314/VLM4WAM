@@ -39,12 +39,6 @@ class Video2WorldCondition(Text2WorldCondition):
     gt_frames: Optional[torch.Tensor] = None
     condition_video_input_mask_B_C_T_H_W: Optional[torch.Tensor] = None
     num_conditional_frames_B: Optional[torch.Tensor] = None
-    target_feature_B_L_D: Optional[torch.Tensor] = None
-
-    def set_target_feature(self, target_feature: Optional[torch.Tensor]) -> "Video2WorldCondition":
-        kwargs = self.to_dict(skip_underscore=False)
-        kwargs["target_feature_B_L_D"] = target_feature
-        return type(self)(**kwargs)
 
     def set_video_condition(
         self,

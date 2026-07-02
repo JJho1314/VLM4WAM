@@ -37,7 +37,6 @@ import transformer_engine as te
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from torch import nn
-from torch.nn import functional as F
 from torch.distributed import ProcessGroup, get_process_group_ranks
 from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper as ptd_checkpoint_wrapper
@@ -63,6 +62,12 @@ from cosmos_predict2._src.predict2.modules.neighborhood_attn import Neighborhood
 from cosmos_predict2._src.predict2.networks.a2a_cp import MinimalA2AAttnOp, NattenA2AAttnOp
 from cosmos_predict2._src.predict2.networks.model_weights_stats import WeightTrainingStat
 from cosmos_predict2._src.predict2.networks.selective_activation_checkpoint import SACConfig as _SACConfig
+from cosmos_predict2._src.predict2.networks.semantic_plan_conditioning import (
+    SemanticPlanContextAdapter,
+    build_semantic_plan_rope_positions,
+    infer_semantic_plan_shape,
+    trim_invalid_semantic_tokens,
+)
 
 
 # selective activation checkpoint; only apply to the minimal v4 model. if there are change in the networks, some policy will not work as we expect.
@@ -495,7 +500,6 @@ class Attention(nn.Module):
         self._query_dim = query_dim
         self._context_dim = context_dim
         self._inner_dim = inner_dim
-        self.last_target_attn_map_B_S: Optional[torch.Tensor] = None
 
     def init_weights(self) -> None:
         std = 1.0 / math.sqrt(self._query_dim)
@@ -558,39 +562,6 @@ class Attention(nn.Module):
         result = self.attn_op(q, k, v, **additional_args)  # [B, S, H, D]
         return self.output_dropout(self.output_proj(result))
 
-    def compute_target_attention_map(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        target_token_indices_B: torch.Tensor,
-        query_chunk_size: int = 2048,
-    ) -> Optional[torch.Tensor]:
-        if target_token_indices_B is None:
-            return None
-        if target_token_indices_B.ndim == 1:
-            target_token_indices_B = target_token_indices_B.unsqueeze(1)
-        valid_B = target_token_indices_B >= 0
-        if not bool(valid_B.any()):
-            return None
-
-        B, S, _, _ = q.shape
-        L = k.shape[1]
-        token_indices_B = target_token_indices_B.to(device=q.device, dtype=torch.long).clamp(min=0, max=L - 1)
-        valid_B = valid_B.to(device=q.device)
-        target_maps = []
-        scale = 1.0 / math.sqrt(self.head_dim)
-        for start in range(0, S, query_chunk_size):
-            q_chunk = q[:, start : start + query_chunk_size].float()
-            scores = torch.einsum("bshd,blhd->bhsl", q_chunk, k.float()) * scale
-            probs = scores.softmax(dim=-1)
-            gather_idx = token_indices_B[:, None, None, :].expand(B, self.n_heads, q_chunk.shape[1], -1)
-            target_prob = probs.gather(dim=-1, index=gather_idx)
-            target_prob = target_prob * valid_B[:, None, None, :].type_as(target_prob)
-            target_prob = target_prob.sum(dim=-1).mean(dim=1)
-            target_prob = target_prob * valid_B.any(dim=1)[:, None].type_as(target_prob)
-            target_maps.append(target_prob)
-        return torch.cat(target_maps, dim=1)
-
     def forward(
         self,
         x,
@@ -598,9 +569,6 @@ class Attention(nn.Module):
         rope_emb: Optional[torch.Tensor] = None,
         video_size: Optional[VideoSize] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
-        capture_target_attention: bool = False,
-        target_token_indices_B: Optional[torch.Tensor] = None,
-        target_attention_query_chunk_size: int = 2048,
     ):
         """
         Args:
@@ -610,14 +578,6 @@ class Attention(nn.Module):
             video_size(VideoSize): Shape [T, H, W]
         """
         q, k, v = self.compute_qkv(x, context, rope_emb=rope_emb)
-        self.last_target_attn_map_B_S = None
-        if capture_target_attention and context is not None:
-            self.last_target_attn_map_B_S = self.compute_target_attention_map(
-                q,
-                k,
-                target_token_indices_B,
-                query_chunk_size=target_attention_query_chunk_size,
-            )
         return self.compute_attention(q, k, v, video_size=video_size, kv_cache_cfg=kv_cache_cfg)
 
     def set_context_parallel_group(self, process_group, ranks, stream, cp_comm_type: str = "p2p"):
@@ -664,1036 +624,63 @@ class I2VCrossAttention(Attention):
         x,
         context=None,
         rope_emb=None,
-        capture_target_attention: bool = False,
-        target_token_indices_B: Optional[torch.Tensor] = None,
-        target_attention_query_chunk_size: int = 2048,
     ):
         q, k, v, k_img, v_img = self.compute_qkv(x, context, rope_emb)
-        self.last_target_attn_map_B_S = None
-        if capture_target_attention:
-            self.last_target_attn_map_B_S = self.compute_target_attention_map(
-                q,
-                k,
-                target_token_indices_B,
-                query_chunk_size=target_attention_query_chunk_size,
-            )
         return self.compute_attention(q, k, v, k_img, v_img)
 
 
-class TargetMaskContextAdapter(nn.Module):
-    """Convert target masks into cross-attention context tokens.
+class SemanticRopeCrossAttention(Attention):
+    """Cross-attention with separate 3D RoPE for latent queries and semantic-plan keys."""
 
-    This follows Omni-Video's visual-context idea: the mask is not appended as an
-    input channel. It is patchified into a small set of learned context tokens,
-    then concatenated with the text/VLM conditioning stream.
-    """
-
-    def __init__(
+    def compute_qkv(
         self,
-        patch_size: Tuple[int, int, int] = (1, 2, 2),
-        hidden_dim: int = 512,
-        out_dim: int = 1024,
-        max_tokens: int = 256,
-        min_patch_area: float = 0.0,
-        include_coords: bool = True,
-        eps: float = 1e-6,
-    ) -> None:
-        super().__init__()
-        self.patch_size = tuple(int(v) for v in patch_size)
-        self.max_tokens = int(max_tokens)
-        self.min_patch_area = float(min_patch_area)
-        self.include_coords = bool(include_coords)
-        in_channels = 4 if self.include_coords else 1
-
-        self.patch_embedding = nn.Conv3d(
-            in_channels,
-            hidden_dim,
-            kernel_size=self.patch_size,
-            stride=self.patch_size,
+        x,
+        context=None,
+        query_rope_emb: Optional[torch.Tensor] = None,
+        key_rope_emb: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q = self.q_proj(x)
+        context = x if context is None else context
+        k = self.k_proj(context)
+        v = self.v_proj(context)
+        q, k, v = map(
+            lambda t: rearrange(t, "b ... (h d) -> b ... h d", h=self.n_heads, d=self.head_dim),
+            (q, k, v),
         )
-        self.norm1 = nn.LayerNorm(hidden_dim, eps=eps, elementwise_affine=False)
-        self.projection = nn.Linear(hidden_dim, out_dim)
-        self.norm2 = nn.LayerNorm(out_dim, eps=eps, elementwise_affine=False)
-        self.type_token = nn.Parameter(torch.zeros(out_dim))
-        self.null_token = nn.Parameter(torch.zeros(out_dim))
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        v = self.v_norm(v)
 
-    def reset_parameters(self) -> None:
-        nn.init.xavier_uniform_(self.patch_embedding.weight.flatten(1))
-        if self.patch_embedding.bias is not None:
-            nn.init.zeros_(self.patch_embedding.bias)
-        nn.init.xavier_uniform_(self.projection.weight)
-        if self.projection.bias is not None:
-            nn.init.zeros_(self.projection.bias)
-        nn.init.zeros_(self.type_token)
-        nn.init.zeros_(self.null_token)
+        original_dtype = q.dtype
+        if self.use_wan_fp32_strategy:
+            q = q.to(torch.float32)
+            k = k.to(torch.float32)
+        if query_rope_emb is not None:
+            q = apply_rotary_pos_emb(q, query_rope_emb, tensor_format=self.qkv_format, fused=True)
+        if key_rope_emb is not None:
+            k = apply_rotary_pos_emb(k, key_rope_emb, tensor_format=self.qkv_format, fused=True)
+        if self.use_wan_fp32_strategy:
+            q = q.to(original_dtype)
+            k = k.to(original_dtype)
 
-    def _mask_with_coords(self, target_mask: torch.Tensor) -> torch.Tensor:
-        target_mask = target_mask.float().clamp(0, 1)
-        if not self.include_coords:
-            return target_mask
-
-        B, _, T, H, W = target_mask.shape
-        t_coord = torch.linspace(-1.0, 1.0, T, device=target_mask.device, dtype=target_mask.dtype).view(1, 1, T, 1, 1)
-        h_coord = torch.linspace(-1.0, 1.0, H, device=target_mask.device, dtype=target_mask.dtype).view(1, 1, 1, H, 1)
-        w_coord = torch.linspace(-1.0, 1.0, W, device=target_mask.device, dtype=target_mask.dtype).view(1, 1, 1, 1, W)
-        return torch.cat(
-            [
-                target_mask,
-                target_mask * t_coord.expand(B, 1, T, H, W),
-                target_mask * h_coord.expand(B, 1, T, H, W),
-                target_mask * w_coord.expand(B, 1, T, H, W),
-            ],
-            dim=1,
-        )
-
-    def forward(self, target_mask_B_C_T_H_W: torch.Tensor) -> Optional[torch.Tensor]:
-        target_mask = target_mask_B_C_T_H_W[:, :1].float().clamp(0, 1)
-        patch_scores = F.avg_pool3d(
-            target_mask,
-            kernel_size=self.patch_size,
-            stride=self.patch_size,
-            ceil_mode=False,
-        ).flatten(2).squeeze(1)
-        if patch_scores.numel() == 0 or not bool((patch_scores > self.min_patch_area).any()):
-            return None
-
-        tokens = self.patch_embedding(self._mask_with_coords(target_mask).type_as(self.patch_embedding.weight))
-        tokens = tokens.flatten(2).transpose(1, 2)
-        tokens = self.norm1(tokens)
-        tokens = self.projection(tokens)
-        tokens = self.norm2(tokens)
-        tokens = tokens + self.type_token.to(device=tokens.device, dtype=tokens.dtype)
-
-        if self.max_tokens > 0 and tokens.shape[1] > self.max_tokens:
-            keep = min(self.max_tokens, tokens.shape[1])
-            topk_scores, topk_idx = torch.topk(patch_scores, k=keep, dim=1)
-            gather_idx = topk_idx.unsqueeze(-1).expand(-1, -1, tokens.shape[-1])
-            tokens = tokens.gather(dim=1, index=gather_idx)
-            valid = topk_scores > self.min_patch_area
-        else:
-            valid = patch_scores > self.min_patch_area
-
-        null_token = self.null_token.to(device=tokens.device, dtype=tokens.dtype).view(1, 1, -1)
-        return torch.where(valid.unsqueeze(-1), tokens, null_token)
-
-
-class TargetFeatureContextAdapter(nn.Module):
-    """Project InstructSAM target embeddings into Cosmos cross-attention tokens."""
-
-    def __init__(
-        self,
-        in_dim: int = 256,
-        hidden_dim: int = 0,
-        out_dim: int = 1024,
-        max_tokens: int = 64,
-        eps: float = 1e-6,
-    ) -> None:
-        super().__init__()
-        self.in_dim = int(in_dim)
-        self.max_tokens = int(max_tokens)
-        self.norm1 = nn.LayerNorm(self.in_dim, eps=eps, elementwise_affine=False)
-        if hidden_dim and hidden_dim > 0:
-            self.projection = nn.Sequential(
-                nn.Linear(self.in_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, out_dim),
-            )
-        else:
-            self.projection = nn.Linear(self.in_dim, out_dim)
-        self.norm2 = nn.LayerNorm(out_dim, eps=eps, elementwise_affine=False)
-        self.type_token = nn.Parameter(torch.zeros(out_dim))
-
-    def reset_parameters(self) -> None:
-        for module in self.projection.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-        nn.init.zeros_(self.type_token)
-
-    def forward(self, target_feature_B_L_D: torch.Tensor) -> torch.Tensor:
-        if target_feature_B_L_D.ndim == 2:
-            target_feature_B_L_D = target_feature_B_L_D.unsqueeze(0)
-        if target_feature_B_L_D.ndim != 3:
-            raise ValueError(f"Expected target feature shape [B,L,D], got {tuple(target_feature_B_L_D.shape)}")
-        if target_feature_B_L_D.shape[-1] != self.in_dim:
-            raise ValueError(
-                f"Expected target feature dim {self.in_dim}, got {target_feature_B_L_D.shape[-1]}. "
-                "Set target_feature_context_in_dim to match instructsam_feature_mode."
-            )
-        if self.max_tokens > 0 and target_feature_B_L_D.shape[1] > self.max_tokens:
-            target_feature_B_L_D = target_feature_B_L_D[:, : self.max_tokens]
-
-        param = self.type_token
-        tokens = target_feature_B_L_D.to(device=param.device, dtype=param.dtype)
-        tokens = torch.nan_to_num(tokens)
-        tokens = self.norm1(tokens)
-        tokens = self.projection(tokens)
-        tokens = self.norm2(tokens)
-        return tokens + self.type_token.to(device=tokens.device, dtype=tokens.dtype)
-
-
-class MultiSourceTargetFeatureContextAdapter(TargetFeatureContextAdapter):
-    """Project a fused multi-source InstructSAM feature into context tokens.
-
-    The fused feature stacks several representations (e.g. mask / detect / vtext)
-    along the token axis with FIXED per-source budgets. Cross-attention has no
-    positional encoding on the context side, so without a source tag the model
-    sees an unordered bag and cannot route the signals. This adapter adds a
-    learned per-source embedding by segment so each representation is marked.
-    """
-
-    def __init__(
-        self,
-        *,
-        source_segments: Sequence[int],
-        in_dim: int = 256,
-        hidden_dim: int = 0,
-        out_dim: int = 1024,
-        eps: float = 1e-6,
-    ) -> None:
-        segments = [int(s) for s in source_segments if int(s) > 0]
-        total = sum(segments)
-        super().__init__(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim, max_tokens=total, eps=eps)
-        self.source_segments = segments
-        self.source_embedding = nn.Embedding(len(segments), out_dim)
-        segment_ids = torch.cat(
-            [torch.full((n,), i, dtype=torch.long) for i, n in enumerate(segments)]
-        )
-        self.register_buffer("segment_ids", segment_ids, persistent=False)
-
-    def reset_parameters(self) -> None:
-        super().reset_parameters()
-        nn.init.zeros_(self.source_embedding.weight)
-
-    def forward(self, target_feature_B_L_D: torch.Tensor) -> torch.Tensor:
-        tokens = super().forward(target_feature_B_L_D)
-        seg = self.segment_ids[: tokens.shape[1]].to(device=tokens.device)
-        source_tokens = self.source_embedding(seg).unsqueeze(0).to(dtype=tokens.dtype)
-        return tokens + source_tokens
-
-
-class TargetWhatWhereContextAdapter(nn.Module):
-    """Fuse target-query tokens (what) with dense spatial tokens (where).
-
-    `target_feature` carries the text-conditioned target selector, e.g. raw
-    InstructSAM [SEG]/[TGT] hidden states. `target_dense_feature` carries the
-    decoder-dense spatial feature map. The output is still plain context tokens
-    for Cosmos cross-attention; no mask or residual is written to video latents.
-    """
-
-    def __init__(
-        self,
-        what_dim: int = 2048,
-        where_dim: int = 256,
-        hidden_dim: int = 512,
-        out_dim: int = 1024,
-        max_tokens: int = 256,
-        init_gate: float = 1.0,
-        eps: float = 1e-6,
-    ) -> None:
-        super().__init__()
-        self.what_dim = int(what_dim)
-        self.where_dim = int(where_dim)
-        self.max_tokens = int(max_tokens)
-        self.init_gate = float(init_gate)
-        hidden_dim = int(hidden_dim) if int(hidden_dim) > 0 else out_dim
-
-        self.what_norm = nn.LayerNorm(self.what_dim, eps=eps, elementwise_affine=False)
-        self.where_norm = nn.LayerNorm(self.where_dim, eps=eps, elementwise_affine=False)
-        self.what_proj = nn.Sequential(
-            nn.Linear(self.what_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
-        self.where_proj = nn.Sequential(
-            nn.Linear(self.where_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
-        self.where_gate = nn.Linear(out_dim, out_dim)
-        self.coord_proj = nn.Linear(2, out_dim)
-        self.out_norm = nn.LayerNorm(out_dim, eps=eps, elementwise_affine=False)
-        self.type_token = nn.Parameter(torch.zeros(out_dim))
-        self.context_gate = nn.Parameter(torch.tensor([self.init_gate], dtype=torch.float32))
-
-    def reset_parameters(self) -> None:
-        for module in (self.what_proj, self.where_proj):
-            for submodule in module.modules():
-                if isinstance(submodule, nn.Linear):
-                    nn.init.xavier_uniform_(submodule.weight)
-                    if submodule.bias is not None:
-                        nn.init.zeros_(submodule.bias)
-        nn.init.zeros_(self.where_gate.weight)
-        nn.init.zeros_(self.where_gate.bias)
-        nn.init.xavier_uniform_(self.coord_proj.weight)
-        nn.init.zeros_(self.coord_proj.bias)
-        nn.init.zeros_(self.type_token)
-        with torch.no_grad():
-            self.context_gate.fill_(self.init_gate)
-
-    @staticmethod
-    def _ensure_3d(name: str, tensor: torch.Tensor) -> torch.Tensor:
-        if tensor.ndim == 2:
-            tensor = tensor.unsqueeze(0)
-        if tensor.ndim != 3:
-            raise ValueError(f"Expected {name} shape [B,L,D], got {tuple(tensor.shape)}")
-        return tensor
-
-    @staticmethod
-    def _repeat_to_batch(tensor: torch.Tensor, batch_size: int, name: str) -> torch.Tensor:
-        if tensor.shape[0] == 1 and batch_size != 1:
-            return tensor.repeat(batch_size, 1, 1)
-        if tensor.shape[0] != batch_size:
-            raise ValueError(f"{name} batch {tensor.shape[0]} does not match batch {batch_size}")
-        return tensor
-
-    def _resize_square_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        if self.max_tokens <= 0 or tokens.shape[1] <= self.max_tokens:
-            return tokens
-        length = tokens.shape[1]
-        side = int(math.isqrt(length))
-        target_side = int(math.isqrt(self.max_tokens))
-        if side * side == length and target_side > 0:
-            target_tokens = target_side * target_side
-            if target_tokens <= self.max_tokens:
-                grid = rearrange(tokens, "b (h w) d -> b d h w", h=side, w=side)
-                grid = F.interpolate(grid.float(), size=(target_side, target_side), mode="bilinear", align_corners=False)
-                grid = grid.to(dtype=tokens.dtype)
-                return rearrange(grid, "b d h w -> b (h w) d")
-        return tokens[:, : self.max_tokens]
-
-    def _coords(self, batch_size: int, length: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        side = int(math.isqrt(length))
-        if side * side == length:
-            y = torch.linspace(-1.0, 1.0, side, device=device, dtype=dtype)
-            x = torch.linspace(-1.0, 1.0, side, device=device, dtype=dtype)
-            yy, xx = torch.meshgrid(y, x, indexing="ij")
-            coords = torch.stack([xx, yy], dim=-1).view(1, length, 2)
-        else:
-            x = torch.linspace(-1.0, 1.0, length, device=device, dtype=dtype)
-            coords = torch.stack([x, torch.zeros_like(x)], dim=-1).view(1, length, 2)
-        return coords.expand(batch_size, -1, -1)
+        return q, k, v
 
     def forward(
         self,
-        target_feature_B_L_D: torch.Tensor,
-        target_dense_feature_B_L_D: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        what = self._ensure_3d("target_feature", target_feature_B_L_D)
-        where = self._ensure_3d("target_dense_feature", target_dense_feature_B_L_D)
-        batch_size = max(what.shape[0], where.shape[0])
-        what = self._repeat_to_batch(what, batch_size, "target_feature")
-        where = self._repeat_to_batch(where, batch_size, "target_dense_feature")
-        if what.shape[-1] != self.what_dim:
-            raise ValueError(f"Expected target_feature dim {self.what_dim}, got {what.shape[-1]}")
-        if where.shape[-1] != self.where_dim:
-            raise ValueError(f"Expected target_dense_feature dim {self.where_dim}, got {where.shape[-1]}")
-
-        param = self.type_token
-        what = torch.nan_to_num(what.to(device=param.device, dtype=param.dtype))
-        where = torch.nan_to_num(where.to(device=param.device, dtype=param.dtype))
-        where = self._resize_square_tokens(where)
-
-        what_valid = what.float().abs().sum(dim=-1) > 0
-        where_valid = where.float().abs().sum(dim=-1) > 0
-        denom = what_valid.to(dtype=what.dtype).sum(dim=1, keepdim=True).clamp_min(1.0)
-        what_context = self.what_proj(self.what_norm(what))
-        what_context = (what_context * what_valid.unsqueeze(-1)).sum(dim=1) / denom
-
-        where_context = self.where_proj(self.where_norm(where))
-        coords = self._coords(where.shape[0], where.shape[1], where.device, where.dtype)
-        coord_context = self.coord_proj(coords)
-        gate = torch.sigmoid(self.where_gate(what_context)).unsqueeze(1)
-        tokens = where_context * gate + what_context.unsqueeze(1) + coord_context
-        tokens = self.out_norm(tokens)
-        tokens = tokens + self.type_token.to(device=tokens.device, dtype=tokens.dtype)
-        tokens = torch.where(where_valid.unsqueeze(-1), tokens, torch.zeros_like(tokens))
-        gate = self.context_gate.tanh().to(device=tokens.device, dtype=tokens.dtype)
-        return gate * tokens, where_valid
-
-
-class DenseTargetWherePriorHead(nn.Module):
-    """Decode an internal soft target-location prior from InstructSAM dense tokens.
-
-    The head is used only as an internal latent-space prior.  At inference,
-    Cosmos still receives no explicit mask; it predicts this soft objectness
-    map from InstructSAM features and uses it to gate the target branch.
-    """
-
-    def __init__(
-        self,
-        what_dim: int = 2048,
-        where_dim: int = 256,
-        hidden_dim: int = 128,
-        max_tokens: int = 1024,
-        init_bias: float = -2.0,
-        eps: float = 1e-6,
-    ) -> None:
-        super().__init__()
-        self.what_dim = int(what_dim)
-        self.where_dim = int(where_dim)
-        self.hidden_dim = int(hidden_dim)
-        self.max_tokens = int(max_tokens)
-        self.init_bias = float(init_bias)
-        self.what_norm = nn.LayerNorm(self.what_dim, eps=eps, elementwise_affine=False)
-        self.where_norm = nn.LayerNorm(self.where_dim, eps=eps, elementwise_affine=False)
-        self.what_proj = nn.Sequential(
-            nn.Linear(self.what_dim, self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
+        x,
+        context: Optional[torch.Tensor] = None,
+        query_rope_emb: Optional[torch.Tensor] = None,
+        key_rope_emb: Optional[torch.Tensor] = None,
+        video_size: Optional[VideoSize] = None,
+        kv_cache_cfg: Optional[KVCacheConfig] = None,
+    ):
+        q, k, v = self.compute_qkv(
+            x,
+            context,
+            query_rope_emb=query_rope_emb,
+            key_rope_emb=key_rope_emb,
         )
-        self.where_proj = nn.Linear(self.where_dim, self.hidden_dim)
-        self.coord_proj = nn.Linear(2, self.hidden_dim)
-        self.film = nn.Linear(self.hidden_dim, 2 * self.hidden_dim)
-        self.in_proj = nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=1)
-        self.dw1 = nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=3, padding=1, groups=self.hidden_dim)
-        self.pw1 = nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=1)
-        self.dw2 = nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=3, padding=1, groups=self.hidden_dim)
-        self.pw2 = nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=1)
-        self.logit_head = nn.Conv2d(self.hidden_dim, 1, kernel_size=1)
-
-    def reset_parameters(self) -> None:
-        for module in self.modules():
-            if isinstance(module, (nn.Linear, nn.Conv2d)):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-        nn.init.zeros_(self.film.weight)
-        nn.init.zeros_(self.film.bias)
-        nn.init.zeros_(self.logit_head.weight)
-        nn.init.constant_(self.logit_head.bias, self.init_bias)
-
-    @staticmethod
-    def _ensure_3d(name: str, tensor: torch.Tensor) -> torch.Tensor:
-        if tensor.ndim == 2:
-            tensor = tensor.unsqueeze(0)
-        if tensor.ndim != 3:
-            raise ValueError(f"Expected {name} shape [B,L,D], got {tuple(tensor.shape)}")
-        return tensor
-
-    @staticmethod
-    def _repeat_to_batch(tensor: torch.Tensor, batch_size: int, name: str) -> torch.Tensor:
-        if tensor.shape[0] == 1 and batch_size != 1:
-            return tensor.repeat(batch_size, 1, 1)
-        if tensor.shape[0] != batch_size:
-            raise ValueError(f"{name} batch {tensor.shape[0]} does not match batch {batch_size}")
-        return tensor
-
-    def _resize_square_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        if self.max_tokens <= 0 or tokens.shape[1] <= self.max_tokens:
-            return tokens
-        length = tokens.shape[1]
-        side = int(math.isqrt(length))
-        target_side = int(math.isqrt(self.max_tokens))
-        if side * side == length and target_side > 0:
-            target_tokens = target_side * target_side
-            if target_tokens <= self.max_tokens:
-                grid = rearrange(tokens, "b (h w) d -> b d h w", h=side, w=side)
-                grid = F.interpolate(grid.float(), size=(target_side, target_side), mode="bilinear", align_corners=False)
-                return rearrange(grid.to(dtype=tokens.dtype), "b d h w -> b (h w) d")
-        return tokens[:, : self.max_tokens]
-
-    def _coords(self, batch_size: int, length: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        side = int(math.isqrt(length))
-        if side * side != length:
-            raise ValueError(f"Dense where prior expects square tokens, got length={length}")
-        y = torch.linspace(-1.0, 1.0, side, device=device, dtype=dtype)
-        x = torch.linspace(-1.0, 1.0, side, device=device, dtype=dtype)
-        yy, xx = torch.meshgrid(y, x, indexing="ij")
-        coords = torch.stack([xx, yy], dim=-1).view(1, length, 2)
-        return coords.expand(batch_size, -1, -1)
-
-    def forward(
-        self,
-        target_feature_B_L_D: torch.Tensor,
-        target_dense_feature_B_L_D: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        what = self._ensure_3d("target_feature", target_feature_B_L_D)
-        where = self._ensure_3d("target_dense_feature", target_dense_feature_B_L_D)
-        batch_size = max(what.shape[0], where.shape[0])
-        what = self._repeat_to_batch(what, batch_size, "target_feature")
-        where = self._repeat_to_batch(where, batch_size, "target_dense_feature")
-        if what.shape[-1] != self.what_dim:
-            raise ValueError(f"Expected target_feature dim {self.what_dim}, got {what.shape[-1]}")
-        if where.shape[-1] != self.where_dim:
-            raise ValueError(f"Expected target_dense_feature dim {self.where_dim}, got {where.shape[-1]}")
-
-        param = self.logit_head.weight
-        what = torch.nan_to_num(what.to(device=param.device, dtype=param.dtype))
-        where = torch.nan_to_num(where.to(device=param.device, dtype=param.dtype))
-        where = self._resize_square_tokens(where)
-        side = int(math.isqrt(where.shape[1]))
-        if side * side != where.shape[1]:
-            raise ValueError(f"Dense where prior expects square tokens, got length={where.shape[1]}")
-
-        what_valid = what.float().abs().sum(dim=-1) > 0
-        where_valid = where.float().abs().sum(dim=-1) > 0
-        denom = what_valid.to(dtype=what.dtype).sum(dim=1, keepdim=True).clamp_min(1.0)
-        what_hidden = self.what_proj(self.what_norm(what))
-        what_hidden = (what_hidden * what_valid.unsqueeze(-1)).sum(dim=1) / denom
-
-        coords = self._coords(where.shape[0], where.shape[1], where.device, where.dtype)
-        h = self.where_proj(self.where_norm(where)) + self.coord_proj(coords)
-        gamma, beta = self.film(what_hidden).chunk(2, dim=-1)
-        h = h * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
-        h = torch.where(where_valid.unsqueeze(-1), h, torch.zeros_like(h))
-        h = rearrange(h, "b (h w) d -> b d h w", h=side, w=side)
-        h = self.in_proj(h)
-        h = h + self.pw1(F.gelu(self.dw1(h)))
-        h = h + self.pw2(F.gelu(self.dw2(h)))
-        logits = self.logit_head(h).squeeze(1)
-        return logits, rearrange(where_valid, "b (h w) -> b h w", h=side, w=side)
-
-
-class DenseTargetSpatialAdapter(nn.Module):
-    """Project target feature + mask grid into video-token-aligned residuals."""
-
-    def __init__(
-        self,
-        feature_dim: int = 256,
-        hidden_dim: int = 512,
-        out_dim: int = 1024,
-        eps: float = 1e-6,
-    ) -> None:
-        super().__init__()
-        self.feature_dim = int(feature_dim)
-        self.in_dim = self.feature_dim + 4  # pooled feature, mask value, x, y, t
-        hidden_dim = int(hidden_dim) if int(hidden_dim) > 0 else out_dim
-        self.norm1 = nn.LayerNorm(self.in_dim, eps=eps, elementwise_affine=False)
-        self.projection = nn.Sequential(
-            nn.Linear(self.in_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
-        self.norm2 = nn.LayerNorm(out_dim, eps=eps, elementwise_affine=False)
-
-    def reset_parameters(self) -> None:
-        for module in self.projection.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-    def _pooled_target_feature(self, target_feature_B_L_D: torch.Tensor, batch_size: int) -> torch.Tensor:
-        if target_feature_B_L_D.ndim == 2:
-            target_feature_B_L_D = target_feature_B_L_D.unsqueeze(0)
-        if target_feature_B_L_D.ndim != 3:
-            raise ValueError(f"Expected target feature shape [B,L,D], got {tuple(target_feature_B_L_D.shape)}")
-        if target_feature_B_L_D.shape[-1] != self.feature_dim:
-            raise ValueError(
-                f"Expected dense target feature dim {self.feature_dim}, got {target_feature_B_L_D.shape[-1]}"
-            )
-        if target_feature_B_L_D.shape[0] == 1 and batch_size != 1:
-            target_feature_B_L_D = target_feature_B_L_D.repeat(batch_size, 1, 1)
-        elif target_feature_B_L_D.shape[0] != batch_size:
-            raise ValueError(
-                f"Target feature batch {target_feature_B_L_D.shape[0]} does not match video batch {batch_size}"
-            )
-
-        feature = torch.nan_to_num(target_feature_B_L_D.float())
-        valid = feature.abs().sum(dim=-1) > 0
-        denom = valid.sum(dim=1).clamp_min(1).float().unsqueeze(-1)
-        pooled = (feature * valid.unsqueeze(-1).float()).sum(dim=1) / denom
-        return pooled
-
-    def forward(
-        self,
-        target_feature_B_L_D: torch.Tensor,
-        target_mask_B_C_T_H_W: torch.Tensor,
-        token_shape: tuple[int, int, int, int],
-    ) -> torch.Tensor:
-        B, T, H, W = token_shape
-        target_mask = target_mask_B_C_T_H_W[:, :1].float().clamp(0, 1)
-        if target_mask.shape[0] == 1 and B != 1:
-            target_mask = target_mask.repeat(B, 1, 1, 1, 1)
-        elif target_mask.shape[0] != B:
-            raise ValueError(f"Target mask batch {target_mask.shape[0]} does not match video batch {B}")
-        mask = F.interpolate(target_mask, size=(T, H, W), mode="nearest")
-        mask = mask.permute(0, 2, 3, 4, 1).contiguous()
-
-        pooled = self._pooled_target_feature(target_feature_B_L_D, B).to(device=mask.device, dtype=mask.dtype)
-        pooled_grid = pooled[:, None, None, None, :].expand(B, T, H, W, self.feature_dim)
-
-        t_coord = torch.linspace(-1.0, 1.0, T, device=mask.device, dtype=mask.dtype).view(1, T, 1, 1, 1)
-        y_coord = torch.linspace(-1.0, 1.0, H, device=mask.device, dtype=mask.dtype).view(1, 1, H, 1, 1)
-        x_coord = torch.linspace(-1.0, 1.0, W, device=mask.device, dtype=mask.dtype).view(1, 1, 1, W, 1)
-        cond = torch.cat(
-            [
-                pooled_grid,
-                mask,
-                x_coord.expand(B, T, H, W, 1),
-                y_coord.expand(B, T, H, W, 1),
-                t_coord.expand(B, T, H, W, 1),
-            ],
-            dim=-1,
-        )
-        cond = cond.to(dtype=next(self.projection.parameters()).dtype)
-        dense = self.norm1(cond)
-        dense = self.projection(dense)
-        dense = self.norm2(dense)
-        return dense * mask
-
-
-class DenseTargetFeatureMapSpatialAdapter(DenseTargetSpatialAdapter):
-    """Project a target feature token grid into video-token-aligned residuals."""
-
-    def _target_feature_map(
-        self,
-        target_feature_B_L_D: torch.Tensor,
-        batch_size: int,
-        height: int,
-        width: int,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        if target_feature_B_L_D.ndim == 2:
-            target_feature_B_L_D = target_feature_B_L_D.unsqueeze(0)
-        if target_feature_B_L_D.ndim != 3:
-            raise ValueError(f"Expected target feature shape [B,L,D], got {tuple(target_feature_B_L_D.shape)}")
-        if target_feature_B_L_D.shape[-1] != self.feature_dim:
-            raise ValueError(
-                f"Expected dense target feature dim {self.feature_dim}, got {target_feature_B_L_D.shape[-1]}"
-            )
-        if target_feature_B_L_D.shape[0] == 1 and batch_size != 1:
-            target_feature_B_L_D = target_feature_B_L_D.repeat(batch_size, 1, 1)
-        elif target_feature_B_L_D.shape[0] != batch_size:
-            raise ValueError(
-                f"Target feature batch {target_feature_B_L_D.shape[0]} does not match video batch {batch_size}"
-            )
-
-        feature = torch.nan_to_num(target_feature_B_L_D.float())
-        num_tokens = int(feature.shape[1])
-        side = int(round(math.sqrt(num_tokens)))
-        if side * side != num_tokens:
-            pooled = self._pooled_target_feature(feature, batch_size).to(device=device, dtype=dtype)
-            return pooled[:, None, None, :].expand(batch_size, height, width, self.feature_dim)
-
-        feature = feature.to(device=device, dtype=dtype)
-        feature = feature.transpose(1, 2).reshape(batch_size, self.feature_dim, side, side)
-        feature = F.interpolate(feature, size=(height, width), mode="bilinear", align_corners=False)
-        return feature.permute(0, 2, 3, 1).contiguous()
-
-    def forward(
-        self,
-        target_feature_B_L_D: torch.Tensor,
-        target_mask_B_C_T_H_W: torch.Tensor,
-        token_shape: tuple[int, int, int, int],
-    ) -> torch.Tensor:
-        B, T, H, W = token_shape
-        target_mask = target_mask_B_C_T_H_W[:, :1].float().clamp(0, 1)
-        if target_mask.shape[0] == 1 and B != 1:
-            target_mask = target_mask.repeat(B, 1, 1, 1, 1)
-        elif target_mask.shape[0] != B:
-            raise ValueError(f"Target mask batch {target_mask.shape[0]} does not match video batch {B}")
-        mask = F.interpolate(target_mask, size=(T, H, W), mode="nearest")
-        mask = mask.permute(0, 2, 3, 4, 1).contiguous()
-
-        feature_grid = self._target_feature_map(
-            target_feature_B_L_D,
-            B,
-            H,
-            W,
-            device=mask.device,
-            dtype=mask.dtype,
-        )
-        feature_grid = feature_grid[:, None].expand(B, T, H, W, self.feature_dim)
-
-        t_coord = torch.linspace(-1.0, 1.0, T, device=mask.device, dtype=mask.dtype).view(1, T, 1, 1, 1)
-        y_coord = torch.linspace(-1.0, 1.0, H, device=mask.device, dtype=mask.dtype).view(1, 1, H, 1, 1)
-        x_coord = torch.linspace(-1.0, 1.0, W, device=mask.device, dtype=mask.dtype).view(1, 1, 1, W, 1)
-        cond = torch.cat(
-            [
-                feature_grid,
-                mask,
-                x_coord.expand(B, T, H, W, 1),
-                y_coord.expand(B, T, H, W, 1),
-                t_coord.expand(B, T, H, W, 1),
-            ],
-            dim=-1,
-        )
-        cond = cond.to(dtype=next(self.projection.parameters()).dtype)
-        dense = self.norm1(cond)
-        dense = self.projection(dense)
-        dense = self.norm2(dense)
-        return dense * mask
-
-
-class MaskFreeDenseTargetFeatureMapAdapter(DenseTargetFeatureMapSpatialAdapter):
-    """Project a target-aware dense feature map into video latents without an explicit mask."""
-
-    def __init__(
-        self,
-        feature_dim: int = 256,
-        hidden_dim: int = 512,
-        out_dim: int = 1024,
-        eps: float = 1e-6,
-    ) -> None:
-        nn.Module.__init__(self)
-        self.feature_dim = int(feature_dim)
-        self.in_dim = self.feature_dim + 3  # dense feature, x, y, t
-        hidden_dim = int(hidden_dim) if int(hidden_dim) > 0 else out_dim
-        self.norm1 = nn.LayerNorm(self.in_dim, eps=eps, elementwise_affine=False)
-        self.projection = nn.Sequential(
-            nn.Linear(self.in_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
-        self.norm2 = nn.LayerNorm(out_dim, eps=eps, elementwise_affine=False)
-
-    def forward(
-        self,
-        target_feature_B_L_D: torch.Tensor,
-        token_shape: tuple[int, int, int, int],
-    ) -> torch.Tensor:
-        B, T, H, W = token_shape
-        param = next(self.projection.parameters())
-        feature_grid = self._target_feature_map(
-            target_feature_B_L_D,
-            B,
-            H,
-            W,
-            device=param.device,
-            dtype=param.dtype,
-        )
-        feature_grid = feature_grid[:, None].expand(B, T, H, W, self.feature_dim)
-
-        t_coord = torch.linspace(-1.0, 1.0, T, device=param.device, dtype=param.dtype).view(1, T, 1, 1, 1)
-        y_coord = torch.linspace(-1.0, 1.0, H, device=param.device, dtype=param.dtype).view(1, 1, H, 1, 1)
-        x_coord = torch.linspace(-1.0, 1.0, W, device=param.device, dtype=param.dtype).view(1, 1, 1, W, 1)
-        cond = torch.cat(
-            [
-                feature_grid,
-                x_coord.expand(B, T, H, W, 1),
-                y_coord.expand(B, T, H, W, 1),
-                t_coord.expand(B, T, H, W, 1),
-            ],
-            dim=-1,
-        )
-        dense = self.norm1(cond)
-        dense = self.projection(dense)
-        return self.norm2(dense)
-
-
-class TargetLatentGroundingAdapter(DenseTargetFeatureMapSpatialAdapter):
-    """Build a mask-free latent target field from InstructSAM dense hidden features.
-
-    This intentionally consumes only text-conditioned InstructSAM features. It
-    never reads mask logits or binary masks; spatial grounding is represented as
-    a dense latent feature field aligned to the Cosmos token grid.
-    """
-
-    def __init__(
-        self,
-        feature_dim: int = 256,
-        hidden_dim: int = 512,
-        out_dim: int = 1024,
-        eps: float = 1e-6,
-    ) -> None:
-        nn.Module.__init__(self)
-        self.feature_dim = int(feature_dim)
-        self.in_dim = self.feature_dim + 3  # dense feature, x, y, t
-        hidden_dim = int(hidden_dim) if int(hidden_dim) > 0 else out_dim
-        self.norm1 = nn.LayerNorm(self.in_dim, eps=eps, elementwise_affine=False)
-        self.projection = nn.Sequential(
-            nn.Linear(self.in_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
-        self.norm2 = nn.LayerNorm(out_dim, eps=eps, elementwise_affine=False)
-
-    def forward(
-        self,
-        target_feature_B_L_D: torch.Tensor,
-        token_shape: tuple[int, int, int, int],
-    ) -> torch.Tensor:
-        B, T, H, W = token_shape
-        param = next(self.projection.parameters())
-        feature_grid = self._target_feature_map(
-            target_feature_B_L_D,
-            B,
-            H,
-            W,
-            device=param.device,
-            dtype=param.dtype,
-        )
-        feature_grid = feature_grid[:, None].expand(B, T, H, W, self.feature_dim)
-
-        t_coord = torch.linspace(-1.0, 1.0, T, device=param.device, dtype=param.dtype).view(1, T, 1, 1, 1)
-        y_coord = torch.linspace(-1.0, 1.0, H, device=param.device, dtype=param.dtype).view(1, 1, H, 1, 1)
-        x_coord = torch.linspace(-1.0, 1.0, W, device=param.device, dtype=param.dtype).view(1, 1, 1, W, 1)
-        cond = torch.cat(
-            [
-                feature_grid,
-                x_coord.expand(B, T, H, W, 1),
-                y_coord.expand(B, T, H, W, 1),
-                t_coord.expand(B, T, H, W, 1),
-            ],
-            dim=-1,
-        )
-        dense = self.norm1(cond)
-        dense = self.projection(dense)
-        return self.norm2(dense)
-
-
-class TargetFeatureInputChannelAdapter(nn.Module):
-    """Project a dense target feature map into TAVID-style extra input channels."""
-
-    def __init__(
-        self,
-        feature_dim: int = 256,
-        hidden_dim: int = 128,
-        out_channels: int = 8,
-        mode: str = "mlp",
-        output_scale: float = 1.0,
-        eps: float = 1e-6,
-    ) -> None:
-        super().__init__()
-        self.feature_dim = int(feature_dim)
-        self.out_channels = int(out_channels)
-        self.mode = str(mode)
-        if self.mode not in {"mlp", "control_map"}:
-            raise ValueError(f"Unknown target feature input adapter mode: {self.mode}")
-        self.output_scale = float(output_scale)
-        self.in_dim = self.feature_dim + (2 if self.mode == "control_map" else 3)
-        hidden_dim = int(hidden_dim) if int(hidden_dim) > 0 else max(self.out_channels * 4, 32)
-        self.norm = nn.LayerNorm(self.in_dim, eps=eps, elementwise_affine=False)
-        self.projection = nn.Sequential(
-            nn.Linear(self.in_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, self.out_channels),
-        )
-
-    def reset_parameters(self) -> None:
-        for module in self.projection.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-    def _feature_map(
-        self,
-        target_feature_B_L_D: torch.Tensor,
-        batch_size: int,
-        height: int,
-        width: int,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        if target_feature_B_L_D.ndim == 2:
-            target_feature_B_L_D = target_feature_B_L_D.unsqueeze(0)
-        if target_feature_B_L_D.ndim != 3:
-            raise ValueError(f"Expected target feature shape [B,L,D], got {tuple(target_feature_B_L_D.shape)}")
-        if target_feature_B_L_D.shape[-1] != self.feature_dim:
-            raise ValueError(
-                f"Expected target feature dim {self.feature_dim}, got {target_feature_B_L_D.shape[-1]}"
-            )
-        if target_feature_B_L_D.shape[0] == 1 and batch_size != 1:
-            target_feature_B_L_D = target_feature_B_L_D.repeat(batch_size, 1, 1)
-        elif target_feature_B_L_D.shape[0] != batch_size:
-            raise ValueError(
-                f"Target feature batch {target_feature_B_L_D.shape[0]} does not match video batch {batch_size}"
-            )
-
-        feature = torch.nan_to_num(target_feature_B_L_D.float())
-        num_tokens = int(feature.shape[1])
-        side = int(round(math.sqrt(num_tokens)))
-        if side * side != num_tokens:
-            valid = feature.abs().sum(dim=-1) > 0
-            denom = valid.sum(dim=1).clamp_min(1).float().unsqueeze(-1)
-            pooled = (feature * valid.unsqueeze(-1).float()).sum(dim=1) / denom
-            return pooled.to(device=device, dtype=dtype)[:, None, None].expand(
-                batch_size, height, width, self.feature_dim
-            )
-
-        feature = feature.to(device=device, dtype=dtype)
-        feature = feature.transpose(1, 2).reshape(batch_size, self.feature_dim, side, side)
-        feature = F.interpolate(feature, size=(height, width), mode="bilinear", align_corners=False)
-        return feature.permute(0, 2, 3, 1).contiguous()
-
-    def forward(self, target_feature_B_L_D: torch.Tensor, shape: tuple[int, int, int, int]) -> torch.Tensor:
-        B, T, H, W = shape
-        param = next(self.projection.parameters())
-        feature_grid = self._feature_map(
-            target_feature_B_L_D,
-            B,
-            H,
-            W,
-            device=param.device,
-            dtype=param.dtype,
-        )
-        y_coord = torch.linspace(-1.0, 1.0, H, device=param.device, dtype=param.dtype).view(1, 1, H, 1, 1)
-        x_coord = torch.linspace(-1.0, 1.0, W, device=param.device, dtype=param.dtype).view(1, 1, 1, W, 1)
-        if self.mode == "control_map":
-            feature_grid = feature_grid[:, None].expand(B, 1, H, W, self.feature_dim)
-            cond = torch.cat(
-                [
-                    feature_grid,
-                    x_coord.expand(B, 1, H, W, 1),
-                    y_coord.expand(B, 1, H, W, 1),
-                ],
-                dim=-1,
-            )
-            cond = self.projection(self.norm(cond))
-            cond = torch.tanh(cond) * self.output_scale
-            return cond.expand(B, T, H, W, self.out_channels).permute(0, 4, 1, 2, 3).contiguous()
-
-        feature_grid = feature_grid[:, None].expand(B, T, H, W, self.feature_dim)
-        t_coord = torch.linspace(-1.0, 1.0, T, device=param.device, dtype=param.dtype).view(1, T, 1, 1, 1)
-        cond = torch.cat(
-            [
-                feature_grid,
-                x_coord.expand(B, T, H, W, 1),
-                y_coord.expand(B, T, H, W, 1),
-                t_coord.expand(B, T, H, W, 1),
-            ],
-            dim=-1,
-        )
-        cond = self.norm(cond)
-        cond = self.projection(cond)
-        return cond.permute(0, 4, 1, 2, 3).contiguous()
-
-
-class TargetMatchGroundModule(nn.Module):
-    """Mask-free target guidance: learned WHERE (matching) + gated WHAT (grounding).
-
-    WHERE: the [SEG] *projection* feature (SAM3 query space, 256-d) is pooled and
-    dot-producted against projected latent tokens -> per-token matching logits.
-    This inherits InstructSAM's segmentation prior (that vector is literally the
-    query SAM3 uses to decode masks). Supervised with GT masks at training; at
-    inference NO external mask is needed.
-
-    WHAT: the raw [SEG] hidden states (2048-d, full task semantics) become
-    grounding tokens read via a small cross-attention; the read is spatially
-    gated by the predicted soft mask and a zero-init scalar gate, so semantics
-    are routed (not painted) and the appearance prior is never overwritten.
-    """
-
-    def __init__(
-        self,
-        query_dim: int = 256,
-        ground_dim: int = 2048,
-        model_dim: int = 2048,
-        match_dim: int = 256,
-        num_heads: int = 8,
-        gate_init: float = 0.0,
-        dropout_prob: float = 0.1,
-        mlp_hidden: int = 0,
-        eps: float = 1e-6,
-    ) -> None:
-        super().__init__()
-        self.query_dim = int(query_dim)
-        self.ground_dim = int(ground_dim)
-        self.dropout_prob = float(dropout_prob)
-        self.gate_init = float(gate_init)
-        self.mlp_hidden = int(mlp_hidden)
-        self.match_scale = float(match_dim) ** -0.5
-        # WHERE: a linear match_q/match_k can only read the features' dominant
-        # common-mode (-> query-independent foreground predictor; this was the
-        # diagnosed root cause of the v1 failure). An MLP recovers query-specific
-        # localization. mlp_hidden>0 selects the nonlinear head.
-        self.query_norm = nn.LayerNorm(self.query_dim, eps=eps, elementwise_affine=False)
-        if self.mlp_hidden > 0:
-            self.match_q = nn.Sequential(
-                nn.Linear(self.query_dim, self.mlp_hidden), nn.GELU(), nn.Linear(self.mlp_hidden, match_dim, bias=False)
-            )
-            self.match_k = nn.Sequential(
-                nn.Linear(model_dim, self.mlp_hidden), nn.GELU(), nn.Linear(self.mlp_hidden, match_dim, bias=False)
-            )
-        else:
-            self.match_q = nn.Linear(self.query_dim, match_dim, bias=False)
-            self.match_k = nn.Linear(model_dim, match_dim, bias=False)
-        # WHAT
-        self.ground_norm = nn.LayerNorm(self.ground_dim, eps=eps, elementwise_affine=False)
-        self.ground_proj = nn.Linear(self.ground_dim, model_dim)
-        self.ground_type_token = nn.Parameter(torch.zeros(model_dim))
-        self.read = nn.MultiheadAttention(model_dim, num_heads, batch_first=True)
-        self.gate = nn.Parameter(torch.full((1,), self.gate_init))
-
-    def reset_parameters(self) -> None:
-        for root in (self.match_q, self.match_k, self.ground_proj):
-            for module in (root.modules() if isinstance(root, nn.Sequential) else (root,)):
-                if isinstance(module, nn.Linear):
-                    nn.init.xavier_uniform_(module.weight)
-                    if module.bias is not None:
-                        nn.init.zeros_(module.bias)
-        self.read._reset_parameters()
-        nn.init.zeros_(self.ground_type_token)
-        with torch.no_grad():
-            self.gate.fill_(self.gate_init)
-
-    @staticmethod
-    def _pool_valid_rows(feat_B_L_D: torch.Tensor, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-        if feat_B_L_D.ndim == 2:
-            feat_B_L_D = feat_B_L_D.unsqueeze(0)
-        if feat_B_L_D.shape[0] == 1 and batch_size != 1:
-            feat_B_L_D = feat_B_L_D.expand(batch_size, -1, -1)
-        feat = torch.nan_to_num(feat_B_L_D.float())
-        valid = feat.abs().sum(dim=-1, keepdim=True) > 0
-        denom = valid.sum(dim=1).clamp_min(1).float()
-        pooled = (feat * valid).sum(dim=1) / denom
-        return pooled, valid
-
-    def forward(
-        self,
-        x_B_T_H_W_D: torch.Tensor,
-        match_query_B_L_D: Optional[torch.Tensor],
-        ground_feature_B_L_D: Optional[torch.Tensor],
-        gt_soft_B_T_H_W: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if match_query_B_L_D is None or ground_feature_B_L_D is None:
-            return x_B_T_H_W_D, None
-        B, T, H, W, D = x_B_T_H_W_D.shape
-        match_q_w = self.match_q[0].weight if isinstance(self.match_q, nn.Sequential) else self.match_q.weight
-        param_dtype = match_q_w.dtype
-        device = match_q_w.device
-
-        # WHERE: pooled query (SAM3 space) vs every latent token.
-        query, q_valid = self._pool_valid_rows(match_query_B_L_D, B)
-        has_query = (q_valid.sum(dim=1) > 0).float().view(B, 1, 1, 1)
-        q = self.match_q(self.query_norm(query.to(device=device, dtype=param_dtype)))  # [B, M]
-        k = self.match_k(x_B_T_H_W_D.reshape(B, -1, D).to(dtype=param_dtype))          # [B, N, M]
-        logits_B_N = (k @ q.unsqueeze(-1)).squeeze(-1) * self.match_scale              # [B, N]
-        logits_B_T_H_W = logits_B_N.view(B, T, H, W)
-        soft_B_T_H_W = torch.sigmoid(logits_B_T_H_W) * has_query.to(logits_B_T_H_W.dtype)
-
-        # GT-gate curriculum (training only): early on, the injection is gated by
-        # the GT mask (the dense recipe that provably opens the gate); `gt_blend`
-        # anneals 1->0 so the predicted soft mask gradually takes over. The BCE
-        # supervision below always sees the PREDICTED logits. Inference never
-        # takes this path, so generation stays mask-free.
-        gt_blend = float(getattr(self, "gt_blend", 0.0) or 0.0)
-        if self.training and gt_soft_B_T_H_W is not None and gt_blend > 0:
-            gt = gt_soft_B_T_H_W.to(device=soft_B_T_H_W.device, dtype=soft_B_T_H_W.dtype).clamp(0, 1)
-            if gt.shape == soft_B_T_H_W.shape:
-                soft_B_T_H_W = gt_blend * gt * has_query.to(gt.dtype) + (1.0 - gt_blend) * soft_B_T_H_W
-
-        # WHAT: grounding tokens from raw [SEG] rows, read via attention.
-        ground = ground_feature_B_L_D
-        if ground.ndim == 2:
-            ground = ground.unsqueeze(0)
-        if ground.shape[0] == 1 and B != 1:
-            ground = ground.expand(B, -1, -1)
-        ground = torch.nan_to_num(ground.float()).to(device=device, dtype=param_dtype)
-        g_valid = ground.abs().sum(dim=-1) > 0                                          # [B, Lg]
-        g_tokens = self.ground_proj(self.ground_norm(ground)) + self.ground_type_token  # [B, Lg, D]
-        # An all-masked key row would NaN attention; always keep slot 0 readable
-        # (its contribution is suppressed by has_query/soft gating anyway).
-        key_padding_mask = ~g_valid
-        key_padding_mask[..., 0] = False
-        x_flat = x_B_T_H_W_D.reshape(B, -1, D).to(dtype=param_dtype)
-        read_out, _ = self.read(x_flat, g_tokens, g_tokens, key_padding_mask=key_padding_mask, need_weights=False)
-        read_out = read_out.view(B, T, H, W, D)
-
-        gate = torch.tanh(self.gate).to(dtype=x_B_T_H_W_D.dtype)
-        spatial = soft_B_T_H_W.unsqueeze(-1).to(dtype=x_B_T_H_W_D.dtype)
-        if self.training and self.dropout_prob > 0:
-            keep = (torch.rand(B, device=x_B_T_H_W_D.device) >= self.dropout_prob).float()
-            spatial = spatial * keep.view(B, 1, 1, 1, 1).to(spatial.dtype)
-        x_out = x_B_T_H_W_D + gate * spatial * read_out.to(dtype=x_B_T_H_W_D.dtype)
-        return x_out, logits_B_T_H_W
+        return self.compute_attention(q, k, v, video_size=video_size, kv_cache_cfg=kv_cache_cfg)
 
 
 class VideoPositionEmb(nn.Module):
@@ -1866,6 +853,44 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
         )
 
         return rearrange(em_T_H_W_D, "t h w d -> (t h w) 1 1 d").float()
+
+    def generate_embeddings_from_positions(
+        self,
+        positions_B_L_3: torch.Tensor,
+        fps: Optional[torch.Tensor] = None,
+        h_ntk_factor: Optional[float] = None,
+        w_ntk_factor: Optional[float] = None,
+        t_ntk_factor: Optional[float] = None,
+    ) -> torch.Tensor:
+        """Generate 3D RoPE for arbitrary [t,h,w] positions in the latent coordinate frame."""
+        h_ntk_factor = h_ntk_factor if h_ntk_factor is not None else self.h_ntk_factor
+        w_ntk_factor = w_ntk_factor if w_ntk_factor is not None else self.w_ntk_factor
+        t_ntk_factor = t_ntk_factor if t_ntk_factor is not None else self.t_ntk_factor
+
+        h_theta = 10000.0 * h_ntk_factor
+        w_theta = 10000.0 * w_ntk_factor
+        t_theta = 10000.0 * t_ntk_factor
+
+        h_spatial_freqs = 1.0 / (h_theta ** self.dim_spatial_range.float())
+        w_spatial_freqs = 1.0 / (w_theta ** self.dim_spatial_range.float())
+        temporal_freqs = 1.0 / (t_theta ** self.dim_temporal_range.float())
+
+        positions = positions_B_L_3[0].to(device=self.dim_spatial_range.device, dtype=torch.float32)
+        assert positions.shape[-1] == 3, f"Expected [L,3] positions, got {positions.shape}"
+        assert positions[:, 1].max() <= self.max_h - 1 and positions[:, 2].max() <= self.max_w - 1, (
+            f"Semantic positions exceed max grid: H={positions[:, 1].max().item()}, "
+            f"W={positions[:, 2].max().item()}, max_h={self.max_h}, max_w={self.max_w}"
+        )
+
+        t_pos = positions[:, 0]
+        if self.enable_fps_modulation and fps is not None:
+            t_pos = t_pos / fps[:1].to(device=t_pos.device, dtype=t_pos.dtype) * self.base_fps
+        half_emb_t = torch.outer(t_pos, temporal_freqs)
+        half_emb_h = torch.outer(positions[:, 1], h_spatial_freqs)
+        half_emb_w = torch.outer(positions[:, 2], w_spatial_freqs)
+
+        em_L_D = torch.cat([half_emb_t, half_emb_h, half_emb_w] * 2, dim=-1)
+        return rearrange(em_L_D, "l d -> l 1 1 d").float()
 
     @property
     def seq_dim(self):
@@ -2235,10 +1260,8 @@ class Block(nn.Module):
         backend: str = "transformer_engine",
         image_context_dim: Optional[int] = None,
         use_wan_fp32_strategy: bool = False,
-        target_cross_attention: bool = False,
-        target_cross_attention_init_gate: float = 0.0,
-        target_latent_grounding: bool = False,
-        target_latent_grounding_init_gate: float = 0.0,
+        semantic_plan_cross_attention: bool = False,
+        semantic_plan_cross_attention_use_rope: bool = True,
     ):
         super().__init__()
         self.x_dim = x_dim
@@ -2270,31 +1293,22 @@ class Block(nn.Module):
                 backend=backend,
             )
 
-        self.target_cross_attention = bool(target_cross_attention)
-        if self.target_cross_attention:
-            self.layer_norm_target_cross_attn = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
-            self.target_cross_attn = Attention(
-                x_dim, context_dim, num_heads, x_dim // num_heads, qkv_format="bshd", backend=backend
+        self.semantic_plan_cross_attention = bool(semantic_plan_cross_attention)
+        if self.semantic_plan_cross_attention:
+            self.layer_norm_semantic_plan_cross_attn = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
+            semantic_attn_cls = SemanticRopeCrossAttention if semantic_plan_cross_attention_use_rope else Attention
+            self.semantic_plan_cross_attn = semantic_attn_cls(
+                x_dim,
+                context_dim,
+                num_heads,
+                x_dim // num_heads,
+                qkv_format="bshd",
+                backend=backend,
+                use_wan_fp32_strategy=use_wan_fp32_strategy,
             )
-            self.target_cross_attn_gate = nn.Parameter(torch.tensor([float(target_cross_attention_init_gate)]))
         else:
-            self.layer_norm_target_cross_attn = None
-            self.target_cross_attn = None
-            self.target_cross_attn_gate = None
-
-        self.target_latent_grounding = bool(target_latent_grounding)
-        if self.target_latent_grounding:
-            self.layer_norm_target_latent = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
-            self.target_latent_mlp = nn.Sequential(
-                nn.Linear(2 * x_dim, x_dim),
-                nn.SiLU(),
-                nn.Linear(x_dim, x_dim),
-            )
-            self.target_latent_gate = nn.Parameter(torch.tensor([float(target_latent_grounding_init_gate)]))
-        else:
-            self.layer_norm_target_latent = None
-            self.target_latent_mlp = None
-            self.target_latent_gate = None
+            self.layer_norm_semantic_plan_cross_attn = None
+            self.semantic_plan_cross_attn = None
 
         self.layer_norm_mlp = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
         self.mlp = GPT2FeedForward(x_dim, int(x_dim * mlp_ratio))
@@ -2316,10 +1330,24 @@ class Block(nn.Module):
                 nn.Linear(x_dim, adaln_lora_dim, bias=False),
                 nn.Linear(adaln_lora_dim, 3 * x_dim, bias=False),
             )
+            if self.semantic_plan_cross_attn is not None:
+                self.adaln_modulation_semantic_plan_cross_attn = nn.Sequential(
+                    nn.SiLU(),
+                    nn.Linear(x_dim, adaln_lora_dim, bias=False),
+                    nn.Linear(adaln_lora_dim, 3 * x_dim, bias=False),
+                )
+            else:
+                self.adaln_modulation_semantic_plan_cross_attn = None
         else:
             self.adaln_modulation_self_attn = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
             self.adaln_modulation_cross_attn = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
             self.adaln_modulation_mlp = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
+            if self.semantic_plan_cross_attn is not None:
+                self.adaln_modulation_semantic_plan_cross_attn = nn.Sequential(
+                    nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False)
+                )
+            else:
+                self.adaln_modulation_semantic_plan_cross_attn = None
 
         self.cp_size = None
         self.use_wan_fp32_strategy = use_wan_fp32_strategy
@@ -2332,14 +1360,19 @@ class Block(nn.Module):
             stream=stream,
             cp_comm_type=cp_comm_type,
         )
+        if self.semantic_plan_cross_attn is not None:
+            self.semantic_plan_cross_attn.set_context_parallel_group(
+                process_group=process_group,
+                ranks=ranks,
+                stream=stream,
+                cp_comm_type=cp_comm_type,
+            )
 
     def reset_parameters(self) -> None:
         self.layer_norm_self_attn.reset_parameters()
         self.layer_norm_cross_attn.reset_parameters()
-        if self.layer_norm_target_cross_attn is not None:
-            self.layer_norm_target_cross_attn.reset_parameters()
-        if self.layer_norm_target_latent is not None:
-            self.layer_norm_target_latent.reset_parameters()
+        if self.layer_norm_semantic_plan_cross_attn is not None:
+            self.layer_norm_semantic_plan_cross_attn.reset_parameters()
         self.layer_norm_mlp.reset_parameters()
 
         if self.use_adaln_lora:
@@ -2347,26 +1380,28 @@ class Block(nn.Module):
             torch.nn.init.trunc_normal_(self.adaln_modulation_self_attn[1].weight, std=std, a=-3 * std, b=3 * std)
             torch.nn.init.trunc_normal_(self.adaln_modulation_cross_attn[1].weight, std=std, a=-3 * std, b=3 * std)
             torch.nn.init.trunc_normal_(self.adaln_modulation_mlp[1].weight, std=std, a=-3 * std, b=3 * std)
+            if self.adaln_modulation_semantic_plan_cross_attn is not None:
+                torch.nn.init.trunc_normal_(
+                    self.adaln_modulation_semantic_plan_cross_attn[1].weight, std=std, a=-3 * std, b=3 * std
+                )
             torch.nn.init.zeros_(self.adaln_modulation_self_attn[2].weight)
             torch.nn.init.zeros_(self.adaln_modulation_cross_attn[2].weight)
             torch.nn.init.zeros_(self.adaln_modulation_mlp[2].weight)
+            if self.adaln_modulation_semantic_plan_cross_attn is not None:
+                torch.nn.init.zeros_(self.adaln_modulation_semantic_plan_cross_attn[2].weight)
         else:
             torch.nn.init.zeros_(self.adaln_modulation_self_attn[1].weight)
             torch.nn.init.zeros_(self.adaln_modulation_cross_attn[1].weight)
             torch.nn.init.zeros_(self.adaln_modulation_mlp[1].weight)
+            if self.adaln_modulation_semantic_plan_cross_attn is not None:
+                torch.nn.init.zeros_(self.adaln_modulation_semantic_plan_cross_attn[1].weight)
 
     def init_weights(self) -> None:
         self.reset_parameters()
         self.self_attn.init_weights()
         self.cross_attn.init_weights()
-        if self.target_cross_attn is not None:
-            self.target_cross_attn.init_weights()
-        if self.target_latent_mlp is not None:
-            for module in self.target_latent_mlp.modules():
-                if isinstance(module, nn.Linear):
-                    nn.init.xavier_uniform_(module.weight)
-                    if module.bias is not None:
-                        nn.init.zeros_(module.bias)
+        if self.semantic_plan_cross_attn is not None:
+            self.semantic_plan_cross_attn.init_weights()
         self.mlp.init_weights()
 
     def forward(
@@ -2378,13 +1413,8 @@ class Block(nn.Module):
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
-        capture_target_cross_attn: bool = False,
-        target_token_indices_B: Optional[torch.Tensor] = None,
-        target_crossattn_emb: Optional[torch.Tensor] = None,
-        target_crossattn_token_indices_B: Optional[torch.Tensor] = None,
-        target_spatial_gate_B_T_H_W: Optional[torch.Tensor] = None,
-        target_latent_field_B_T_H_W_D: Optional[torch.Tensor] = None,
-        target_attention_query_chunk_size: int = 2048,
+        semantic_plan_crossattn_emb: Optional[torch.Tensor] = None,
+        semantic_plan_key_rope_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
@@ -2408,6 +1438,12 @@ class Block(nn.Module):
                     self.adaln_modulation_cross_attn(emb_B_T_D).chunk(3, dim=-1)
                 )
                 shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = self.adaln_modulation_mlp(emb_B_T_D).chunk(3, dim=-1)
+            if self.adaln_modulation_semantic_plan_cross_attn is not None:
+                (
+                    shift_semantic_plan_cross_attn_B_T_D,
+                    scale_semantic_plan_cross_attn_B_T_D,
+                    gate_semantic_plan_cross_attn_B_T_D,
+                ) = self.adaln_modulation_semantic_plan_cross_attn(emb_B_T_D).chunk(3, dim=-1)
 
         # Reshape tensors from (B, T, D) to (B, T, 1, 1, D) for broadcasting
         shift_self_attn_B_T_1_1_D = rearrange(shift_self_attn_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
@@ -2421,6 +1457,16 @@ class Block(nn.Module):
         shift_mlp_B_T_1_1_D = rearrange(shift_mlp_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
         scale_mlp_B_T_1_1_D = rearrange(scale_mlp_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
         gate_mlp_B_T_1_1_D = rearrange(gate_mlp_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
+        if self.adaln_modulation_semantic_plan_cross_attn is not None:
+            shift_semantic_plan_cross_attn_B_T_1_1_D = rearrange(
+                shift_semantic_plan_cross_attn_B_T_D, "b t d -> b t 1 1 d"
+            ).type_as(x_B_T_H_W_D)
+            scale_semantic_plan_cross_attn_B_T_1_1_D = rearrange(
+                scale_semantic_plan_cross_attn_B_T_D, "b t d -> b t 1 1 d"
+            ).type_as(x_B_T_H_W_D)
+            gate_semantic_plan_cross_attn_B_T_1_1_D = rearrange(
+                gate_semantic_plan_cross_attn_B_T_D, "b t d -> b t 1 1 d"
+            ).type_as(x_B_T_H_W_D)
 
         B, T, H, W, D = x_B_T_H_W_D.shape
 
@@ -2465,7 +1511,6 @@ class Block(nn.Module):
             layer_norm_cross_attn,
             _scale_cross_attn_B_T_1_1_D,
             _shift_cross_attn_B_T_1_1_D,
-            _gate_cross_attn_B_T_1_1_D,
         ):
             _normalized_x_B_T_H_W_D = _fn(
                 _x_B_T_H_W_D, layer_norm_cross_attn, _scale_cross_attn_B_T_1_1_D, _shift_cross_attn_B_T_1_1_D
@@ -2475,16 +1520,12 @@ class Block(nn.Module):
                     rearrange(_normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
                     crossattn_emb,
                     rope_emb=rope_emb_L_1_1_D,
-                    capture_target_attention=capture_target_cross_attn and target_crossattn_emb is None,
-                    target_token_indices_B=target_token_indices_B,
-                    target_attention_query_chunk_size=target_attention_query_chunk_size,
                 ),
                 "b (t h w) d -> b t h w d",
                 t=T,
                 h=H,
                 w=W,
             )
-            # _x_B_T_H_W_D = _x_B_T_H_W_D + _gate_cross_attn_B_T_1_1_D * _result_B_T_H_W_D
             return _result_B_T_H_W_D
 
         result_B_T_H_W_D = _x_fn(
@@ -2492,51 +1533,43 @@ class Block(nn.Module):
             self.layer_norm_cross_attn,
             scale_cross_attn_B_T_1_1_D,
             shift_cross_attn_B_T_1_1_D,
-            gate_cross_attn_B_T_1_1_D,
         )
-        x_B_T_H_W_D = result_B_T_H_W_D * gate_cross_attn_B_T_1_1_D + x_B_T_H_W_D
+        x_B_T_H_W_D = x_B_T_H_W_D + gate_cross_attn_B_T_1_1_D * result_B_T_H_W_D
 
-        if self.target_cross_attn is not None and target_crossattn_emb is not None:
-            normalized_target_x_B_T_H_W_D = self.layer_norm_target_cross_attn(x_B_T_H_W_D)
-            target_result_B_T_H_W_D = rearrange(
-                self.target_cross_attn(
-                    rearrange(normalized_target_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
-                    target_crossattn_emb,
-                    rope_emb=None,
-                    capture_target_attention=capture_target_cross_attn,
-                    target_token_indices_B=target_crossattn_token_indices_B,
-                    target_attention_query_chunk_size=target_attention_query_chunk_size,
-                ),
-                "b (t h w) d -> b t h w d",
-                t=T,
-                h=H,
-                w=W,
+        if self.semantic_plan_cross_attn is not None and semantic_plan_crossattn_emb is not None:
+            normalized_semantic_x_B_T_H_W_D = _fn(
+                x_B_T_H_W_D,
+                self.layer_norm_semantic_plan_cross_attn,
+                scale_semantic_plan_cross_attn_B_T_1_1_D,
+                shift_semantic_plan_cross_attn_B_T_1_1_D,
             )
-            if target_spatial_gate_B_T_H_W is not None:
-                spatial_gate = target_spatial_gate_B_T_H_W.to(
-                    device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype
+            if isinstance(self.semantic_plan_cross_attn, SemanticRopeCrossAttention):
+                semantic_result_B_T_H_W_D = rearrange(
+                    self.semantic_plan_cross_attn(
+                        rearrange(normalized_semantic_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
+                        semantic_plan_crossattn_emb,
+                        query_rope_emb=rope_emb_L_1_1_D,
+                        key_rope_emb=semantic_plan_key_rope_emb,
+                        video_size=video_size,
+                    ),
+                    "b (t h w) d -> b t h w d",
+                    t=T,
+                    h=H,
+                    w=W,
                 )
-                if spatial_gate.shape != (B, T, H, W):
-                    spatial_gate = F.interpolate(
-                        spatial_gate.unsqueeze(1).float(),
-                        size=(T, H, W),
-                        mode="trilinear",
-                        align_corners=False,
-                    ).squeeze(1).to(dtype=x_B_T_H_W_D.dtype)
-                target_result_B_T_H_W_D = target_result_B_T_H_W_D * spatial_gate.unsqueeze(-1)
-            gate = self.target_cross_attn_gate.to(device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype)
-            x_B_T_H_W_D = x_B_T_H_W_D + gate * target_result_B_T_H_W_D
-
-        if self.target_latent_mlp is not None and target_latent_field_B_T_H_W_D is not None:
-            target_latent_field_B_T_H_W_D = target_latent_field_B_T_H_W_D.to(
-                device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype
-            )
-            normalized_target_x_B_T_H_W_D = self.layer_norm_target_latent(x_B_T_H_W_D)
-            target_result_B_T_H_W_D = self.target_latent_mlp(
-                torch.cat([normalized_target_x_B_T_H_W_D, target_latent_field_B_T_H_W_D], dim=-1)
-            )
-            gate = self.target_latent_gate.tanh().to(device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype)
-            x_B_T_H_W_D = x_B_T_H_W_D + gate * target_result_B_T_H_W_D
+            else:
+                semantic_result_B_T_H_W_D = rearrange(
+                    self.semantic_plan_cross_attn(
+                        rearrange(normalized_semantic_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
+                        semantic_plan_crossattn_emb,
+                        rope_emb=None,
+                    ),
+                    "b (t h w) d -> b t h w d",
+                    t=T,
+                    h=H,
+                    w=W,
+                )
+            x_B_T_H_W_D = x_B_T_H_W_D + gate_semantic_plan_cross_attn_B_T_1_1_D * semantic_result_B_T_H_W_D
 
         normalized_x_B_T_H_W_D = _fn(
             x_B_T_H_W_D,
@@ -2631,6 +1664,16 @@ class MiniTrainDIT(WeightTrainingStat):
         use_crossattn_projection: bool = False,
         crossattn_proj_in_channels: int = 1024,
         extra_image_context_dim: Optional[int] = None,
+        semantic_plan_context: bool = False,
+        semantic_plan_in_dim: int = 1152,
+        semantic_plan_hidden_dim: int = 2048,
+        semantic_plan_max_tokens: int = 0,
+        semantic_plan_num_keyframes: int = 0,
+        semantic_plan_source_num_keyframes: int = 0,
+        semantic_plan_spatial_grid: int = 0,
+        semantic_plan_coord_hidden_dim: int = 256,
+        semantic_plan_use_rope: bool = True,
+        semantic_plan_cross_attention_blocks: Optional[List[int]] = None,
         # positional embedding settings
         pos_emb_cls: str = "sincos",
         pos_emb_learnable: bool = False,
@@ -2652,61 +1695,6 @@ class MiniTrainDIT(WeightTrainingStat):
         natten_parameters: Union[dict, list] = None,
         # if True, will closely match wan's strategy to use fp32 in certain layers/operations
         use_wan_fp32_strategy: bool = False,
-        tavid_attn_alignment_blocks: Optional[List[int]] = None,
-        tavid_attn_alignment_token_source: str = "text",
-        tavid_attn_query_chunk_size: int = 2048,
-        target_mask_concat_input: bool = False,
-        target_mask_context_tokens: bool = False,
-        target_mask_context_patch_size: Tuple[int, int, int] = (1, 2, 2),
-        target_mask_context_hidden_dim: int = 512,
-        target_mask_context_max_tokens: int = 256,
-        target_mask_context_min_patch_area: float = 0.0,
-        target_mask_context_include_coords: bool = True,
-        target_feature_context_tokens: bool = False,
-        target_feature_context_in_dim: int = 256,
-        target_feature_context_hidden_dim: int = 0,
-        target_feature_context_max_tokens: int = 64,
-        target_feature_context_append_to_text: bool = True,
-        target_feature_context_replace_text: bool = False,
-        target_feature_context_source_segments: Optional[List[int]] = None,
-        target_what_where_context_tokens: bool = False,
-        target_what_where_where_dim: int = 256,
-        target_what_where_hidden_dim: int = 512,
-        target_what_where_max_tokens: int = 256,
-        target_what_where_context_init_gate: float = 1.0,
-        target_what_where_spatial_prior: bool = False,
-        target_what_where_prior_hidden_dim: int = 128,
-        target_what_where_prior_init_bias: float = -2.0,
-        target_feature_cross_attention: bool = False,
-        target_feature_cross_attention_blocks: Optional[List[int]] = None,
-        target_feature_cross_attention_init_gate: float = 0.0,
-        target_feature_concat_input: bool = False,
-        target_feature_concat_input_dim: int = 256,
-        target_feature_concat_input_hidden_dim: int = 128,
-        target_feature_concat_input_channels: int = 8,
-        target_feature_concat_input_mode: str = "mlp",
-        target_feature_concat_input_output_scale: float = 1.0,
-        target_dense_spatial_tokens: bool = False,
-        target_dense_spatial_feature_dim: int = 256,
-        target_dense_spatial_hidden_dim: int = 512,
-        target_dense_spatial_init_gate: float = 0.01,
-        target_dense_spatial_use_feature_map: bool = False,
-        target_dense_spatial_hybrid_feature_map: bool = False,
-        target_dense_spatial_feature_map_init_gate: float = 0.0,
-        target_dense_spatial_mask_free: bool = False,
-        target_latent_grounding: bool = False,
-        target_latent_grounding_feature_dim: int = 256,
-        target_latent_grounding_hidden_dim: int = 512,
-        target_latent_grounding_blocks: Optional[List[int]] = None,
-        target_latent_grounding_init_gate: float = 0.0,
-        target_match_ground: bool = False,
-        target_match_ground_query_dim: int = 256,
-        target_match_ground_dim: int = 2048,
-        target_match_ground_match_dim: int = 256,
-        target_match_ground_num_heads: int = 8,
-        target_match_ground_gate_init: float = 0.0,
-        target_match_ground_dropout: float = 0.1,
-        target_match_ground_mlp_hidden: int = 0,
     ) -> None:
         super().__init__()
         self.max_img_h = max_img_h
@@ -2736,10 +1724,6 @@ class MiniTrainDIT(WeightTrainingStat):
         self.extra_t_extrapolation_ratio = extra_t_extrapolation_ratio
         self.rope_enable_fps_modulation = rope_enable_fps_modulation
         self.extra_image_context_dim = extra_image_context_dim
-        self.target_feature_concat_input = bool(target_feature_concat_input)
-        self.target_feature_concat_input_channels = (
-            int(target_feature_concat_input_channels) if self.target_feature_concat_input else 0
-        )
         self.build_patch_embed()
         self.build_pos_embed()
         self.use_adaln_lora = use_adaln_lora
@@ -2751,167 +1735,47 @@ class MiniTrainDIT(WeightTrainingStat):
         self.use_crossattn_projection = use_crossattn_projection
         self.crossattn_proj_in_channels = crossattn_proj_in_channels
         self.use_wan_fp32_strategy = use_wan_fp32_strategy
-        self.tavid_attn_alignment_blocks = set(tavid_attn_alignment_blocks or [])
-        self.tavid_attn_alignment_token_source = tavid_attn_alignment_token_source
-        if self.tavid_attn_alignment_token_source not in {"text", "feature", "text_feature"}:
-            raise ValueError(
-                "tavid_attn_alignment_token_source must be one of "
-                "{'text', 'feature', 'text_feature'}"
-            )
-        self.tavid_attn_query_chunk_size = tavid_attn_query_chunk_size
-        self.tavid_target_attn_maps: list[torch.Tensor] = []
-        self.tavid_target_attn_source: str = "none"
-        self.tavid_target_mask_B_T_H_W: Optional[torch.Tensor] = None
-        self.target_feature_contrastive_video_tokens_B_T_H_W_D: Optional[torch.Tensor] = None
-        self.target_feature_contrastive_tokens_B_L_D: Optional[torch.Tensor] = None
-        self.target_feature_contrastive_valid_B_L: Optional[torch.Tensor] = None
-        self.target_mask_concat_input = bool(target_mask_concat_input)
-        self.target_mask_context_tokens = bool(target_mask_context_tokens)
-        self.target_mask_context_token_start: Optional[int] = None
-        self.target_mask_context_tokens_B_L_D: Optional[torch.Tensor] = None
-        self.target_feature_context_tokens = bool(target_feature_context_tokens)
-        self.target_feature_context_append_to_text = bool(target_feature_context_append_to_text)
-        self.target_feature_context_replace_text = bool(target_feature_context_replace_text)
-        self.target_feature_context_source_segments = (
-            [int(s) for s in target_feature_context_source_segments]
-            if target_feature_context_source_segments
-            else None
-        )
-        self.target_feature_cross_attention = bool(target_feature_cross_attention)
-        if target_feature_cross_attention_blocks is None:
-            target_feature_cross_attention_blocks = tavid_attn_alignment_blocks
-        self.target_feature_cross_attention_blocks = set(target_feature_cross_attention_blocks or [])
-        self.target_feature_context_token_start: Optional[int] = None
-        self.target_feature_context_tokens_B_L_D: Optional[torch.Tensor] = None
-        self.target_feature_context_valid_B_L: Optional[torch.Tensor] = None
-        self.target_what_where_context_tokens = bool(target_what_where_context_tokens)
-        self.target_what_where_spatial_prior = bool(target_what_where_spatial_prior)
-        self.target_where_prior_logits_B_T_H_W: Optional[torch.Tensor] = None
-        self.target_where_prior_prob_B_T_H_W: Optional[torch.Tensor] = None
-        if self.target_feature_concat_input:
-            self.target_feature_input_adapter = TargetFeatureInputChannelAdapter(
-                feature_dim=target_feature_concat_input_dim,
-                hidden_dim=target_feature_concat_input_hidden_dim,
-                out_channels=self.target_feature_concat_input_channels,
-                mode=target_feature_concat_input_mode,
-                output_scale=target_feature_concat_input_output_scale,
-            )
-        else:
-            self.target_feature_input_adapter = None
-        self.target_dense_spatial_tokens = bool(target_dense_spatial_tokens)
-        self.target_dense_spatial_hybrid_feature_map = bool(target_dense_spatial_hybrid_feature_map)
-        self.target_dense_spatial_mask_free = bool(target_dense_spatial_mask_free)
-        if self.target_dense_spatial_tokens:
-            if self.target_dense_spatial_mask_free:
-                adapter_cls = MaskFreeDenseTargetFeatureMapAdapter
-            elif self.target_dense_spatial_hybrid_feature_map:
-                adapter_cls = DenseTargetSpatialAdapter
-            elif target_dense_spatial_use_feature_map:
-                adapter_cls = DenseTargetFeatureMapSpatialAdapter
-            else:
-                adapter_cls = DenseTargetSpatialAdapter
-            self.target_dense_spatial_adapter = adapter_cls(
-                feature_dim=target_dense_spatial_feature_dim,
-                hidden_dim=target_dense_spatial_hidden_dim,
-                out_dim=model_channels,
-            )
-            self.target_dense_spatial_gate = nn.Parameter(torch.full((1,), float(target_dense_spatial_init_gate)))
-            if self.target_dense_spatial_hybrid_feature_map:
-                self.target_dense_feature_map_adapter = DenseTargetFeatureMapSpatialAdapter(
-                    feature_dim=target_dense_spatial_feature_dim,
-                    hidden_dim=target_dense_spatial_hidden_dim,
-                    out_dim=model_channels,
-                )
-                self.target_dense_feature_map_gate = nn.Parameter(
-                    torch.full((1,), float(target_dense_spatial_feature_map_init_gate))
-                )
-            else:
-                self.target_dense_feature_map_adapter = None
-                self.target_dense_feature_map_gate = None
-        else:
-            self.target_dense_spatial_adapter = None
-            self.target_dense_spatial_gate = None
-            self.target_dense_feature_map_adapter = None
-            self.target_dense_feature_map_gate = None
+        self.semantic_plan_context = bool(semantic_plan_context)
+        self.semantic_plan_num_keyframes = int(semantic_plan_num_keyframes)
+        self.semantic_plan_source_num_keyframes = int(semantic_plan_source_num_keyframes)
+        self.semantic_plan_spatial_grid = int(semantic_plan_spatial_grid)
+        self.semantic_plan_use_rope = bool(semantic_plan_use_rope)
+        if semantic_plan_cross_attention_blocks is None:
+            semantic_plan_cross_attention_blocks = list(range(num_blocks)) if self.semantic_plan_context else []
+        self.semantic_plan_cross_attention_blocks = set(semantic_plan_cross_attention_blocks)
+        self.semantic_plan_context_tokens_B_L_D: Optional[torch.Tensor] = None
+        self.semantic_plan_context_valid_B_L: Optional[torch.Tensor] = None
 
-        self.target_latent_grounding = bool(target_latent_grounding)
-        if target_latent_grounding_blocks is None:
-            target_latent_grounding_blocks = [num_blocks // 3, num_blocks // 2, (2 * num_blocks) // 3, num_blocks - 2]
-        self.target_latent_grounding_blocks = set(target_latent_grounding_blocks or [])
-        if self.target_latent_grounding:
-            self.target_latent_grounding_adapter = TargetLatentGroundingAdapter(
-                feature_dim=target_latent_grounding_feature_dim,
-                hidden_dim=target_latent_grounding_hidden_dim,
-                out_dim=model_channels,
-            )
-        else:
-            self.target_latent_grounding_adapter = None
-
-        self.target_match_ground = bool(target_match_ground)
-        self.target_matching_logits_B_T_H_W: Optional[torch.Tensor] = None
-        if self.target_match_ground:
-            self.target_match_ground_module = TargetMatchGroundModule(
-                query_dim=target_match_ground_query_dim,
-                ground_dim=target_match_ground_dim,
-                model_dim=model_channels,
-                match_dim=target_match_ground_match_dim,
-                num_heads=target_match_ground_num_heads,
-                gate_init=target_match_ground_gate_init,
-                dropout_prob=target_match_ground_dropout,
-                mlp_hidden=target_match_ground_mlp_hidden,
-            )
-        else:
-            self.target_match_ground_module = None
-
-        if self.target_mask_context_tokens:
-            self.target_mask_context_adapter = TargetMaskContextAdapter(
-                patch_size=target_mask_context_patch_size,
-                hidden_dim=target_mask_context_hidden_dim,
+        if self.semantic_plan_context:
+            self.semantic_plan_context_adapter = SemanticPlanContextAdapter(
+                in_dim=semantic_plan_in_dim,
+                hidden_dim=semantic_plan_hidden_dim,
                 out_dim=crossattn_emb_channels,
-                max_tokens=target_mask_context_max_tokens,
-                min_patch_area=target_mask_context_min_patch_area,
-                include_coords=target_mask_context_include_coords,
+                max_tokens=semantic_plan_max_tokens,
+                num_keyframes=semantic_plan_num_keyframes,
+                source_num_keyframes=semantic_plan_source_num_keyframes,
+                spatial_grid_size=semantic_plan_spatial_grid,
+                coord_hidden_dim=semantic_plan_coord_hidden_dim,
             )
         else:
-            self.target_mask_context_adapter = None
-        if self.target_what_where_context_tokens:
-            self.target_feature_context_adapter = TargetWhatWhereContextAdapter(
-                what_dim=target_feature_context_in_dim,
-                where_dim=target_what_where_where_dim,
-                hidden_dim=target_what_where_hidden_dim,
-                out_dim=crossattn_emb_channels,
-                max_tokens=target_what_where_max_tokens,
-                init_gate=target_what_where_context_init_gate,
+            self.semantic_plan_context_adapter = None
+
+        if self.semantic_plan_context and self.semantic_plan_use_rope:
+            semantic_grid = max(1, self.semantic_plan_spatial_grid)
+            semantic_keyframes = max(1, self.semantic_plan_num_keyframes)
+            self.semantic_plan_rope_embedder = VideoRopePosition3DEmb(
+                head_dim=model_channels // num_heads,
+                len_h=max(self.max_img_h // self.patch_spatial, semantic_grid),
+                len_w=max(self.max_img_w // self.patch_spatial, semantic_grid),
+                len_t=max(self.max_frames // self.patch_temporal, semantic_keyframes),
+                base_fps=24,
+                h_extrapolation_ratio=self.rope_h_extrapolation_ratio,
+                w_extrapolation_ratio=self.rope_w_extrapolation_ratio,
+                t_extrapolation_ratio=self.rope_t_extrapolation_ratio,
+                enable_fps_modulation=self.rope_enable_fps_modulation,
             )
-            if self.target_what_where_spatial_prior:
-                self.target_where_prior_head = DenseTargetWherePriorHead(
-                    what_dim=target_feature_context_in_dim,
-                    where_dim=target_what_where_where_dim,
-                    hidden_dim=target_what_where_prior_hidden_dim,
-                    max_tokens=target_what_where_max_tokens,
-                    init_bias=target_what_where_prior_init_bias,
-                )
-            else:
-                self.target_where_prior_head = None
-        elif self.target_feature_context_tokens:
-            self.target_where_prior_head = None
-            if self.target_feature_context_source_segments:
-                self.target_feature_context_adapter = MultiSourceTargetFeatureContextAdapter(
-                    source_segments=self.target_feature_context_source_segments,
-                    in_dim=target_feature_context_in_dim,
-                    hidden_dim=target_feature_context_hidden_dim,
-                    out_dim=crossattn_emb_channels,
-                )
-            else:
-                self.target_feature_context_adapter = TargetFeatureContextAdapter(
-                    in_dim=target_feature_context_in_dim,
-                    hidden_dim=target_feature_context_hidden_dim,
-                    out_dim=crossattn_emb_channels,
-                    max_tokens=target_feature_context_max_tokens,
-                )
         else:
-            self.target_feature_context_adapter = None
-            self.target_where_prior_head = None
+            self.semantic_plan_rope_embedder = None
 
         self.blocks = nn.ModuleList(
             [
@@ -2925,14 +1789,10 @@ class MiniTrainDIT(WeightTrainingStat):
                     backend=atten_backend,
                     image_context_dim=None if extra_image_context_dim is None else model_channels,
                     use_wan_fp32_strategy=use_wan_fp32_strategy,
-                    target_cross_attention=(
-                        self.target_feature_cross_attention and i in self.target_feature_cross_attention_blocks
+                    semantic_plan_cross_attention=(
+                        self.semantic_plan_context and i in self.semantic_plan_cross_attention_blocks
                     ),
-                    target_cross_attention_init_gate=target_feature_cross_attention_init_gate,
-                    target_latent_grounding=(
-                        self.target_latent_grounding and i in self.target_latent_grounding_blocks
-                    ),
-                    target_latent_grounding_init_gate=target_latent_grounding_init_gate,
+                    semantic_plan_cross_attention_use_rope=self.semantic_plan_use_rope,
                 )
                 for i in range(num_blocks)
             ]
@@ -2974,13 +1834,15 @@ class MiniTrainDIT(WeightTrainingStat):
 
     def init_weights(self):
         self.x_embedder.init_weights()
-        if self.target_feature_concat_input_channels > 0:
-            self._zero_target_feature_patch_weights()
         self.pos_embedder.reset_parameters()
         if self.extra_per_block_abs_pos_emb:
             self.extra_pos_embedder.reset_parameters()
 
         self.t_embedder[1].init_weights()
+        if self.semantic_plan_context_adapter is not None:
+            self.semantic_plan_context_adapter.reset_parameters()
+        if self.semantic_plan_rope_embedder is not None:
+            self.semantic_plan_rope_embedder.reset_parameters()
         for block in self.blocks:
             block.init_weights()
 
@@ -2989,22 +1851,6 @@ class MiniTrainDIT(WeightTrainingStat):
 
         if self.extra_image_context_dim is not None:
             self.img_context_proj[0].reset_parameters()
-        if self.target_mask_context_adapter is not None:
-            self.target_mask_context_adapter.reset_parameters()
-        if self.target_feature_context_adapter is not None:
-            self.target_feature_context_adapter.reset_parameters()
-        if self.target_where_prior_head is not None:
-            self.target_where_prior_head.reset_parameters()
-        if self.target_feature_input_adapter is not None:
-            self.target_feature_input_adapter.reset_parameters()
-        if self.target_dense_spatial_adapter is not None:
-            self.target_dense_spatial_adapter.reset_parameters()
-        if self.target_dense_feature_map_adapter is not None:
-            self.target_dense_feature_map_adapter.reset_parameters()
-        if self.target_latent_grounding_adapter is not None:
-            self.target_latent_grounding_adapter.reset_parameters()
-        if self.target_match_ground_module is not None:
-            self.target_match_ground_module.reset_parameters()
 
     def build_patch_embed(self):
         (
@@ -3024,17 +1870,9 @@ class MiniTrainDIT(WeightTrainingStat):
         self.x_embedder = PatchEmbed(
             spatial_patch_size=patch_spatial,
             temporal_patch_size=patch_temporal,
-            in_channels=in_channels + self.target_feature_concat_input_channels,
+            in_channels=in_channels,
             out_channels=model_channels,
         )
-
-    def _zero_target_feature_patch_weights(self) -> None:
-        patch_dim = self.patch_spatial * self.patch_spatial * self.patch_temporal
-        feature_dim = self.target_feature_concat_input_channels * patch_dim
-        if feature_dim <= 0:
-            return
-        with torch.no_grad():
-            self.x_embedder.proj[1].weight[:, -feature_dim:] = 0
 
     def build_pos_embed(self):
         if self.pos_emb_cls == "rope3d":
@@ -3075,8 +1913,6 @@ class MiniTrainDIT(WeightTrainingStat):
         x_B_C_T_H_W: torch.Tensor,
         fps: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
-        target_mask_B_C_T_H_W: Optional[torch.Tensor] = None,
-        target_feature_B_L_D: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Prepares an embedded sequence tensor by applying positional embeddings and handling padding masks.
@@ -3109,30 +1945,6 @@ class MiniTrainDIT(WeightTrainingStat):
             x_B_C_T_H_W = torch.cat(
                 [x_B_C_T_H_W, padding_mask.unsqueeze(1).repeat(1, 1, x_B_C_T_H_W.shape[2], 1, 1)], dim=1
             )
-        if self.target_mask_concat_input and target_mask_B_C_T_H_W is not None:
-            if target_mask_B_C_T_H_W.shape[2:] != x_B_C_T_H_W.shape[2:]:
-                target_mask_B_C_T_H_W = F.interpolate(
-                    target_mask_B_C_T_H_W.type_as(x_B_C_T_H_W),
-                    size=x_B_C_T_H_W.shape[2:],
-                    mode="nearest",
-                )
-            x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, target_mask_B_C_T_H_W.type_as(x_B_C_T_H_W)], dim=1)
-        if self.target_feature_input_adapter is not None:
-            B, _, T, H, W = x_B_C_T_H_W.shape
-            if target_feature_B_L_D is None:
-                feature_channels = torch.zeros(
-                    B,
-                    self.target_feature_concat_input_channels,
-                    T,
-                    H,
-                    W,
-                    device=x_B_C_T_H_W.device,
-                    dtype=x_B_C_T_H_W.dtype,
-                )
-            else:
-                feature_channels = self.target_feature_input_adapter(target_feature_B_L_D, (B, T, H, W))
-                feature_channels = feature_channels.to(device=x_B_C_T_H_W.device, dtype=x_B_C_T_H_W.dtype)
-            x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, feature_channels], dim=1)
         x_B_T_H_W_D = self.x_embedder(x_B_C_T_H_W)
 
         if self.extra_per_block_abs_pos_emb:
@@ -3146,140 +1958,6 @@ class MiniTrainDIT(WeightTrainingStat):
 
         return x_B_T_H_W_D, None, extra_pos_emb
 
-    def make_target_mask_tokens(self, target_mask_B_C_T_H_W: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        if target_mask_B_C_T_H_W is None:
-            return None
-        target_mask = target_mask_B_C_T_H_W.float()
-        _, _, T, H, W = target_mask.shape
-        T = T - (T % self.patch_temporal)
-        H = H - (H % self.patch_spatial)
-        W = W - (W % self.patch_spatial)
-        target_mask = target_mask[:, :, :T, :H, :W]
-        if target_mask.numel() == 0:
-            return None
-        target_mask = rearrange(
-            target_mask,
-            "b c (t pt) (h ph) (w pw) -> b t h w (c pt ph pw)",
-            pt=self.patch_temporal,
-            ph=self.patch_spatial,
-            pw=self.patch_spatial,
-        )
-        return target_mask.mean(dim=-1).clamp(0, 1)
-
-    def append_target_mask_context(
-        self,
-        crossattn_emb: torch.Tensor,
-        target_mask_B_C_T_H_W: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        self.target_mask_context_token_start = None
-        self.target_mask_context_tokens_B_L_D = None
-        if self.target_mask_context_adapter is None or target_mask_B_C_T_H_W is None:
-            return crossattn_emb
-
-        mask_tokens = self.target_mask_context_adapter(target_mask_B_C_T_H_W)
-        if mask_tokens is None:
-            return crossattn_emb
-        mask_tokens = mask_tokens.to(device=crossattn_emb.device, dtype=crossattn_emb.dtype)
-        self.target_mask_context_token_start = crossattn_emb.shape[1]
-        self.target_mask_context_tokens_B_L_D = mask_tokens
-        return torch.cat([crossattn_emb, mask_tokens], dim=1)
-
-    def append_target_feature_context(
-        self,
-        crossattn_emb: torch.Tensor,
-        target_feature_B_L_D: Optional[torch.Tensor],
-        target_dense_feature_B_L_D: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        self.target_feature_context_token_start = None
-        self.target_feature_context_tokens_B_L_D = None
-        self.target_feature_context_valid_B_L = None
-        if self.target_feature_context_adapter is None or target_feature_B_L_D is None:
-            return crossattn_emb
-
-        if self.target_what_where_context_tokens:
-            if target_dense_feature_B_L_D is None:
-                return crossattn_emb
-            feature_tokens, feature_valid_B_L = self.target_feature_context_adapter(
-                target_feature_B_L_D,
-                target_dense_feature_B_L_D,
-            )
-        else:
-            feature_valid_B_L = target_feature_B_L_D
-            if feature_valid_B_L.ndim == 2:
-                feature_valid_B_L = feature_valid_B_L.unsqueeze(0)
-            if feature_valid_B_L.ndim != 3:
-                raise ValueError(f"Expected target feature shape [B,L,D], got {tuple(feature_valid_B_L.shape)}")
-            if self.target_feature_context_adapter.max_tokens > 0:
-                feature_valid_B_L = feature_valid_B_L[:, : self.target_feature_context_adapter.max_tokens]
-            feature_valid_B_L = feature_valid_B_L.float().abs().sum(dim=-1) > 0
-            feature_tokens = self.target_feature_context_adapter(target_feature_B_L_D)
-        feature_tokens = feature_tokens.to(device=crossattn_emb.device, dtype=crossattn_emb.dtype)
-        if feature_tokens.shape[0] == 1 and crossattn_emb.shape[0] != 1:
-            feature_tokens = feature_tokens.repeat(crossattn_emb.shape[0], 1, 1)
-            feature_valid_B_L = feature_valid_B_L.repeat(crossattn_emb.shape[0], 1)
-        elif feature_tokens.shape[0] != crossattn_emb.shape[0]:
-            raise ValueError(
-                f"Target feature batch {feature_tokens.shape[0]} does not match cross-attention batch "
-                f"{crossattn_emb.shape[0]}"
-            )
-
-        self.target_feature_context_token_start = 0
-        feature_valid_B_L = feature_valid_B_L.to(device=feature_tokens.device)
-        feature_tokens = torch.where(feature_valid_B_L.unsqueeze(-1), feature_tokens, torch.zeros_like(feature_tokens))
-        self.target_feature_context_tokens_B_L_D = feature_tokens
-        self.target_feature_context_valid_B_L = feature_valid_B_L
-        if self.target_feature_context_replace_text:
-            # Text-free: the InstructSAM features ARE the entire cross-attention
-            # context; the incoming T5 stream is discarded.
-            return feature_tokens
-        if not self.target_feature_context_append_to_text:
-            return crossattn_emb
-        return torch.cat([feature_tokens, crossattn_emb], dim=1)
-
-    def make_target_branch_attention_token_indices(self) -> Optional[torch.Tensor]:
-        """Build token indices for the dedicated target cross-attention branch."""
-        feature_tokens = self.target_feature_context_tokens_B_L_D
-        if feature_tokens is None:
-            return None
-        feature_len = feature_tokens.shape[1]
-        feature_indices = torch.arange(feature_len, device=feature_tokens.device, dtype=torch.long)
-        feature_indices = feature_indices.view(1, -1).expand(feature_tokens.shape[0], -1)
-        if self.target_feature_context_valid_B_L is None:
-            return feature_indices
-        feature_valid = self.target_feature_context_valid_B_L.to(device=feature_indices.device)
-        return torch.where(feature_valid, feature_indices, torch.full_like(feature_indices, -1))
-
-    def make_tavid_attention_token_indices(
-        self,
-        text_token_indices_B: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        """Build context-token indices used by the selective target-attention loss."""
-        pieces = []
-        feature_tokens = self.target_feature_context_tokens_B_L_D
-        feature_len = 0 if feature_tokens is None else feature_tokens.shape[1]
-
-        if self.tavid_attn_alignment_token_source in {"feature", "text_feature"} and feature_len > 0:
-            feature_indices = torch.arange(feature_len, device=feature_tokens.device, dtype=torch.long)
-            feature_indices = feature_indices.view(1, -1).expand(feature_tokens.shape[0], -1)
-            if self.target_feature_context_valid_B_L is not None:
-                feature_valid = self.target_feature_context_valid_B_L.to(device=feature_indices.device)
-                feature_indices = torch.where(feature_valid, feature_indices, torch.full_like(feature_indices, -1))
-            pieces.append(feature_indices)
-
-        if self.tavid_attn_alignment_token_source in {"text", "text_feature"} and text_token_indices_B is not None:
-            text_indices = text_token_indices_B
-            if text_indices.ndim == 1:
-                text_indices = text_indices.unsqueeze(1)
-            text_indices = text_indices.to(dtype=torch.long)
-            if feature_len > 0:
-                text_indices = torch.where(text_indices >= 0, text_indices + feature_len, text_indices)
-            pieces.append(text_indices)
-
-        if not pieces:
-            return None
-        device = next(piece.device for piece in pieces if piece is not None)
-        return torch.cat([piece.to(device=device) for piece in pieces], dim=1)
-
     def unpatchify(self, x_B_T_H_W_M):
         x_B_C_Tt_Hp_Wp = rearrange(
             x_B_T_H_W_M,
@@ -3289,6 +1967,59 @@ class MiniTrainDIT(WeightTrainingStat):
             t=self.patch_temporal,
         )
         return x_B_C_Tt_Hp_Wp
+
+    def prepare_semantic_plan_context(
+        self,
+        semantic_plan_B_L_D: Optional[torch.Tensor],
+        latent_shape_T_H_W: Optional[Tuple[int, int, int]] = None,
+        fps: Optional[torch.Tensor] = None,
+        semantic_plan_times_B_N: Optional[torch.Tensor] = None,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        self.semantic_plan_context_tokens_B_L_D = None
+        self.semantic_plan_context_valid_B_L = None
+        if self.semantic_plan_context_adapter is None or semantic_plan_B_L_D is None:
+            return None, None
+
+        semantic_tokens_B_L_D, semantic_valid_B_L, semantic_times_B_N = self.semantic_plan_context_adapter(
+            semantic_plan_B_L_D,
+            keyframe_times_B_N=semantic_plan_times_B_N,
+        )
+        if not semantic_valid_B_L.any():
+            return None, None
+
+        semantic_rope = None
+        if self.semantic_plan_rope_embedder is not None:
+            n, h, w = infer_semantic_plan_shape(
+                num_tokens=semantic_tokens_B_L_D.shape[1],
+                num_keyframes=self.semantic_plan_num_keyframes,
+                spatial_grid_size=self.semantic_plan_spatial_grid,
+            )
+            latent_t, latent_h, latent_w = latent_shape_T_H_W or (n, h, w)
+            semantic_positions = build_semantic_plan_rope_positions(
+                batch_size=semantic_tokens_B_L_D.shape[0],
+                num_tokens=semantic_tokens_B_L_D.shape[1],
+                num_keyframes=n,
+                spatial_grid_size=h,
+                latent_t=latent_t,
+                latent_h=latent_h,
+                latent_w=latent_w,
+                keyframe_times_N=semantic_times_B_N,
+                device=semantic_tokens_B_L_D.device,
+                dtype=torch.float32,
+            )
+            semantic_rope = self.semantic_plan_rope_embedder.generate_embeddings_from_positions(
+                semantic_positions,
+                fps=fps,
+            )
+        semantic_tokens_B_L_D, semantic_valid_B_L, keep_L = trim_invalid_semantic_tokens(
+            semantic_tokens_B_L_D,
+            semantic_valid_B_L,
+        )
+        if semantic_rope is not None:
+            semantic_rope = semantic_rope[keep_L]
+        self.semantic_plan_context_tokens_B_L_D = semantic_tokens_B_L_D
+        self.semantic_plan_context_valid_B_L = semantic_valid_B_L
+        return semantic_tokens_B_L_D, semantic_rope
 
     def forward(
         self,
@@ -3300,10 +2031,8 @@ class MiniTrainDIT(WeightTrainingStat):
         data_type: Optional[DataType] = DataType.VIDEO,
         intermediate_feature_ids: Optional[List[int]] = None,
         img_context_emb: Optional[torch.Tensor] = None,
-        target_mask_B_C_T_H_W: Optional[torch.Tensor] = None,
-        target_feature_B_L_D: Optional[torch.Tensor] = None,
-        target_dense_feature_B_L_D: Optional[torch.Tensor] = None,
-        tgt_token_indices_B: Optional[torch.Tensor] = None,
+        semantic_plan_B_L_D: Optional[torch.Tensor] = None,
+        semantic_plan_times_B_N: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Args:
@@ -3314,133 +2043,14 @@ class MiniTrainDIT(WeightTrainingStat):
         assert isinstance(data_type, DataType), (
             f"Expected DataType, got {type(data_type)}. We need discuss this flag later."
         )
-        self.tavid_target_attn_maps = []
-        self.tavid_target_attn_source = "none"
-        self.tavid_target_mask_B_T_H_W = self.make_target_mask_tokens(target_mask_B_C_T_H_W)
-        self.target_feature_contrastive_video_tokens_B_T_H_W_D = None
-        self.target_feature_contrastive_tokens_B_L_D = None
-        self.target_feature_contrastive_valid_B_L = None
-        self.target_mask_context_token_start = None
-        self.target_mask_context_tokens_B_L_D = None
-        self.target_feature_context_token_start = None
-        self.target_feature_context_tokens_B_L_D = None
-        self.target_feature_context_valid_B_L = None
-        self.target_where_prior_logits_B_T_H_W = None
-        self.target_where_prior_prob_B_T_H_W = None
         x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = self.prepare_embedded_sequence(
             x_B_C_T_H_W,
             fps=fps,
             padding_mask=padding_mask,
-            target_mask_B_C_T_H_W=target_mask_B_C_T_H_W,
-            target_feature_B_L_D=target_feature_B_L_D,
         )
-        if self.target_dense_spatial_adapter is not None and target_feature_B_L_D is not None:
-            B, T, H, W, _ = x_B_T_H_W_D.shape
-            if self.target_dense_spatial_mask_free:
-                dense_target = self.target_dense_spatial_adapter(
-                    target_feature_B_L_D,
-                    token_shape=(B, T, H, W),
-                ).to(device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype)
-            elif target_mask_B_C_T_H_W is not None:
-                dense_target = self.target_dense_spatial_adapter(
-                    target_feature_B_L_D,
-                    target_mask_B_C_T_H_W,
-                    token_shape=(B, T, H, W),
-                ).to(device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype)
-            else:
-                dense_target = None
-            if dense_target is not None:
-                x_B_T_H_W_D = x_B_T_H_W_D + self.target_dense_spatial_gate.tanh().to(
-                    device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype
-                ) * dense_target
-        if (
-            self.target_dense_feature_map_adapter is not None
-            and target_dense_feature_B_L_D is not None
-            and target_mask_B_C_T_H_W is not None
-        ):
-            B, T, H, W, _ = x_B_T_H_W_D.shape
-            dense_target = self.target_dense_feature_map_adapter(
-                target_dense_feature_B_L_D,
-                target_mask_B_C_T_H_W,
-                token_shape=(B, T, H, W),
-            ).to(device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype)
-            x_B_T_H_W_D = x_B_T_H_W_D + self.target_dense_feature_map_gate.tanh().to(
-                device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype
-            ) * dense_target
-
-        self.target_matching_logits_B_T_H_W = None
-        if self.target_match_ground_module is not None:
-            if (target_feature_B_L_D is None or target_dense_feature_B_L_D is None) and not getattr(
-                self, "_match_ground_input_warned", False
-            ):
-                self._match_ground_input_warned = True
-                log.warning(
-                    "match-ground module enabled but inputs missing: "
-                    f"target_feature_B_L_D={'ok' if target_feature_B_L_D is not None else 'None'} "
-                    f"target_dense_feature_B_L_D={'ok' if target_dense_feature_B_L_D is not None else 'None'}"
-                )
-            x_B_T_H_W_D, match_logits = self.target_match_ground_module(
-                x_B_T_H_W_D,
-                target_dense_feature_B_L_D,
-                target_feature_B_L_D,
-                gt_soft_B_T_H_W=self.tavid_target_mask_B_T_H_W,
-            )
-            self.target_matching_logits_B_T_H_W = match_logits
-
-        target_latent_field_B_T_H_W_D = None
-        if self.target_latent_grounding_adapter is not None and target_feature_B_L_D is not None:
-            B, T, H, W, _ = x_B_T_H_W_D.shape
-            target_latent_field_B_T_H_W_D = self.target_latent_grounding_adapter(
-                target_feature_B_L_D,
-                token_shape=(B, T, H, W),
-            ).to(device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype)
-
-        target_spatial_gate_B_T_H_W = None
-        if (
-            self.target_where_prior_head is not None
-            and target_feature_B_L_D is not None
-            and target_dense_feature_B_L_D is not None
-        ):
-            B, T, H, W, _ = x_B_T_H_W_D.shape
-            prior_logits_2d, prior_valid_2d = self.target_where_prior_head(
-                target_feature_B_L_D,
-                target_dense_feature_B_L_D,
-            )
-            prior_logits_2d = prior_logits_2d.to(device=x_B_T_H_W_D.device)
-            prior_valid_2d = prior_valid_2d.to(device=x_B_T_H_W_D.device)
-            prior_logits = F.interpolate(
-                prior_logits_2d.unsqueeze(1).unsqueeze(2).float(),
-                size=(T, H, W),
-                mode="trilinear",
-                align_corners=False,
-            ).squeeze(1).to(dtype=x_B_T_H_W_D.dtype)
-            prior_valid = F.interpolate(
-                prior_valid_2d.unsqueeze(1).unsqueeze(2).float(),
-                size=(T, H, W),
-                mode="nearest",
-            ).squeeze(1).to(dtype=x_B_T_H_W_D.dtype)
-            prior_logits = torch.where(prior_valid > 0.5, prior_logits, torch.full_like(prior_logits, -20.0))
-            self.target_where_prior_logits_B_T_H_W = prior_logits
-            target_spatial_gate_B_T_H_W = torch.sigmoid(prior_logits)
-            self.target_where_prior_prob_B_T_H_W = target_spatial_gate_B_T_H_W
 
         if self.use_crossattn_projection:
             crossattn_emb = self.crossattn_proj(crossattn_emb)
-        crossattn_emb = self.append_target_feature_context(
-            crossattn_emb,
-            target_feature_B_L_D,
-            target_dense_feature_B_L_D,
-        )
-        target_branch_tokens_B_L_D = self.target_feature_context_tokens_B_L_D
-        target_branch_token_indices_B = self.make_target_branch_attention_token_indices()
-        self.target_feature_contrastive_tokens_B_L_D = target_branch_tokens_B_L_D
-        self.target_feature_contrastive_valid_B_L = self.target_feature_context_valid_B_L
-        use_target_branch_for_loss = bool(
-            self.target_feature_cross_attention and target_branch_token_indices_B is not None
-        )
-        self.tavid_target_attn_source = "target_branch" if use_target_branch_for_loss else "mixed_context"
-        crossattn_emb = self.append_target_mask_context(crossattn_emb, target_mask_B_C_T_H_W)
-        target_token_indices_for_attn_B = self.make_tavid_attention_token_indices(tgt_token_indices_B)
 
         if img_context_emb is not None:
             assert self.extra_image_context_dim is not None, (
@@ -3450,6 +2060,14 @@ class MiniTrainDIT(WeightTrainingStat):
             context_input = (crossattn_emb, img_context_emb)
         else:
             context_input = crossattn_emb
+
+        B, T, H, W, D = x_B_T_H_W_D.shape
+        semantic_plan_crossattn_emb, semantic_plan_key_rope_emb = self.prepare_semantic_plan_context(
+            semantic_plan_B_L_D,
+            latent_shape_T_H_W=(T, H, W),
+            fps=fps,
+            semantic_plan_times_B_N=semantic_plan_times_B_N,
+        )
 
         with amp.autocast("cuda", enabled=self.use_wan_fp32_strategy, dtype=torch.float32):
             if timesteps_B_T.ndim == 1:
@@ -3469,21 +2087,10 @@ class MiniTrainDIT(WeightTrainingStat):
                 f"{x_B_T_H_W_D.shape} != {extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape}"
             )
 
-        B, T, H, W, D = x_B_T_H_W_D.shape
         # x_B_THW_D = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
 
         intermediate_features_outputs = []
         for i, block in enumerate(self.blocks):
-            target_indices_available = (
-                target_branch_token_indices_B is not None
-                if use_target_branch_for_loss
-                else target_token_indices_for_attn_B is not None
-            )
-            capture_target_cross_attn = (
-                i in self.tavid_attn_alignment_blocks
-                and target_indices_available
-                and self.tavid_target_mask_B_T_H_W is not None
-            )
             x_B_T_H_W_D = block(
                 x_B_T_H_W_D,
                 t_embedding_B_T_D,
@@ -3491,41 +2098,15 @@ class MiniTrainDIT(WeightTrainingStat):
                 rope_emb_L_1_1_D=rope_emb_L_1_1_D,
                 adaln_lora_B_T_3D=adaln_lora_B_T_3D,
                 extra_per_block_pos_emb=extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
-                capture_target_cross_attn=capture_target_cross_attn,
-                target_token_indices_B=None if use_target_branch_for_loss else target_token_indices_for_attn_B,
-                target_crossattn_emb=target_branch_tokens_B_L_D,
-                target_crossattn_token_indices_B=target_branch_token_indices_B,
-                target_spatial_gate_B_T_H_W=target_spatial_gate_B_T_H_W,
-                target_latent_field_B_T_H_W_D=target_latent_field_B_T_H_W_D,
-                target_attention_query_chunk_size=self.tavid_attn_query_chunk_size,
+                semantic_plan_crossattn_emb=semantic_plan_crossattn_emb,
+                semantic_plan_key_rope_emb=semantic_plan_key_rope_emb,
             )
-            target_attn_map_B_S = None
-            if (
-                use_target_branch_for_loss
-                and self.blocks[i].target_cross_attn is not None
-                and self.blocks[i].target_cross_attn.last_target_attn_map_B_S is not None
-            ):
-                target_attn_map_B_S = self.blocks[i].target_cross_attn.last_target_attn_map_B_S
-            elif self.blocks[i].cross_attn.last_target_attn_map_B_S is not None:
-                target_attn_map_B_S = self.blocks[i].cross_attn.last_target_attn_map_B_S
-            if capture_target_cross_attn and target_attn_map_B_S is not None:
-                self.tavid_target_attn_maps.append(
-                    rearrange(
-                        target_attn_map_B_S,
-                        "b (t h w) -> b t h w",
-                        t=T,
-                        h=H,
-                        w=W,
-                    )
-                )
             if intermediate_feature_ids and i in intermediate_feature_ids:
                 x_reshaped_for_disc = rearrange(x_B_T_H_W_D, "b tp hp wp d -> b (tp hp wp) d")
                 intermediate_features_outputs.append(x_reshaped_for_disc)
 
         # x_B_T_H_W_D = rearrange(x_B_THW_D, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
         # O = out_channels * spatial_patch_size * spatial_patch_size * temporal_patch_size
-        if target_branch_tokens_B_L_D is not None and self.tavid_target_mask_B_T_H_W is not None:
-            self.target_feature_contrastive_video_tokens_B_T_H_W_D = x_B_T_H_W_D
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
         if intermediate_feature_ids:
@@ -3575,6 +2156,8 @@ class MiniTrainDIT(WeightTrainingStat):
         fully_shard(self.final_layer, mesh=mesh, reshard_after_forward=True, **fsdp_kwargs)
         if self.extra_per_block_abs_pos_emb:
             fully_shard(self.extra_pos_embedder, mesh=mesh, reshard_after_forward=True, **fsdp_kwargs)
+        if self.semantic_plan_context_adapter is not None:
+            fully_shard(self.semantic_plan_context_adapter, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
         fully_shard(self.t_embedder, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
         if self.extra_image_context_dim is not None:
             fully_shard(self.img_context_proj, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)

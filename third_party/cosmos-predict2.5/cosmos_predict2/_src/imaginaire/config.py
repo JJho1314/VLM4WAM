@@ -320,11 +320,6 @@ class CheckpointConfig:
     broadcast_via_filesystem: bool = False
     load_ema_to_reg: bool = False
 
-    # In dcp planner, skip the weight shape check; used by TAViD-style post-training
-    # where the conv-in layer gains an extra mask channel and the loaded base
-    # checkpoint has a smaller in_channels: mismatched tensors are simply skipped.
-    dcp_allow_mismatched_size: bool = False
-
     # Enable GCS patch in boto3 for loading/saving checkpoints from/to GCS
     enable_gcs_patch_in_boto3: bool = False
 

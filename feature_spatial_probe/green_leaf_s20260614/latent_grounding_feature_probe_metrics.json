@@ -1,0 +1,97 @@
+{
+  "num_samples": 1,
+  "aggregate_mean": {
+    "feature_norm": {
+      "auc": 0.12124215066432953,
+      "inside_mean": 0.13082295656204224,
+      "outside_mean": 0.4917972683906555,
+      "inside_outside_ratio": 0.2660099292339379,
+      "pointing_game": 0.0,
+      "top10_inside_fraction": 0.009803921915590763,
+      "mask_area_fraction": 0.0146484375
+    },
+    "centered_energy": {
+      "auc": 0.8208787441253662,
+      "inside_mean": 0.5323290824890137,
+      "outside_mean": 0.23698817193508148,
+      "inside_outside_ratio": 2.2462263755291354,
+      "pointing_game": 0.0,
+      "top10_inside_fraction": 0.04901960864663124,
+      "mask_area_fraction": 0.0146484375
+    },
+    "pca1_abs": {
+      "auc": 0.7783944606781006,
+      "inside_mean": 0.48834162950515747,
+      "outside_mean": 0.2869764566421509,
+      "inside_outside_ratio": 1.7016783718746016,
+      "pointing_game": 0.0,
+      "top10_inside_fraction": 0.04901960864663124,
+      "mask_area_fraction": 0.0146484375
+    },
+    "oracle_linear_probe": {
+      "auc": 0.9717872738838196,
+      "inside_mean": 0.8930515050888062,
+      "outside_mean": 0.3096129894256592,
+      "inside_outside_ratio": 2.884412268185007,
+      "pointing_game": 1.0,
+      "top10_inside_fraction": 0.14705882966518402,
+      "mask_area_fraction": 0.0146484375
+    }
+  },
+  "samples": [
+    {
+      "stem": "74616_exterior_image_1_left",
+      "feature_shape": [
+        1024,
+        256
+      ],
+      "feature_side": 32,
+      "meta": {
+        "query": "Please segment the yellow carrot with green leaves in the image.",
+        "target_phrase": "yellow carrot",
+        "caption": "A Franka robotic arm with a parallel-jaw gripper carefully grasp only the [TGT] yellow carrot in the sink basin and place it into the black pot next to the banana, without moving the banana.",
+        "instructsam_text": "<|object_ref_start|>the yellow carrot with green leaves<|object_ref_end|><|mask_start|>[SEG]<|mask_end|><|im_end|>",
+        "score": 0.375,
+        "feature_mode": "decoder_dense"
+      },
+      "maps": {
+        "feature_norm": {
+          "auc": 0.12124215066432953,
+          "inside_mean": 0.13082295656204224,
+          "outside_mean": 0.4917972683906555,
+          "inside_outside_ratio": 0.2660099292339379,
+          "pointing_game": 0.0,
+          "top10_inside_fraction": 0.009803921915590763,
+          "mask_area_fraction": 0.0146484375
+        },
+        "centered_energy": {
+          "auc": 0.8208787441253662,
+          "inside_mean": 0.5323290824890137,
+          "outside_mean": 0.23698817193508148,
+          "inside_outside_ratio": 2.2462263755291354,
+          "pointing_game": 0.0,
+          "top10_inside_fraction": 0.04901960864663124,
+          "mask_area_fraction": 0.0146484375
+        },
+        "pca1_abs": {
+          "auc": 0.7783944606781006,
+          "inside_mean": 0.48834162950515747,
+          "outside_mean": 0.2869764566421509,
+          "inside_outside_ratio": 1.7016783718746016,
+          "pointing_game": 0.0,
+          "top10_inside_fraction": 0.04901960864663124,
+          "mask_area_fraction": 0.0146484375
+        },
+        "oracle_linear_probe": {
+          "auc": 0.9717872738838196,
+          "inside_mean": 0.8930515050888062,
+          "outside_mean": 0.3096129894256592,
+          "inside_outside_ratio": 2.884412268185007,
+          "pointing_game": 1.0,
+          "top10_inside_fraction": 0.14705882966518402,
+          "mask_area_fraction": 0.0146484375
+        }
+      }
+    }
+  ]
+}

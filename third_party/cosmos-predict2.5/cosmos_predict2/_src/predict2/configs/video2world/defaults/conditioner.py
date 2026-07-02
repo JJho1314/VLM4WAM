@@ -44,29 +44,17 @@ class Video2WorldCondition(Text2WorldCondition):
     gt_frames: Optional[torch.Tensor] = None
     condition_video_input_mask_B_C_T_H_W: Optional[torch.Tensor] = None
     num_conditional_frames_B: Optional[torch.Tensor] = None
-    target_mask_B_C_T_H_W: Optional[torch.Tensor] = None
-    target_feature_B_L_D: Optional[torch.Tensor] = None
-    target_dense_feature_B_L_D: Optional[torch.Tensor] = None
-    tgt_token_indices_B: Optional[torch.Tensor] = None
+    semantic_plan_B_L_D: Optional[torch.Tensor] = None
+    semantic_plan_times_B_N: Optional[torch.Tensor] = None
 
-    def set_target_mask(self, target_mask: Optional[torch.Tensor]) -> "Video2WorldCondition":
+    def set_semantic_plan(
+        self,
+        semantic_plan: Optional[torch.Tensor],
+        semantic_plan_times: Optional[torch.Tensor] = None,
+    ) -> "Video2WorldCondition":
         kwargs = self.to_dict(skip_underscore=False)
-        kwargs["target_mask_B_C_T_H_W"] = target_mask
-        return type(self)(**kwargs)
-
-    def set_target_feature(self, target_feature: Optional[torch.Tensor]) -> "Video2WorldCondition":
-        kwargs = self.to_dict(skip_underscore=False)
-        kwargs["target_feature_B_L_D"] = target_feature
-        return type(self)(**kwargs)
-
-    def set_target_dense_feature(self, target_dense_feature: Optional[torch.Tensor]) -> "Video2WorldCondition":
-        kwargs = self.to_dict(skip_underscore=False)
-        kwargs["target_dense_feature_B_L_D"] = target_dense_feature
-        return type(self)(**kwargs)
-
-    def set_tgt_token_indices(self, tgt_token_indices: Optional[torch.Tensor]) -> "Video2WorldCondition":
-        kwargs = self.to_dict(skip_underscore=False)
-        kwargs["tgt_token_indices_B"] = tgt_token_indices
+        kwargs["semantic_plan_B_L_D"] = semantic_plan
+        kwargs["semantic_plan_times_B_N"] = semantic_plan_times if semantic_plan is not None else None
         return type(self)(**kwargs)
 
     def set_video_condition(
@@ -176,11 +164,9 @@ class Video2WorldCondition(Text2WorldCondition):
         # extra efforts
         gt_frames = self.gt_frames
         condition_video_input_mask_B_C_T_H_W = self.condition_video_input_mask_B_C_T_H_W
-        target_mask_B_C_T_H_W = self.target_mask_B_C_T_H_W
         kwargs = self.to_dict(skip_underscore=False)
         kwargs["gt_frames"] = None
         kwargs["condition_video_input_mask_B_C_T_H_W"] = None
-        kwargs["target_mask_B_C_T_H_W"] = None
         new_condition = Text2WorldCondition.broadcast(
             type(self)(**kwargs),
             process_group,
@@ -205,16 +191,10 @@ class Video2WorldCondition(Text2WorldCondition):
                         condition_video_input_mask_B_C_T_H_W, "b c t h w -> b c (t h w)"
                     )
                     gt_frames = rearrange(gt_frames, "b c t h w -> b c (t h w)")
-                    if target_mask_B_C_T_H_W is not None:
-                        target_mask_B_C_T_H_W = rearrange(target_mask_B_C_T_H_W, "b c t h w -> b c (t h w)")
                 gt_frames = broadcast_split_tensor(gt_frames, seq_dim=2, process_group=process_group)
                 condition_video_input_mask_B_C_T_H_W = broadcast_split_tensor(
                     condition_video_input_mask_B_C_T_H_W, seq_dim=2, process_group=process_group
                 )
-                if target_mask_B_C_T_H_W is not None:
-                    target_mask_B_C_T_H_W = broadcast_split_tensor(
-                        target_mask_B_C_T_H_W, seq_dim=2, process_group=process_group
-                    )
                 if use_spatial_split:
                     condition_video_input_mask_B_C_T_H_W = rearrange(
                         condition_video_input_mask_B_C_T_H_W,
@@ -225,16 +205,8 @@ class Video2WorldCondition(Text2WorldCondition):
                     gt_frames = rearrange(
                         gt_frames, "b c (t h w) -> b c t h w", t=after_split_shape[0], h=after_split_shape[1]
                     )
-                    if target_mask_B_C_T_H_W is not None:
-                        target_mask_B_C_T_H_W = rearrange(
-                            target_mask_B_C_T_H_W,
-                            "b c (t h w) -> b c t h w",
-                            t=after_split_shape[0],
-                            h=after_split_shape[1],
-                        )
         kwargs["gt_frames"] = gt_frames
         kwargs["condition_video_input_mask_B_C_T_H_W"] = condition_video_input_mask_B_C_T_H_W
-        kwargs["target_mask_B_C_T_H_W"] = target_mask_B_C_T_H_W
         return type(self)(**kwargs)
 
 

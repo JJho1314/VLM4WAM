@@ -19,22 +19,25 @@ import json
 import os
 import random
 import traceback
+import glob
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 import torch
 from decord import VideoReader, cpu
-from PIL import Image
 from megatron.core import parallel_state
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from torchvision import transforms as T
-from torchvision.transforms import InterpolationMode
-from torchvision.transforms import functional as TF
 
 from cosmos_predict2._src.imaginaire.lazy_config import LazyCall as L
 from cosmos_predict2._src.imaginaire.utils import log
 from cosmos_predict2._src.predict2.datasets.local_datasets.dataset_utils import ResizePreprocess, ToTensorVideo
+from cosmos_predict2._src.predict2.networks.semantic_plan_conditioning import (
+    load_semantic_plan_tensor,
+    normalize_semantic_plan_tensor,
+    semantic_plan_times_from_frame_indices,
+)
 
 
 class VideoDataset(Dataset):
@@ -46,28 +49,18 @@ class VideoDataset(Dataset):
         prompt_type: str | None = None,  # "long", "short", "medium", or None for auto
         caption_format: str = "auto",  # "text", "json", or "auto"
         video_paths: Optional[list[str]] = None,
-        target_mask_dir: Optional[str] = None,
-        target_mask_default_to_zero: bool = True,
-        target_feature_dir: Optional[str] = None,
-        target_feature_default_to_zero: bool = True,
-        target_feature_dim: int = 256,
-        target_feature_max_tokens: int = 64,
-        target_dense_feature_dir: Optional[str] = None,
-        target_dense_feature_default_to_zero: bool = True,
-        target_dense_feature_dim: int = 256,
-        target_dense_feature_max_tokens: int = 64,
-        target_prompt_suffix: str = "",
-        target_mask_dropout_prob: float = 0.0,
-        caption_dropout_prob: float = 0.0,
-        # Keeps the [TGT] marker (the target feature is injected at that token position)
-        # but drops the object identity, so the model must read the feature to know which.
-        generic_caption: str = "A Franka robotic arm with a parallel-jaw gripper grasps the [TGT] object and places it.",
-        strip_tgt_token: bool = False,
-        exclude_video_stems_file: Optional[str] = None,
-        require_frame_range: bool = False,
-        frame_stride: int = 1,
-        frame_stride_choices: Optional[list[int]] = None,
-        frame_start_policy: str = "random",
+        semantic_plan_dir: Optional[str] = None,
+        semantic_plan_default_to_zero: bool = False,
+        semantic_plan_dim: int = 1152,
+        semantic_plan_max_tokens: int = 0,
+        semantic_plan_manifest: Optional[str] = None,
+        semantic_plan_skip_features: bool = False,
+        vae_latent_dir: Optional[str] = None,
+        vae_latent_manifest: Optional[str] = None,
+        episode_sampling: bool = False,
+        frame_ranges_path: Optional[str] = None,
+        episode_frame_strides: Optional[Sequence[int]] = None,
+        episode_samples_per_epoch: int = 0,
     ) -> None:
         """Dataset class for loading image-text-to-video generation data.
 
@@ -90,51 +83,20 @@ class VideoDataset(Dataset):
         self.sequence_length = num_frames
         self.prompt_type = prompt_type
         self.caption_format = caption_format
-        self.target_mask_dir = self._resolve_target_mask_dir(target_mask_dir)
-        self.target_mask_default_to_zero = target_mask_default_to_zero
-        target_feature_dir_str = str(target_feature_dir) if target_feature_dir is not None else None
-        self.target_feature_enabled = target_feature_dir_str is not None and target_feature_dir_str.lower() != "none"
-        self.target_feature_dir = self._resolve_target_feature_dir(target_feature_dir_str)
-        self.target_feature_default_to_zero = target_feature_default_to_zero
-        self.target_feature_dim = int(target_feature_dim)
-        self.target_feature_max_tokens = int(target_feature_max_tokens)
-        target_dense_feature_dir_str = str(target_dense_feature_dir) if target_dense_feature_dir is not None else None
-        self.target_dense_feature_enabled = (
-            target_dense_feature_dir_str is not None and target_dense_feature_dir_str.lower() != "none"
-        )
-        self.target_dense_feature_dir = self._resolve_target_feature_dir(target_dense_feature_dir_str)
-        self.target_dense_feature_default_to_zero = target_dense_feature_default_to_zero
-        self.target_dense_feature_dim = int(target_dense_feature_dim)
-        self.target_dense_feature_max_tokens = int(target_dense_feature_max_tokens)
-        self.target_prompt_suffix = target_prompt_suffix
-        self.target_mask_dropout_prob = float(target_mask_dropout_prob)
-        # Caption dropout: with this prob, replace the target-naming caption with a
-        # generic instruction so the model must read the target FEATURE (not text) to
-        # know which/where -- forces text+feature complementarity. Independent of mask
-        # dropout (feature stays present unless drop_mask also fires).
-        self.caption_dropout_prob = float(caption_dropout_prob)
-        self.generic_caption = str(generic_caption)
-        self.strip_tgt_token = strip_tgt_token
-        self.exclude_video_stems_file = exclude_video_stems_file
-        self.require_frame_range = bool(require_frame_range)
-        assert 0.0 <= self.target_mask_dropout_prob <= 1.0, "target_mask_dropout_prob must be in [0,1]"
-        assert 0.0 <= self.caption_dropout_prob <= 1.0, "caption_dropout_prob must be in [0,1]"
-        assert self.target_feature_dim > 0, "target_feature_dim must be positive"
-        assert self.target_feature_max_tokens >= 0, "target_feature_max_tokens must be >= 0"
-        assert self.target_dense_feature_dim > 0, "target_dense_feature_dim must be positive"
-        assert self.target_dense_feature_max_tokens >= 0, "target_dense_feature_max_tokens must be >= 0"
-        # Temporal sub-sampling: 33 contiguous frames only cover ~2s of source
-        # video at 15 fps, so the model never sees the full task arc and the
-        # robot motion looks slow. With stride k, 33 frames span 33*k source
-        # frames -- choose k to cover the manipulation task length.
-        if frame_stride_choices is not None and len(frame_stride_choices) > 0:
-            assert all(int(s) >= 1 for s in frame_stride_choices), "frame_stride_choices must be >=1"
-            self.frame_stride_choices = [int(s) for s in frame_stride_choices]
-        else:
-            assert int(frame_stride) >= 1, "frame_stride must be >=1"
-            self.frame_stride_choices = [int(frame_stride)]
-        assert frame_start_policy in {"random", "range_start"}, "frame_start_policy must be 'random' or 'range_start'"
-        self.frame_start_policy = frame_start_policy
+        self.semantic_plan_dir = self._resolve_optional_dir(semantic_plan_dir)
+        self.semantic_plan_default_to_zero = bool(semantic_plan_default_to_zero)
+        self.semantic_plan_dim = int(semantic_plan_dim)
+        self.semantic_plan_max_tokens = int(semantic_plan_max_tokens)
+        self.semantic_plan_manifest = semantic_plan_manifest
+        # Manifest windows/VAE latents are still used, but semantic-plan .pt features are not
+        # loaded — the model encodes plans online from the video (semantic_plan_online_*).
+        self.semantic_plan_skip_features = bool(semantic_plan_skip_features)
+        self.vae_latent_dir = self._resolve_optional_dir(vae_latent_dir)
+        self.vae_latent_manifest = vae_latent_manifest
+        if self.semantic_plan_dim <= 0:
+            raise ValueError("semantic_plan_dim must be positive")
+        if self.semantic_plan_max_tokens < 0:
+            raise ValueError("semantic_plan_max_tokens must be non-negative")
 
         # Determine caption format and directory
         self._setup_caption_format()
@@ -146,112 +108,116 @@ class VideoDataset(Dataset):
             self.video_paths = sorted(self.video_paths)
         else:
             self.video_paths = video_paths
-        self.video_paths = self._filter_excluded_video_stems(self.video_paths)
-        self.frame_ranges = self._load_frame_ranges()
-        if self.require_frame_range:
-            before = len(self.video_paths)
-            self.video_paths = [
-                path
-                for path in self.video_paths
-                if os.path.splitext(os.path.basename(path))[0] in self.frame_ranges
-            ]
-            log.info(f"Filtered {before - len(self.video_paths)} videos without frame_ranges entries")
-        log.info(f"{len(self.video_paths)} videos in total")
+        # Ctrl-World-style episode sampling: a per-stem frame-range index, with windows
+        # constructed fully at random inside __getitem__ (random stride, random start).
+        # No window manifest / precomputed features are used in this mode.
+        self.episode_sampling = bool(episode_sampling)
+        self.episode_frame_strides = sorted({int(s) for s in (episode_frame_strides or (1,)) if int(s) > 0})
+        self.episode_samples_per_epoch = int(episode_samples_per_epoch)
+        self.episode_ranges: list[tuple[str, int, int]] = []
+        self.episode_range_probs: Optional[np.ndarray] = None
+        if self.episode_sampling:
+            self._build_episode_ranges(frame_ranges_path)
+
+        self.semantic_plan_records = (
+            [] if self.episode_sampling else self._load_semantic_plan_manifest(self.semantic_plan_manifest)
+        )
+        self.vae_latent_records = {} if self.episode_sampling else self._load_vae_latent_manifest(self.vae_latent_manifest)
+        if self.episode_sampling:
+            log.info(
+                f"episode sampling: {len(self.episode_ranges)} motion ranges, "
+                f"{self.episode_samples_per_epoch} samples per epoch, strides {self.episode_frame_strides}"
+            )
+        elif self.semantic_plan_records:
+            log.info(f"{len(self.semantic_plan_records)} semantic-plan window samples in total")
+        else:
+            log.info(f"{len(self.video_paths)} videos in total")
+        if self.vae_latent_records:
+            log.info(f"{len(self.vae_latent_records)} VAE latent window samples in total")
 
         self.num_failed_loads = 0
         self.preprocess = T.Compose([ToTensorVideo(), ResizePreprocess((video_size[0], video_size[1]))])
-        self.mask_size = (video_size[0], video_size[1])
 
-    def _filter_excluded_video_stems(self, video_paths: list[str]) -> list[str]:
-        """Drop split entries listed in an optional newline-delimited stem file."""
-        if not self.exclude_video_stems_file:
-            return video_paths
-        exclude_path = self.exclude_video_stems_file
-        if exclude_path.lower() == "auto":
-            exclude_path = os.path.join(self.dataset_dir, "exclude_no_tgt_stems.txt")
-        if not os.path.exists(exclude_path):
-            log.warning(f"exclude_video_stems_file does not exist: {exclude_path}")
-            return video_paths
-        with open(exclude_path, "r") as f:
-            excluded = {line.strip() for line in f if line.strip() and not line.startswith("#")}
-        if not excluded:
-            return video_paths
-        filtered = [
-            path for path in video_paths if os.path.splitext(os.path.basename(path))[0] not in excluded
+    def _build_episode_ranges(self, frame_ranges_path: Optional[str]) -> None:
+        if not frame_ranges_path:
+            frame_ranges_path = os.path.join(self.dataset_dir, "frame_ranges.json")
+        if not os.path.isabs(frame_ranges_path):
+            frame_ranges_path = os.path.join(self.dataset_dir, frame_ranges_path)
+        if not os.path.exists(frame_ranges_path):
+            raise FileNotFoundError(f"frame_ranges file not found for episode sampling: {frame_ranges_path}")
+        with open(frame_ranges_path, "r", encoding="utf-8") as f:
+            ranges_by_stem = json.load(f)
+        min_span = self.sequence_length  # stride-1 window must fit
+        spans: list[int] = []
+        for stem, ranges in ranges_by_stem.items():
+            for range_start, range_end in ranges:
+                range_start = max(int(range_start), 0)
+                range_end = int(range_end)
+                if range_end - range_start < min_span:
+                    continue
+                self.episode_ranges.append((str(stem), range_start, range_end))
+                spans.append(range_end - range_start)
+        if not self.episode_ranges:
+            raise ValueError(f"No usable frame ranges (>= {min_span} frames) in {frame_ranges_path}")
+        # Per-window-equivalent weighting: ranges are drawn proportional to their length,
+        # like Ctrl-World's dense per-start-frame enumeration.
+        probs = np.asarray(spans, dtype=np.float64)
+        self.episode_range_probs = probs / probs.sum()
+        if self.episode_samples_per_epoch <= 0:
+            self.episode_samples_per_epoch = max(int(sum(spans) // self.sequence_length), 1)
+
+    def _getitem_episode(self) -> dict[str, Any]:
+        ridx = int(np.random.choice(len(self.episode_ranges), p=self.episode_range_probs))
+        stem, range_start, range_end = self.episode_ranges[ridx]
+        strides = [
+            s for s in self.episode_frame_strides if (self.sequence_length - 1) * s + 1 <= range_end - range_start
         ]
-        log.info(f"Filtered {len(video_paths) - len(filtered)} videos listed in {exclude_path}")
-        return filtered
+        if strides:
+            # Weight strides by their number of valid start positions so that (stride, start)
+            # is uniform over all valid windows of this range — matching the distribution of a
+            # dense per-window enumeration instead of over-representing long strides.
+            stride_weights = [
+                range_end - range_start - ((self.sequence_length - 1) * s + 1) + 1 for s in strides
+            ]
+            frame_stride = random.choices(strides, weights=stride_weights, k=1)[0]
+        else:
+            frame_stride = 1
+        span = (self.sequence_length - 1) * frame_stride + 1
+        start = random.randint(range_start, range_end - span)
+        frame_ids = [start + frame_stride * i for i in range(self.sequence_length)]
+
+        video, fps = self._get_frames_by_ids(self._video_path_for_stem(stem), frame_ids)
+        fps = float(fps) / frame_stride
+        video = video.permute(1, 0, 2, 3)
+
+        data: dict[str, Any] = {}
+        data["video"] = video
+        data["ai_caption"] = self._load_caption_for_stem(stem)
+        _, _, h, w = video.shape
+        data["fps"] = fps
+        data["image_size"] = torch.tensor([h, w, h, w])
+        data["num_frames"] = self.sequence_length
+        data["padding_mask"] = torch.zeros(1, h, w)
+        return data
 
     def __str__(self) -> str:
+        if self.episode_sampling:
+            return (
+                f"episode sampling over {len(self.episode_ranges)} ranges "
+                f"({self.episode_samples_per_epoch} samples/epoch) from {self.dataset_dir}"
+            )
+        if self.semantic_plan_records:
+            return f"{len(self.semantic_plan_records)} semantic-plan window samples from {self.dataset_dir}"
         return f"{len(self.video_paths)} samples from {self.dataset_dir}"
 
     def __len__(self) -> int:
+        if self.episode_sampling:
+            return self.episode_samples_per_epoch
+        if self.semantic_plan_records:
+            return len(self.semantic_plan_records)
         return len(self.video_paths)
 
-    def _resolve_target_mask_dir(self, target_mask_dir: Optional[str]) -> Optional[str]:
-        """Resolve optional target-mask directory for TAViD-style conditioning."""
-        if target_mask_dir is None:
-            for dirname in ("masks", "target_masks"):
-                candidate = os.path.join(self.dataset_dir, dirname)
-                if os.path.isdir(candidate):
-                    return candidate
-            return None
-        if target_mask_dir.lower() == "none":
-            return None
-        if target_mask_dir.lower() == "auto":
-            for dirname in ("masks", "target_masks"):
-                candidate = os.path.join(self.dataset_dir, dirname)
-                if os.path.isdir(candidate):
-                    return candidate
-            return None
-        return target_mask_dir
-
-    def _resolve_target_feature_dir(self, target_feature_dir: Optional[str]) -> Optional[str]:
-        """Resolve optional target-feature directory for implicit target conditioning."""
-        if target_feature_dir is None:
-            return None
-        if target_feature_dir.lower() == "none":
-            return None
-        if target_feature_dir.lower() == "auto":
-            for dirname in ("target_features", "instructsam_features", "features", "target_feature"):
-                candidate = os.path.join(self.dataset_dir, dirname)
-                if os.path.isdir(candidate):
-                    return candidate
-            return None
-        # A literal (non-auto) name is resolved relative to the dataset dir so a
-        # bare subdir name like "target_features_multisource" works regardless of
-        # the process CWD; absolute paths pass through unchanged.
-        if not os.path.isabs(target_feature_dir):
-            return os.path.join(self.dataset_dir, target_feature_dir)
-        return target_feature_dir
-
-    def _load_frame_ranges(self) -> dict[str, list[tuple[int, int]]]:
-        """Load optional per-video frame ranges used to avoid static lead-in/tail frames."""
-        ranges_path = os.path.join(self.dataset_dir, "frame_ranges.json")
-        if not os.path.exists(ranges_path):
-            return {}
-        try:
-            with open(ranges_path, "r") as f:
-                raw_ranges = json.load(f)
-        except Exception as exc:
-            log.warning(f"Failed to read frame ranges from {ranges_path}: {exc}")
-            return {}
-
-        frame_ranges: dict[str, list[tuple[int, int]]] = {}
-        for name, ranges in raw_ranges.items():
-            clean_ranges = []
-            for item in ranges:
-                if not isinstance(item, (list, tuple)) or len(item) != 2:
-                    continue
-                start, end = int(item[0]), int(item[1])
-                if end >= start:
-                    clean_ranges.append((start, end))
-            if clean_ranges:
-                frame_ranges[str(name)] = clean_ranges
-        log.info(f"Loaded frame ranges for {len(frame_ranges)} videos from {ranges_path}")
-        return frame_ranges
-
-    def _load_video(self, video_path: str) -> tuple[np.ndarray, float, np.ndarray, int]:
+    def _load_video(self, video_path: str) -> tuple[np.ndarray, float]:
         vr = VideoReader(video_path, ctx=cpu(0), num_threads=2)
         total_frames = len(vr)
         if total_frames < self.sequence_length:
@@ -260,63 +226,11 @@ class VideoDataset(Dataset):
                 f"at least {self.sequence_length} frames are required."
             )
 
-        video_basename = os.path.basename(video_path).replace(".mp4", "")
-        ranges = self.frame_ranges.get(video_basename, [(0, total_frames - 1)])
-        ranges = [
-            (max(0, start), min(total_frames - 1, end))
-            for start, end in ranges
-            if min(total_frames - 1, end) >= max(0, start)
-        ]
-        if not ranges:
-            ranges = [(0, total_frames - 1)]
-
-        # Pick a stride and range that fit; this lets curated datasets provide
-        # motion-only frame ranges without physically cutting every mp4.
-        range_candidates = []
-        for stride_choice in self.frame_stride_choices:
-            span_choice = stride_choice * (self.sequence_length - 1) + 1
-            for range_start, range_end in ranges:
-                if span_choice <= (range_end - range_start + 1):
-                    range_candidates.append((stride_choice, range_start, range_end))
-
-        if range_candidates:
-            stride, range_start, range_end = range_candidates[np.random.randint(len(range_candidates))]
-            span = stride * (self.sequence_length - 1) + 1
-            if self.frame_start_policy == "range_start":
-                start_frame = range_start
-            else:
-                max_start_idx = range_end - span + 1
-                start_frame = np.random.randint(range_start, max_start_idx + 1)
-        else:
-            if self.frame_start_policy == "range_start":
-                range_start, range_end = max(ranges, key=lambda item: item[1] - item[0])
-                range_len = range_end - range_start + 1
-                candidates = [
-                    s for s in self.frame_stride_choices if (s * (self.sequence_length - 1) + 1) <= range_len
-                ]
-                if candidates:
-                    stride = int(np.random.choice(candidates))
-                elif range_len >= self.sequence_length:
-                    stride = 1
-                else:
-                    candidates = [
-                        s for s in self.frame_stride_choices if (s * (self.sequence_length - 1) + 1) <= total_frames
-                    ]
-                    stride = int(np.random.choice(candidates)) if candidates else max(1, (total_frames - 1) // max(1, (self.sequence_length - 1)))
-                    range_start = 0
-                start_frame = range_start
-            else:
-                candidates = [
-                    s for s in self.frame_stride_choices if (s * (self.sequence_length - 1) + 1) <= total_frames
-                ]
-                if not candidates:
-                    stride = max(1, (total_frames - 1) // max(1, (self.sequence_length - 1)))
-                else:
-                    stride = int(np.random.choice(candidates))
-                span = stride * (self.sequence_length - 1) + 1
-                max_start_idx = total_frames - span
-                start_frame = np.random.randint(0, max_start_idx + 1)
-        frame_ids = (start_frame + stride * np.arange(self.sequence_length)).tolist()
+        # randomly sample a sequence of frames
+        max_start_idx = total_frames - self.sequence_length
+        start_frame = np.random.randint(0, max_start_idx + 1)
+        end_frame = start_frame + self.sequence_length
+        frame_ids = np.arange(start_frame, end_frame).tolist()
 
         frame_data = vr.get_batch(frame_ids).asnumpy()
         vr.seek(0)  # set video reader point back to 0 to clean up cache
@@ -326,7 +240,111 @@ class VideoDataset(Dataset):
         except Exception:  # failed to read FPS, assume it is 16
             fps = 16
         del vr  # delete the reader to avoid memory leak
-        return frame_data, fps, np.asarray(frame_ids, dtype=np.int64), total_frames
+        return frame_data, fps
+
+    def _load_video_frame_ids(self, video_path: str, frame_ids: list[int]) -> tuple[np.ndarray, float]:
+        vr = VideoReader(video_path, ctx=cpu(0), num_threads=2)
+        total_frames = len(vr)
+        if not frame_ids:
+            raise ValueError(f"No frame ids provided for {video_path}")
+        safe_frame_ids = [min(max(int(frame_id), 0), total_frames - 1) for frame_id in frame_ids]
+        frame_data = vr.get_batch(safe_frame_ids).asnumpy()
+        vr.seek(0)
+
+        try:
+            fps = vr.get_avg_fps()
+        except Exception:
+            fps = 16
+        del vr
+        return frame_data, fps
+
+    def _resolve_optional_dir(self, path: Optional[str]) -> Optional[str]:
+        if path is None or str(path).lower() == "none":
+            return None
+        if os.path.isabs(path):
+            return path
+        return os.path.join(self.dataset_dir, path)
+
+    def _resolve_manifest_paths(self, manifest: Optional[str]) -> list[str]:
+        if not manifest or str(manifest).lower() == "none":
+            return []
+        candidates: list[str] = []
+        for item in str(manifest).split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if os.path.isabs(item):
+                pattern = item
+            elif self.semantic_plan_dir is not None:
+                pattern = os.path.join(self.semantic_plan_dir, item)
+            else:
+                pattern = os.path.join(self.dataset_dir, item)
+            if any(char in pattern for char in "*?[]"):
+                candidates.extend(sorted(glob.glob(pattern)))
+            else:
+                candidates.append(pattern)
+        return candidates
+
+    def _resolve_manifest_paths_in_dir(self, manifest: Optional[str], base_dir: Optional[str]) -> list[str]:
+        if not manifest or str(manifest).lower() == "none" or base_dir is None:
+            return []
+        candidates: list[str] = []
+        for item in str(manifest).split(","):
+            item = item.strip()
+            if not item:
+                continue
+            pattern = item if os.path.isabs(item) else os.path.join(base_dir, item)
+            if any(char in pattern for char in "*?[]"):
+                candidates.extend(sorted(glob.glob(pattern)))
+            else:
+                candidates.append(pattern)
+        return candidates
+
+    def _load_semantic_plan_manifest(self, manifest: Optional[str]) -> list[dict[str, Any]]:
+        manifest_paths = self._resolve_manifest_paths(manifest)
+        if manifest and str(manifest).lower() != "none" and not manifest_paths:
+            raise FileNotFoundError(f"Semantic plan manifest not found: {manifest}")
+        if not manifest_paths:
+            return []
+        records: list[dict[str, Any]] = []
+        for manifest_path in manifest_paths:
+            if not os.path.exists(manifest_path):
+                raise FileNotFoundError(f"Semantic plan manifest not found: {manifest_path}")
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                for line_no, line in enumerate(f, start=1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    if "sample_id" not in record:
+                        raise ValueError(f"{manifest_path}:{line_no} missing sample_id")
+                    if "stem" not in record:
+                        record["stem"] = str(record["sample_id"]).split("__", 1)[0]
+                    records.append(record)
+        if not records:
+            raise ValueError(f"No semantic plan records found in {manifest_paths}")
+        return records
+
+    def _load_vae_latent_manifest(self, manifest: Optional[str]) -> dict[str, dict[str, Any]]:
+        manifest_paths = self._resolve_manifest_paths_in_dir(manifest, self.vae_latent_dir)
+        if manifest and str(manifest).lower() != "none" and self.vae_latent_dir is not None and not manifest_paths:
+            raise FileNotFoundError(f"VAE latent manifest not found: {self.vae_latent_dir}/{manifest}")
+        records: dict[str, dict[str, Any]] = {}
+        for manifest_path in manifest_paths:
+            if not os.path.exists(manifest_path):
+                raise FileNotFoundError(f"VAE latent manifest not found: {manifest_path}")
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                for line_no, line in enumerate(f, start=1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    sample_id = record.get("sample_id")
+                    latent_path = record.get("latent_path")
+                    if not sample_id or not latent_path:
+                        raise ValueError(f"{manifest_path}:{line_no} missing sample_id or latent_path")
+                    records[str(sample_id)] = record
+        return records
 
     def _setup_caption_format(self) -> None:
         """Determine the caption format and set up the caption directory."""
@@ -398,311 +416,166 @@ class VideoDataset(Dataset):
             log.warning(f"Failed to read JSON caption file {json_path}: {e}")
             return ""
 
-    def _get_frames(self, video_path: str) -> tuple[torch.Tensor, float, np.ndarray, int]:
-        frames, fps, frame_ids, total_frames = self._load_video(video_path)
+    def _get_frames(self, video_path: str) -> tuple[torch.Tensor, float]:
+        frames, fps = self._load_video(video_path)
+        return self._frames_to_tensor(frames), fps
+
+    def _get_frames_by_ids(self, video_path: str, frame_ids: list[int]) -> tuple[torch.Tensor, float]:
+        frames, fps = self._load_video_frame_ids(video_path, frame_ids)
+        return self._frames_to_tensor(frames), fps
+
+    def _frames_to_tensor(self, frames: np.ndarray) -> torch.Tensor:
         frames = frames.astype(np.uint8)
         frames = torch.from_numpy(frames).permute(0, 3, 1, 2)  # [T, C, H, W]
         frames = self.preprocess(frames)
         frames = torch.clamp(frames * 255.0, 0, 255).to(torch.uint8)
-        return frames, fps, frame_ids, total_frames
+        return frames
 
-    def _target_mask_path_candidates(self, video_basename: str) -> list[str]:
-        if self.target_mask_dir is None:
+    def _semantic_plan_candidates(self, video_basename: str) -> list[str]:
+        if self.semantic_plan_dir is None:
             return []
         return [
-            os.path.join(self.target_mask_dir, f"{video_basename}{ext}")
-            for ext in (".mp4", ".npz", ".png", ".jpg", ".jpeg", ".webp")
+            os.path.join(self.semantic_plan_dir, f"{video_basename}{suffix}")
+            for suffix in (".pt", ".pth", ".npy", ".npz")
         ]
 
-    def _target_feature_path_candidates(self, video_basename: str, feature_dir: Optional[str] = None) -> list[str]:
-        feature_dir = self.target_feature_dir if feature_dir is None else feature_dir
-        if feature_dir is None:
-            return []
-        return [
-            os.path.join(feature_dir, f"{video_basename}{ext}")
-            for ext in (".pt", ".pth", ".npy", ".npz")
-        ]
+    def _zero_semantic_plan(self) -> torch.Tensor:
+        tokens = self.semantic_plan_max_tokens if self.semantic_plan_max_tokens > 0 else 1
+        return torch.zeros(tokens, self.semantic_plan_dim, dtype=torch.float32)
 
-    def _zero_target_feature(
-        self,
-        *,
-        feature_dim: Optional[int] = None,
-        max_tokens: Optional[int] = None,
-    ) -> torch.Tensor:
-        feature_dim = self.target_feature_dim if feature_dim is None else int(feature_dim)
-        max_tokens = self.target_feature_max_tokens if max_tokens is None else int(max_tokens)
-        num_tokens = max_tokens if max_tokens > 0 else 1
-        return torch.zeros(num_tokens, feature_dim, dtype=torch.float32)
-
-    def _select_feature_from_mapping(self, feature_dict: dict[str, Any]) -> Any:
-        for key in (
-            "semantic_plan",  # Baton-style SigLIP2 continuous future semantic blueprint.
-            "target_feature",
-            "target_dense_weighted",  # InstructSAM [SEG]-dense weighted target dense ([G*G,256])
-            "features",
-            "feature_B_L_D",
-            "feature",
-            "seg_output_embeddings",
-        ):
-            if key in feature_dict:
-                return feature_dict[key]
-        for value in feature_dict.values():
-            if isinstance(value, (torch.Tensor, np.ndarray, list, tuple)):
-                return value
-        raise ValueError("No tensor-like feature found in target feature file")
-
-    def _normalize_target_feature(
-        self,
-        feature: Any,
-        feature_path: str,
-        *,
-        feature_dim: Optional[int] = None,
-        max_tokens: Optional[int] = None,
-    ) -> torch.Tensor:
-        feature_dim = self.target_feature_dim if feature_dim is None else int(feature_dim)
-        max_tokens = self.target_feature_max_tokens if max_tokens is None else int(max_tokens)
-        if isinstance(feature, dict):
-            feature = self._select_feature_from_mapping(feature)
-        if isinstance(feature, np.ndarray) and feature.dtype == object and feature.size == 1:
-            feature = feature.reshape(()).item()
-            if isinstance(feature, dict):
-                feature = self._select_feature_from_mapping(feature)
-        if isinstance(feature, torch.Tensor):
-            feature_tensor = feature.detach().cpu().float()
-        else:
-            feature_tensor = torch.as_tensor(feature, dtype=torch.float32)
-
-        if feature_tensor.ndim == 1:
-            feature_tensor = feature_tensor.unsqueeze(0)
-        elif feature_tensor.ndim == 3 and feature_tensor.shape[0] == 1:
-            feature_tensor = feature_tensor[0]
-        elif feature_tensor.ndim > 2:
-            feature_tensor = feature_tensor.reshape(-1, feature_tensor.shape[-1])
-        if feature_tensor.ndim != 2:
-            raise ValueError(f"Unsupported target feature shape {tuple(feature_tensor.shape)} in {feature_path}")
-        if feature_tensor.shape[-1] != feature_dim:
-            raise ValueError(
-                f"Target feature dim mismatch in {feature_path}: expected {feature_dim}, "
-                f"got {feature_tensor.shape[-1]}"
-            )
-
-        feature_tensor = torch.nan_to_num(feature_tensor.contiguous())
-        if max_tokens > 0:
-            num_tokens = feature_tensor.shape[0]
-            if num_tokens > max_tokens:
-                feature_tensor = feature_tensor[:max_tokens]
-            elif num_tokens < max_tokens:
-                pad = torch.zeros(
-                    max_tokens - num_tokens,
-                    feature_dim,
-                    dtype=feature_tensor.dtype,
-                )
-                feature_tensor = torch.cat([feature_tensor, pad], dim=0)
-        return feature_tensor
-
-    def _load_target_feature(
-        self,
-        video_basename: str,
-        *,
-        feature_dir: Optional[str] = None,
-        default_to_zero: Optional[bool] = None,
-        feature_dim: Optional[int] = None,
-        max_tokens: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Load precomputed InstructSAM target features as [L,D]."""
-        feature_dir = self.target_feature_dir if feature_dir is None else feature_dir
-        default_to_zero = self.target_feature_default_to_zero if default_to_zero is None else bool(default_to_zero)
-        feature_dim = self.target_feature_dim if feature_dim is None else int(feature_dim)
-        max_tokens = self.target_feature_max_tokens if max_tokens is None else int(max_tokens)
-        feature_path = next(
-            (path for path in self._target_feature_path_candidates(video_basename, feature_dir) if os.path.exists(path)),
-            None,
+    def _normalize_semantic_plan(self, semantic_plan: Any) -> torch.Tensor:
+        return normalize_semantic_plan_tensor(
+            semantic_plan,
+            semantic_plan_dim=self.semantic_plan_dim,
+            max_tokens=self.semantic_plan_max_tokens,
         )
-        if feature_path is None:
-            if default_to_zero:
-                return self._zero_target_feature(feature_dim=feature_dim, max_tokens=max_tokens)
+
+    def _load_semantic_plan(self, semantic_plan_id: str) -> torch.Tensor:
+        candidates = self._semantic_plan_candidates(semantic_plan_id)
+        path = next((candidate for candidate in candidates if os.path.exists(candidate)), None)
+        if path is None:
+            if self.semantic_plan_default_to_zero:
+                return self._zero_semantic_plan()
             raise FileNotFoundError(
-                f"Target feature for {video_basename} not found in "
-                f"{feature_dir or 'auto-resolved feature directories'}"
+                f"Semantic plan not found for {semantic_plan_id}; tried {candidates}"
             )
-
-        if feature_path.endswith((".pt", ".pth")):
-            raw_feature = torch.load(feature_path, map_location="cpu")
-        elif feature_path.endswith(".npy"):
-            raw_feature = np.load(feature_path, allow_pickle=True)
-        elif feature_path.endswith(".npz"):
-            with np.load(feature_path, allow_pickle=True) as feature_npz:
-                raw_feature = self._select_feature_from_mapping({key: feature_npz[key] for key in feature_npz.files})
-        else:
-            raise ValueError(f"Unsupported target feature extension: {feature_path}")
-        return self._normalize_target_feature(
-            raw_feature,
-            feature_path,
-            feature_dim=feature_dim,
-            max_tokens=max_tokens,
+        return load_semantic_plan_tensor(
+            path,
+            semantic_plan_dim=self.semantic_plan_dim,
+            max_tokens=self.semantic_plan_max_tokens,
         )
 
-    def _resize_binary_mask_video(self, mask: torch.Tensor) -> torch.Tensor:
-        """Resize [T,1,H,W] mask video and return [1,T,H,W]."""
-        mask = torch.stack(
-            [TF.resize(frame, self.mask_size, interpolation=InterpolationMode.NEAREST) for frame in mask.float()]
-        )
-        mask = (mask > 0.5).float()
-        return mask.permute(1, 0, 2, 3).contiguous()
+    def _load_vae_latent(self, sample_id: str) -> tuple[torch.Tensor, dict[str, Any]]:
+        if self.vae_latent_dir is None:
+            raise RuntimeError("vae_latent_dir is not configured")
+        record = self.vae_latent_records[sample_id]
+        latent_path = str(record["latent_path"])
+        if not os.path.isabs(latent_path):
+            latent_path = os.path.join(self.vae_latent_dir, latent_path)
+        payload = torch.load(latent_path, map_location="cpu", weights_only=False)
+        latent = payload["latent"] if isinstance(payload, dict) and "latent" in payload else payload
+        if latent.ndim == 5 and latent.shape[0] == 1:
+            latent = latent[0]
+        if latent.ndim != 4:
+            raise ValueError(f"Expected VAE latent [C,T,H,W], got {tuple(latent.shape)} from {latent_path}")
+        return latent.contiguous(), record
 
-    def _load_npz_target_mask(
-        self,
-        mask_path: str,
-        frame_ids: np.ndarray,
-        video_frame_count: int | None = None,
-    ) -> torch.Tensor:
-        mask_npz = np.load(mask_path, allow_pickle=True)
-        if "masks_packed" in mask_npz.files and "shape" in mask_npz.files:
-            shape = tuple(int(dim) for dim in mask_npz["shape"].tolist())
-            if len(shape) != 3:
-                raise ValueError(f"Unsupported packed target mask shape {shape} in {mask_path}")
-            flat_pixels = int(np.prod(shape[1:]))
-            unpacked = np.unpackbits(mask_npz["masks_packed"], axis=1)[:, :flat_pixels]
-            mask_arr = unpacked.reshape(shape)
+    def _video_path_for_stem(self, stem: str) -> str:
+        return os.path.join(self.dataset_dir, "videos", f"{stem}.mp4")
+
+    def _frame_ids_from_record(self, record: dict[str, Any]) -> list[int]:
+        frame_ids = record.get("video_frame_indices")
+        if frame_ids:
+            frame_ids = [int(frame_id) for frame_id in frame_ids]
         else:
-            key = "masks" if "masks" in mask_npz.files else mask_npz.files[0]
-            mask_arr = mask_npz[key]
-        if mask_arr.ndim == 5:
-            # RoboInter SAM files are typically [N,T,1,H,W]. Merge annotated target
-            # masks when multiple instances are present.
-            mask_arr = mask_arr.max(axis=0)
-        if mask_arr.ndim == 4:
-            if mask_arr.shape[1] == 1:  # [T,1,H,W]
-                mask_arr = mask_arr[:, 0]
-            elif mask_arr.shape[0] == 1:  # [1,T,H,W]
-                mask_arr = mask_arr[0]
-            else:
-                mask_arr = mask_arr.max(axis=0)
-        if mask_arr.ndim == 2:
-            mask_arr = np.repeat(mask_arr[None], len(frame_ids), axis=0)
-        if mask_arr.ndim != 3:
-            raise ValueError(f"Unsupported target mask shape {mask_arr.shape} in {mask_path}")
-        if (
-            video_frame_count is not None
-            and video_frame_count > 1
-            and mask_arr.shape[0] > 1
-            and mask_arr.shape[0] != video_frame_count
-        ):
-            valid_frame_ids = np.rint(frame_ids * (mask_arr.shape[0] - 1) / (video_frame_count - 1)).astype(
-                np.int64
+            start = int(record.get("range_start", record.get("start", 0)))
+            frame_stride = int(record.get("frame_stride", 1) or 1)
+            frame_ids = [start + frame_stride * i for i in range(self.sequence_length)]
+        if len(frame_ids) > self.sequence_length:
+            # Longer manifest windows are cropped to sequence_length at a random offset
+            # (e.g. training 49-frame clips from 93-frame window manifests). A fixed front
+            # crop would leave the final (len - seq_len) frames of every episode range
+            # uncovered as generation targets; the random offset restores coverage and adds
+            # temporal augmentation while keeping the per-record frame stride.
+            offset = random.randint(0, len(frame_ids) - self.sequence_length)
+            frame_ids = frame_ids[offset : offset + self.sequence_length]
+        if len(frame_ids) != self.sequence_length:
+            raise ValueError(
+                f"Manifest sample {record.get('sample_id')} has {len(frame_ids)} frames, "
+                f"expected {self.sequence_length}"
             )
-        else:
-            valid_frame_ids = frame_ids
-        valid_frame_ids = np.clip(valid_frame_ids, 0, mask_arr.shape[0] - 1)
-        mask_arr = mask_arr[valid_frame_ids]
-        mask = torch.from_numpy(mask_arr).unsqueeze(1).float()  # [T,1,H,W]
-        return self._resize_binary_mask_video(mask)
+        return frame_ids
 
-    def _load_target_mask(
-        self,
-        video_basename: str,
-        frame_ids: np.ndarray,
-        video_frame_count: int | None = None,
-    ) -> torch.Tensor:
-        """Load target mask as [1,T,H,W].
+    def _frame_stride_from_record(self, record: dict[str, Any], frame_ids: list[int]) -> float:
+        if record.get("frame_stride") is not None:
+            return max(float(record.get("frame_stride") or 1.0), 1.0)
+        if len(frame_ids) < 2:
+            return 1.0
+        diffs = np.diff(np.asarray(frame_ids, dtype=np.float32))
+        positive_diffs = diffs[diffs > 0]
+        if positive_diffs.size == 0:
+            return 1.0
+        return max(float(np.median(positive_diffs)), 1.0)
 
-        If a mask video exists, it is sampled with the same frame ids as the RGB video.
-        If a single image mask exists, it is treated like TAViD's initial-frame target mask
-        and placed on the first sampled frame only; all future frames are zero.
-        """
-        T_frames = len(frame_ids)
-        zero_mask = torch.zeros(1, T_frames, *self.mask_size, dtype=torch.float32)
-        mask_path = next((path for path in self._target_mask_path_candidates(video_basename) if os.path.exists(path)), None)
-        if mask_path is None:
-            if self.target_mask_default_to_zero:
-                return zero_mask
-            raise FileNotFoundError(f"Target mask for {video_basename} not found in {self.target_mask_dir}")
+    def _load_caption_for_stem(self, stem: str) -> str:
+        if self.caption_format == "json":
+            caption_path = os.path.join(self.caption_dir, f"{stem}.json")
+            return self._load_json_caption(Path(caption_path))
+        caption_path = os.path.join(self.caption_dir, f"{stem}.txt")
+        return self._load_text(Path(caption_path))
 
-        if mask_path.endswith(".mp4"):
-            mask_reader = VideoReader(mask_path, ctx=cpu(0), num_threads=1)
-            valid_frame_ids = np.clip(frame_ids, 0, len(mask_reader) - 1).tolist()
-            mask_frames = mask_reader.get_batch(valid_frame_ids).asnumpy()
-            mask_reader.seek(0)
-            del mask_reader
-            mask = torch.from_numpy(mask_frames[..., 0]).unsqueeze(1).float() / 255.0  # [T,1,H,W]
-            return self._resize_binary_mask_video(mask)
+    def _getitem_manifest(self, index: int) -> dict[str, Any]:
+        record = dict(self.semantic_plan_records[index])
+        stem = str(record["stem"])
+        sample_id = str(record["sample_id"])
+        frame_ids = self._frame_ids_from_record(record)
+        frame_stride = self._frame_stride_from_record(record, frame_ids)
+        video, fps = self._get_frames_by_ids(self._video_path_for_stem(stem), frame_ids)
+        fps = float(fps) / frame_stride
+        video = video.permute(1, 0, 2, 3)
 
-        if mask_path.endswith(".npz"):
-            return self._load_npz_target_mask(mask_path, frame_ids, video_frame_count)
+        data: dict[str, Any] = {}
+        data["video"] = video
+        data["ai_caption"] = self._load_caption_for_stem(stem)
 
-        mask_img = Image.open(mask_path).convert("L")
-        mask = TF.to_tensor(mask_img)
-        mask = TF.resize(mask, self.mask_size, interpolation=InterpolationMode.NEAREST)
-        zero_mask[:, 0] = (mask > 0.5).float()
-        return zero_mask
+        _, _, h, w = video.shape
+        data["fps"] = fps
+        data["image_size"] = torch.tensor([h, w, h, w])
+        data["num_frames"] = self.sequence_length
+        data["padding_mask"] = torch.zeros(1, h, w)
+        if self.semantic_plan_dir is not None:
+            if not self.semantic_plan_skip_features:
+                data["semantic_plan"] = self._load_semantic_plan(sample_id)
+                semantic_plan_times = semantic_plan_times_from_frame_indices(
+                    record.get("future_frame_indices"),
+                    record.get("video_frame_indices"),
+                )
+                if semantic_plan_times is not None:
+                    data["semantic_plan_times"] = semantic_plan_times
+            data["semantic_plan_meta"] = record
+        if sample_id in self.vae_latent_records:
+            data["vae_latent"], data["vae_latent_meta"] = self._load_vae_latent(sample_id)
+        return data
 
     def __getitem__(self, index: int) -> dict | Any:
         try:
+            if self.episode_sampling:
+                return self._getitem_episode()
+            if self.semantic_plan_records:
+                return self._getitem_manifest(index)
+
             data = dict()
-            video, fps, frame_ids, total_frames = self._get_frames(self.video_paths[index])
+            video, fps = self._get_frames(self.video_paths[index])
             video = video.permute(1, 0, 2, 3)  # Rearrange from [T, C, H, W] to [C, T, H, W]
 
             # Load caption based on format
             video_path = self.video_paths[index]
             video_basename = os.path.basename(video_path).replace(".mp4", "")
 
-            if self.caption_format == "json":
-                caption_path = os.path.join(self.caption_dir, f"{video_basename}.json")
-                caption = self._load_json_caption(Path(caption_path))
-            else:  # text format
-                caption_path = os.path.join(self.caption_dir, f"{video_basename}.txt")
-                caption = self._load_text(Path(caption_path))
-            if self.strip_tgt_token:
-                caption = " ".join(caption.replace("[TGT]", "").split())
-            # Caption dropout: genericize the prompt so the target identity comes ONLY
-            # from the feature. Applied independently of the mask/feature dropout below.
-            if self.caption_dropout_prob > 0 and random.random() < self.caption_dropout_prob:
-                caption = self.generic_caption
-            # CFG-style joint dropout: with prob `target_mask_dropout_prob`,
-            # zero out the target mask AND drop the prompt suffix so the model
-            # also sees the base caption distribution without mask guidance.
-            drop_mask = (
-                (self.target_mask_dir is not None or self.target_prompt_suffix)
-                and self.target_mask_dropout_prob > 0
-                and random.random() < self.target_mask_dropout_prob
-            )
-
-            if self.target_prompt_suffix and not drop_mask and "[TGT]" not in caption:
-                caption = f"{caption.rstrip()} {self.target_prompt_suffix.strip()}".strip()
+            caption = self._load_caption_for_stem(video_basename)
 
             data["video"] = video
             data["ai_caption"] = caption
-            if self.target_mask_dir is not None or self.target_prompt_suffix:
-                if drop_mask:
-                    data["target_mask"] = torch.zeros(
-                        1, len(frame_ids), *self.mask_size, dtype=torch.float32
-                    )
-                else:
-                    data["target_mask"] = self._load_target_mask(video_basename, frame_ids, total_frames)
-            if self.target_feature_enabled:
-                data["target_feature"] = (
-                    self._zero_target_feature()
-                    if drop_mask
-                    else self._load_target_feature(video_basename)
-                )
-            if self.target_dense_feature_enabled:
-                data["target_dense_feature"] = (
-                    self._zero_target_feature(
-                        feature_dim=self.target_dense_feature_dim,
-                        max_tokens=self.target_dense_feature_max_tokens,
-                    )
-                    if drop_mask
-                    else self._load_target_feature(
-                        video_basename,
-                        feature_dir=self.target_dense_feature_dir,
-                        default_to_zero=self.target_dense_feature_default_to_zero,
-                        feature_dim=self.target_dense_feature_dim,
-                        max_tokens=self.target_dense_feature_max_tokens,
-                    )
-                )
-            # Always expose the key so batch collation is consistent across dropout and
-            # non-dropout samples; the text encoder locates the "[TGT]" marker position.
-            data["tgt_token_text"] = "[TGT]" if "[TGT]" in caption else ""
 
             _, _, h, w = video.shape
 
@@ -710,19 +583,27 @@ class VideoDataset(Dataset):
             data["image_size"] = torch.tensor([h, w, h, w])
             data["num_frames"] = self.sequence_length
             data["padding_mask"] = torch.zeros(1, h, w)
+            if self.semantic_plan_dir is not None:
+                data["semantic_plan"] = self._load_semantic_plan(video_basename)
 
             return data
         except Exception as e:
-            if self.target_feature_enabled and isinstance(e, FileNotFoundError) and "Target feature" in str(e):
-                raise
             self.num_failed_loads += 1
+            if self.semantic_plan_records and index < len(self.semantic_plan_records):
+                failed_item = self.semantic_plan_records[index].get("sample_id")
+            elif index < len(self.video_paths):
+                failed_item = self.video_paths[index]
+            else:
+                failed_item = f"episode-sample-{index}"
             log.warning(
-                f"Failed to load video {self.video_paths[index]} (total failures: {self.num_failed_loads}): {e}\n"
+                f"Failed to load video {failed_item} (total failures: {self.num_failed_loads}): {e}\n"
                 f"{traceback.format_exc()}",
                 rank0_only=False,
             )
+            if self.semantic_plan_records:
+                raise
             # Randomly sample another video
-            return self[np.random.randint(len(self.video_paths))]
+            return self[np.random.randint(len(self))]
 
 
 def get_generic_dataloader(
@@ -768,9 +649,25 @@ def get_generic_dataloader(
     )
 
 
+class EpochAwareDistributedSampler(DistributedSampler):
+    """DistributedSampler that reshuffles on every dataloader epoch.
+
+    The imaginaire trainer recreates ``iter(dataloader_train)`` when the loader is
+    exhausted but never calls ``set_epoch``, so a vanilla DistributedSampler with
+    shuffle=True replays the identical permutation every epoch. torch's
+    DistributedSampler builds the full index list eagerly inside ``__iter__``, so
+    bumping the epoch right after delegating affects the next epoch only.
+    """
+
+    def __iter__(self):
+        iterator = super().__iter__()
+        self.set_epoch(self.epoch + 1)
+        return iterator
+
+
 def get_sampler(dataset) -> DistributedSampler:
     """Create a distributed sampler for the dataset."""
-    return DistributedSampler(
+    return EpochAwareDistributedSampler(
         dataset,
         num_replicas=parallel_state.get_data_parallel_world_size(),
         rank=parallel_state.get_data_parallel_rank(),

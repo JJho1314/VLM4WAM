@@ -1,0 +1,50 @@
+{
+  "run_root": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/spatialpos_xattn_iter1200_yellow_carrot_20260619_153151",
+  "reference": "keep",
+  "mask_npz": "/data/user/jhe724/workspace/VLM4WAM/eval_prev_iter2000_full/input_datasets/robointer_74616_yellow_carrot_prompt_targetaware_dataset/target_masks/74616_exterior_image_1_left.npz",
+  "frame_indices": [
+    0,
+    12,
+    24,
+    36,
+    48
+  ],
+  "variants": {
+    "keep": {
+      "mean_abs_rgb": 0.0,
+      "max_abs_rgb": 0.0,
+      "num_frames_compared": 49,
+      "target_mask_mean_abs_rgb": 0.0,
+      "background_mean_abs_rgb": 0.0,
+      "target_to_background_diff_ratio": 1.0,
+      "target_mask_area_fraction": 0.013577835648148148
+    },
+    "wrong_banana": {
+      "mean_abs_rgb": 8.631269454956055,
+      "max_abs_rgb": 255.0,
+      "num_frames_compared": 49,
+      "target_mask_mean_abs_rgb": 7.55419397354126,
+      "background_mean_abs_rgb": 8.646089553833008,
+      "target_to_background_diff_ratio": 0.8737122416496277,
+      "target_mask_area_fraction": 0.013577835648148148
+    },
+    "zero": {
+      "mean_abs_rgb": 92.9178695678711,
+      "max_abs_rgb": 255.0,
+      "num_frames_compared": 49,
+      "target_mask_mean_abs_rgb": 134.15687561035156,
+      "background_mean_abs_rgb": 92.35018920898438,
+      "target_to_background_diff_ratio": 1.4526973962783813,
+      "target_mask_area_fraction": 0.013577835648148148
+    },
+    "drop": {
+      "mean_abs_rgb": 91.55855560302734,
+      "max_abs_rgb": 255.0,
+      "num_frames_compared": 49,
+      "target_mask_mean_abs_rgb": 129.5568389892578,
+      "background_mean_abs_rgb": 91.03570556640625,
+      "target_to_background_diff_ratio": 1.4231431484222412,
+      "target_mask_area_fraction": 0.013577835648148148
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "run_root": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/siglip2_oracle_iter1600_yellow_carrot_20260626_152218",
+  "checkpoint": "/data/user/jhe724/workspace/cosmos-predict2.5/outputs/droid_v21_siglip2_semantic_oracle_context_320_49f_s123_vlm4wam/cosmos_predict_v2p5/video2world/2b_siglip2_semantic_oracle_context_iou50_320_49f_s123_bs4accum4_gbs128_1600/checkpoints/iter_000001600",
+  "experiment": "predict2_video2world_training_2b_droid_success_v21_siglip2_semantic_oracle_context_320",
+  "variants": [
+    "keep",
+    "wrong_other",
+    "zero",
+    "drop"
+  ],
+  "wrong_other_note": "first attempt failed because path override did not flatten [6,81,1152]; repaired with wrong_other_repair.exit=0",
+  "explicit_mask_used_for_generation": false,
+  "video_size": [
+    320,
+    576
+  ],
+  "num_steps": 35,
+  "guidance": 3.0,
+  "seed": 20260613,
+  "wrong_feature": "/data/user/jhe724/workspace/datasets/droid_v21_iou50_taskdiverse_half/siglip2_semantic_plan_k6_g9_full/episode_039737_left_external.pt",
+  "contact_sheet": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/siglip2_oracle_iter1600_yellow_carrot_20260626_152218/siglip2_oracle_iter1600_yellow_carrot_contact_sheet.jpg",
+  "diff_sheet": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/siglip2_oracle_iter1600_yellow_carrot_20260626_152218/siglip2_oracle_iter1600_yellow_carrot_diff_vs_keep.jpg",
+  "metrics": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/siglip2_oracle_iter1600_yellow_carrot_20260626_152218/siglip2_oracle_iter1600_yellow_carrot_metrics.json",
+  "videos": {
+    "keep": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/siglip2_oracle_iter1600_yellow_carrot_20260626_152218/keep/sample_000_generated.mp4",
+    "wrong_other": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/siglip2_oracle_iter1600_yellow_carrot_20260626_152218/wrong_other/sample_000_generated.mp4",
+    "zero": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/siglip2_oracle_iter1600_yellow_carrot_20260626_152218/zero/sample_000_generated.mp4",
+    "drop": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/siglip2_oracle_iter1600_yellow_carrot_20260626_152218/drop/sample_000_generated.mp4"
+  }
+}

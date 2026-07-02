@@ -128,32 +128,6 @@ class TextEncoder:
         """
         return (tensor - tensor.mean(dim=-1, keepdim=True)) / (tensor.std(dim=-1, keepdim=True) + 1e-8)
 
-    def _encode_marker_ids(self, marker_text: str) -> list[int]:
-        """Tokenize a target marker without chat-template special tokens."""
-        tokenizer = getattr(self.model.tokenizer, "processor", self.model.tokenizer)
-        tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
-        for text in (f" {marker_text}", marker_text):
-            try:
-                ids = tokenizer.encode(text, add_special_tokens=False)
-            except TypeError:
-                ids = tokenizer.encode(text)
-            if isinstance(ids, torch.Tensor):
-                ids = ids.flatten().tolist()
-            elif isinstance(ids, dict):
-                ids = ids["input_ids"]
-            if ids:
-                return [int(x) for x in ids]
-        return []
-
-    @staticmethod
-    def _find_subsequence(sequence: list[int], subsequence: list[int]) -> int:
-        if not subsequence or len(subsequence) > len(sequence):
-            return -1
-        for idx in range(len(sequence) - len(subsequence) + 1):
-            if sequence[idx : idx + len(subsequence)] == subsequence:
-                return idx
-        return -1
-
     def compute_text_embeddings_online(
         self, data_batch: dict[str, torch.Tensor], input_caption_key: str
     ) -> torch.Tensor:
@@ -164,9 +138,6 @@ class TextEncoder:
 
         # Tokenize prompts
         input_ids_batch = []
-
-        target_token_text = data_batch.get("tgt_token_text", None)
-        target_token_indices = []
 
         for sample_idx in range(len(data_batch[input_caption_key])):
             conversations = [
@@ -198,12 +169,6 @@ class TextEncoder:
             input_ids = tokenizer_output["input_ids"]
             pad_id = self.model.tokenizer.pad_id
 
-            if target_token_text is not None:
-                marker = target_token_text[sample_idx] if isinstance(target_token_text, (list, tuple)) else target_token_text
-                marker_ids = self._encode_marker_ids(str(marker))
-                input_ids_list = input_ids.tolist()
-                target_token_indices.append(self._find_subsequence(input_ids_list, marker_ids))
-
             # Do padding or truncation
             if NUM_EMBEDDING_PADDING_TOKENS > len(input_ids):
                 # Do padding:
@@ -216,8 +181,6 @@ class TextEncoder:
             input_ids_batch.append(input_ids)
 
         input_ids_batch = torch.stack(input_ids_batch, dim=0)
-        if target_token_indices:
-            data_batch["tgt_token_indices"] = torch.tensor(target_token_indices, dtype=torch.long, device="cuda")
 
         # Compute text embeddings
         self.model = self.model.to(self.device)

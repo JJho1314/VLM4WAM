@@ -440,6 +440,8 @@ class InferenceArguments(CommonInferenceArguments):
     """Inference type."""
     input_path: ResolvedFilePath | None = None
     """Optional and ignored for TEXT2WORLD. Required path to the image if inference_type is IMAGE2WORLD or video if inference_type is VIDEO2WORLD."""
+    semantic_plan_path: ResolvedFilePath | None = None
+    """Optional path to a .pt/.pth/.npy/.npz semantic-plan tensor used by semantic-plan-conditioned checkpoints."""
 
     # Advanced parameters
     resolution: str = "none"
@@ -460,35 +462,6 @@ class InferenceArguments(CommonInferenceArguments):
         default=1, description="Number of overlapping frames between consecutive chunks"
     )
     """Number of overlapping frames between consecutive chunks for temporal consistency. Default to 1 meaning image to video generation for the following chunk."""
-
-    # Target-aware mask conditioning
-    target_query: str | None = None
-    """Optional InstructSAM text query used to segment the manipulation target from the conditioning image/video first frame."""
-    instructsam_model_path: Path | None = None
-    """Optional InstructSAM checkpoint path. Required when target_query is provided."""
-    instructsam_source_root: Path | None = None
-    """Optional source checkout for importing InstructSAM. Defaults to this repo's third_party/InstructSAM copy."""
-    target_mask_path: Path | None = None
-    """Optional precomputed target mask path. Used instead of InstructSAM when provided."""
-    target_feature_path: Path | None = None
-    """Optional precomputed target-feature .pt (e.g. fused multi-source InstructSAM
-    feature). Loaded as target_feature, bypassing on-the-fly InstructSAM — needed
-    for the text-free multisource model since InstructSAM can't run in the cosmos
-    venv. The .pt may be a raw [L,D] tensor or a dict with a 'target_feature' key."""
-    target_dense_feature_path: Path | None = None
-    """Optional second precomputed feature .pt fed as `target_dense_feature` (e.g.
-    the [SEG] projection used as the match-ground WHERE query). Same format as
-    target_feature_path."""
-    target_mask_combine_mode: Literal["best", "union"] = "best"
-    """How to reduce multiple InstructSAM masks: best-scoring mask or union."""
-    target_mask_threshold: float = 0.0
-    """Threshold applied to InstructSAM mask logits or precomputed mask values."""
-    instructsam_feature_mode: Literal["mask_query", "raw_seg", "decoder_dense"] = "mask_query"
-    """Which InstructSAM target embedding to pass into Cosmos. mask_query is the default 256-d projected token."""
-    route_decoder_dense_to_target_dense_feature: bool = False
-    """When instructsam_feature_mode='decoder_dense', route decoder_dense to target_dense_feature and raw_seg to target_feature."""
-    pass_instructsam_mask_to_cosmos: bool = False
-    """Whether the InstructSAM mask is passed to Cosmos. Set false for mask-free inference."""
 
     # Override defaults
     # pyrefly: ignore  # bad-override
@@ -512,10 +485,6 @@ class InferenceArguments(CommonInferenceArguments):
                 raise ValueError(
                     f"input_path has unsupported file extension '{self.input_path.suffix}' for inference type {self.inference_type}. Supported extensions: {supported_extensions}"
                 )
-        if self.target_query is not None and self.instructsam_model_path is None:
-            raise ValueError("instructsam_model_path is required when target_query is provided")
-        if self.target_query is not None and self.inference_type == InferenceType.TEXT2WORLD:
-            raise ValueError("target_query requires IMAGE2WORLD or VIDEO2WORLD input_path")
         return self
 
     @cached_property

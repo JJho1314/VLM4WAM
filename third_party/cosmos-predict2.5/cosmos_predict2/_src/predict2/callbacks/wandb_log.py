@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Tuple
 
 import torch
@@ -30,62 +30,18 @@ from cosmos_predict2._src.imaginaire.utils.callback import Callback
 from cosmos_predict2._src.imaginaire.utils.easy_io import easy_io
 
 
-_TARGET_ATTENTION_LOG_KEYS = (
-    "target_attention_loss",
-    "target_attention_loss_weighted",
-    "target_attention_pos_mse",
-    "target_attention_neg_mse",
-    "target_attention_mass_loss",
-    "target_attention_mask_valid_ratio",
-    "target_attention_mask_area_ratio",
-    "target_attention_mass_in_mask",
-    "target_attention_mass_lift",
-    "target_attention_inside_mean",
-    "target_attention_outside_mean",
-    "target_attention_inside_outside_ratio",
-    "target_attention_num_maps",
-    "target_where_prior_loss",
-    "target_where_prior_loss_weighted",
-    "target_where_prior_pos_bce",
-    "target_where_prior_neg_bce",
-    "target_where_prior_dice",
-    "target_where_prior_prob_inside",
-    "target_where_prior_prob_outside",
-    "target_where_prior_inside_outside_ratio",
-)
-
-
-def _scalar_tensor(value: Any) -> torch.Tensor:
-    if torch.is_tensor(value):
-        return value.detach().float().mean()
-    return torch.tensor(float(value), device="cuda", dtype=torch.float32)
-
-
 @dataclass
 class _LossRecord:
     loss: float = 0
     iter_count: int = 0
     edm_loss: float = 0
-    extra_sums: dict[str, torch.Tensor] = field(default_factory=dict)
-    extra_counts: dict[str, torch.Tensor] = field(default_factory=dict)
 
     def reset(self) -> None:
         self.loss = 0
         self.iter_count = 0
         self.edm_loss = 0
-        self.extra_sums.clear()
-        self.extra_counts.clear()
 
-    def update_extras(self, output_batch: dict[str, torch.Tensor]) -> None:
-        for key in _TARGET_ATTENTION_LOG_KEYS:
-            if key not in output_batch:
-                continue
-            value = _scalar_tensor(output_batch[key])
-            count = torch.ones((), device=value.device, dtype=torch.float32)
-            self.extra_sums[key] = self.extra_sums.get(key, torch.zeros_like(value)) + value
-            self.extra_counts[key] = self.extra_counts.get(key, torch.zeros_like(count)) + count
-
-    def get_stat(self) -> Tuple[float, float, dict[str, float]]:
+    def get_stat(self) -> Tuple[float, float]:
         if self.iter_count > 0:
             avg_loss = self.loss / self.iter_count
             avg_edm_loss = self.edm_loss / self.iter_count
@@ -93,20 +49,11 @@ class _LossRecord:
             dist.all_reduce(avg_edm_loss, op=dist.ReduceOp.AVG)
             avg_loss = avg_loss.item()
             avg_edm_loss = avg_edm_loss.item()
-            avg_extras = {}
-            for key in _TARGET_ATTENTION_LOG_KEYS:
-                extra_sum = self.extra_sums.get(key, torch.zeros((), device="cuda", dtype=torch.float32))
-                extra_count = self.extra_counts.get(key, torch.zeros((), device="cuda", dtype=torch.float32))
-                dist.all_reduce(extra_sum, op=dist.ReduceOp.SUM)
-                dist.all_reduce(extra_count, op=dist.ReduceOp.SUM)
-                if extra_count.item() > 0:
-                    avg_extras[key] = (extra_sum / extra_count).item()
         else:
             avg_loss = 0
             avg_edm_loss = 0
-            avg_extras = {}
         self.reset()
-        return avg_loss, avg_edm_loss, avg_extras
+        return avg_loss, avg_edm_loss
 
 
 class WandbCallback(Callback):
@@ -191,17 +138,14 @@ class WandbCallback(Callback):
                 self.train_image_log.loss += loss.detach().float()
                 self.train_image_log.iter_count += 1
                 self.train_image_log.edm_loss += output_batch["edm_loss"].detach().float()
-                self.train_image_log.update_extras(output_batch)
             else:
                 self.train_video_log.loss += loss.detach().float()
                 self.train_video_log.iter_count += 1
                 self.train_video_log.edm_loss += output_batch["edm_loss"].detach().float()
-                self.train_video_log.update_extras(output_batch)
 
             self.final_loss_log.loss += loss.detach().float()
             self.final_loss_log.iter_count += 1
             self.final_loss_log.edm_loss += output_batch["edm_loss"].detach().float()
-            self.final_loss_log.update_extras(output_batch)
         else:
             if model.is_image_batch(data_batch):
                 self.img_unstable_count += 1
@@ -213,9 +157,9 @@ class WandbCallback(Callback):
                 timer_results = {}
             else:
                 timer_results = self.trainer.training_timer.compute_average_results()
-            avg_image_loss, avg_image_edm_loss, avg_image_extras = self.train_image_log.get_stat()
-            avg_video_loss, avg_video_edm_loss, avg_video_extras = self.train_video_log.get_stat()
-            avg_final_loss, avg_final_edm_loss, avg_final_extras = self.final_loss_log.get_stat()
+            avg_image_loss, avg_image_edm_loss = self.train_image_log.get_stat()
+            avg_video_loss, avg_video_edm_loss = self.train_video_log.get_stat()
+            avg_final_loss, avg_final_edm_loss = self.final_loss_log.get_stat()
 
             dist.all_reduce(self.img_unstable_count, op=dist.ReduceOp.SUM)
             dist.all_reduce(self.video_unstable_count, op=dist.ReduceOp.SUM)
@@ -235,15 +179,6 @@ class WandbCallback(Callback):
                         "iteration": iteration,
                         "sample_counter": getattr(self.trainer, "sample_counter", iteration),
                     }
-                )
-                info.update(
-                    {f"train{self.wandb_extra_tag}/{key}": value for key, value in avg_final_extras.items()}
-                )
-                info.update(
-                    {f"train{self.wandb_extra_tag}/image_{key}": value for key, value in avg_image_extras.items()}
-                )
-                info.update(
-                    {f"train{self.wandb_extra_tag}/video_{key}": value for key, value in avg_video_extras.items()}
                 )
                 if self.save_s3:
                     if (
@@ -278,8 +213,6 @@ class WandbCallback(Callback):
             output_batches=[],
             loss=torch.tensor(0.0, device="cuda"),
             sample_size=torch.tensor(0, device="cuda"),
-            extra_sums={},
-            extra_counts={},
         )
 
     def on_validation_step_end(
@@ -294,35 +227,16 @@ class WandbCallback(Callback):
         batch_size = misc.get_data_batch_size(data_batch)
         self._val_cache["loss"] += loss * batch_size
         self._val_cache["sample_size"] += batch_size
-        batch_size_tensor = torch.tensor(float(batch_size), device=loss.device, dtype=torch.float32)
-        for key in _TARGET_ATTENTION_LOG_KEYS:
-            if key not in output_batch:
-                continue
-            value = _scalar_tensor(output_batch[key])
-            self._val_cache["extra_sums"][key] = (
-                self._val_cache["extra_sums"].get(key, torch.zeros_like(value)) + value * batch_size_tensor
-            )
-            self._val_cache["extra_counts"][key] = (
-                self._val_cache["extra_counts"].get(key, torch.zeros_like(batch_size_tensor)) + batch_size_tensor
-            )
 
     def on_validation_end(self, model: ImaginaireModel, iteration: int = 0) -> None:
         # Compute the average validation loss across all devices.
         dist.all_reduce(self._val_cache["loss"], op=dist.ReduceOp.SUM)
         dist.all_reduce(self._val_cache["sample_size"], op=dist.ReduceOp.SUM)
-        loss = self._val_cache["loss"].item() / self._val_cache["sample_size"].item()
-        val_info = {"val/loss": loss}
-        for key in _TARGET_ATTENTION_LOG_KEYS:
-            extra_sum = self._val_cache["extra_sums"].get(key, torch.zeros((), device="cuda", dtype=torch.float32))
-            extra_count = self._val_cache["extra_counts"].get(key, torch.zeros((), device="cuda", dtype=torch.float32))
-            dist.all_reduce(extra_sum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(extra_count, op=dist.ReduceOp.SUM)
-            if extra_count.item() > 0:
-                val_info[f"val/{key}"] = (extra_sum / extra_count).item()
+        loss = self._val_cache["loss"].item() / self._val_cache["sample_size"]
         # Log data/stats of validation set to W&B.
         if distributed.is_rank0():
             log.info(f"Validation loss (iteration {iteration}): {loss}")
-            wandb.log(val_info, step=iteration)
+            wandb.log({"val/loss": loss}, step=iteration)
 
     def on_train_end(self, model: ImaginaireModel, iteration: int = 0) -> None:
         wandb.finish()

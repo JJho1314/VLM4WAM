@@ -68,7 +68,7 @@ import subprocess
 import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Annotated, Optional, TypeAlias
+from typing import Annotated, TypeAlias
 
 import pydantic
 from typing_extensions import Self, override
@@ -156,6 +156,11 @@ def _hf_download(cmd_args: list[str]) -> str:
     Uses a newer Hugging Face CLI version to download checkpoint. The dependency
     version is very old and not robust.
     """
+    local_path = _find_local_hf_mirror(cmd_args)
+    if local_path is not None:
+        log.info(f"Using local Hugging Face mirror: {local_path}")
+        return local_path
+
     cmd = [
         "uvx",
         f"hf>={_MINIMUM_HF_CLI_VERSION}",
@@ -165,6 +170,74 @@ def _hf_download(cmd_args: list[str]) -> str:
     log.info(f"{shlex.join(cmd)}")
     subprocess.check_call(cmd, text=True)
     return subprocess.check_output([*cmd, "--quiet"], text=True, env=dict(os.environ) | {"HF_HUB_OFFLINE": "1"}).strip()
+
+
+def _find_local_hf_mirror(cmd_args: list[str]) -> str | None:
+    """Resolve known HF checkpoint requests from a local model mirror.
+
+    This keeps cluster training offline when the full Cosmos model tree already
+    exists on shared storage.
+    """
+    if not cmd_args:
+        return None
+    repository = cmd_args[0]
+    repo_name = repository.rsplit("/", 1)[-1]
+    local_roots = []
+    for env_name in ("COSMOS_HF_LOCAL_DIRS", "COSMOS_LOCAL_MODEL_DIR", "COSMOS_HF_LOCAL_DIR"):
+        env_value = os.environ.get(env_name)
+        if env_value:
+            local_roots.extend(item for item in env_value.split(os.pathsep) if item)
+    if not local_roots:
+        return None
+
+    roots: list[Path] = []
+    for local_root in local_roots:
+        root = Path(local_root)
+        if root.name == repo_name:
+            roots.append(root)
+        repo_root = root / repo_name
+        if repo_root.exists():
+            roots.append(repo_root)
+    roots = list(dict.fromkeys(roots))
+
+    filenames: list[str] = []
+    include_patterns: list[str] = []
+    i = 1
+    while i < len(cmd_args):
+        item = cmd_args[i]
+        if item in {"--repo-type", "--revision"}:
+            i += 2
+            continue
+        if item == "--include":
+            i += 1
+            while i < len(cmd_args) and not cmd_args[i].startswith("--"):
+                include_patterns.append(cmd_args[i])
+                i += 1
+            continue
+        if item == "--exclude":
+            i += 1
+            while i < len(cmd_args) and not cmd_args[i].startswith("--"):
+                i += 1
+            continue
+        if not item.startswith("--"):
+            filenames.append(item)
+        i += 1
+
+    for root in roots:
+        if not root.exists():
+            continue
+        if not filenames and not include_patterns:
+            return str(root)
+        if filenames:
+            paths = [root / filename for filename in filenames]
+            if all(path.exists() for path in paths):
+                return str(paths[0] if len(paths) == 1 else root)
+        if include_patterns:
+            import glob
+
+            if all(glob.glob(str(root / pattern)) for pattern in include_patterns):
+                return str(root)
+    return None
 
 
 class _CheckpointHf(_CheckpointUri, ABC):
@@ -289,40 +362,8 @@ class CheckpointConfig(pydantic.BaseModel):
         """Return full name for debugging."""
         return f"{self.name}({self.uuid})"
 
-    def _local_mirror_path(self) -> Optional[str]:
-        """Return $COSMOS_CHECKPOINTS_DIR mirror path if checkpoint is staged locally.
-
-        Layout example:
-          $COSMOS_CHECKPOINTS_DIR/Cosmos-Predict2.5-2B/base/pre-trained/<uuid>_ema_bf16.pt
-        """
-        cosmos_dir = os.environ.get("COSMOS_CHECKPOINTS_DIR")
-        if not cosmos_dir or self.hf is None:
-            return None
-        candidates: list[str] = []
-        repo_base = self.hf.repository.split("/")[-1]
-        name_base = self.name.split("/")[-1]
-        for base in (repo_base, name_base):
-            if not base:
-                continue
-            if isinstance(self.hf, CheckpointFileHf):
-                candidates.append(os.path.join(cosmos_dir, base, self.hf.filename))
-            elif isinstance(self.hf, CheckpointDirHf):
-                candidates.append(
-                    os.path.join(cosmos_dir, base, self.hf.subdirectory)
-                    if self.hf.subdirectory
-                    else os.path.join(cosmos_dir, base)
-                )
-        for candidate in dict.fromkeys(candidates):
-            if os.path.exists(candidate):
-                log.info(f"Using local checkpoint from COSMOS_CHECKPOINTS_DIR: {candidate}")
-                return candidate
-        return None
-
     def download(self) -> str:
         """Download checkpoint and return the local path."""
-        local = self._local_mirror_path()
-        if local is not None:
-            return local
         if INTERNAL:
             return self.s3.uri
 

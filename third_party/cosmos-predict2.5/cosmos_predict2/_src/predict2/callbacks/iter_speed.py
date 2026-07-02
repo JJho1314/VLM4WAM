@@ -27,34 +27,6 @@ from cosmos_predict2._src.imaginaire.utils.distributed import rank0_only
 from cosmos_predict2._src.imaginaire.utils.easy_io import easy_io
 
 
-_TARGET_ATTENTION_CONSOLE_KEYS = (
-    "target_attention_loss",
-    "target_attention_mass_loss",
-    "target_attention_mass_in_mask",
-    "target_attention_mass_lift",
-    "target_attention_inside_outside_ratio",
-    "target_where_prior_loss",
-    "target_where_prior_prob_inside",
-    "target_where_prior_prob_outside",
-    "target_where_prior_inside_outside_ratio",
-    "target_matching_loss",
-    "target_matching_prob_inside",
-    "target_matching_prob_outside",
-)
-
-
-def _format_target_attention_stats(output_batch: dict[str, torch.Tensor]) -> str:
-    parts = []
-    for key in _TARGET_ATTENTION_CONSOLE_KEYS:
-        if key not in output_batch:
-            continue
-        value = output_batch[key]
-        if torch.is_tensor(value):
-            value = value.detach().float().mean().item()
-        parts.append(f"{key}: {float(value):.4f}")
-    return " | " + " | ".join(parts) if parts else ""
-
-
 class IterSpeed(EveryN):
     """
     Args:
@@ -82,13 +54,11 @@ class IterSpeed(EveryN):
         iteration: int = 0,
     ) -> None:
         if self.hit_counter < self.hit_thres:
-            target_attention_stats = _format_target_attention_stats(output_batch)
             log.info(
                 f"Iteration {iteration}: "
                 f"Hit counter: {self.hit_counter + 1}/{self.hit_thres} | "
                 f"Loss: {loss.item():.4f} | "
                 f"Time: {time.time() - self.last_hit_time:.2f}s"
-                f"{target_attention_stats}"
             )
             self.hit_counter += 1
             self.last_hit_time = time.time()
@@ -113,11 +83,7 @@ class IterSpeed(EveryN):
         cur_time = time.time()
         iter_speed = (cur_time - self.time) / self.every_n / self.step_size
 
-        target_attention_stats = _format_target_attention_stats(output_batch)
-        log.info(
-            f"{iteration} : iter_speed {iter_speed:.2f} seconds per iteration | "
-            f"Loss: {loss.item():.4f}{target_attention_stats}"
-        )
+        log.info(f"{iteration} : iter_speed {iter_speed:.2f} seconds per iteration | Loss: {loss.item():.4f}")
 
         if wandb.run:
             sample_counter = getattr(trainer, "sample_counter", iteration)

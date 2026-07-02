@@ -1,0 +1,1 @@
+A Franka robotic arm with a parallel-jaw gripper carefully grasp only the [TGT] yellow carrot in the sink basin and place it into the black pot next to the banana, without moving the banana.

@@ -1,0 +1,20 @@
+{
+  "run_root": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/spatialpos_xattn_iter2000_yellow_carrot_20260619_224554",
+  "checkpoint": "/data/user/jhe724/workspace/cosmos-predict2.5/outputs/droid_v21_match_ground_v3_target_context_spatialpos_crossattn_49f_s123_vlm4wam/cosmos_predict_v2p5/video2world/2b_mgv3_target_context_spatialpos_xattn_iou50_49f_s123_bs1accum16_gbs128_2000/checkpoints/iter_000002000",
+  "experiment": "predict2_video2world_training_2b_droid_success_v21_match_ground_v3_target_context_spatialpos_crossattn",
+  "job_name": "2b_mgv3_target_context_spatialpos_xattn_iou50_49f_s123_bs1accum16_gbs128_2000",
+  "explicit_mask_used_for_generation": false,
+  "generation_variants": [
+    "keep",
+    "wrong_banana",
+    "zero",
+    "drop"
+  ],
+  "intermediate_note": "GT mask is used only inside the intermediate analysis script to compute metrics and overlays.",
+  "generation_contact_sheet": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/spatialpos_xattn_iter2000_yellow_carrot_20260619_224554/feature_guidance_iter2000_contact_sheet.jpg",
+  "generation_diff_sheet": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/spatialpos_xattn_iter2000_yellow_carrot_20260619_224554/feature_guidance_iter2000_diff_vs_keep.jpg",
+  "generation_metrics": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/spatialpos_xattn_iter2000_yellow_carrot_20260619_224554/feature_guidance_iter2000_metrics.json",
+  "intermediate_summary": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/spatialpos_xattn_iter2000_yellow_carrot_20260619_224554/intermediate/vlm_feature_guidance_intermediate_summary.json",
+  "intermediate_figure": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/spatialpos_xattn_iter2000_yellow_carrot_20260619_224554/intermediate/sample_000_vlm_guidance_intermediate.jpg",
+  "overall_exit": 0
+}

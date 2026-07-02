@@ -1,62 +1,69 @@
 # VLM4WAM
 
-Workspace for staging a fusion of Cosmos Predict 2.5 and InstructSAM, with
-`/data/LFT-W02_data/junjie/VLA_WM/Omni-Video` as a reference project.
+Workspace for semantic-plan guided Cosmos Predict 2.5 robot video generation.
 
-Imported reference code:
+The current Cosmos copy has been reset from the clean upstream checkout at:
 
-- `third_party/cosmos-predict2.5`
-  - Source: `/data/LFT-W02_data/junjie/cosmos-predict2.5`
-  - Excluded: `.git`, `.venv`, `outputs`, caches, and logs.
-- `third_party/InstructSAM`
-  - Source: `/data/LFT-W02_data/junjie/InstructSAM`
-  - Excluded: `.git`, caches, checkpoints, logs, work dirs, and generated
-    visualization folders.
+```text
+/data/LFT-W02_data/junjie/VLA_WM/cosmos-predict2.5
+```
 
-## Target-Aware Integration
+Old target-aware experiment switches, explicit mask paths, and prior
+branch-specific Cosmos paths have been removed from the active Cosmos tree. The
+active Stage-2 route is now only:
 
-The Cosmos copy now has an InstructSAM-to-Cosmos bridge for target-aware robot
-video generation:
+```text
+semantic_plan [B, L, 1152]
+-> SemanticPlanContextAdapter
+-> semantic cross-attention in Cosmos DiT blocks
+-> video prediction
+```
 
-- InstructSAM segments the target object from the conditioning image/video first
-  frame using `target_query`.
-- Cosmos receives InstructSAM's target embedding as cross-attention context:
-  `seg_output_embeddings -> mask_hidden_fcs -> TargetFeatureContextAdapter`.
-  This follows Omni-Video's VLM-feature path (`norm/proj` into the diffusion
-  text/context stream) and uses the same ordering pattern:
-  `InstructSAM feature -> Text -> optional mask tokens`.
-- The mask is still returned for optional target-attention supervision or
-  visualization, but the implicit config does not concatenate it to the
-  latent/video input.
-- The old explicit mask-channel path is disabled by default:
-  `target_mask_concat_input=False` in the DiT and `concat_target_mask=False`
-  in the RoboInter training configs.
-- TAViD-style target-awareness loss is preserved by supervising selected
-  V2T cross-attention blocks (`tavid_attn_alignment_blocks`). The InstructSAM
-  feature config uses `tavid_attn_alignment_token_source="text_feature"`, so
-  the selective loss can align both the `[TGT]` text token and the prepended
-  InstructSAM target feature tokens to the target mask.
+Main files:
 
-Implicit training config:
+- `third_party/cosmos-predict2.5/cosmos_predict2/_src/predict2/networks/semantic_plan_conditioning.py`
+- `third_party/cosmos-predict2.5/cosmos_predict2/_src/predict2/networks/minimal_v4_dit.py`
+- `third_party/cosmos-predict2.5/cosmos_predict2/experiments/base/semantic_plan.py`
+- `third_party/cosmos-predict2.5/scripts/sbatch_train_semantic_plan_cosmos_2b_320x576_93f.sh`
+
+Training entry:
 
 ```bash
-experiment=predict2_video2world_training_2b_droid_success_v21_instructsam_implicit_mask
-# alias:
-experiment=predict2_video2world_training_2b_droid_success_v21_instructsam_feature_context
+cd third_party/cosmos-predict2.5
+sbatch scripts/sbatch_train_semantic_plan_cosmos_2b_320x576_93f.sh
 ```
 
-Inference JSON fields:
+The script defaults to 93 frames, 320x576, SigLIP2 semantic plans with
+`k=6, grid=9`, and global batch size 128 on 8 GPUs. Override paths and
+hyperparameters with environment variables such as `DATASET_ROOT`,
+`SEMANTIC_PLAN_DIR`, `CHECKPOINT_LOAD_PATH`, `BATCH_SIZE`,
+`GRAD_ACCUM_ITER`, and `MAX_ITER`.
 
-```json
-{
-  "name": "target_aware_demo",
-  "inference_type": "video2world",
-  "input_path": "/path/to/input.mp4",
-  "prompt": "A robot arm picks up the target object.",
-  "target_query": "Please segment 'the cup' in the image.",
-  "instructsam_model_path": "/data/LFT-W02_data/junjie/InstructSAM/work_dirs/stage2",
-  "instructsam_feature_mode": "mask_query",
-  "target_mask_combine_mode": "best",
-  "target_mask_threshold": 0.0
-}
-```
+Conditioning behavior:
+
+- `SEMANTIC_PLAN_DROPOUT_PROB` (default `0.15`): training-time probability of
+  dropping the semantic-plan conditioning for a micro-batch, so the CFG
+  unconditional branch (`semantic_plan=None` at inference) is a trained
+  configuration.
+- Keyframe times: the dataset reads `future_frame_indices` /
+  `video_frame_indices` from the semantic-plan manifest and passes normalized
+  keyframe times through to the DiT, so semantic-token RoPE/coord temporal
+  positions match the true keyframe locations (labels sample keyframes from
+  window positions `round(linspace(1, T-1, k))`, and k16->k8 selection is
+  non-uniform). Manifests without frame indices fall back to the previous
+  uniform-spacing assumption.
+- Native-grid plans: with `SEMANTIC_PLAN_SPATIAL_GRID=0` the per-keyframe
+  token count is inferred from `SEMANTIC_PLAN_SOURCE_NUM_KEYFRAMES`, so
+  keyframe selection also works for native SigLIP2 grids (27x27 = 729
+  tokens/frame) built with `--grid-size 0`.
+- Online encoding (`SEMANTIC_PLAN_ONLINE=1`): SigLIP2 plans are encoded on the
+  fly from the training video window by a frozen per-rank encoder
+  (`OnlineSemanticPlanEncoder`, outside state_dict/EMA/FSDP), Baton-style — no
+  .pt features are read, so native grids need no label storage. The manifest
+  under `SEMANTIC_PLAN_DIR` still defines windows and VAE-latent pairing.
+  Keyframe indices/times match the offline builder exactly; features match the
+  offline teacher space (token cosine ~0.999, difference is only the resize
+  implementation). Training-only: inference still takes
+  `--semantic-plan-path`. The dropout decision is broadcast from rank 0 —
+  per-rank divergence would desync FSDP all-gathers (the adapter is its own
+  FSDP unit) and hang NCCL.

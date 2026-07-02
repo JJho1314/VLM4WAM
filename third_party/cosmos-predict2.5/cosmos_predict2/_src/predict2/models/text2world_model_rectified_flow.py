@@ -803,10 +803,6 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
             "per_instance_loss": per_instance_loss,
             "n_cond_frames": condition.num_conditional_frames_B,
         }
-        if hasattr(self, "compute_extra_training_loss"):
-            extra_output, extra_loss = self.compute_extra_training_loss(condition)
-            output_batch.update(extra_output)
-            loss = loss + extra_loss
 
         return output_batch, loss
 
@@ -817,7 +813,10 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
 
         # Latent state
         raw_state = data_batch[self.input_image_key if is_image_batch else self.input_data_key]
-        latent_state = self.encode(raw_state).contiguous().float()
+        if "vae_latent" in data_batch:
+            latent_state = data_batch["vae_latent"].to(**self.tensor_kwargs_fp32).contiguous()
+        else:
+            latent_state = self.encode(raw_state).contiguous().float()
 
         # Condition
         condition = self.conditioner(data_batch)
@@ -987,10 +986,19 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
 
     @torch.no_grad()
     def encode(self, state: torch.Tensor) -> torch.Tensor:
+        # COSMOS_DISABLE_CUDNN_CONV: some training environments fail to load cuDNN
+        # sublibraries (CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED) for the VAE convolutions;
+        # fall back to PyTorch's own conv kernels there (same trap as COSMOS_DISABLE_CUDNN_SDPA).
+        if os.environ.get("COSMOS_DISABLE_CUDNN_CONV", "0") == "1":
+            with torch.backends.cudnn.flags(enabled=False):
+                return self.tokenizer.encode(state)
         return self.tokenizer.encode(state)
 
     @torch.no_grad()
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
+        if os.environ.get("COSMOS_DISABLE_CUDNN_CONV", "0") == "1":
+            with torch.backends.cudnn.flags(enabled=False):
+                return self.tokenizer.decode(latent)
         return self.tokenizer.decode(latent)
 
     def get_video_height_width(self) -> Tuple[int, int]:

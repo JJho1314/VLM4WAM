@@ -1,0 +1,1 @@
+A Franka robotic arm with a parallel-jaw gripper switch the [TGT] kettle on.

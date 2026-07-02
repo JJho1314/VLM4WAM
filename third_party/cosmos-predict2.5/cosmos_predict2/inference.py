@@ -17,15 +17,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from cosmos_predict2._src.imaginaire.auxiliary.guardrail.common import presets as guardrail_presets
 from cosmos_predict2._src.imaginaire.flags import SMOKE
 from cosmos_predict2._src.imaginaire.lazy_config.lazy import LazyConfig
 from cosmos_predict2._src.imaginaire.utils import distributed, log
 from cosmos_predict2._src.imaginaire.visualize.video import save_img_or_video
 from cosmos_predict2._src.predict2.inference.video2world import Video2WorldInference
-from cosmos_predict2._src.predict2.target_aware.instructsam_mask import (
-    InstructSAMTargetMaskGenerator,
-    load_target_mask_file,
-)
 from cosmos_predict2.config import InferenceArguments, SetupArguments, path_to_str
 
 
@@ -64,10 +61,6 @@ class Inference:
         self.guardrail_enabled = not args.disable_guardrails
 
         if self.rank0 and self.guardrail_enabled:
-            # Import guardrails lazily so `--disable-guardrails` doesn't try
-            # to download gated guardrail assets at import time.
-            from cosmos_predict2._src.imaginaire.auxiliary.guardrail.common import presets as guardrail_presets
-
             self.text_guardrail_runner = guardrail_presets.create_text_guardrail_runner(
                 offload_model_to_cpu=args.offload_guardrail_models
             )
@@ -79,84 +72,6 @@ class Inference:
             self.text_guardrail_runner = None
             # pyrefly: ignore  # bad-assignment
             self.video_guardrail_runner = None
-        self._instructsam_generators: dict[tuple[str, str | None], InstructSAMTargetMaskGenerator] = {}
-
-    def _get_instructsam_generator(self, sample: InferenceArguments) -> InstructSAMTargetMaskGenerator:
-        assert sample.instructsam_model_path is not None
-        model_path = str(sample.instructsam_model_path)
-        source_root = path_to_str(sample.instructsam_source_root)
-        cache_key = (model_path, source_root)
-        if cache_key not in self._instructsam_generators:
-            log.info(f"Loading InstructSAM target segmenter from {model_path}")
-            self._instructsam_generators[cache_key] = InstructSAMTargetMaskGenerator(
-                model_path=model_path,
-                source_root=source_root,
-            )
-        return self._instructsam_generators[cache_key]
-
-    def _get_target_condition(
-        self,
-        sample: InferenceArguments,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-        self._last_target_feature_payload: dict | None = None
-        if sample.target_feature_path is not None:
-            log.info(f"Loading precomputed target feature from {sample.target_feature_path}")
-            payload = torch.load(str(sample.target_feature_path), map_location="cpu", weights_only=False)
-            if isinstance(payload, dict):
-                self._last_target_feature_payload = payload
-            feat = payload["target_feature"] if isinstance(payload, dict) else payload
-            feat = torch.as_tensor(feat).float()
-            if feat.ndim == 2:
-                feat = feat.unsqueeze(0)  # [L, D] -> [1, L, D]
-            log.info(f"Precomputed target feature shape: {tuple(feat.shape)}")
-            dense_feat = None
-            if isinstance(payload, dict) and payload.get("target_dense_feature") is not None:
-                dense_feat = torch.as_tensor(payload["target_dense_feature"]).float()
-                if dense_feat.ndim == 2:
-                    dense_feat = dense_feat.unsqueeze(0)
-                log.info(f"Precomputed target dense feature shape: {tuple(dense_feat.shape)}")
-            mask = None
-            if sample.target_mask_path is not None:
-                mask = load_target_mask_file(sample.target_mask_path, mask_threshold=sample.target_mask_threshold)
-            return mask, feat, dense_feat
-        if sample.target_mask_path is not None:
-            log.info(f"Loading precomputed target mask from {sample.target_mask_path}")
-            return load_target_mask_file(
-                sample.target_mask_path,
-                mask_threshold=sample.target_mask_threshold,
-            ), None, None
-        if sample.target_query is None:
-            return None, None, None
-        if sample.input_path is None:
-            raise ValueError("target_query requires an image/video input_path")
-
-        generator = self._get_instructsam_generator(sample)
-        result = generator.predict_from_input(
-            sample.input_path,
-            sample.target_query,
-            combine_mode=sample.target_mask_combine_mode,
-            mask_threshold=sample.target_mask_threshold,
-            feature_mode=sample.instructsam_feature_mode,
-        )
-        target_feature = result.feature_B_L_D
-        target_dense_feature = None
-        if sample.route_decoder_dense_to_target_dense_feature:
-            if sample.instructsam_feature_mode != "decoder_dense":
-                raise ValueError("route_decoder_dense_to_target_dense_feature requires instructsam_feature_mode='decoder_dense'")
-            target_dense_feature = result.feature_B_L_D
-            target_feature = generator._extract_target_feature(feature_mode="raw_seg")
-            if target_feature is None:
-                raise RuntimeError("InstructSAM did not expose raw_seg target feature after decoder_dense extraction")
-        if result.score is None:
-            log.info(f"InstructSAM target query produced mask: {result.text}")
-        else:
-            log.info(f"InstructSAM target query score={result.score:.4f}: {result.text}")
-        if target_feature is not None:
-            log.info(f"InstructSAM target feature shape: {tuple(target_feature.shape)}")
-        if target_dense_feature is not None:
-            log.info(f"InstructSAM target dense feature shape: {tuple(target_dense_feature.shape)}")
-        mask = result.mask_B_C_T_H_W if sample.pass_instructsam_mask_to_cosmos else None
-        return mask, target_feature, target_dense_feature
 
     def generate(self, samples: list[InferenceArguments], output_dir: Path) -> list[str]:
         if SMOKE:
@@ -184,8 +99,6 @@ class Inference:
 
             # run text guardrail on the prompt
             if self.text_guardrail_runner is not None:
-                from cosmos_predict2._src.imaginaire.auxiliary.guardrail.common import presets as guardrail_presets
-
                 if not guardrail_presets.run_text_guardrail(sample.prompt, self.text_guardrail_runner):
                     message = f"Guardrail blocked text2world generation. Prompt: {sample.prompt}"
                     log.critical(message)
@@ -200,16 +113,9 @@ class Inference:
 
         # Choose generation mode based on autoregressive flag
         video: torch.Tensor
-        target_mask, target_feature, target_dense_feature = self._get_target_condition(sample)
-        if sample.target_dense_feature_path is not None:
-            log.info(f"Loading precomputed dense (match-query) feature from {sample.target_dense_feature_path}")
-            payload = torch.load(str(sample.target_dense_feature_path), map_location="cpu", weights_only=False)
-            feat = payload["target_feature"] if isinstance(payload, dict) else payload
-            feat = torch.as_tensor(feat).float()
-            if feat.ndim == 2:
-                feat = feat.unsqueeze(0)
-            target_dense_feature = feat
         if sample.enable_autoregressive:
+            if sample.semantic_plan_path is not None:
+                raise ValueError("semantic_plan_path is only supported for standard generate_vid2world inference")
             log.info(f"Generating video with autoregressive mode...")
             video = self.pipe.generate_autoregressive_from_batch(
                 prompt=sample.prompt,
@@ -223,9 +129,6 @@ class Inference:
                 seed=sample.seed,
                 negative_prompt=sample.negative_prompt,
                 num_steps=sample.num_steps,
-                target_mask=target_mask,
-                target_feature=target_feature,
-                target_dense_feature=target_dense_feature,
             )
         else:
             log.info(f"Generating video with standard mode...")
@@ -239,9 +142,7 @@ class Inference:
                 seed=sample.seed,
                 negative_prompt=sample.negative_prompt,
                 num_steps=sample.num_steps,
-                target_mask=target_mask,
-                target_feature=target_feature,
-                target_dense_feature=target_dense_feature,
+                semantic_plan_path=path_to_str(sample.semantic_plan_path),
             )
 
         if self.rank0:
@@ -249,8 +150,6 @@ class Inference:
 
             # run video guardrail on the video
             if self.video_guardrail_runner is not None:
-                from cosmos_predict2._src.imaginaire.auxiliary.guardrail.common import presets as guardrail_presets
-
                 log.info("Running guardrail check on video...")
                 frames = (video * 255.0).clamp(0.0, 255.0).to(torch.uint8)
                 frames = frames.permute(1, 2, 3, 0).cpu().numpy().astype(np.uint8)  # (T, H, W, C)
@@ -272,43 +171,4 @@ class Inference:
 
             save_img_or_video(video, str(output_path), fps=16)
             log.success(f"Saved video to {output_path}.mp4")
-            self._save_instructsam_mask_visualization(sample, output_path)
         return f"{output_path}.mp4"
-
-    def _save_instructsam_mask_visualization(self, sample: InferenceArguments, output_path: Path) -> None:
-        """Save the InstructSAM mask overlaid on the conditioning frame next to the video.
-
-        The precomputed feature payload records `mask_png` (written by the
-        multisource extraction); this renders conditioning-frame + mask + query
-        as `<name>_instructsam_mask.png` so every generated video carries a
-        visualization of what InstructSAM pointed the model at. Best-effort:
-        never fails the generation.
-        """
-        try:
-            payload = getattr(self, "_last_target_feature_payload", None)
-            if not payload:
-                return
-            mask_png = payload.get("mask_png")
-            if not mask_png or not Path(str(mask_png)).exists():
-                return
-            from PIL import Image, ImageDraw
-
-            from cosmos_predict2._src.predict2.target_aware.instructsam_mask import read_first_frame_image
-
-            base = read_first_frame_image(str(sample.input_path)).convert("RGB")
-            mask = Image.open(str(mask_png)).convert("L")
-            if mask.size != base.size:
-                mask = mask.resize(base.size, Image.NEAREST)
-            arr = np.array(base)
-            mb = np.array(mask) > 127
-            arr[mb] = (0.35 * arr[mb] + 0.65 * np.array([255, 140, 0])).astype(np.uint8)
-            im = Image.fromarray(arr)
-            draw = ImageDraw.Draw(im)
-            query = str(payload.get("query", ""))
-            draw.rectangle([0, 0, im.width, 22], fill=(0, 0, 0))
-            draw.text((5, 4), f"InstructSAM mask | {query}"[:120], fill=(255, 200, 0))
-            out = f"{output_path}_instructsam_mask.png"
-            im.save(out)
-            log.info(f"Saved InstructSAM mask visualization to {out}")
-        except Exception as exc:  # visualization must never break generation
-            log.warning(f"Skipping InstructSAM mask visualization: {exc}")

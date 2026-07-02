@@ -1,0 +1,1 @@
+A Franka robotic arm with a parallel-jaw gripper put one [TGT] egg in the red cup.

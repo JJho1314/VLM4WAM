@@ -77,6 +77,17 @@ def restore_planner(args: argparse.Namespace, meta: dict[str, Any], device: torc
         hidden_size=hidden_size,
         semantic_dim=int(meta["semantic_dim"]),
         plan_token_id=plan_token_id,
+        plan_len=int(meta["num_keyframes"]) * int(meta["grid_size"]) * int(meta["grid_size"]),
+        plan_head_type=str(meta.get("plan_head_type", "mlp")),
+        plan_head_num_heads=int(meta.get("plan_head_num_heads", 16)),
+        plan_head_dropout=float(meta.get("plan_head_dropout", 0.0)),
+        sem_mlp_hidden_size=int(meta.get("sem_mlp_hidden_size", 0)),
+        mse_loss_weight=float(meta.get("mse_loss_weight", 1.0)),
+        cosine_loss_weight=float(meta.get("cosine_loss_weight", 0.0)),
+        norm_loss_weight=float(meta.get("norm_loss_weight", 0.0)),
+        variance_loss_weight=float(meta.get("variance_loss_weight", 0.0)),
+        infonce_loss_weight=float(meta.get("infonce_loss_weight", 0.0)),
+        infonce_temperature=float(meta.get("infonce_temperature", 0.07)),
     )
     state = torch.load(args.checkpoint_dir / "plan_head.pt", map_location="cpu", weights_only=False)
     wrapper.plan_head.load_state_dict(state)
@@ -91,18 +102,7 @@ def predict(wrapper: PlannerWrapper, batch: dict[str, Any], device: torch.device
     batch.pop("stems", None)
     model_dtype = next(wrapper.model.parameters()).dtype
     batch = move_qwen_inputs_to_device(batch, device, model_dtype=model_dtype)
-    outputs = wrapper.model(**batch, output_hidden_states=True, use_cache=False)
-    hidden = outputs.hidden_states[-1]
-    input_ids = batch["input_ids"]
-    plan_mask = input_ids == wrapper.plan_token_id
-    bsz, plan_len, sem_dim = target.shape
-    pred = hidden.new_zeros((bsz, plan_len, sem_dim), dtype=torch.float32)
-    head_dtype = next(wrapper.plan_head.parameters()).dtype
-    for b in range(bsz):
-        h = hidden[b, plan_mask[b]]
-        if h.shape[0] != plan_len:
-            raise RuntimeError(f"Found {h.shape[0]} plan tokens, expected {plan_len}")
-        pred[b] = wrapper.plan_head(h.to(dtype=head_dtype)).float()
+    pred = wrapper.predict_semantic_plan(**batch)
     return pred, target
 
 
@@ -145,15 +145,19 @@ def main() -> None:
     )
 
     n_batches = 0
+    n_samples = 0
     n_tokens = 0
     mse_sum = 0.0
     cos_sum = 0.0
     retrieval_sum = 0.0
     pred_norm_sum = 0.0
     target_norm_sum = 0.0
+    pred_disp_sum = 0.0
+    target_disp_sum = 0.0
     for batch in loader:
         pred, target = predict(wrapper, batch, device)
         n_batches += 1
+        n_samples += int(pred.shape[0])
         n_tokens += int(pred.shape[0] * pred.shape[1])
         mse_sum += float(F.mse_loss(pred, target, reduction="sum").item())
         pred_flat = pred.flatten(0, 1)
@@ -163,8 +167,18 @@ def main() -> None:
         retrieval_sum += sample_retrieval_top1(pred, target) * pred.shape[0]
         pred_norm_sum += float(pred_flat.norm(dim=-1).sum().item())
         target_norm_sum += float(target_flat.norm(dim=-1).sum().item())
+        # Per-sample dispersion of tokens around their mean: a mean-collapsed prediction
+        # (same vector at every token) drives pred dispersion toward 0.
+        pred_disp = (pred - pred.mean(dim=1, keepdim=True)).norm(dim=-1).mean(dim=1)
+        target_disp = (target - target.mean(dim=1, keepdim=True)).norm(dim=-1).mean(dim=1)
+        pred_disp_sum += float(pred_disp.sum().item())
+        target_disp_sum += float(target_disp.sum().item())
 
     denom = max(n_tokens, 1)
+    pred_norm = pred_norm_sum / denom
+    target_norm = target_norm_sum / denom
+    pred_disp = pred_disp_sum / max(n_samples, 1)
+    target_disp = target_disp_sum / max(n_samples, 1)
     summary = {
         "checkpoint_dir": str(args.checkpoint_dir),
         "num_samples": len(dataset),
@@ -172,8 +186,12 @@ def main() -> None:
         "mse_per_value": mse_sum / max(denom * int(meta["semantic_dim"]), 1),
         "mean_cosine": cos_sum / denom,
         "sample_retrieval_top1": retrieval_sum / max(len(dataset), 1),
-        "pred_norm": pred_norm_sum / denom,
-        "target_norm": target_norm_sum / denom,
+        "pred_norm": pred_norm,
+        "target_norm": target_norm,
+        "norm_ratio": pred_norm / max(target_norm, 1e-6),
+        "pred_token_dispersion": pred_disp,
+        "target_token_dispersion": target_disp,
+        "token_dispersion_ratio": pred_disp / max(target_disp, 1e-6),
         "meta": meta,
     }
     args.output_json.parent.mkdir(parents=True, exist_ok=True)

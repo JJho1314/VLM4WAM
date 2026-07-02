@@ -1,0 +1,40 @@
+{
+  "num_points": 85,
+  "first_iteration": 1,
+  "last_iteration": 85,
+  "first10_mean": {
+    "loss": 1.49488,
+    "target_attention_loss": 0.76106,
+    "target_attention_mass_loss": 4.84317,
+    "target_attention_mass_in_mask": 0.01023,
+    "target_attention_mass_lift": 1.00448,
+    "target_attention_inside_outside_ratio": 1.00471,
+    "target_matching_loss": 1.3820999999999999,
+    "target_matching_prob_inside": 0.49881,
+    "target_matching_prob_outside": 0.49699
+  },
+  "last10_mean": {
+    "loss": 1.50718,
+    "target_attention_loss": 0.75427,
+    "target_attention_mass_loss": 5.11289,
+    "target_attention_mass_in_mask": 0.00989,
+    "target_attention_mass_lift": 1.02312,
+    "target_attention_inside_outside_ratio": 1.02366,
+    "target_matching_loss": 1.3853,
+    "target_matching_prob_inside": 0.49933,
+    "target_matching_prob_outside": 0.49845
+  },
+  "delta_last10_minus_first10": {
+    "loss": 0.012299999999999978,
+    "target_attention_loss": -0.006789999999999963,
+    "target_attention_mass_loss": 0.2697200000000004,
+    "target_attention_mass_in_mask": -0.00034,
+    "target_attention_mass_lift": 0.01863999999999999,
+    "target_attention_inside_outside_ratio": 0.018950000000000022,
+    "target_matching_loss": 0.0032000000000000917,
+    "target_matching_prob_inside": 0.0005200000000000204,
+    "target_matching_prob_outside": 0.0014600000000000168
+  },
+  "csv": "/data/LFT-W02_data/junjie/VLA_WM/VLM4WAM/feature_guidance_analysis/target_context_allblocks_fix2_training_metrics.csv",
+  "figure": "/data/LFT-W02_data/junjie/VLA_WM/VLM4WAM/feature_guidance_analysis/target_context_allblocks_fix2_feature_guidance_metrics.png"
+}

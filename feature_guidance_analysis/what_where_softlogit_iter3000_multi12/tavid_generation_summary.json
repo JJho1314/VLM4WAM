@@ -1,0 +1,113 @@
+{
+  "checkpoint": "/data/user/jhe724/workspace/cosmos-predict2.5/outputs/droid_v21_what_where_softlogit_320x576_49f_s123_vlm4wam/cosmos_predict_v2p5/video2world/2b_what_where_softlogit_iou50_320x576_49f_s123_bs4accum4_gbs128_3000/checkpoints/iter_000003000",
+  "checkpoint_iter_from_path": 3000,
+  "loaded_iter_returned_by_checkpointer": 0,
+  "num_samples": 12,
+  "skip_samples": 0,
+  "sample_index_offset": 0,
+  "num_steps": 35,
+  "guidance": 3.0,
+  "seed": 20260613,
+  "fps": 8,
+  "layout": "standalone generated/GT videos",
+  "target_feature_mode": "keep",
+  "target_feature_path": null,
+  "samples": [
+    {
+      "sample_index": 0,
+      "caption": "A Franka robotic arm with a parallel-jaw gripper put the [TGT] brown doll in the silver pot.",
+      "generated": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_000_generated.mp4",
+      "gt": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_000_gt.mp4",
+      "caption_file": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_000_caption.txt",
+      "target_feature_override": "keep"
+    },
+    {
+      "sample_index": 1,
+      "caption": "A Franka robotic arm with a parallel-jaw gripper take the [TGT] bowl and put on the table.",
+      "generated": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_001_generated.mp4",
+      "gt": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_001_gt.mp4",
+      "caption_file": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_001_caption.txt",
+      "target_feature_override": "keep"
+    },
+    {
+      "sample_index": 2,
+      "caption": "A Franka robotic arm with a parallel-jaw gripper use the [TGT] towel to wipe the inside of the mug on the plate, then put it in the silver bowl next to the plate.",
+      "generated": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_002_generated.mp4",
+      "gt": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_002_gt.mp4",
+      "caption_file": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_002_caption.txt",
+      "target_feature_override": "keep"
+    },
+    {
+      "sample_index": 3,
+      "caption": "A Franka robotic arm with a parallel-jaw gripper close the [TGT] toaster.",
+      "generated": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_003_generated.mp4",
+      "gt": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_003_gt.mp4",
+      "caption_file": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_003_caption.txt",
+      "target_feature_override": "keep"
+    },
+    {
+      "sample_index": 4,
+      "caption": "A Franka robotic arm with a parallel-jaw gripper fold the [TGT] shirt and place it in the basket.",
+      "generated": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_004_generated.mp4",
+      "gt": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_004_gt.mp4",
+      "caption_file": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_004_caption.txt",
+      "target_feature_override": "keep"
+    },
+    {
+      "sample_index": 5,
+      "caption": "A Franka robotic arm with a parallel-jaw gripper pull [TGT] out the drawer on the far right.",
+      "generated": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_005_generated.mp4",
+      "gt": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_005_gt.mp4",
+      "caption_file": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_005_caption.txt",
+      "target_feature_override": "keep"
+    },
+    {
+      "sample_index": 6,
+      "caption": "A Franka robotic arm with a parallel-jaw gripper place the [TGT] cylindrical block on top of the square block at the back.",
+      "generated": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_006_generated.mp4",
+      "gt": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_006_gt.mp4",
+      "caption_file": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_006_caption.txt",
+      "target_feature_override": "keep"
+    },
+    {
+      "sample_index": 7,
+      "caption": "A Franka robotic arm with a parallel-jaw gripper remove the [TGT] yellow bowl from the cabinet.",
+      "generated": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_007_generated.mp4",
+      "gt": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_007_gt.mp4",
+      "caption_file": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_007_caption.txt",
+      "target_feature_override": "keep"
+    },
+    {
+      "sample_index": 8,
+      "caption": "A Franka robotic arm with a parallel-jaw gripper put the [TGT] strings in the blue box.",
+      "generated": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_008_generated.mp4",
+      "gt": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_008_gt.mp4",
+      "caption_file": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_008_caption.txt",
+      "target_feature_override": "keep"
+    },
+    {
+      "sample_index": 9,
+      "caption": "A Franka robotic arm with a parallel-jaw gripper open the [TGT] box.",
+      "generated": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_009_generated.mp4",
+      "gt": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_009_gt.mp4",
+      "caption_file": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_009_caption.txt",
+      "target_feature_override": "keep"
+    },
+    {
+      "sample_index": 10,
+      "caption": "A Franka robotic arm with a parallel-jaw gripper switch the [TGT] kettle on.",
+      "generated": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_010_generated.mp4",
+      "gt": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_010_gt.mp4",
+      "caption_file": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_010_caption.txt",
+      "target_feature_override": "keep"
+    },
+    {
+      "sample_index": 11,
+      "caption": "A Franka robotic arm with a parallel-jaw gripper move the [TGT] green plushie to the left.",
+      "generated": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_011_generated.mp4",
+      "gt": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_011_gt.mp4",
+      "caption_file": "/data/user/jhe724/workspace/VLM4WAM/feature_guidance_analysis/what_where_softlogit_iter3000_multi12/sample_011_caption.txt",
+      "target_feature_override": "keep"
+    }
+  ]
+}

@@ -75,10 +75,6 @@ class ActionVideo2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
             num_conditional_frames=data_batch.get(NUM_CONDITIONAL_FRAMES_KEY, None),
             conditional_frames_probs=self.config.conditional_frames_probs,
         )
-        target_feature = data_batch.get("target_feature", None)
-        if target_feature is not None:
-            target_feature = target_feature.to(device=latent_state.device, dtype=latent_state.dtype)
-            condition = condition.set_target_feature(target_feature)
         return raw_state, latent_state, condition
 
     @torch.no_grad()
@@ -278,11 +274,6 @@ class ActionVideo2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
         uncondition = uncondition.edit_for_inference(
             is_cfg_conditional=False, num_conditional_frames=num_conditional_frames
         )
-
-        target_feature = data_batch.get("target_feature", None)
-        if target_feature is not None:
-            target_feature = target_feature.to(device=x0.device, dtype=x0.dtype)
-            condition = condition.set_target_feature(target_feature)
 
         _, condition, _, _ = self.broadcast_split_for_model_parallelsim(x0, condition, None, None)
         _, uncondition, _, _ = self.broadcast_split_for_model_parallelsim(x0, uncondition, None, None)

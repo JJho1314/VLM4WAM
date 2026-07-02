@@ -97,10 +97,6 @@ class ActionConditionedVideo2WorldModel(Text2WorldModel):
             random_max_num_conditional_frames=self.config.max_num_conditional_frames,
             num_conditional_frames=data_batch.get(NUM_CONDITIONAL_FRAMES_KEY, None),
         )
-        target_feature = data_batch.get("target_feature", None)
-        if target_feature is not None:
-            target_feature = target_feature.to(device=latent_state.device, dtype=latent_state.dtype)
-            condition = condition.set_target_feature(target_feature)
         return raw_state, latent_state, condition
 
     def draw_training_sigma_and_epsilon(self, x0_size: int, condition: Any) -> torch.Tensor:
@@ -296,11 +292,6 @@ class ActionConditionedVideo2WorldModel(Text2WorldModel):
         uncondition = uncondition.edit_for_inference(
             is_cfg_conditional=False, num_conditional_frames=num_conditional_frames
         )
-
-        target_feature = data_batch.get("target_feature", None)
-        if target_feature is not None:
-            target_feature = target_feature.to(device=x0.device, dtype=x0.dtype)
-            condition = condition.set_target_feature(target_feature)
 
         _, condition, _, _ = self.broadcast_split_for_model_parallelsim(x0, condition, None, None)
         _, uncondition, _, _ = self.broadcast_split_for_model_parallelsim(x0, uncondition, None, None)

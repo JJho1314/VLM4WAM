@@ -68,6 +68,7 @@ from cosmos_predict2._src.interactive.utils.model_loader import (
     load_model_from_checkpoint as load_distilled_model_from_checkpoint,
 )
 from cosmos_predict2._src.predict2.inference.get_t5_emb import get_text_embedding
+from cosmos_predict2._src.predict2.networks.semantic_plan_conditioning import load_semantic_plan_payload
 from cosmos_predict2._src.predict2.utils.model_loader import load_model_from_checkpoint
 
 _IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"]
@@ -84,35 +85,6 @@ class CameraConditionInputs:
     intrinsics: torch.Tensor | list | tuple
     image_size: torch.Tensor | tuple[int, int] | list[int] | None = None
     metadata: dict[str, Any] | None = None
-
-
-def _resize_mask_to(mask: torch.Tensor, num_frames: int, height: int, width: int) -> torch.Tensor:
-    """Resample a TAViD-style target mask to ``[B, 1, num_frames, height, width]``.
-
-    Accepts shapes ``[H,W]``, ``[T,H,W]``, ``[1,T,H,W]`` or ``[B,1,T,H,W]``.
-    Temporal resampling is nearest-neighbour, spatial is also nearest.
-    """
-    if mask is None:
-        return None
-    m = mask.detach().float()
-    if m.ndim == 2:                          # [H,W]
-        m = m[None, None, None]              # -> [1,1,1,H,W]
-    elif m.ndim == 3:                        # [T,H,W]
-        m = m.unsqueeze(0).unsqueeze(0)      # -> [1,1,T,H,W]
-    elif m.ndim == 4:                        # [1,T,H,W] or [B,T,H,W]
-        m = m.unsqueeze(1)                   # -> [B,1,T,H,W]
-    elif m.ndim != 5:
-        raise ValueError(f"Unsupported mask shape {tuple(mask.shape)}")
-    B, _, T, H, W = m.shape
-    if T != num_frames:
-        if T == 1:
-            m = m.repeat(1, 1, num_frames, 1, 1)
-        else:
-            idx = torch.linspace(0, T - 1, num_frames, device=m.device).round().long()
-            m = m[:, :, idx]
-    if (H, W) != (height, width):
-        m = torch.nn.functional.interpolate(m, size=(num_frames, height, width), mode="nearest")
-    return (m > 0.5).float()
 
 
 def resize_input(video: torch.Tensor, resolution: list[int]):
@@ -430,9 +402,8 @@ class Video2WorldInference:
         use_neg_prompt: bool = True,
         camera: CameraConditionInputs | None = None,
         action: torch.Tensor | None = None,
-        target_mask: torch.Tensor | None = None,
-        target_feature: torch.Tensor | None = None,
-        target_dense_feature: torch.Tensor | None = None,
+        semantic_plan: torch.Tensor | None = None,
+        semantic_plan_times: torch.Tensor | None = None,
     ):
         """
         Prepares the input data batch for the diffusion model.
@@ -449,6 +420,8 @@ class Video2WorldInference:
             use_neg_prompt (bool, optional): Whether to include negative prompt embeddings. Defaults to True.
             camera (CameraConditionInputs | None): Optional typed camera metadata container.
             action: (torch.Tensor, optional) Target robot action for the K output videos, must be provided for action conditioned model.
+            semantic_plan: Optional semantic-plan tensor with shape [L,D] or [B,L,D].
+            semantic_plan_times: Optional per-keyframe times in [0,1] with shape [N] or [B,N].
 
         Returns:
             dict: A dictionary containing the prepared data batch, moved to the correct device and dtype.
@@ -463,14 +436,26 @@ class Video2WorldInference:
             "padding_mask": torch.zeros(self.batch_size, 1, H, W),  # Padding mask (assumed no padding here)
             "num_conditional_frames": num_conditional_frames,  # Specify number of conditional frames
         }
-        if target_mask is not None:
-            # Expected shape [B, 1, T, H, W] in {0,1}. Spatial size matched to video.
-            data_batch["target_mask"] = target_mask
-        if target_feature is not None:
-            # Expected shape [B, L, D]. These become Cosmos cross-attention context tokens.
-            data_batch["target_feature"] = target_feature
-        if target_dense_feature is not None:
-            data_batch["target_dense_feature"] = target_dense_feature
+        if semantic_plan is not None:
+            if semantic_plan.ndim == 2:
+                semantic_plan = semantic_plan.unsqueeze(0)
+            if semantic_plan.ndim != 3:
+                raise ValueError(f"Expected semantic_plan shape [B,L,D] or [L,D], got {tuple(semantic_plan.shape)}")
+            if semantic_plan.shape[0] == 1 and self.batch_size != 1:
+                semantic_plan = semantic_plan.repeat(self.batch_size, 1, 1)
+            if semantic_plan.shape[0] != self.batch_size:
+                raise ValueError(f"Expected semantic_plan batch {self.batch_size}, got {semantic_plan.shape[0]}")
+            data_batch["semantic_plan"] = semantic_plan
+            if semantic_plan_times is not None:
+                if semantic_plan_times.ndim == 1:
+                    semantic_plan_times = semantic_plan_times.unsqueeze(0)
+                if semantic_plan_times.ndim != 2:
+                    raise ValueError(
+                        f"Expected semantic_plan_times shape [B,N] or [N], got {tuple(semantic_plan_times.shape)}"
+                    )
+                if semantic_plan_times.shape[0] == 1 and self.batch_size != 1:
+                    semantic_plan_times = semantic_plan_times.repeat(self.batch_size, 1)
+                data_batch["semantic_plan_times"] = semantic_plan_times.float()
         if camera is not None:
             image_size = camera.image_size
             if image_size is None:
@@ -525,9 +510,8 @@ class Video2WorldInference:
         camera: CameraConditionInputs | None = None,
         action: torch.Tensor | None = None,
         num_steps: int = 35,
-        target_mask: torch.Tensor | None = None,
-        target_feature: torch.Tensor | None = None,
-        target_dense_feature: torch.Tensor | None = None,
+        semantic_plan_path: str | None = None,
+        semantic_plan: torch.Tensor | None = None,
     ):
         """
         Generates a video based on an input image or video and text prompt.
@@ -547,6 +531,8 @@ class Video2WorldInference:
             camera: CameraConditionInputs containing extrinsics, intrinsics, and optional image size metadata.
             action: Target robot action for the K output videos. Must be provided if model is action conditioned.
             num_steps: Number of generation steps. Defaults to 35.
+            semantic_plan_path: Optional path to semantic-plan tokens saved as .pt/.pth/.npy/.npz.
+            semantic_plan: Optional preloaded semantic-plan tensor with shape [L,D] or [B,L,D].
             offload_diffusion_model: If True, offload diffusion model to CPU to save GPU memory. Defaults to False.
             offload_text_encoder: If True, offload text encoder to CPU to save GPU memory. Defaults to False.
             offload_tokenizer: If True, offload tokenizer to CPU to save GPU memory. Defaults to False.
@@ -557,6 +543,11 @@ class Video2WorldInference:
         assert camera is not None or action is not None or num_input_video == 1 and num_output_video == 1, (
             "expected num_output_video==1 and num_output_video==1 for no camera conditioning or action conditioning"
         )
+        if semantic_plan_path is not None and semantic_plan is not None:
+            raise ValueError("Only one of semantic_plan_path or semantic_plan may be provided")
+        semantic_plan_times = None
+        if semantic_plan is None and semantic_plan_path is not None:
+            semantic_plan, semantic_plan_times = load_semantic_plan_payload(semantic_plan_path)
 
         # Parse resolution string into tuple of integers
         if resolution == "none":
@@ -613,9 +604,8 @@ class Video2WorldInference:
             num_conditional_frames=num_latent_conditional_frames,
             negative_prompt=negative_prompt,
             use_neg_prompt=True,
-            target_mask=target_mask,
-            target_feature=target_feature,
-            target_dense_feature=target_dense_feature,
+            semantic_plan=semantic_plan,
+            semantic_plan_times=semantic_plan_times,
         )
 
         mem_bytes = torch.cuda.memory_allocated(device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
@@ -738,9 +728,6 @@ class Video2WorldInference:
         camera: torch.Tensor | None = None,
         action: torch.Tensor | None = None,
         num_steps: int = 35,
-        target_mask: torch.Tensor | None = None,
-        target_feature: torch.Tensor | None = None,
-        target_dense_feature: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Generate video using autoregressive sliding window approach.
@@ -905,37 +892,6 @@ class Video2WorldInference:
             else:
                 chunk_latent_conditional = self.model.tokenizer.get_latent_num_frames(chunk_overlap)
 
-            # Per-frame TAViD target mask: slice the full mask track to this
-            # chunk's frame window so every chunk gets dense mask guidance
-            # (matches training when target_mask_condition_frames_only=False).
-            # If the user passed a single static mask (T==1), it is broadcast
-            # across all chunks (TAViD-original behaviour).
-            chunk_target_mask: torch.Tensor | None = None
-            if target_mask is not None:
-                mask_h, mask_w = chunk_input.shape[3], chunk_input.shape[4]
-                full_mask = _resize_mask_to(
-                    target_mask,
-                    num_frames=target_mask.shape[-3] if target_mask.ndim >= 3 else 1,
-                    height=mask_h,
-                    width=mask_w,
-                )
-                full_T = full_mask.shape[2]
-                if full_T == 1:
-                    # Static mask: broadcast to every frame of this chunk.
-                    chunk_target_mask = full_mask.repeat(1, 1, model_required_frames, 1, 1)
-                else:
-                    # Per-frame mask: slice the window and zero-pad to model size.
-                    slice_end = min(end_frame, full_T)
-                    sliced = full_mask[:, :, start_frame:slice_end]
-                    pad_T = model_required_frames - sliced.shape[2]
-                    if pad_T > 0:
-                        pad = torch.zeros(
-                            sliced.shape[0], 1, pad_T, mask_h, mask_w,
-                            dtype=sliced.dtype, device=sliced.device,
-                        )
-                        sliced = torch.cat([sliced, pad], dim=2)
-                    chunk_target_mask = sliced
-
             # Generate chunk
             chunk_video = self.generate_vid2world(
                 prompt=prompt,
@@ -949,9 +905,6 @@ class Video2WorldInference:
                 camera=camera,
                 action=action,
                 num_steps=num_steps,
-                target_mask=chunk_target_mask,
-                target_feature=target_feature,
-            target_dense_feature=target_dense_feature,
             )  # Returns (1, C, T, H, W)
 
             # Extract only the actual generated frames (remove padding)
