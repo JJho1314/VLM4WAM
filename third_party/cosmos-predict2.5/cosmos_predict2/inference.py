@@ -14,6 +14,7 @@
 # limitations under the License.
 from pathlib import Path
 
+import os
 import numpy as np
 import torch
 
@@ -169,6 +170,6 @@ class Inference:
             else:
                 log.warning("Guardrail checks on video are disabled")
 
-            save_img_or_video(video, str(output_path), fps=16)
+            save_img_or_video(video, str(output_path), fps=int(os.environ.get("COSMOS_SAVE_FPS", "16")))
             log.success(f"Saved video to {output_path}.mp4")
         return f"{output_path}.mp4"

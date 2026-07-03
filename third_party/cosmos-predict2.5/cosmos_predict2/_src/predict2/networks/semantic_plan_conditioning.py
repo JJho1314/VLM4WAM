@@ -1,4 +1,5 @@
 import math
+import os
 import random
 from os import PathLike
 from typing import Optional, Sequence, Tuple
@@ -64,6 +65,8 @@ class OnlineSemanticPlanEncoder:
     ) -> None:
         self.model_path = str(model_path)
         self.num_keyframes = int(num_keyframes)
+        self.keyframe_scheme = os.environ.get("SEMANTIC_PLAN_KEYFRAME_SCHEME", "uniform")
+        self.late_gamma = float(os.environ.get("SEMANTIC_PLAN_KEYFRAME_GAMMA", "0.6"))
         self.grid_size = int(grid_size)
         self.image_size = int(image_size)
         self.dtype = dtype
@@ -90,6 +93,16 @@ class OnlineSemanticPlanEncoder:
         n = max(min(self.num_keyframes, int(num_frames)), 1)
         if num_frames <= 1:
             return torch.zeros(n, dtype=torch.long)
+        if self.keyframe_scheme == "late" and n > 1:
+            # end-densified: sqrt-warp clusters keyframes toward the last (manipulation/
+            # placement) frames while still spanning [1, T-1]; gamma<1 => later-dense.
+            u = torch.linspace(0.0, 1.0, n) ** self.late_gamma
+            idx = (1.0 + (num_frames - 1 - 1) * u).round().long()
+            idx = torch.clamp(idx, 1, num_frames - 1)
+            for i in range(1, n):  # enforce strictly increasing
+                if idx[i] <= idx[i - 1]:
+                    idx[i] = min(int(idx[i - 1]) + 1, num_frames - 1)
+            return idx
         return torch.linspace(1, num_frames - 1, n).round().long()
 
     @torch.no_grad()
