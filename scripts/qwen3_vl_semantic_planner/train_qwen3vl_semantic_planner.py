@@ -222,14 +222,13 @@ class SemanticPlanDataset(Dataset):
 @dataclass
 class Collator:
     processor: Any
-    plan_token: str
-    plan_len: int
+    plan_sequence: list[str]
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         images = [x["image"] for x in batch]
         labels = torch.stack([x["semantic_plan"] for x in batch], dim=0)
         texts = []
-        plan_text = " ".join([self.plan_token] * self.plan_len)
+        plan_text = " ".join(self.plan_sequence)
         for item in batch:
             user_text = (
                 "You are a robot video semantic planner. Given the first frame and instruction, "
@@ -409,7 +408,7 @@ class PlannerWrapper(nn.Module):
         model: nn.Module,
         hidden_size: int,
         semantic_dim: int,
-        plan_token_id: int,
+        plan_token_ids: list[int],
         target_len: int,
         num_keyframes: int,
         grid_size: int,
@@ -468,11 +467,14 @@ class PlannerWrapper(nn.Module):
             )
         else:
             raise ValueError(f"Unsupported plan_head_type: {plan_head_type}")
-        self.plan_token_id = int(plan_token_id)
+        self.plan_token_ids = [int(x) for x in plan_token_ids]
         self.model = model
 
     def collect_plan_hidden(self, hidden: torch.Tensor, input_ids: torch.Tensor, plan_len: int) -> torch.Tensor:
-        plan_mask = input_ids == self.plan_token_id
+        ids = torch.as_tensor(self.plan_token_ids, device=input_ids.device)
+        # Distinct latent tokens each appear once, in emit order (keyframe-major); the single
+        # <|sem_plan|> token (mlp/baton) appears plan_len times. Both gather in sequence order.
+        plan_mask = torch.isin(input_ids, ids)
         plan_hidden = []
         for b in range(input_ids.shape[0]):
             h = hidden[b, plan_mask[b]]
@@ -585,13 +587,14 @@ def set_trainable(model: nn.Module, *, freeze_vision: bool, freeze_lm_head: bool
             p.requires_grad_(False)
 
 
-def register_single_row_hook(param: nn.Parameter, row_id: int) -> None:
+def register_plan_rows_hook(param: nn.Parameter, row_ids: list[int]) -> None:
     if param.ndim != 2:
         raise RuntimeError(f"Expected embedding weight with ndim=2, got {tuple(param.shape)}")
-    if row_id < 0 or row_id >= param.shape[0]:
-        raise RuntimeError(f"Plan token id {row_id} outside embedding rows {param.shape[0]}")
     row_mask = torch.zeros((param.shape[0], 1), dtype=torch.float32)
-    row_mask[row_id] = 1.0
+    for row_id in row_ids:
+        if row_id < 0 or row_id >= param.shape[0]:
+            raise RuntimeError(f"Plan token id {row_id} outside embedding rows {param.shape[0]}")
+        row_mask[row_id] = 1.0
 
     def hook(grad: torch.Tensor) -> torch.Tensor:
         return grad * row_mask.to(device=grad.device, dtype=grad.dtype)
@@ -670,7 +673,8 @@ def save_checkpoint(
     module.model.save_pretrained(ckpt / "qwen3vl_lora_or_model")
     processor.save_pretrained(ckpt / "processor")
     torch.save(module.plan_head.state_dict(), ckpt / "plan_head.pt")
-    plan_embedding = module.model.get_input_embeddings().weight[module.plan_token_id].detach().cpu()
+    plan_ids = torch.as_tensor(module.plan_token_ids)
+    plan_embedding = module.model.get_input_embeddings().weight[plan_ids].detach().cpu()
     torch.save(plan_embedding, ckpt / "plan_token_embedding.pt")
     feature_type = str(getattr(args, "sample_feature_type", "unknown"))
     summary_path = args.plan_label_dir / "summary.json"
@@ -682,7 +686,7 @@ def save_checkpoint(
     meta = {
         "step": step,
         "plan_token": PLAN_TOKEN,
-        "plan_token_id": module.plan_token_id,
+        "plan_token_ids": module.plan_token_ids,
         "num_keyframes": args.num_keyframes,
         "grid_size": args.grid_size,
         "semantic_dim": args.semantic_dim,
@@ -733,10 +737,24 @@ def main() -> None:
         local_files_only=True,
         eval_mode=False,
     )
-    added = 0 if PLAN_TOKEN in processor.tokenizer.get_vocab() else processor.tokenizer.add_tokens([PLAN_TOKEN], special_tokens=True)
-    plan_token_id = processor.tokenizer.convert_tokens_to_ids(PLAN_TOKEN)
-    if added:
+    # DIAL-style distinct latent tokens (gr00t <|bridge_i|>): for the CoVT bottleneck the LM
+    # emits a small, structured set of latents (num_keyframes x num_latent_per_keyframe), so
+    # give each position its OWN learnable token/embedding instead of repeating one
+    # <|sem_plan|> — identical inputs differentiated by position alone tend to collapse
+    # (all latents become the same -> keyframes stop evolving). mlp/baton keep the single
+    # repeated token (their latent_len = target_len = thousands of tokens).
+    if args.plan_head_type == "covt":
+        _latent_len = int(args.num_keyframes) * int(args.num_latent_per_keyframe)
+        plan_token_strs = [f"<|sem_plan_{i}|>" for i in range(_latent_len)]
+        plan_sequence = list(plan_token_strs)
+    else:
+        plan_token_strs = [PLAN_TOKEN]
+        plan_sequence = [PLAN_TOKEN] * (int(args.num_keyframes) * int(args.grid_size) * int(args.grid_size))
+    new_tokens = [t for t in plan_token_strs if t not in processor.tokenizer.get_vocab()]
+    if new_tokens:
+        processor.tokenizer.add_tokens(new_tokens, special_tokens=True)
         model.resize_token_embeddings(len(processor.tokenizer))
+    plan_token_ids = [processor.tokenizer.convert_tokens_to_ids(t) for t in plan_token_strs]
     model.config.use_cache = False
     if hasattr(model, "gradient_checkpointing_enable"):
         try:
@@ -752,7 +770,7 @@ def main() -> None:
         full_finetune=args.full_finetune,
     )
     if args.train_plan_token_embedding and not args.full_finetune:
-        register_single_row_hook(model.get_input_embeddings().weight, plan_token_id)
+        register_plan_rows_hook(model.get_input_embeddings().weight, plan_token_ids)
     model = apply_lora(model, args)
 
     # Probe a sample label for semantic dim + feature type (the latter is recorded in
@@ -770,7 +788,7 @@ def main() -> None:
         model=model,
         hidden_size=hidden_size,
         semantic_dim=args.semantic_dim,
-        plan_token_id=plan_token_id,
+        plan_token_ids=plan_token_ids,
         target_len=args.num_keyframes * args.grid_size * args.grid_size,
         num_keyframes=args.num_keyframes,
         grid_size=args.grid_size,
@@ -832,8 +850,7 @@ def main() -> None:
         num_workers=args.num_workers,
         collate_fn=Collator(
             processor=processor,
-            plan_token=PLAN_TOKEN,
-            plan_len=(wrapper.module if isinstance(wrapper, DDP) else wrapper).latent_len,
+            plan_sequence=plan_sequence,
         ),
         pin_memory=True,
     )
