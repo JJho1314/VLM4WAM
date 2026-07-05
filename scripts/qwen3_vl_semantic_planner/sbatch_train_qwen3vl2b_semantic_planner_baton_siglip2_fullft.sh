@@ -41,6 +41,15 @@ PLAN_HEAD_TYPE=${PLAN_HEAD_TYPE:-mlp}
 # CoVT bottleneck (plan-head-type=covt): LM emits NUM_LATENT_PER_KEYFRAME latents/keyframe;
 # a decoder reconstructs the dense GRID_SIZE x GRID_SIZE SigLIP grid. Ignored by mlp/baton.
 NUM_LATENT_PER_KEYFRAME=${NUM_LATENT_PER_KEYFRAME:-4}
+# Online labels (cosmos-style episode sampling): random window per stem per epoch from
+# frame_ranges.json, SigLIP2 targets encoded on the fly. PLAN_LABEL_DIR is unused then.
+ONLINE_PLAN_LABELS=${ONLINE_PLAN_LABELS:-0}
+SIGLIP2_ENCODER_PATH=${SIGLIP2_ENCODER_PATH:-/data/user/jhe724/workspace/weights/siglip2-so400m-patch14-384}
+KEYFRAME_SCHEME=${KEYFRAME_SCHEME:-uniform}
+KEYFRAME_GAMMA=${KEYFRAME_GAMMA:-0.6}
+SEQUENCE_LENGTH=${SEQUENCE_LENGTH:-49}
+ONLINE_GRID_SIZE=${ONLINE_GRID_SIZE:-0}
+SEMANTIC_DIM=${SEMANTIC_DIM:-0}
 PLAN_HEAD_NUM_HEADS=${PLAN_HEAD_NUM_HEADS:-16}
 PLAN_HEAD_DROPOUT=${PLAN_HEAD_DROPOUT:-0.0}
 SEM_MLP_HIDDEN_SIZE=${SEM_MLP_HIDDEN_SIZE:--1}
@@ -77,7 +86,7 @@ if [[ ! -d "$MODEL_PATH" ]]; then
   echo "ERROR: Qwen3-VL-2B model path not found: $MODEL_PATH" >&2
   exit 2
 fi
-if [[ ! -d "$PLAN_LABEL_DIR" ]]; then
+if [[ "$ONLINE_PLAN_LABELS" != "1" && ! -d "$PLAN_LABEL_DIR" ]]; then
   echo "ERROR: semantic plan label dir not found: $PLAN_LABEL_DIR" >&2
   exit 2
 fi
@@ -95,6 +104,7 @@ echo "loss: mse=$MSE_LOSS_WEIGHT cosine=$COSINE_LOSS_WEIGHT norm=$NORM_LOSS_WEIG
 echo "freeze_vision=$FREEZE_VISION freeze_lm_head=$FREEZE_LM_HEAD"
 echo "NOTE: num-keyframes/grid-size MUST match the world model's SEMANTIC_PLAN_NUM_KEYFRAMES/SPATIAL_GRID for the plan to be consumable."
 
+if [[ "$ONLINE_PLAN_LABELS" != "1" ]]; then
 "$PY" - <<'PY'
 import json
 import pathlib
@@ -116,11 +126,13 @@ print(json.dumps({
     "first_frame_index": payload.get("first_frame_index", 0),
 }), flush=True)
 PY
+else
+  echo "online_plan_labels=1 keyframe_scheme=$KEYFRAME_SCHEME gamma=$KEYFRAME_GAMMA seq_len=$SEQUENCE_LENGTH online_grid=$ONLINE_GRID_SIZE siglip2=$SIGLIP2_ENCODER_PATH"
+fi
 
 TRAIN_ARGS=(
   --model-path "$MODEL_PATH"
   --dataset-root "$DATASET_ROOT"
-  --plan-label-dir "$PLAN_LABEL_DIR"
   --output-dir "$OUTPUT_DIR"
   --max-samples "$MAX_SAMPLES"
   --max-steps "$MAX_STEPS"
@@ -153,6 +165,20 @@ TRAIN_ARGS=(
   --ddp-find-unused-parameters
   --train-plan-token-embedding
 )
+
+if [[ "$ONLINE_PLAN_LABELS" == "1" ]]; then
+  TRAIN_ARGS+=(
+    --online-plan-labels
+    --siglip2-encoder-path "$SIGLIP2_ENCODER_PATH"
+    --sequence-length "$SEQUENCE_LENGTH"
+    --keyframe-scheme "$KEYFRAME_SCHEME"
+    --keyframe-gamma "$KEYFRAME_GAMMA"
+    --online-grid-size "$ONLINE_GRID_SIZE"
+    --semantic-dim "$SEMANTIC_DIM"
+  )
+else
+  TRAIN_ARGS+=(--plan-label-dir "$PLAN_LABEL_DIR")
+fi
 
 if [[ "$SAMPLE_ONE_WINDOW_PER_STEM" == "1" ]]; then
   TRAIN_ARGS+=(--sample-one-window-per-stem)

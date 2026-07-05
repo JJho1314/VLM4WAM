@@ -38,8 +38,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--dataset-root", type=Path, required=True)
-    parser.add_argument("--plan-label-dir", type=Path, required=True)
+    parser.add_argument("--plan-label-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, required=True)
+    # Online labels (cosmos-style episode sampling): instead of fixed precomputed .pt windows,
+    # sample a random sequence-length window per stem per epoch from frame_ranges.json and
+    # encode the SigLIP2 targets on the fly — aligns the planner's window distribution with
+    # the world model's episode sampling and makes the keyframe scheme an env-free switch.
+    parser.add_argument("--online-plan-labels", action="store_true")
+    parser.add_argument("--frame-ranges-json", type=Path, default=None)
+    parser.add_argument("--siglip2-encoder-path", type=Path, default=None)
+    parser.add_argument("--sequence-length", type=int, default=49)
+    parser.add_argument("--keyframe-scheme", choices=["uniform", "late"], default="uniform")
+    parser.add_argument("--keyframe-gamma", type=float, default=0.6)
+    parser.add_argument("--online-grid-size", type=int, default=0, help="<=0 keeps the native SigLIP2 grid")
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--sample-one-window-per-stem", action="store_true")
     parser.add_argument("--episode-window-sampling", choices=["random", "round_robin"], default="random")
@@ -219,6 +230,100 @@ class SemanticPlanDataset(Dataset):
         }
 
 
+def keyframe_offsets(sequence_length: int, n: int, scheme: str, gamma: float) -> list[int]:
+    """Window-relative keyframe positions; mirrors the world model's
+    semantic_plan_conditioning.keyframe_indices (uniform over [1, T-1] excluding the
+    conditioning frame; "late" = end-densified sqrt-warp with strictly increasing fixup)."""
+    n = max(min(n, sequence_length), 1)
+    if sequence_length <= 1:
+        return [0] * n
+    if scheme == "late" and n > 1:
+        u = torch.linspace(0.0, 1.0, n) ** float(gamma)
+        idx = (1.0 + (sequence_length - 1 - 1) * u).round().long()
+        idx = torch.clamp(idx, 1, sequence_length - 1)
+        for i in range(1, n):
+            if idx[i] <= idx[i - 1]:
+                idx[i] = min(int(idx[i - 1]) + 1, sequence_length - 1)
+        return idx.tolist()
+    return torch.linspace(1, sequence_length - 1, n).round().long().tolist()
+
+
+class OnlineSemanticPlanDataset(Dataset):
+    """Cosmos-style episode sampling for planner training.
+
+    Each item is a stem; every epoch a fresh stride-1 window of ``sequence_length`` frames
+    is drawn from that stem's valid frame ranges (range picked ∝ its number of valid starts,
+    start uniform within the range).  Returns the window's first frame (planner input) plus
+    the raw keyframe frames; SigLIP2 targets are encoded on-GPU in the training loop with the
+    offline builder's exact encode_images, so online targets match precomputed labels."""
+
+    def __init__(
+        self,
+        dataset_root: Path,
+        frame_ranges_json: Path,
+        num_keyframes: int,
+        sequence_length: int,
+        keyframe_scheme: str,
+        keyframe_gamma: float,
+        max_samples: int = 0,
+        seed: int = 0,
+    ) -> None:
+        from build_siglip2_semantic_plan_labels import load_frame_ranges
+
+        self.dataset_root = dataset_root
+        self.sequence_length = int(sequence_length)
+        self.offsets = keyframe_offsets(self.sequence_length, num_keyframes, keyframe_scheme, keyframe_gamma)
+        self.seed = int(seed)
+        self.epoch = 0
+        ranges = load_frame_ranges(frame_ranges_json)
+        self.items: list[tuple[str, list[tuple[int, int, int]]]] = []
+        for stem in sorted(ranges):
+            fitting = []
+            for range_start, range_end in ranges[stem]:
+                n_starts = int(range_end) - int(range_start) - self.sequence_length + 1
+                if n_starts > 0:
+                    fitting.append((int(range_start), int(range_end), n_starts))
+            if fitting:
+                self.items.append((stem, fitting))
+        if max_samples > 0:
+            self.items = self.items[:max_samples]
+        if not self.items:
+            raise RuntimeError(f"No stems with a fitting {self.sequence_length}-frame window in {frame_ranges_json}")
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        import numpy as np
+
+        from build_siglip2_semantic_plan_labels import load_frames, read_meta
+
+        stem, fitting = self.items[index]
+        rng_seed = (self.seed + 1_000_003 * self.epoch + 9_176 * index) & 0xFFFFFFFF
+        rng = random.Random(rng_seed)
+        total = sum(n for _, _, n in fitting)
+        pick = rng.randrange(total)
+        for range_start, _range_end, n_starts in fitting:
+            if pick < n_starts:
+                start = range_start + pick
+                break
+            pick -= n_starts
+        frame_indices = [start] + [start + o for o in self.offsets]
+        video_path = self.dataset_root / "videos" / f"{stem}.mp4"
+        frames = load_frames(video_path, frame_indices)
+        keyframes = np.stack([np.asarray(img, dtype=np.uint8) for img in frames[1:]], axis=0)
+        return {
+            "stem": stem,
+            "sample_id": f"{stem}__s{start:06d}",
+            "image": frames[0],
+            "prompt": read_meta(self.dataset_root, stem),
+            "keyframe_images": torch.from_numpy(keyframes),  # (K, H, W, 3) uint8
+        }
+
+
 @dataclass
 class Collator:
     processor: Any
@@ -226,7 +331,12 @@ class Collator:
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         images = [x["image"] for x in batch]
-        labels = torch.stack([x["semantic_plan"] for x in batch], dim=0)
+        labels = None
+        keyframes = None
+        if "semantic_plan" in batch[0]:
+            labels = torch.stack([x["semantic_plan"] for x in batch], dim=0)
+        else:  # online mode: raw keyframes, targets encoded on GPU in the training loop
+            keyframes = torch.stack([x["keyframe_images"] for x in batch], dim=0)
         texts = []
         plan_text = " ".join(self.plan_sequence)
         for item in batch:
@@ -247,7 +357,10 @@ class Collator:
             ]
             texts.append(self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False))
         inputs = self.processor(text=texts, images=images, padding=True, return_tensors="pt")
-        inputs["semantic_plan_labels"] = labels
+        if labels is not None:
+            inputs["semantic_plan_labels"] = labels
+        if keyframes is not None:
+            inputs["keyframe_images"] = keyframes
         inputs["stems"] = [x["stem"] for x in batch]
         return inputs
 
@@ -677,8 +790,8 @@ def save_checkpoint(
     plan_embedding = module.model.get_input_embeddings().weight[plan_ids].detach().cpu()
     torch.save(plan_embedding, ckpt / "plan_token_embedding.pt")
     feature_type = str(getattr(args, "sample_feature_type", "unknown"))
-    summary_path = args.plan_label_dir / "summary.json"
-    if summary_path.exists():
+    summary_path = args.plan_label_dir / "summary.json" if args.plan_label_dir else None
+    if summary_path is not None and summary_path.exists():
         try:
             feature_type = json.loads(summary_path.read_text()).get("feature_type", feature_type)
         except Exception:
@@ -693,8 +806,15 @@ def save_checkpoint(
         "model_path": str(args.model_path),
         "objective": "continuous_semantic_blueprint_regression",
         "feature_type": feature_type,
-        "plan_label_dir": str(args.plan_label_dir),
+        "plan_label_dir": str(args.plan_label_dir) if args.plan_label_dir else None,
         "sample_one_window_per_stem": bool(args.sample_one_window_per_stem),
+        "online_plan_labels": bool(args.online_plan_labels),
+        "keyframe_scheme": str(args.keyframe_scheme),
+        "keyframe_gamma": float(args.keyframe_gamma),
+        "sequence_length": int(args.sequence_length),
+        "online_grid_size": int(args.online_grid_size),
+        "siglip2_encoder_path": str(args.siglip2_encoder_path) if args.siglip2_encoder_path else None,
+        "frame_ranges_json": str(args.frame_ranges_json) if args.frame_ranges_json else None,
         "plan_head_type": module.plan_head_type,
         "plan_head_num_heads": int(module.plan_head_num_heads),
         "plan_head_dropout": float(module.plan_head_dropout),
@@ -779,15 +899,39 @@ def main() -> None:
             register_plan_rows_hook(embed_weight, plan_token_ids)
     model = apply_lora(model, args)
 
-    # Probe a sample label for semantic dim + feature type (the latter is recorded in
-    # planner_meta.json; the old summary.json path never exists for these label dirs).
-    first = next(iter(sorted(args.plan_label_dir.glob("*.pt"))), None)
-    if first is None:
-        raise RuntimeError(f"No .pt labels under {args.plan_label_dir}")
-    payload = torch.load(first, map_location="cpu", weights_only=False)
-    args.sample_feature_type = str(payload.get("feature_type", "unknown"))
-    if args.semantic_dim <= 0:
-        args.semantic_dim = int(payload["semantic_plan"].shape[-1])
+    sig_model = sig_processor = sig_encode = None
+    if args.online_plan_labels:
+        from build_siglip2_semantic_plan_labels import encode_images, load_siglip2, semantic_feature_type
+
+        if args.siglip2_encoder_path is None:
+            raise ValueError("--online-plan-labels requires --siglip2-encoder-path")
+        if args.frame_ranges_json is None:
+            args.frame_ranges_json = args.dataset_root / "frame_ranges.json"
+        sig_model, sig_processor = load_siglip2(args.siglip2_encoder_path, device, "bf16")
+        sig_model.requires_grad_(False)
+        sig_encode = encode_images
+        # Probe dim + tokens-per-keyframe with a dummy frame; validates the head grid early.
+        probe = sig_encode(sig_model, sig_processor, [Image.new("RGB", (64, 64))], args.online_grid_size, device, torch.float32)
+        if probe.shape[1] != args.grid_size * args.grid_size:
+            raise ValueError(
+                f"online grid {args.online_grid_size} yields {probe.shape[1]} tokens/keyframe, "
+                f"but --grid-size {args.grid_size} expects {args.grid_size * args.grid_size}"
+            )
+        args.sample_feature_type = semantic_feature_type(args.online_grid_size)
+        if args.semantic_dim <= 0:
+            args.semantic_dim = int(probe.shape[-1])
+    else:
+        if args.plan_label_dir is None:
+            raise ValueError("--plan-label-dir is required unless --online-plan-labels is set")
+        # Probe a sample label for semantic dim + feature type (the latter is recorded in
+        # planner_meta.json; the old summary.json path never exists for these label dirs).
+        first = next(iter(sorted(args.plan_label_dir.glob("*.pt"))), None)
+        if first is None:
+            raise RuntimeError(f"No .pt labels under {args.plan_label_dir}")
+        payload = torch.load(first, map_location="cpu", weights_only=False)
+        args.sample_feature_type = str(payload.get("feature_type", "unknown"))
+        if args.semantic_dim <= 0:
+            args.semantic_dim = int(payload["semantic_plan"].shape[-1])
 
     hidden_size = int(model.config.text_config.hidden_size)
     wrapper = PlannerWrapper(
@@ -839,14 +983,40 @@ def main() -> None:
             static_graph=not args.ddp_find_unused_parameters,
         )
 
-    dataset = SemanticPlanDataset(
-        dataset_root=args.dataset_root,
-        label_dir=args.plan_label_dir,
-        num_keyframes=args.num_keyframes,
-        grid_size=args.grid_size,
-        max_samples=args.max_samples,
-        sample_one_window_per_stem=args.sample_one_window_per_stem,
-    )
+    if args.online_plan_labels:
+        dataset = OnlineSemanticPlanDataset(
+            dataset_root=args.dataset_root,
+            frame_ranges_json=args.frame_ranges_json,
+            num_keyframes=args.num_keyframes,
+            sequence_length=args.sequence_length,
+            keyframe_scheme=args.keyframe_scheme,
+            keyframe_gamma=args.keyframe_gamma,
+            max_samples=args.max_samples,
+            seed=args.seed,
+        )
+        if is_main(rank):
+            print(
+                json.dumps(
+                    {
+                        "online_plan_labels": True,
+                        "stems": len(dataset),
+                        "keyframe_scheme": args.keyframe_scheme,
+                        "keyframe_offsets": dataset.offsets,
+                        "sequence_length": args.sequence_length,
+                        "feature_type": args.sample_feature_type,
+                    }
+                ),
+                flush=True,
+            )
+    else:
+        dataset = SemanticPlanDataset(
+            dataset_root=args.dataset_root,
+            label_dir=args.plan_label_dir,
+            num_keyframes=args.num_keyframes,
+            grid_size=args.grid_size,
+            max_samples=args.max_samples,
+            sample_one_window_per_stem=args.sample_one_window_per_stem,
+        )
     sampler = DistributedSampler(dataset, num_replicas=world, rank=rank, shuffle=True) if world > 1 else None
     loader = DataLoader(
         dataset,
@@ -889,9 +1059,18 @@ def main() -> None:
         dataset.set_epoch(step)
         for batch in loader:
             batch.pop("stems", None)
+            keyframes = batch.pop("keyframe_images", None)
             module = wrapper.module if isinstance(wrapper, DDP) else wrapper
             model_dtype = next(module.model.parameters()).dtype
             batch = move_qwen_inputs_to_device(batch, device, model_dtype=model_dtype)
+            if keyframes is not None:
+                # Online targets: frozen SigLIP2 over the sampled keyframes, exactly the
+                # offline builder's encode path (bit-consistent with precomputed labels).
+                with torch.no_grad():
+                    b, k = keyframes.shape[0], keyframes.shape[1]
+                    imgs = [keyframes[i, j].numpy() for i in range(b) for j in range(k)]
+                    target = sig_encode(sig_model, sig_processor, imgs, args.online_grid_size, device, torch.float32)
+                    batch["semantic_plan_labels"] = target.reshape(b, k * target.shape[1], target.shape[-1])
             out = wrapper(**batch)
             (out["loss"] / args.grad_accum).backward()
             running_loss += float(out["loss"].detach())
