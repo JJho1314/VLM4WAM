@@ -63,6 +63,10 @@ NUM_WORKERS=${NUM_WORKERS:-2}
 FREEZE_VISION=${FREEZE_VISION:-1}
 FREEZE_LM_HEAD=${FREEZE_LM_HEAD:-1}
 
+# HPC3 compute nodes have no internet: offline wandb only (sync later with `wandb sync`).
+export WANDB_MODE=${WANDB_MODE:-offline}
+export WANDB_PROJECT=${WANDB_PROJECT:-qwen3vl_semantic_planner}
+
 export PLAN_LABEL_DIR
 
 if [[ ! -x "$PY" ]]; then

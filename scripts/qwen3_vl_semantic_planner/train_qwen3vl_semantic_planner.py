@@ -769,8 +769,14 @@ def main() -> None:
         freeze_lm_head=args.freeze_lm_head,
         full_finetune=args.full_finetune,
     )
-    if args.train_plan_token_embedding and not args.full_finetune:
-        register_plan_rows_hook(model.get_input_embeddings().weight, plan_token_ids)
+    if args.train_plan_token_embedding:
+        embed_weight = model.get_input_embeddings().weight
+        if not embed_weight.requires_grad:
+            # Covers both LoRA (backbone frozen) and full-FT with tied embeddings
+            # (Qwen3-VL-2B has tie_word_embeddings=true, so freezing lm_head also
+            # froze the input embeddings). Re-enable ONLY the plan-token rows via a
+            # masked grad hook; with no LM text loss the lm_head side gets no grad.
+            register_plan_rows_hook(embed_weight, plan_token_ids)
     model = apply_lora(model, args)
 
     # Probe a sample label for semantic dim + feature type (the latter is recorded in
@@ -857,6 +863,20 @@ def main() -> None:
 
     optim = build_optimizer(wrapper.module if isinstance(wrapper, DDP) else wrapper, args)
     scheduler = build_scheduler(optim, args)
+    wandb_run = None
+    if is_main(rank) and os.environ.get("PLANNER_WANDB", "1") == "1":
+        try:
+            import wandb
+
+            wandb_run = wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "qwen3vl_semantic_planner"),
+                name=os.environ.get("WANDB_NAME", args.output_dir.name),
+                dir=str(args.output_dir),
+                mode=os.environ.get("WANDB_MODE", "offline"),
+                config={k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+            )
+        except Exception as exc:  # missing wandb must not kill training; JSON stdout remains
+            print(f"wandb disabled: {exc}", flush=True)
     step = 0
     accum = 0
     running_loss = 0.0
@@ -893,6 +913,8 @@ def main() -> None:
                             {key: float(value) for key, value in out.items() if key != "loss"}
                         )
                         print(json.dumps(log_entry), flush=True)
+                        if wandb_run is not None:
+                            wandb_run.log(log_entry, step=step)
                         running_loss = 0.0
                     if step % args.save_steps == 0:
                         save_checkpoint(args.output_dir, step, wrapper, processor, args, rank)
@@ -904,6 +926,8 @@ def main() -> None:
     save_checkpoint(args.output_dir, step, wrapper, processor, args, rank)
     if is_main(rank):
         pbar.close()
+    if wandb_run is not None:
+        wandb_run.finish()
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
 
