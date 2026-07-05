@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 from dataclasses import dataclass
@@ -51,7 +52,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--head-lr", type=float, default=1e-4)
-    parser.add_argument("--plan-head-type", choices=["mlp", "baton_crossattn"], default="mlp")
+    parser.add_argument("--plan-head-type", choices=["mlp", "baton_crossattn", "covt"], default="mlp")
+    # CoVT-style bottleneck: the LM emits only num-latent-per-keyframe continuous latents per
+    # keyframe (a compact "visual thought"), and a decoder reconstructs the dense SigLIP grid
+    # from them. Decouples the LM sequence length from the target grid resolution.
+    parser.add_argument("--num-latent-per-keyframe", type=int, default=4)
     parser.add_argument("--plan-head-num-heads", type=int, default=16)
     parser.add_argument("--plan-head-dropout", type=float, default=0.0)
     parser.add_argument("--sem-mlp-hidden-size", type=int, default=0)
@@ -69,6 +74,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--infonce-temperature", type=float, default=0.07)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--warmup-steps", type=int, default=50)
+    parser.add_argument("--lr-schedule", choices=["cosine", "constant", "none"], default="cosine")
+    parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
@@ -320,6 +327,82 @@ class BatonCrossAttentionPlanHead(nn.Module):
         return self.sem_mlp(query)
 
 
+class CoVTLatentDecoderHead(nn.Module):
+    """CoVT DINO-branch-style latent bottleneck decoder.
+
+    Faithful to the reference DINO head in CoVT (arXiv 2511.19418,
+    train/src/training/covt_qwen2_5_vl.py): the VLM emits a small budget of continuous
+    thinking tokens (CoVT uses 4 for DINO); each is projected to the target feature dim
+    and L2-normalized, then a bank of learnable grid queries (the full target token grid)
+    cross-attends to them through a single MultiheadAttention whose output is *directly*
+    the reconstructed dense feature map (regressed to the frozen encoder features by MSE).
+    No residual / LayerNorm / extra MLP — CoVT keeps this head minimal.
+
+    Reference (per single image):
+        dino_projection   = nn.Linear(hidden, 1024)         # LM hidden -> DINO dim
+        dino_query_vectors= nn.Parameter(randn(1025, 1024)) # full DINO grid
+        dino_cross_attn   = nn.MultiheadAttention(1024, 8)
+        kv   = F.normalize(dino_projection(hidden[<dino> positions]))   # [B, 4, 1024]
+        pred = dino_cross_attn(query=dino_query_vectors, key=kv, value=kv)  # [B, 1025, 1024]
+
+    Here the target is the per-keyframe SigLIP grid, so the same head is applied per
+    keyframe: keyframe kf is reconstructed from *its own* num_latent_per_keyframe thinking
+    tokens, with a keyframe embedding added to the shared grid queries.  The LM sequence
+    length (num_keyframes*num_latent_per_keyframe) is decoupled from the target grid
+    resolution (num_keyframes*grid_size**2).
+    """
+
+    def __init__(
+        self,
+        *,
+        num_keyframes: int,
+        num_latent_per_keyframe: int,
+        grid_size: int,
+        hidden_size: int,
+        semantic_dim: int,
+        num_heads: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        if semantic_dim % num_heads != 0:
+            raise ValueError(f"semantic_dim={semantic_dim} must be divisible by num_heads={num_heads}")
+        if grid_size <= 0:
+            raise ValueError(f"covt head needs a positive target grid_size, got {grid_size}")
+        self.num_keyframes = int(num_keyframes)
+        self.num_latent_per_keyframe = int(num_latent_per_keyframe)
+        self.grid_size = int(grid_size)
+        self.grid_tokens = self.grid_size * self.grid_size
+        # Project LM hidden -> target feature dim, then the queries/attention live in that dim.
+        self.latent_projection = nn.Linear(hidden_size, semantic_dim)
+        self.grid_query = nn.Parameter(torch.randn(self.grid_tokens, semantic_dim))
+        self.keyframe_embed = nn.Parameter(torch.zeros(self.num_keyframes, semantic_dim))
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=semantic_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+    def forward(self, latent_hidden: torch.Tensor) -> torch.Tensor:
+        # latent_hidden: (B, num_keyframes * num_latent_per_keyframe, H)
+        batch = latent_hidden.shape[0]
+        hidden = latent_hidden.shape[-1]
+        expected = self.num_keyframes * self.num_latent_per_keyframe
+        if latent_hidden.shape[1] != expected:
+            raise RuntimeError(
+                f"covt head expected {expected} latent tokens, got {latent_hidden.shape[1]}"
+            )
+        latents = latent_hidden.reshape(batch * self.num_keyframes, self.num_latent_per_keyframe, hidden)
+        # CoVT: project thinking tokens to the target dim and L2-normalize before cross-attn.
+        kv = F.normalize(self.latent_projection(latents), dim=-1)
+        # Per-keyframe grid queries: (num_keyframes, grid_tokens, D) -> (B*num_keyframes, grid_tokens, D)
+        query = self.grid_query.unsqueeze(0) + self.keyframe_embed.unsqueeze(1)
+        query = query.unsqueeze(0).expand(batch, -1, -1, -1)
+        query = query.reshape(batch * self.num_keyframes, self.grid_tokens, self.grid_query.shape[-1])
+        attn_out, _ = self.cross_attn(query.to(kv.dtype), kv, kv, need_weights=False)
+        return attn_out.reshape(batch, self.num_keyframes * self.grid_tokens, attn_out.shape[-1])
+
+
 class PlannerWrapper(nn.Module):
     def __init__(
         self,
@@ -327,7 +410,10 @@ class PlannerWrapper(nn.Module):
         hidden_size: int,
         semantic_dim: int,
         plan_token_id: int,
-        plan_len: int,
+        target_len: int,
+        num_keyframes: int,
+        grid_size: int,
+        num_latent_per_keyframe: int = 4,
         plan_head_type: str = "mlp",
         plan_head_num_heads: int = 16,
         plan_head_dropout: float = 0.0,
@@ -352,15 +438,31 @@ class PlannerWrapper(nn.Module):
         self.plan_head_type = plan_head_type
         self.plan_head_num_heads = int(plan_head_num_heads)
         self.plan_head_dropout = float(plan_head_dropout)
-        self.plan_len = int(plan_len)
+        self.num_latent_per_keyframe = int(num_latent_per_keyframe)
+        # target_len = tokens the loss regresses (dense SigLIP grid). latent_len = <|sem_plan|>
+        # tokens the LM actually emits. They differ only for the CoVT bottleneck head.
+        self.target_len = int(target_len)
         if plan_head_type == "mlp":
+            self.latent_len = int(target_len)
             self.plan_head = MLPPlanHead(hidden_size, semantic_dim, sem_mlp_hidden_size)
         elif plan_head_type == "baton_crossattn":
+            self.latent_len = int(target_len)
             self.plan_head = BatonCrossAttentionPlanHead(
-                plan_len=plan_len,
+                plan_len=self.latent_len,
                 hidden_size=hidden_size,
                 semantic_dim=semantic_dim,
                 sem_mlp_hidden_size=sem_mlp_hidden_size,
+                num_heads=plan_head_num_heads,
+                dropout=plan_head_dropout,
+            )
+        elif plan_head_type == "covt":
+            self.latent_len = int(num_keyframes) * int(num_latent_per_keyframe)
+            self.plan_head = CoVTLatentDecoderHead(
+                num_keyframes=num_keyframes,
+                num_latent_per_keyframe=num_latent_per_keyframe,
+                grid_size=grid_size,
+                hidden_size=hidden_size,
+                semantic_dim=semantic_dim,
                 num_heads=plan_head_num_heads,
                 dropout=plan_head_dropout,
             )
@@ -383,7 +485,7 @@ class PlannerWrapper(nn.Module):
         outputs = self.model(**inputs, output_hidden_states=True, use_cache=False)
         hidden = outputs.hidden_states[-1]
         input_ids = inputs["input_ids"]
-        plan_hidden = self.collect_plan_hidden(hidden, input_ids, self.plan_len)
+        plan_hidden = self.collect_plan_hidden(hidden, input_ids, self.latent_len)
         head_dtype = next(self.plan_head.parameters()).dtype
         return self.plan_head(plan_hidden.to(dtype=head_dtype)).float()
 
@@ -444,12 +546,14 @@ class PlannerWrapper(nn.Module):
         }
 
     def forward(self, semantic_plan_labels: torch.Tensor, **inputs: Any) -> dict[str, torch.Tensor]:
-        batch, plan_len, _ = semantic_plan_labels.shape
-        if plan_len != self.plan_len:
-            raise RuntimeError(f"Batch has {plan_len} plan tokens, wrapper expects {self.plan_len}")
+        batch, target_len, _ = semantic_plan_labels.shape
+        if target_len != self.target_len:
+            raise RuntimeError(f"Batch has {target_len} target tokens, wrapper expects {self.target_len}")
         pred = self.predict_semantic_plan(**inputs)
         if pred.shape[0] != batch:
             raise RuntimeError(f"Prediction batch {pred.shape[0]} does not match labels batch {batch}")
+        if pred.shape[1] != self.target_len:
+            raise RuntimeError(f"Prediction has {pred.shape[1]} tokens, expected target_len {self.target_len}")
         target = semantic_plan_labels.to(device=pred.device, dtype=torch.float32)
         return self.compute_plan_losses(pred, target)
 
@@ -511,6 +615,34 @@ def build_optimizer(wrapper: PlannerWrapper, args: argparse.Namespace) -> torch.
     return torch.optim.AdamW(groups)
 
 
+def build_scheduler(
+    optimizer: torch.optim.Optimizer, args: argparse.Namespace
+) -> torch.optim.lr_scheduler.LambdaLR | None:
+    """Linear warmup to the base LR, then cosine decay to ``min_lr_ratio`` of it.
+
+    ``--warmup-steps`` was previously parsed but never consumed, leaving the run
+    at a constant LR with no warmup. The multiplier is shared across param groups
+    so the backbone (--lr) and plan head (--head-lr) decay proportionally.
+    """
+    if args.lr_schedule == "none":
+        return None
+    warmup = max(0, int(args.warmup_steps))
+    total = max(1, int(args.max_steps))
+    min_ratio = float(args.min_lr_ratio)
+
+    def lr_lambda(step: int) -> float:
+        if warmup > 0 and step < warmup:
+            return (step + 1) / warmup
+        if args.lr_schedule == "constant" or total <= warmup:
+            return 1.0
+        progress = (step - warmup) / max(1, total - warmup)
+        progress = min(1.0, max(0.0, progress))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_ratio + (1.0 - min_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 def count_trainable_parameters(module: nn.Module) -> tuple[int, int]:
     total = 0
     trainable = 0
@@ -540,7 +672,7 @@ def save_checkpoint(
     torch.save(module.plan_head.state_dict(), ckpt / "plan_head.pt")
     plan_embedding = module.model.get_input_embeddings().weight[module.plan_token_id].detach().cpu()
     torch.save(plan_embedding, ckpt / "plan_token_embedding.pt")
-    feature_type = "unknown"
+    feature_type = str(getattr(args, "sample_feature_type", "unknown"))
     summary_path = args.plan_label_dir / "summary.json"
     if summary_path.exists():
         try:
@@ -562,6 +694,9 @@ def save_checkpoint(
         "plan_head_type": module.plan_head_type,
         "plan_head_num_heads": int(module.plan_head_num_heads),
         "plan_head_dropout": float(module.plan_head_dropout),
+        "num_latent_per_keyframe": int(module.num_latent_per_keyframe),
+        "latent_len": int(module.latent_len),
+        "target_len": int(module.target_len),
         "sem_mlp_hidden_size": int(module.sem_mlp_hidden_size),
         "mse_loss_weight": float(module.mse_loss_weight),
         "cosine_loss_weight": float(module.cosine_loss_weight),
@@ -620,12 +755,14 @@ def main() -> None:
         register_single_row_hook(model.get_input_embeddings().weight, plan_token_id)
     model = apply_lora(model, args)
 
-    # Probe semantic dim if not supplied.
+    # Probe a sample label for semantic dim + feature type (the latter is recorded in
+    # planner_meta.json; the old summary.json path never exists for these label dirs).
+    first = next(iter(sorted(args.plan_label_dir.glob("*.pt"))), None)
+    if first is None:
+        raise RuntimeError(f"No .pt labels under {args.plan_label_dir}")
+    payload = torch.load(first, map_location="cpu", weights_only=False)
+    args.sample_feature_type = str(payload.get("feature_type", "unknown"))
     if args.semantic_dim <= 0:
-        first = next(iter(sorted(args.plan_label_dir.glob("*.pt"))), None)
-        if first is None:
-            raise RuntimeError(f"No .pt labels under {args.plan_label_dir}")
-        payload = torch.load(first, map_location="cpu", weights_only=False)
         args.semantic_dim = int(payload["semantic_plan"].shape[-1])
 
     hidden_size = int(model.config.text_config.hidden_size)
@@ -634,7 +771,10 @@ def main() -> None:
         hidden_size=hidden_size,
         semantic_dim=args.semantic_dim,
         plan_token_id=plan_token_id,
-        plan_len=args.num_keyframes * args.grid_size * args.grid_size,
+        target_len=args.num_keyframes * args.grid_size * args.grid_size,
+        num_keyframes=args.num_keyframes,
+        grid_size=args.grid_size,
+        num_latent_per_keyframe=args.num_latent_per_keyframe,
         plan_head_type=args.plan_head_type,
         plan_head_num_heads=args.plan_head_num_heads,
         plan_head_dropout=args.plan_head_dropout,
@@ -693,12 +833,13 @@ def main() -> None:
         collate_fn=Collator(
             processor=processor,
             plan_token=PLAN_TOKEN,
-            plan_len=args.num_keyframes * args.grid_size * args.grid_size,
+            plan_len=(wrapper.module if isinstance(wrapper, DDP) else wrapper).latent_len,
         ),
         pin_memory=True,
     )
 
     optim = build_optimizer(wrapper.module if isinstance(wrapper, DDP) else wrapper, args)
+    scheduler = build_scheduler(optim, args)
     step = 0
     accum = 0
     running_loss = 0.0
@@ -706,6 +847,9 @@ def main() -> None:
     while step < args.max_steps:
         if sampler is not None:
             sampler.set_epoch(step)
+        # Advance the dataset epoch too, else sample_one_window_per_stem never resamples the
+        # window per stem (the new epoch is picked up when the DataLoader respawns workers).
+        dataset.set_epoch(step)
         for batch in loader:
             batch.pop("stems", None)
             module = wrapper.module if isinstance(wrapper, DDP) else wrapper
@@ -718,6 +862,8 @@ def main() -> None:
             if accum >= args.grad_accum:
                 torch.nn.utils.clip_grad_norm_([p for p in wrapper.parameters() if p.requires_grad], 1.0)
                 optim.step()
+                if scheduler is not None:
+                    scheduler.step()
                 optim.zero_grad(set_to_none=True)
                 step += 1
                 accum = 0
@@ -725,7 +871,7 @@ def main() -> None:
                     pbar.update(1)
                     if step % args.log_steps == 0:
                         avg = running_loss / max(args.log_steps * args.grad_accum, 1)
-                        log_entry = {"step": step, "loss": avg}
+                        log_entry = {"step": step, "loss": avg, "lr": optim.param_groups[0]["lr"]}
                         log_entry.update(
                             {key: float(value) for key, value in out.items() if key != "loss"}
                         )

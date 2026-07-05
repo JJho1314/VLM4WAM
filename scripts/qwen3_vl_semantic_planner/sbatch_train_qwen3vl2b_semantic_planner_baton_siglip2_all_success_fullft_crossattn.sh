@@ -30,7 +30,10 @@ export PLAN_HEAD_TYPE=${PLAN_HEAD_TYPE:-baton_crossattn}
 export PLAN_HEAD_NUM_HEADS=${PLAN_HEAD_NUM_HEADS:-16}
 export PLAN_HEAD_DROPOUT=${PLAN_HEAD_DROPOUT:-0.0}
 export SEM_MLP_HIDDEN_SIZE=${SEM_MLP_HIDDEN_SIZE:--1}
-export COSINE_LOSS_WEIGHT=${COSINE_LOSS_WEIGHT:-0.0}
+# Keep the anti-collapse recipe (cosine on). The base launcher now defaults all loss
+# weights; only override here if intentionally ablating.
+export COSINE_LOSS_WEIGHT=${COSINE_LOSS_WEIGHT:-1.0}
+export WARMUP_STEPS=${WARMUP_STEPS:-200}
 export SAVE_STEPS=${SAVE_STEPS:-1000}
 
 exec scripts/qwen3_vl_semantic_planner/sbatch_train_qwen3vl2b_semantic_planner_baton_siglip2_fullft.sh

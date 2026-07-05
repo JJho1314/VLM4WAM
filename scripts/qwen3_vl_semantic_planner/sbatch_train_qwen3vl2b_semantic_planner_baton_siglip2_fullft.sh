@@ -38,10 +38,25 @@ GRID_SIZE=${GRID_SIZE:-9}
 LR=${LR:-2e-6}
 HEAD_LR=${HEAD_LR:-1e-4}
 PLAN_HEAD_TYPE=${PLAN_HEAD_TYPE:-mlp}
+# CoVT bottleneck (plan-head-type=covt): LM emits NUM_LATENT_PER_KEYFRAME latents/keyframe;
+# a decoder reconstructs the dense GRID_SIZE x GRID_SIZE SigLIP grid. Ignored by mlp/baton.
+NUM_LATENT_PER_KEYFRAME=${NUM_LATENT_PER_KEYFRAME:-4}
 PLAN_HEAD_NUM_HEADS=${PLAN_HEAD_NUM_HEADS:-16}
 PLAN_HEAD_DROPOUT=${PLAN_HEAD_DROPOUT:-0.0}
 SEM_MLP_HIDDEN_SIZE=${SEM_MLP_HIDDEN_SIZE:--1}
-COSINE_LOSS_WEIGHT=${COSINE_LOSS_WEIGHT:-0.0}
+# Anti-collapse loss recipe (matches the train script defaults). Plain MSE alone regresses
+# multimodal futures to their per-sample mean; cosine/norm/variance/infonce keep the plan
+# discriminative. Do NOT set COSINE_LOSS_WEIGHT=0 — that was the pre-fix recipe.
+MSE_LOSS_WEIGHT=${MSE_LOSS_WEIGHT:-1.0}
+COSINE_LOSS_WEIGHT=${COSINE_LOSS_WEIGHT:-1.0}
+NORM_LOSS_WEIGHT=${NORM_LOSS_WEIGHT:-0.2}
+VARIANCE_LOSS_WEIGHT=${VARIANCE_LOSS_WEIGHT:-0.1}
+INFONCE_LOSS_WEIGHT=${INFONCE_LOSS_WEIGHT:-0.1}
+INFONCE_TEMPERATURE=${INFONCE_TEMPERATURE:-0.07}
+WEIGHT_DECAY=${WEIGHT_DECAY:-0.0}
+WARMUP_STEPS=${WARMUP_STEPS:-100}
+LR_SCHEDULE=${LR_SCHEDULE:-cosine}
+MIN_LR_RATIO=${MIN_LR_RATIO:-0.1}
 DTYPE=${DTYPE:-bf16}
 SAVE_STEPS=${SAVE_STEPS:-500}
 NUM_WORKERS=${NUM_WORKERS:-2}
@@ -71,8 +86,10 @@ echo "labels=$PLAN_LABEL_DIR"
 echo "output=$OUTPUT_DIR"
 echo "max_samples=$MAX_SAMPLES max_steps=$MAX_STEPS batch_per_gpu=$BATCH_SIZE accum=$GRAD_ACCUM num_gpus=$NUM_GPUS global_batch=$((BATCH_SIZE * GRAD_ACCUM * NUM_GPUS))"
 echo "sample_one_window_per_stem=$SAMPLE_ONE_WINDOW_PER_STEM"
-echo "keyframes=$NUM_KEYFRAMES grid=$GRID_SIZE lr=$LR head_lr=$HEAD_LR plan_head_type=$PLAN_HEAD_TYPE plan_head_num_heads=$PLAN_HEAD_NUM_HEADS plan_head_dropout=$PLAN_HEAD_DROPOUT sem_mlp_hidden_size=$SEM_MLP_HIDDEN_SIZE cosine_loss_weight=$COSINE_LOSS_WEIGHT"
+echo "keyframes=$NUM_KEYFRAMES grid=$GRID_SIZE lr=$LR head_lr=$HEAD_LR plan_head_type=$PLAN_HEAD_TYPE num_latent_per_keyframe=$NUM_LATENT_PER_KEYFRAME plan_head_num_heads=$PLAN_HEAD_NUM_HEADS plan_head_dropout=$PLAN_HEAD_DROPOUT sem_mlp_hidden_size=$SEM_MLP_HIDDEN_SIZE"
+echo "loss: mse=$MSE_LOSS_WEIGHT cosine=$COSINE_LOSS_WEIGHT norm=$NORM_LOSS_WEIGHT variance=$VARIANCE_LOSS_WEIGHT infonce=$INFONCE_LOSS_WEIGHT temp=$INFONCE_TEMPERATURE | sched=$LR_SCHEDULE warmup=$WARMUP_STEPS min_lr_ratio=$MIN_LR_RATIO weight_decay=$WEIGHT_DECAY"
 echo "freeze_vision=$FREEZE_VISION freeze_lm_head=$FREEZE_LM_HEAD"
+echo "NOTE: num-keyframes/grid-size MUST match the world model's SEMANTIC_PLAN_NUM_KEYFRAMES/SPATIAL_GRID for the plan to be consumable."
 
 "$PY" - <<'PY'
 import json
@@ -110,11 +127,21 @@ TRAIN_ARGS=(
   --lr "$LR"
   --head-lr "$HEAD_LR"
   --plan-head-type "$PLAN_HEAD_TYPE"
+  --num-latent-per-keyframe "$NUM_LATENT_PER_KEYFRAME"
   --plan-head-num-heads "$PLAN_HEAD_NUM_HEADS"
   --plan-head-dropout "$PLAN_HEAD_DROPOUT"
   --lora-r 0
   --sem-mlp-hidden-size "$SEM_MLP_HIDDEN_SIZE"
+  --mse-loss-weight "$MSE_LOSS_WEIGHT"
   --cosine-loss-weight "$COSINE_LOSS_WEIGHT"
+  --norm-loss-weight "$NORM_LOSS_WEIGHT"
+  --variance-loss-weight "$VARIANCE_LOSS_WEIGHT"
+  --infonce-loss-weight "$INFONCE_LOSS_WEIGHT"
+  --infonce-temperature "$INFONCE_TEMPERATURE"
+  --weight-decay "$WEIGHT_DECAY"
+  --warmup-steps "$WARMUP_STEPS"
+  --lr-schedule "$LR_SCHEDULE"
+  --min-lr-ratio "$MIN_LR_RATIO"
   --dtype "$DTYPE"
   --save-steps "$SAVE_STEPS"
   --num-workers "$NUM_WORKERS"
