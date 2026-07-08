@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from enum import Enum
 from typing import Callable, Dict, Optional, Tuple
 
@@ -35,6 +36,15 @@ from cosmos_predict2._src.predict2.networks.semantic_plan_conditioning import (
 )
 
 NUM_CONDITIONAL_FRAMES_KEY: str = "num_conditional_frames"
+
+
+def _first_frames_to_pil(raw_state: torch.Tensor):
+    """[B,C,T,H,W] [-1,1] video → list of RGB PIL first frames for the Stage-2 planner."""
+    from PIL import Image
+
+    frames = raw_state[:, :, 0]  # [B,C,H,W]
+    frames = ((frames.float() * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round().to(torch.uint8)
+    return [Image.fromarray(frames[b].permute(1, 2, 0).cpu().numpy(), mode="RGB") for b in range(frames.shape[0])]
 
 
 class ConditioningStrategy(str, Enum):
@@ -91,6 +101,35 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
             self._semantic_plan_online_encoder_obj = encoder
         return encoder
 
+    def _semantic_plan_planner(self):
+        """Stage-2: a frozen/trainable Qwen3-VL planner that predicts the plan in-loop.
+
+        Env-guarded (SEMANTIC_PLAN_PLANNER_CKPT unset → None → zero effect, GT online-encode path
+        is used). Plain attribute (like the online encoder): kept out of state_dict / EMA / FSDP.
+        """
+        ckpt = os.environ.get("SEMANTIC_PLAN_PLANNER_CKPT", "").strip()
+        if not ckpt:
+            return None
+        planner = getattr(self, "_semantic_plan_planner_obj", None)
+        if planner is None:
+            import sys
+
+            code_dir = os.environ.get("SEMANTIC_PLAN_PLANNER_CODE_DIR", "").strip()
+            if code_dir and code_dir not in sys.path:
+                sys.path.insert(0, code_dir)
+            from planner_plan_provider import PlannerPlanProvider
+
+            self._sp_planner_trainable = os.environ.get("SEMANTIC_PLAN_PLANNER_TRAINABLE", "0") == "1"
+            self._sp_planner_grad_alpha = float(os.environ.get("SEMANTIC_PLAN_PLANNER_GRAD_ALPHA", "0.1"))
+            device = (
+                torch.device("cuda", torch.cuda.current_device())
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
+            planner = PlannerPlanProvider(ckpt, device=device, dtype="bf16", trainable=self._sp_planner_trainable)
+            self._semantic_plan_planner_obj = planner
+        return planner
+
     def get_data_and_condition(
         self, data_batch: dict[str, torch.Tensor]
     ) -> Tuple[Tensor, Tensor, Video2WorldCondition]:
@@ -106,18 +145,29 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
         semantic_plan = data_batch.get("semantic_plan", None)
         semantic_plan_times = data_batch.get("semantic_plan_times", None)
         online_encoder = self._online_semantic_plan_encoder()
+        planner = self._semantic_plan_planner()
         dropped = self.training and sample_semantic_plan_dropout(
             self.config.semantic_plan_dropout_prob, latent_state.device
         )
+        can_generate = (
+            semantic_plan is None and self.training and raw_state.ndim == 5 and raw_state.shape[2] > 1
+        )
         if dropped:
             semantic_plan = None
-        elif (
-            semantic_plan is None
-            and online_encoder is not None
-            and self.training
-            and raw_state.ndim == 5
-            and raw_state.shape[2] > 1
-        ):
+        elif can_generate and planner is not None:
+            # Stage-2 (closed loop): feed the planner's PREDICTED plan instead of the GT online
+            # encode. Tier-1b = frozen (no_grad); Tier-2 = trainable + DIAL grad throttle.
+            prompts = data_batch.get("ai_caption", None)
+            if prompts is not None:
+                images = _first_frames_to_pil(raw_state)
+                if getattr(self, "_sp_planner_trainable", False):
+                    semantic_plan = planner.predict(images, list(prompts))
+                    a = getattr(self, "_sp_planner_grad_alpha", 0.1)
+                    semantic_plan = semantic_plan * a + semantic_plan.detach() * (1.0 - a)
+                else:
+                    semantic_plan = planner.predict_frozen(images, list(prompts))
+                semantic_plan_times = None  # uniform k5 → adapter uses uniform spacing
+        elif can_generate and online_encoder is not None:
             semantic_plan, semantic_plan_times = online_encoder(raw_state)
         if semantic_plan is not None:
             semantic_plan = semantic_plan.to(device=latent_state.device, dtype=latent_state.dtype)
