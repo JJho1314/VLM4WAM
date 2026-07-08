@@ -15,6 +15,7 @@ the training env (flex_attention vs sdpa attention_mode). Validate right after t
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 from typing import Sequence
 
@@ -24,6 +25,29 @@ import torch.nn.functional as F
 
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def _import_teacher_builder(lingbot_root: str):
+    """Import lingbot's DINO-video teacher builder WITHOUT running the heavy ``lingbotvla.models``
+    package __init__ (which imports Auto* APIs removed in transformers 5.x). We pre-stub the parent
+    packages with the correct ``__path__`` so only the self-contained ``dino_video`` subtree executes.
+    """
+    if lingbot_root not in sys.path:
+        sys.path.insert(0, lingbot_root)
+    for pkg, sub in [
+        ("lingbotvla", "lingbotvla"),
+        ("lingbotvla.models", "lingbotvla/models"),
+        ("lingbotvla.models.vla", "lingbotvla/models/vla"),
+        ("lingbotvla.models.vla.vision_models", "lingbotvla/models/vla/vision_models"),
+    ]:
+        if pkg not in sys.modules:
+            m = types.ModuleType(pkg)
+            m.__path__ = [f"{lingbot_root}/{sub}"]
+            m.__package__ = pkg
+            sys.modules[pkg] = m
+    from lingbotvla.models.vla.vision_models.dino_video.teacher import build_dino_video_teacher
+
+    return build_dino_video_teacher
 
 
 class DinoVideoTargetEncoder(nn.Module):
@@ -40,10 +64,7 @@ class DinoVideoTargetEncoder(nn.Module):
         lingbot_root: str | Path = "/data/LFT-W02_data/junjie/VLA_WM/lingbot-vla-v2",
     ) -> None:
         super().__init__()
-        root = str(lingbot_root)
-        if root not in sys.path:
-            sys.path.insert(0, root)
-        from lingbotvla.models.vla.vision_models.dino_video.teacher import build_dino_video_teacher
+        build_dino_video_teacher = _import_teacher_builder(str(lingbot_root))
 
         self.input_size = int(input_size)
         self.device = torch.device(device)

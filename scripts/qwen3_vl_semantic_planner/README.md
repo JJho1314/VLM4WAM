@@ -24,14 +24,23 @@ head's weak per-token identity (low retrieval / small norm). Same SigLIP target 
 
 Kept flat (not in a subdir) because it reuses the sibling shared infra (`qwen3vl_wrapper`, SigLIP builder).
 
-### 3. lingbot-DINO · 4B  → `lingbot_dino_4b/`  (new, in progress)
+### 3. lingbot-DINO · 4B  (new)
 Full lingbot-vla-v2 recipe: base = Qwen3-VL-4B **extracted from the open `robbyant/lingbot-vla-v2-6b`**;
-target = **DINO-video** (1024-d), not SigLIP; head = faithful `TaskTokenResampler` warm-started from
-lingbot's `future_video_align_head`; loss = plain MSE. Plan = 5 keyframes × 256 tokens = [B, 1280, 1024].
+target = **DINO-video** (1024-d, 256 tokens/keyframe), not SigLIP; head = faithful `TaskTokenResampler`
+warm-started from lingbot's `future_video_align_head`; loss = plain MSE. Plan = 5 keyframes × 256 =
+[B, 1280, 1024]. Trainer `train_qwen3vl4b_lingbot_dino_planner.py` (flat, reuses the shared data infra);
+4B-specific modules + launcher live in `lingbot_dino_4b/`.
+```bash
+DATASET_ROOT=<droid dataset> bash lingbot_dino_4b/train_lingbot_dino_4b.sh          # full (2 GPU)
+NUM_GPUS=1 BATCH_SIZE=1 MAX_STEPS=2 FULL_FINETUNE=0 DATASET_ROOT=<...> \
+  bash lingbot_dino_4b/train_lingbot_dino_4b.sh                                     # smoke
+```
+Validated on this box: teacher import/build (parent-stub bypass for transformers 5.x), VLM extraction
+(clean 4.44B load), head warm-start (19 keys), and `--help`/imports. Smoke/full run pending a dataset path.
 > Switching the target off SigLIP means the **Cosmos WM must be retrained** to consume DINO-video
-> conditioning — that is a separate downstream step (block E), not covered by these scripts.
+> conditioning — a separate downstream step (block E), not covered by these scripts.
 
-See `lingbot_dino_4b/LINGBOT_DINO_SPEC.md` for the full spec + the training-script swap plan.
+See `lingbot_dino_4b/LINGBOT_DINO_SPEC.md` for the full spec + the 9-step training-script swap plan.
 
 ## Stage-2: planner ⊗ Cosmos-WM (DIAL-style)
 - `planner_plan_provider.py` — load a trained planner ckpt, predict the plan in the WM's `semantic_plan` space
@@ -44,13 +53,15 @@ See `lingbot_dino_4b/LINGBOT_DINO_SPEC.md` for the full spec + the training-scri
 qwen3_vl_semantic_planner/
 ├── train_qwen3vl_semantic_planner.py        # line 1 (CoVT/SigLIP 2B, baseline)
 ├── train_qwen3vl_tasktoken_planner.py       # line 2 (tasktoken/SigLIP 2B)
+├── train_qwen3vl4b_lingbot_dino_planner.py  # line 3 trainer (flat: reuses shared data infra)
 ├── qwen3vl_wrapper.py, build_siglip2_*.py    # shared infra
 ├── planner_plan_provider.py, STAGE2_PLAN.md  # stage-2 planner⊗WM
-├── sbatch_train_qwen3vl2b_*.sh               # launchers
-└── lingbot_dino_4b/                          # line 3 (lingbot-DINO 4B)
+├── sbatch_train_qwen3vl2b_*.sh               # launchers (lines 1-2)
+└── lingbot_dino_4b/                          # line 3 modules (lingbot-DINO 4B)
     ├── lingbot_resampler.py                  # verbatim TaskTokenResampler port (warm-start key-compat)
     ├── lingbot_dino_head.py                  # 5-keyframe head [B,1280,1024]
-    ├── dino_video_target.py                  # DINO-video teacher target encoder
+    ├── dino_video_target.py                  # DINO-video teacher target encoder (parent-stub import bypass)
     ├── extract_qwenvl_from_lingbot.py        # extract stock Qwen3-VL-4B from the 6b ckpt
+    ├── train_lingbot_dino_4b.sh              # self-contained torchrun launcher
     └── LINGBOT_DINO_SPEC.md                   # spec + swap plan
 ```
