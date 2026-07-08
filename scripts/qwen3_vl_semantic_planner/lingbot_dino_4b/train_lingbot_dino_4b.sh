@@ -12,7 +12,9 @@ PLANNER_DIR="$(dirname "$HERE")"                       # scripts/qwen3_vl_semant
 REPO_ROOT="$(cd "$PLANNER_DIR/../.." && pwd)"
 cd "$REPO_ROOT" || exit 2
 
-PY=${PY:-python3}
+# covt/planner training env: transformers 4.57 (Qwen3-VL) + torch 2.6 flex_attention + mistral_common 1.9
+# (the box default python has transformers 5.x with a broken mistral_common, so pin this env).
+PY=${PY:-/data/LFT-W02_data/.conda/envs/starVLA/bin/python}
 NUM_GPUS=${NUM_GPUS:-2}
 
 WEIGHTS=${WEIGHTS:-/data/LFT-W02_data/junjie/weights}
