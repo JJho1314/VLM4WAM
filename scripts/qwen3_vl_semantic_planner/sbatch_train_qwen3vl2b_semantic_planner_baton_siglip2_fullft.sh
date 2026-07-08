@@ -196,13 +196,16 @@ else
   TRAIN_ARGS+=(--no-freeze-lm-head)
 fi
 
+# Overridable entry script (backward-compatible: defaults to the SigLIP CoVT planner). Independent
+# variants (e.g. the tasktoken planner) set TRAIN_SCRIPT to their own file without touching this harness.
+TRAIN_SCRIPT=${TRAIN_SCRIPT:-scripts/qwen3_vl_semantic_planner/train_qwen3vl_semantic_planner.py}
 if [[ "$NUM_GPUS" -gt 1 ]]; then
   "$PY" -m torch.distributed.run \
     --standalone \
     --nnodes=1 \
     --nproc_per_node="$NUM_GPUS" \
-    scripts/qwen3_vl_semantic_planner/train_qwen3vl_semantic_planner.py \
+    "$TRAIN_SCRIPT" \
     "${TRAIN_ARGS[@]}"
 else
-  "$PY" scripts/qwen3_vl_semantic_planner/train_qwen3vl_semantic_planner.py "${TRAIN_ARGS[@]}"
+  "$PY" "$TRAIN_SCRIPT" "${TRAIN_ARGS[@]}"
 fi
