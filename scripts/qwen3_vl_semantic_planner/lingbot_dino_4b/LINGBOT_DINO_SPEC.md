@@ -1,7 +1,8 @@
 # lingbot-vla-v2 DINO-video align — spec for the 4B planner port
 
 Source: verified read of `/data/LFT-W02_data/junjie/VLA_WM/lingbot-vla-v2` (file:line cited inline).
-Target file to build: `train_qwen3vl4b_lingbot_dino_planner.py` (independent; 2B CoVT + tasktoken untouched).
+All files for this 4B line live in this directory: `scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/`.
+Target file to build (here): `train_qwen3vl4b_lingbot_dino_planner.py` (independent; 2B CoVT + tasktoken untouched).
 
 ## Teacher (target encoder) — block C
 - `build_dino_video_teacher` → `DinoVideoTeacher.build()` (dino_video/teacher.py:132,15).
