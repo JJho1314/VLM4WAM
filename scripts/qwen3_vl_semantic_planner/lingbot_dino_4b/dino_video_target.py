@@ -14,6 +14,7 @@ the training env (flex_attention vs sdpa attention_mode). Validate right after t
 """
 from __future__ import annotations
 
+import os
 import sys
 import types
 from pathlib import Path
@@ -22,6 +23,9 @@ from typing import Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# box default; override on other hosts (e.g. HPC3) via env LINGBOT_SRC_ROOT.
+_LINGBOT_ROOT = os.environ.get("LINGBOT_SRC_ROOT", "/data/LFT-W02_data/junjie/VLA_WM/lingbot-vla-v2")
 
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -61,7 +65,7 @@ class DinoVideoTargetEncoder(nn.Module):
         cls_pool: str = "last",
         effective_fps: float = 1.0,
         device: str | torch.device = "cuda",
-        lingbot_root: str | Path = "/data/LFT-W02_data/junjie/VLA_WM/lingbot-vla-v2",
+        lingbot_root: str | Path = _LINGBOT_ROOT,
     ) -> None:
         super().__init__()
         build_dino_video_teacher = _import_teacher_builder(str(lingbot_root))
