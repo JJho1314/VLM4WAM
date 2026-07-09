@@ -41,10 +41,12 @@ from qwen3vl_wrapper import load_qwen3vl_model_and_processor, move_qwen_inputs_t
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lingbot_dino_4b"))
 from lingbot_dino_head import LingbotDinoPlanHead  # noqa: E402
 from dino_video_target import DinoVideoTargetEncoder  # noqa: E402
+from depth_target import DepthTargetEncoder  # noqa: E402
 
 
 def _load_lingbot_head_state(src_6b_dir: Path) -> dict:
-    """Stream the future-video align head + query tensors from a lingbot-vla-v2 6b checkpoint."""
+    """Stream the future-video AND future-depth align heads + query tensors from a lingbot-vla-v2 6b
+    checkpoint (one dict warm-starts both heads; each head picks its own keys by marker)."""
     from collections import defaultdict
 
     from safetensors import safe_open
@@ -53,7 +55,8 @@ def _load_lingbot_head_state(src_6b_dir: Path) -> dict:
     index = json.loads((src / "model.safetensors.index.json").read_text())["weight_map"]
     want = [
         k for k in index
-        if "future_video_align_head." in k or k.endswith("future_video_align_embs")
+        if any(m in k for m in ("future_video_align_head.", "future_depth_align_head."))
+        or k.endswith(("future_video_align_embs", "future_depth_align_embs"))
     ]
     by_file: dict[str, list[str]] = defaultdict(list)
     for k in want:
@@ -104,6 +107,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dino-teacher-ckpt", type=Path, default=None, help="dino_video/teacher_step_*.pth")
     parser.add_argument("--dino-teacher-config", type=Path, default=None, help="dino_video/config.yaml")
     parser.add_argument("--dino-input-size", type=int, default=256)
+    # Auxiliary future-DEPTH alignment (lingbot-style): MoGe-2 -> MoRGBD depth-feature teacher + a
+    # second warm-started TaskTokenResampler head, smooth_L1 loss. Off unless --use-depth.
+    parser.add_argument("--use-depth", action="store_true", help="add lingbot future-depth alignment (aux)")
+    parser.add_argument("--depth-moge-path", type=Path, default=None, help="MoGe-2 weights (moge-2-vitb-normal/model.pt)")
+    parser.add_argument("--depth-morgbd-path", type=Path, default=None, help="LingBot-Depth/MoRGBD weights (6b/depth/model.pt)")
+    parser.add_argument("--depth-input-size", type=int, default=256)
+    parser.add_argument("--depth-grid-size", type=int, default=16, help="depth teacher token grid side (16 -> 256)")
+    parser.add_argument("--depth-dim", type=int, default=1024, help="MoRGBD feature dim")
+    parser.add_argument("--depth-loss-weight", type=float, default=0.004, help="lingbot future_depth_loss_weight")
     parser.add_argument(
         "--head-warmstart-ckpt", type=Path, default=None,
         help="lingbot-vla-v2-6b dir: warm-start the head from future_video_align_head.*",
@@ -588,6 +600,10 @@ class PlannerWrapper(nn.Module):
         variance_loss_weight: float = 0.1,
         infonce_loss_weight: float = 0.1,
         infonce_temperature: float = 0.07,
+        use_depth: bool = False,
+        depth_dim: int = 1024,
+        depth_grid_size: int = 16,
+        depth_loss_weight: float = 0.004,
     ) -> None:
         super().__init__()
         if sem_mlp_hidden_size < 0:
@@ -644,6 +660,20 @@ class PlannerWrapper(nn.Module):
             )
         else:
             raise ValueError(f"Unsupported plan_head_type: {plan_head_type}")
+        # Auxiliary future-DEPTH alignment head (lingbot-style, only for lingbot_dino): a second shared
+        # TaskTokenResampler, warm-started from future_depth_align_head, reading the SAME image+latent
+        # context and regressing LingBot-Depth features (MoGe-2 -> MoRGBD) with smooth_L1.
+        self.use_depth = bool(use_depth) and plan_head_type == "lingbot_dino"
+        self.depth_loss_weight = float(depth_loss_weight)
+        self.depth_head = None
+        if self.use_depth:
+            self.depth_head = LingbotDinoPlanHead(
+                num_keyframes=num_keyframes,
+                num_latent_per_keyframe=num_latent_per_keyframe,
+                num_backbone_tokens=int(depth_grid_size) * int(depth_grid_size),
+                llm_hidden=hidden_size,
+                dim_out=depth_dim,
+            )
         self.plan_token_ids = [int(x) for x in plan_token_ids]
         self.model = model
         # image-token id used by the lingbot_dino head to gather the LLM's image-token hiddens
@@ -676,16 +706,22 @@ class PlannerWrapper(nn.Module):
         batch, _, hidden_dim = hidden.shape
         return hidden[mask].reshape(batch, n_img, hidden_dim)
 
-    def predict_semantic_plan(self, **inputs: Any) -> torch.Tensor:
+    def _forward_hiddens(self, **inputs: Any) -> tuple[torch.Tensor | None, torch.Tensor]:
+        """One VLM forward -> (image_hidden|None, plan_hidden). Image tokens are DETACHED (lingbot
+        detach_image_feats=True). Shared by the video head, the depth head, and inference."""
         outputs = self.model(**inputs, output_hidden_states=True, use_cache=False)
         hidden = outputs.hidden_states[-1]
         input_ids = inputs["input_ids"]
         plan_hidden = self.collect_plan_hidden(hidden, input_ids, self.latent_len)
+        image_hidden = None
+        if self.plan_head_type == "lingbot_dino":
+            image_hidden = self.collect_image_hidden(hidden, input_ids).detach()
+        return image_hidden, plan_hidden
+
+    def predict_semantic_plan(self, **inputs: Any) -> torch.Tensor:
+        image_hidden, plan_hidden = self._forward_hiddens(**inputs)
         head_dtype = next(self.plan_head.parameters()).dtype
         if self.plan_head_type == "lingbot_dino":
-            # image tokens are DETACHED (lingbot detach_image_feats=True): the head reads the frozen
-            # image features + the trainable plan latents.
-            image_hidden = self.collect_image_hidden(hidden, input_ids).detach()
             return self.plan_head(
                 image_hidden.to(dtype=head_dtype), plan_hidden.to(dtype=head_dtype)
             ).float()
@@ -747,10 +783,33 @@ class PlannerWrapper(nn.Module):
             "token_retrieval_top1": token_retrieval,
         }
 
-    def forward(self, semantic_plan_labels: torch.Tensor, **inputs: Any) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        semantic_plan_labels: torch.Tensor,
+        depth_plan_labels: torch.Tensor | None = None,
+        **inputs: Any,
+    ) -> dict[str, torch.Tensor]:
         batch, target_len, _ = semantic_plan_labels.shape
         if target_len != self.target_len:
             raise RuntimeError(f"Batch has {target_len} target tokens, wrapper expects {self.target_len}")
+        if self.plan_head_type == "lingbot_dino":
+            # One VLM forward feeds BOTH the video head and (optionally) the auxiliary depth head.
+            image_hidden, plan_hidden = self._forward_hiddens(**inputs)
+            head_dtype = next(self.plan_head.parameters()).dtype
+            pred = self.plan_head(image_hidden.to(head_dtype), plan_hidden.to(head_dtype)).float()
+            if pred.shape[0] != batch or pred.shape[1] != self.target_len:
+                raise RuntimeError(f"Prediction {tuple(pred.shape[:2])} != ({batch}, {self.target_len})")
+            out = self.compute_plan_losses(pred, semantic_plan_labels.to(device=pred.device, dtype=torch.float32))
+            if self.depth_head is not None and depth_plan_labels is not None:
+                depth_pred = self.depth_head(image_hidden.to(head_dtype), plan_hidden.to(head_dtype)).float()
+                depth_target = depth_plan_labels.to(device=pred.device, dtype=torch.float32)
+                depth_l = F.smooth_l1_loss(depth_pred, depth_target)  # lingbot depth loss (_emb_loss)
+                out["loss"] = out["loss"] + self.depth_loss_weight * depth_l
+                out["depth_smooth_l1"] = depth_l.detach()
+                out["depth_norm_ratio"] = (
+                    depth_pred.norm(dim=-1).mean() / depth_target.norm(dim=-1).mean().clamp_min(1e-6)
+                ).detach()
+            return out
         pred = self.predict_semantic_plan(**inputs)
         if pred.shape[0] != batch:
             raise RuntimeError(f"Prediction batch {pred.shape[0]} does not match labels batch {batch}")
@@ -805,10 +864,15 @@ def register_plan_rows_hook(param: nn.Parameter, row_ids: list[int]) -> None:
 
 def build_optimizer(wrapper: PlannerWrapper, args: argparse.Namespace) -> torch.optim.Optimizer:
     head_params = [p for p in wrapper.plan_head.parameters() if p.requires_grad]
+    if getattr(wrapper, "depth_head", None) is not None:
+        # the auxiliary depth head trains at head_lr alongside plan_head (both are fresh-ish resamplers)
+        head_params += [p for p in wrapper.depth_head.parameters() if p.requires_grad]
     other_params = [
         p
         for n, p in wrapper.named_parameters()
-        if p.requires_grad and not n.startswith("plan_head.")
+        if p.requires_grad
+        and not n.startswith("plan_head.")
+        and not n.startswith("depth_head.")
     ]
     groups = []
     if other_params:
@@ -988,6 +1052,7 @@ def main() -> None:
 
     sig_model = sig_processor = sig_encode = None
     dino_encoder = None
+    depth_encoder = None
     if args.plan_head_type == "lingbot_dino":
         if not args.online_plan_labels:
             raise ValueError("lingbot_dino requires --online-plan-labels (online DINO-video targets)")
@@ -1002,6 +1067,16 @@ def main() -> None:
         args.sample_feature_type = "dino_video"
         if args.semantic_dim <= 0:
             args.semantic_dim = 1024
+        if args.use_depth:
+            if args.depth_moge_path is None or args.depth_morgbd_path is None:
+                raise ValueError("--use-depth requires --depth-moge-path and --depth-morgbd-path")
+            depth_encoder = DepthTargetEncoder(
+                moge_path=args.depth_moge_path,
+                morgbd_path=args.depth_morgbd_path,
+                input_size=args.depth_input_size,
+                num_tokens=args.depth_grid_size * args.depth_grid_size,
+                device=device,
+            )
     elif args.online_plan_labels:
         from build_siglip2_semantic_plan_labels import encode_images, load_siglip2, semantic_feature_type
 
@@ -1055,12 +1130,20 @@ def main() -> None:
         variance_loss_weight=args.variance_loss_weight,
         infonce_loss_weight=args.infonce_loss_weight,
         infonce_temperature=args.infonce_temperature,
+        use_depth=args.use_depth,
+        depth_dim=args.depth_dim,
+        depth_grid_size=args.depth_grid_size,
+        depth_loss_weight=args.depth_loss_weight,
     )
     if args.plan_head_type == "lingbot_dino" and args.head_warmstart_ckpt is not None:
         head_state = _load_lingbot_head_state(args.head_warmstart_ckpt)
-        report = wrapper.plan_head.load_lingbot_warmstart(head_state)
+        report = wrapper.plan_head.load_lingbot_warmstart(head_state, head_name="future_video_align_head")
+        if wrapper.depth_head is not None:
+            depth_report = wrapper.depth_head.load_lingbot_warmstart(head_state, head_name="future_depth_align_head")
         if is_main(rank):
             print(json.dumps({"head_warmstart": report}), flush=True)
+            if wrapper.depth_head is not None:
+                print(json.dumps({"depth_head_warmstart": depth_report}), flush=True)
     wrapper.to(device)
     wrapper.train()
     if is_main(rank):
@@ -1179,6 +1262,9 @@ def main() -> None:
                         cur = current.permute(0, 3, 1, 2).contiguous()  # (B,3,H,W)
                         kfs = [keyframes[:, j].permute(0, 3, 1, 2).contiguous() for j in range(keyframes.shape[1])]
                         batch["semantic_plan_labels"] = dino_encoder.encode_future_keyframes(cur, kfs).float()
+                        if depth_encoder is not None:
+                            # LingBot-Depth targets over the SAME future keyframes -> [B, K*256, 1024].
+                            batch["depth_plan_labels"] = depth_encoder.encode_future_keyframes(kfs).float()
                     else:
                         # Online SigLIP2 targets (bit-consistent with the offline builder).
                         b, k = keyframes.shape[0], keyframes.shape[1]

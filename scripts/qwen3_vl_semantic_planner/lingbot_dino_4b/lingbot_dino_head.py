@@ -77,15 +77,18 @@ class LingbotDinoPlanHead(nn.Module):
         return torch.stack(outs, dim=1).reshape(batch, kf * self.num_backbone_tokens, self.dim_out)
 
     @torch.no_grad()
-    def load_lingbot_warmstart(self, state: dict) -> dict:
+    def load_lingbot_warmstart(self, state: dict, head_name: str = "future_video_align_head") -> dict:
         """Warm-start from a lingbot-vla-v2 6b state_dict (or any dict containing the head keys).
 
-        Returns a report ``{"resampler_missing":..., "resampler_unexpected":..., "query_loaded":bool}``.
+        ``head_name`` selects which lingbot head to warm-start from: ``future_video_align_head`` (DINO,
+        default) or ``future_depth_align_head`` (LingBot-Depth). Returns a report
+        ``{"resampler_missing":..., "resampler_unexpected":..., "query_loaded":bool}``.
         """
-        marker = "future_video_align_head.projector."
+        marker = f"{head_name}.projector."
+        embs_suffix = head_name.replace("_head", "_embs")  # future_{video,depth}_align_embs
         proj = {k.split(marker, 1)[1]: v for k, v in state.items() if marker in k}
         res = self.resampler.load_state_dict(proj, strict=False)
-        query = [v for k, v in state.items() if k.endswith("future_video_align_embs")]
+        query = [v for k, v in state.items() if k.endswith(embs_suffix)]
         query_loaded = False
         if query and query[0].shape == self.query_embs.shape:
             self.query_embs.data.copy_(query[0].to(self.query_embs.dtype))

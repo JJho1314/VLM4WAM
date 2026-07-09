@@ -24,6 +24,18 @@ DINO_TEACHER_CKPT=${DINO_TEACHER_CKPT:-$LINGBOT_6B/dino_video/teacher_step_10000
 DINO_TEACHER_CONFIG=${DINO_TEACHER_CONFIG:-$LINGBOT_6B/dino_video/config.yaml}
 HEAD_WARMSTART_CKPT=${HEAD_WARMSTART_CKPT:-$LINGBOT_6B}             # warm-start head from future_video_align_head.*
 
+# --- auxiliary future-DEPTH alignment (lingbot-style: MoGe-2 -> MoRGBD, smooth_L1; OFF by default) ---
+USE_DEPTH=${USE_DEPTH:-0}
+DEPTH_MOGE_PATH=${DEPTH_MOGE_PATH:-$WEIGHTS/moge-2-vitb-normal/model.pt}   # MoGe-2 (HF Ruicheng/moge-2-vitb-normal)
+DEPTH_MORGBD_PATH=${DEPTH_MORGBD_PATH:-$LINGBOT_6B/depth/model.pt}         # LingBot-Depth / MoRGBD
+DEPTH_LOSS_WEIGHT=${DEPTH_LOSS_WEIGHT:-0.004}   # lingbot future_depth_loss_weight
+DEPTH_GRID_SIZE=${DEPTH_GRID_SIZE:-16}          # 16 -> 256 depth tokens/keyframe
+DEPTH_DIM=${DEPTH_DIM:-1024}
+
+# lingbot source (moge/mdm/dino teacher code) + MoGe-pinned utils3d; override on non-box hosts (HPC3).
+LINGBOT_SRC_ROOT=${LINGBOT_SRC_ROOT:-/data/LFT-W02_data/junjie/VLA_WM/lingbot-vla-v2}
+UTILS3D_MOGE_PATH=${UTILS3D_MOGE_PATH:-/data/LFT-W02_data/junjie/weights/py_deps/utils3d_moge}
+
 DATASET_ROOT=${DATASET_ROOT:?set DATASET_ROOT to the DROID semantic-plan dataset dir}
 OUTPUT_DIR=${OUTPUT_DIR:-$REPO_ROOT/outputs/qwen3vl_semantic_planner/qwen3vl4b_lingbot_dino_uniform_k5}
 
@@ -50,6 +62,7 @@ LR=${LR:-1e-5}
 HEAD_LR=${HEAD_LR:-1e-4}
 MAX_STEPS=${MAX_STEPS:-16000}
 SAVE_STEPS=${SAVE_STEPS:-1000}
+LOG_STEPS=${LOG_STEPS:-10}
 WARMUP_STEPS=${WARMUP_STEPS:-400}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.01}
 NUM_WORKERS=${NUM_WORKERS:-4}
@@ -82,6 +95,7 @@ TRAIN_ARGS=(
   --warmup-steps "$WARMUP_STEPS"
   --dtype "$DTYPE"
   --save-steps "$SAVE_STEPS"
+  --log-steps "$LOG_STEPS"
   --num-workers "$NUM_WORKERS"
   --freeze-vision
   --train-plan-token-embedding
@@ -94,12 +108,27 @@ TRAIN_ARGS=(
   --dino-teacher-ckpt "$DINO_TEACHER_CKPT"
   --dino-teacher-config "$DINO_TEACHER_CONFIG"
   --dino-input-size "$DINO_INPUT_SIZE"
-  --head-warmstart-ckpt "$HEAD_WARMSTART_CKPT"
 )
+# warm-start only if the 6b model shards are actually present (skip gracefully, e.g. smoke on HPC3).
+if [[ -n "$HEAD_WARMSTART_CKPT" && -f "$HEAD_WARMSTART_CKPT/model.safetensors.index.json" ]]; then
+  TRAIN_ARGS+=(--head-warmstart-ckpt "$HEAD_WARMSTART_CKPT")
+else
+  echo "[launch] skip head warm-start (no model.safetensors.index.json under '$HEAD_WARMSTART_CKPT')"
+fi
 [[ "$FULL_FINETUNE" == "1" ]] && TRAIN_ARGS+=(--full-finetune)
+[[ "$USE_DEPTH" == "1" ]] && TRAIN_ARGS+=(
+  --use-depth
+  --depth-moge-path "$DEPTH_MOGE_PATH"
+  --depth-morgbd-path "$DEPTH_MORGBD_PATH"
+  --depth-loss-weight "$DEPTH_LOSS_WEIGHT"
+  --depth-grid-size "$DEPTH_GRID_SIZE"
+  --depth-dim "$DEPTH_DIM"
+)
 
 TRAIN_SCRIPT="$PLANNER_DIR/train_qwen3vl4b_lingbot_dino_planner.py"
 export PYTHONUNBUFFERED=1
+export XFORMERS_DISABLED=1   # MoGe/MoRGBD dinov2 -> F.scaled_dot_product_attention (unbuilt xformers op)
+export LINGBOT_SRC_ROOT UTILS3D_MOGE_PATH
 if [[ "$NUM_GPUS" -gt 1 ]]; then
   "$PY" -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node="$NUM_GPUS" \
     "$TRAIN_SCRIPT" "${TRAIN_ARGS[@]}"
