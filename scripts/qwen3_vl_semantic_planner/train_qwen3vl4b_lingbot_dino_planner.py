@@ -25,6 +25,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+# Per-rank torch.compile / Triton cache dirs. With N ranks sharing ONE cache dir, concurrent
+# flex_attention kernel compiles race on the same artifact (FileNotFoundError on
+# triton_tem_fused_*.cubin). torchrun exports LOCAL_RANK before this script runs, so scope the
+# cache per rank BEFORE importing torch (inductor/triton read these env vars at compile time).
+_local_rank = os.environ.get("LOCAL_RANK")
+if _local_rank is not None:
+    for _cache_var in ("TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR"):
+        _base = os.environ.get(_cache_var)
+        if _base:
+            os.environ[_cache_var] = os.path.join(_base, f"rank{_local_rank}")
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
