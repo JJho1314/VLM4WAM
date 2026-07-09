@@ -1,1 +1,0 @@
-A Franka robotic arm with a parallel-jaw gripper put the [TGT] strings in the blue box.

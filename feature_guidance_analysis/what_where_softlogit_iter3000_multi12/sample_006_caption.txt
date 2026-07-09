@@ -1,1 +1,0 @@
-A Franka robotic arm with a parallel-jaw gripper place the [TGT] cylindrical block on top of the square block at the back.

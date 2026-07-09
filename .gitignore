@@ -63,3 +63,10 @@ vis_droid_scenes/
 .claude/
 .vscode/
 .idea/
+
+# Evaluation / analysis result artifacts (code-only repo; keep these out of git)
+eval_results_*/
+eval_what_where_context_*/
+feature_guidance_analysis/
+feature_spatial_probe/
+maskfree_instructsam_cosmos_pipeline_*.png

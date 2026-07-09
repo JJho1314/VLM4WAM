@@ -1,1 +1,0 @@
-A Franka robotic arm with a parallel-jaw gripper use the [TGT] towel to wipe the inside of the mug on the plate, then put it in the silver bowl next to the plate.

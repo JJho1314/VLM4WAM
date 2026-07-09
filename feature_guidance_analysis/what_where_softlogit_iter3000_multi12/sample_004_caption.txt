@@ -1,1 +1,0 @@
-A Franka robotic arm with a parallel-jaw gripper fold the [TGT] shirt and place it in the basket.

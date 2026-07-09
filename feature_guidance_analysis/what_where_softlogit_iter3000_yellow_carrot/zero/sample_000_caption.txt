@@ -1,1 +1,0 @@
-A Franka robotic arm with a parallel-jaw gripper grasps the [TGT] object and places it.
