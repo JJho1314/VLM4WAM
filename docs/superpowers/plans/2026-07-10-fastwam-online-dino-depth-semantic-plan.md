@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Train a FastWAM-aligned 4B planner and use it online, frozen, in FastWAM Cosmos so that same-position DINO and depth features are fused into a `[B, 1280, 1024]` semantic plan with correct five-keyframe timing and effective-video-FPS-aware RoPE.
+**Goal:** Train a FastWAM-aligned 4B planner and use it online, frozen, in FastWAM Cosmos so that same-position DINO and depth features are fused into a `[B, 1024, 1024]` semantic plan with four-keyframe timing and effective-video-FPS-aware RoPE.
 
-**Architecture:** The 4B planner observes the same current multi-camera image and raw instruction as FastWAM, performs one frozen VLM forward, and emits separate DINO and depth branches for five future keyframes. A trainable fusion module owned by the Cosmos video expert normalizes and projects each branch, applies a learnable depth gate, and sends the fused tensor through the existing Cosmos semantic adapter and cross-attention path. The dataset owns the sampled-video FPS contract, while FastWAM routes that FPS and normalized keyframe times through training, standalone inference, and AGRA foresight.
+**Architecture:** The 4B planner observes the same current multi-camera image and raw instruction as FastWAM, performs one frozen VLM forward, and emits separate DINO and depth branches for four future keyframes. At each keyframe, 32 shared VLM queries are combined with 32 modality-private queries, so each head consumes 64 of 96 unique queries. A trainable fusion module owned by the Cosmos video expert fuses the dense branch outputs before the existing Cosmos semantic adapter and cross-attention path.
 
 **Tech Stack:** Python 3, PyTorch, Hugging Face Transformers/Qwen3-VL, Hydra/OmegaConf, pytest, FastWAM Cosmos/Wan VAE, shell launchers.
 
@@ -12,8 +12,9 @@
 
 - Preserve the FastWAM LIBERO default horizon: 33 raw records sampled at `action_video_freq_ratio=4` produce 9 RGB frames, with the first frame as context and 8 future RGB frames as targets.
 - Train the new planner for `sequence_length=9`. Do not reuse the existing 49-frame planner checkpoint as the production provider.
-- Use exactly five future semantic keyframes at RGB offsets `[1, 3, 4, 6, 8]`. Their normalized times are `[0.125, 0.375, 0.5, 0.75, 1.0]`.
-- Preserve keyframe-major, then row-major spatial ordering. Each branch is `[B, 5 * 16 * 16, 1024] = [B, 1280, 1024]`.
+- Use exactly four future semantic keyframes at RGB offsets `[2, 4, 6, 8]`. Their normalized times are `[0.25, 0.5, 0.75, 1.0]`.
+- For each keyframe, emit queries in `[32 shared, 32 DINO-private, 32 depth-private]` order. Each head consumes 64 queries, the VLM emits 96 unique queries per keyframe, and the four-keyframe sequence contains 384 query tokens.
+- Preserve keyframe-major, then row-major spatial ordering. Each branch is `[B, 4 * 16 * 16, 1024] = [B, 1024, 1024]`.
 - Run the planner online for both FastWAM training and inference. Keep the VLM, DINO head, depth head, and plan-token embeddings frozen, in evaluation mode, under `torch.no_grad()`, and detached from the FastWAM graph.
 - Keep the DINO and depth branches separate until the trainable FastWAM fusion module. Do not concatenate them on the token axis or feature axis.
 - The fusion module belongs to the video expert, is included in FastWAM checkpoints, and is the only trainable part of the planner-to-semantic bridge before the existing semantic adapter.
@@ -35,8 +36,8 @@
   - Load and validate a complete frozen planner checkpoint.
   - Convert online image tensors and instructions into Qwen inputs.
   - Return DINO, depth, and normalized keyframe times.
-- Add `scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_depth_fastwam_k5.sh`
-  - Pin the FastWAM-aligned nine-frame, five-keyframe training contract.
+- Add `scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_depth_fastwam_k4.sh`
+  - Pin the FastWAM-aligned nine-frame, four-keyframe training contract.
 
 ### FastWAM model and data integration
 
@@ -103,6 +104,7 @@ import json
 from argparse import Namespace
 from pathlib import Path
 
+import pytest
 import torch
 from torch import nn
 
@@ -133,12 +135,52 @@ class CountingHead(nn.Module):
 
     def forward(self, image_hidden, plan_hidden):
         self.calls += 1
+        self.last_plan_hidden = plan_hidden.detach().clone()
         batch = plan_hidden.shape[0]
         return torch.full(
-            (batch, 5 * 16 * 16, 1024),
+            (batch, 4 * 16 * 16, 1024),
             self.value,
             device=plan_hidden.device,
         )
+
+
+def test_split_lingbot_queries_shares_only_the_shared_group():
+    module = load_trainer_module()
+    wrapper = module.PlannerWrapper.__new__(module.PlannerWrapper)
+    nn.Module.__init__(wrapper)
+    wrapper.num_keyframes = 4
+    wrapper.shared_latent_per_keyframe = 32
+    wrapper.private_latent_per_keyframe = 32
+    wrapper.branch_latent_per_keyframe = 64
+    wrapper.total_unique_latent_per_keyframe = 96
+    hidden = torch.arange(4 * 96, dtype=torch.float32).reshape(1, 4 * 96, 1)
+
+    dino_hidden, depth_hidden = wrapper.split_lingbot_query_hidden(hidden)
+
+    grouped = hidden.reshape(1, 4, 96, 1)
+    expected_dino = torch.cat(
+        [grouped[:, :, :32], grouped[:, :, 32:64]],
+        dim=2,
+    ).reshape(1, 4 * 64, 1)
+    expected_depth = torch.cat(
+        [grouped[:, :, :32], grouped[:, :, 64:96]],
+        dim=2,
+    ).reshape(1, 4 * 64, 1)
+    assert torch.equal(dino_hidden, expected_dino)
+    assert torch.equal(depth_hidden, expected_depth)
+    assert not torch.equal(dino_hidden[:, 32:64], depth_hidden[:, 32:64])
+
+
+def test_even_future_offsets_cover_every_second_future_frame():
+    module = load_trainer_module()
+    assert module.keyframe_offsets(9, 4, 'even_future', 0.6) == [
+        2,
+        4,
+        6,
+        8,
+    ]
+    with pytest.raises(ValueError, match='divisible'):
+        module.keyframe_offsets(9, 3, 'even_future', 0.6)
 
 
 def test_predict_dino_depth_plan_uses_one_vlm_forward():
@@ -148,11 +190,20 @@ def test_predict_dino_depth_plan_uses_one_vlm_forward():
     wrapper.plan_head = CountingHead(1.0)
     wrapper.depth_head = CountingHead(2.0)
     wrapper.plan_head_type = 'lingbot_dino'
+    wrapper.num_keyframes = 4
+    wrapper.shared_latent_per_keyframe = 32
+    wrapper.private_latent_per_keyframe = 32
+    wrapper.branch_latent_per_keyframe = 64
+    wrapper.total_unique_latent_per_keyframe = 96
     wrapper.vlm_forward_calls = 0
 
     def fake_forward_hiddens(**_inputs):
         wrapper.vlm_forward_calls += 1
-        return torch.zeros(2, 6, 64), torch.zeros(2, 40, 64)
+        plan_hidden = torch.arange(
+            2 * 4 * 96 * 64,
+            dtype=torch.float32,
+        ).reshape(2, 4 * 96, 64)
+        return torch.zeros(2, 6, 64), plan_hidden
 
     wrapper._forward_hiddens = fake_forward_hiddens
     dino, depth = wrapper.predict_dino_depth_plan(input_ids=torch.ones(2, 4))
@@ -160,7 +211,9 @@ def test_predict_dino_depth_plan_uses_one_vlm_forward():
     assert wrapper.vlm_forward_calls == 1
     assert wrapper.plan_head.calls == 1
     assert wrapper.depth_head.calls == 1
-    assert dino.shape == depth.shape == (2, 1280, 1024)
+    assert wrapper.plan_head.last_plan_hidden.shape == (2, 4 * 64, 64)
+    assert wrapper.depth_head.last_plan_hidden.shape == (2, 4 * 64, 64)
+    assert dino.shape == depth.shape == (2, 1024, 1024)
     assert torch.all(dino == 1)
     assert torch.all(depth == 2)
 
@@ -174,7 +227,7 @@ def test_predict_dino_depth_plan_requires_depth_head():
     wrapper.plan_head_type = 'lingbot_dino'
     wrapper._forward_hiddens = lambda **_: (
         torch.zeros(1, 6, 64),
-        torch.zeros(1, 40, 64),
+        torch.zeros(1, 4 * 96, 64),
     )
 
     try:
@@ -190,10 +243,11 @@ def test_predict_dino_depth_plan_requires_depth_head():
 Run:
 
 ```bash
-pytest -q tests/test_lingbot_dino_depth_contract.py -k predict_dino_depth
+pytest -q tests/test_lingbot_dino_depth_contract.py \
+  -k 'even_future_offsets or split_lingbot_queries or predict_dino_depth'
 ```
 
-Expected: FAIL because `PlannerWrapper.predict_dino_depth_plan` does not exist.
+Expected: FAIL because `split_lingbot_query_hidden` and `predict_dino_depth_plan` do not exist.
 
 - [ ] **Step 3: Add a shared input builder and the one-forward dual-output method**
 
@@ -257,9 +311,48 @@ def build_planner_inputs(processor, images, instructions, plan_sequence):
 
 Change `Collator.__call__` to collect its images and raw prompts, then call this function. Do not maintain a second copy of the user prompt.
 
-Add this method beside `predict_semantic_plan`:
+Add these methods beside `predict_semantic_plan`:
 
 ```python
+def split_lingbot_query_hidden(self, plan_hidden):
+    batch, token_count, hidden_size = plan_hidden.shape
+    expected = (
+        self.num_keyframes
+        * self.total_unique_latent_per_keyframe
+    )
+    if token_count != expected:
+        raise RuntimeError(
+            f'expected {expected} shared/private query tokens, '
+            f'got {token_count}'
+        )
+    grouped = plan_hidden.reshape(
+        batch,
+        self.num_keyframes,
+        self.total_unique_latent_per_keyframe,
+        hidden_size,
+    )
+    shared_end = self.shared_latent_per_keyframe
+    dino_end = shared_end + self.private_latent_per_keyframe
+    depth_end = dino_end + self.private_latent_per_keyframe
+    shared = grouped[:, :, :shared_end]
+    dino_private = grouped[:, :, shared_end:dino_end]
+    depth_private = grouped[:, :, dino_end:depth_end]
+    dino_hidden = torch.cat([shared, dino_private], dim=2)
+    depth_hidden = torch.cat([shared, depth_private], dim=2)
+    return (
+        dino_hidden.reshape(
+            batch,
+            self.num_keyframes * self.branch_latent_per_keyframe,
+            hidden_size,
+        ),
+        depth_hidden.reshape(
+            batch,
+            self.num_keyframes * self.branch_latent_per_keyframe,
+            hidden_size,
+        ),
+    )
+
+
 def predict_dino_depth_plan(self, **model_inputs):
     if self.plan_head_type != 'lingbot_dino':
         raise RuntimeError(
@@ -268,17 +361,20 @@ def predict_dino_depth_plan(self, **model_inputs):
     if self.depth_head is None:
         raise RuntimeError(
             'DINO+depth prediction requires a configured depth head'
-        )
+    )
     image_hidden, plan_hidden = self._forward_hiddens(**model_inputs)
+    dino_hidden, depth_hidden = self.split_lingbot_query_hidden(
+        plan_hidden
+    )
     dino_dtype = next(self.plan_head.parameters()).dtype
     depth_dtype = next(self.depth_head.parameters()).dtype
     dino_plan = self.plan_head(
         image_hidden.to(dtype=dino_dtype),
-        plan_hidden.to(dtype=dino_dtype),
+        dino_hidden.to(dtype=dino_dtype),
     ).float()
     depth_plan = self.depth_head(
         image_hidden.to(dtype=depth_dtype),
-        plan_hidden.to(dtype=depth_dtype),
+        depth_hidden.to(dtype=depth_dtype),
     ).float()
     if dino_plan.shape != depth_plan.shape:
         raise RuntimeError(
@@ -288,7 +384,67 @@ def predict_dino_depth_plan(self, **model_inputs):
     return dino_plan, depth_plan
 ```
 
-Refactor the training `forward` method to call `_forward_hiddens` once and reuse those hidden states for both losses. Do not call `predict_dino_depth_plan` from training if the DINO-only mode must remain supported.
+Add parser arguments `--shared-latent-per-keyframe` and `--private-latent-per-keyframe`, both positive integers for the dual-branch mode.
+
+Extend `--keyframe-scheme` with `even_future` and add this branch before the legacy `late`/rounded-linspace behavior:
+
+```python
+if scheme == 'even_future':
+    future_frames = sequence_length - 1
+    if future_frames % n != 0:
+        raise ValueError(
+            f'even_future requires {future_frames} future frames '
+            f'to be divisible by {n} keyframes'
+        )
+    step = future_frames // n
+    return [step * (index + 1) for index in range(n)]
+```
+
+In `PlannerWrapper.__init__`, store:
+
+```python
+self.num_keyframes = int(num_keyframes)
+self.shared_latent_per_keyframe = int(shared_latent_per_keyframe)
+self.private_latent_per_keyframe = int(private_latent_per_keyframe)
+self.branch_latent_per_keyframe = (
+    self.shared_latent_per_keyframe
+    + self.private_latent_per_keyframe
+)
+self.total_unique_latent_per_keyframe = (
+    self.shared_latent_per_keyframe
+    + 2 * self.private_latent_per_keyframe
+)
+self.num_latent_per_keyframe = self.branch_latent_per_keyframe
+self.latent_len = (
+    self.num_keyframes
+    * self.total_unique_latent_per_keyframe
+)
+```
+
+For the dual-branch `lingbot_dino` mode, construct both `LingbotDinoPlanHead` instances with `num_latent_per_keyframe=self.branch_latent_per_keyframe`. Require `use_depth=True` and require the exact production values `32/32` when exporting a FastWAM checkpoint. The generic CoVT and legacy DINO-only paths retain their current `num_latent_per_keyframe` behavior.
+
+When creating distinct plan tokens in `main`, use `wrapper.latent_len`-equivalent geometry before wrapper construction:
+
+```python
+if (
+    args.plan_head_type == 'lingbot_dino'
+    and args.use_depth
+    and args.shared_latent_per_keyframe > 0
+):
+    latent_len = args.num_keyframes * (
+        args.shared_latent_per_keyframe
+        + 2 * args.private_latent_per_keyframe
+    )
+else:
+    latent_len = (
+        args.num_keyframes * args.num_latent_per_keyframe
+    )
+plan_token_strs = [
+    f'<|sem_plan_{index}|>' for index in range(latent_len)
+]
+```
+
+Refactor training `forward` to call `_forward_hiddens` once, split once, and pass the DINO/depth branch-specific 64-query tensors to their respective heads. `predict_semantic_plan` must use only the DINO branch when shared/private mode is active.
 
 - [ ] **Step 4: Add failing tests for checkpoint completeness and exact metadata**
 
@@ -298,7 +454,7 @@ Append:
 class FakeSaveableModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.embedding = nn.Embedding(64, 8)
+        self.embedding = nn.Embedding(512, 8)
 
     def get_input_embeddings(self):
         return self.embedding
@@ -323,11 +479,16 @@ def test_save_checkpoint_writes_depth_and_fastwam_contract(tmp_path):
     wrapper.model = FakeSaveableModel()
     wrapper.plan_head = nn.Linear(8, 8)
     wrapper.depth_head = nn.Linear(8, 8)
-    wrapper.plan_token_ids = list(range(3, 43))
+    wrapper.plan_token_ids = list(range(3, 387))
     wrapper.plan_head_type = 'lingbot_dino'
-    wrapper.num_latent_per_keyframe = 8
-    wrapper.latent_len = 40
-    wrapper.target_len = 1280
+    wrapper.num_keyframes = 4
+    wrapper.shared_latent_per_keyframe = 32
+    wrapper.private_latent_per_keyframe = 32
+    wrapper.branch_latent_per_keyframe = 64
+    wrapper.total_unique_latent_per_keyframe = 96
+    wrapper.num_latent_per_keyframe = 64
+    wrapper.latent_len = 384
+    wrapper.target_len = 1024
     wrapper.plan_head_num_heads = 16
     wrapper.plan_head_dropout = 0.0
     wrapper.sem_mlp_hidden_size = 0
@@ -343,7 +504,7 @@ def test_save_checkpoint_writes_depth_and_fastwam_contract(tmp_path):
         plan_label_dir=None,
         sample_one_window_per_stem=False,
         online_plan_labels=True,
-        keyframe_scheme='uniform',
+        keyframe_scheme='even_future',
         keyframe_gamma=0.6,
         sequence_length=9,
         online_grid_size=16,
@@ -351,7 +512,9 @@ def test_save_checkpoint_writes_depth_and_fastwam_contract(tmp_path):
         frame_ranges_json=None,
         fastwam_data_config=Path('configs/data/libero_2cam_cosmos.yaml'),
         model_path=Path('Qwen3-VL-4B-lingbot-vlm'),
-        num_keyframes=5,
+        num_keyframes=4,
+        shared_latent_per_keyframe=32,
+        private_latent_per_keyframe=32,
         grid_size=16,
         semantic_dim=1024,
         train_plan_token_embedding=True,
@@ -380,15 +543,22 @@ def test_save_checkpoint_writes_depth_and_fastwam_contract(tmp_path):
     assert (checkpoint / 'plan_token_embedding.pt').is_file()
     metadata = json.loads((checkpoint / 'planner_meta.json').read_text())
     assert metadata['sequence_length'] == 9
-    assert metadata['num_keyframes'] == 5
+    assert metadata['num_keyframes'] == 4
     assert metadata['grid_size'] == 16
     assert metadata['semantic_dim'] == 1024
-    assert metadata['target_tokens'] == 1280
-    assert metadata['keyframe_offsets'] == [1, 3, 4, 6, 8]
+    assert metadata['target_tokens'] == 1024
+    assert metadata['keyframe_offsets'] == [2, 4, 6, 8]
     assert metadata['has_depth_head'] is True
     assert metadata['token_order'] == 'keyframe_major_row_major'
+    assert metadata['query_layout'] == (
+        'keyframe_major__shared_dino_private_depth_private'
+    )
+    assert metadata['shared_latent_per_keyframe'] == 32
+    assert metadata['private_latent_per_keyframe'] == 32
+    assert metadata['branch_latent_per_keyframe'] == 64
+    assert metadata['total_unique_latent_per_keyframe'] == 96
     assert metadata['plan_token_strings'] == [
-        f'<|sem_plan_{index}|>' for index in range(40)
+        f'<|sem_plan_{index}|>' for index in range(384)
     ]
 ```
 
@@ -435,14 +605,28 @@ meta.update(
         ),
         'depth_grid_size': int(args.depth_grid_size),
         'depth_loss_weight': float(module.depth_loss_weight),
-        'num_latent_per_keyframe': int(module.num_latent_per_keyframe),
+        'shared_latent_per_keyframe': int(
+            module.shared_latent_per_keyframe
+        ),
+        'private_latent_per_keyframe': int(
+            module.private_latent_per_keyframe
+        ),
+        'branch_latent_per_keyframe': int(
+            module.branch_latent_per_keyframe
+        ),
+        'total_unique_latent_per_keyframe': int(
+            module.total_unique_latent_per_keyframe
+        ),
+        'query_layout': (
+            'keyframe_major__shared_dino_private_depth_private'
+        ),
         'plan_token_strings': [
             f'<|sem_plan_{index}|>' for index in range(module.latent_len)
         ],
         'token_order': 'keyframe_major_row_major',
         'planner_input_frame': (
             'fastwam_current_multicamera_composite'
-            if args.fastwam_data_config is not None
+            if getattr(args, 'fastwam_data_config', None) is not None
             else 'legacy_single_current_frame'
         ),
     }
@@ -523,20 +707,28 @@ def load_provider_module():
 def valid_metadata():
     return {
         'sequence_length': 9,
-        'num_keyframes': 5,
+        'num_keyframes': 4,
         'grid_size': 16,
         'semantic_dim': 1024,
-        'target_tokens': 1280,
-        'keyframe_offsets': [1, 3, 4, 6, 8],
-        'normalized_keyframe_times': [0.125, 0.375, 0.5, 0.75, 1.0],
+        'target_tokens': 1024,
+        'keyframe_offsets': [2, 4, 6, 8],
+        'keyframe_scheme': 'even_future',
+        'normalized_keyframe_times': [0.25, 0.5, 0.75, 1.0],
         'has_depth_head': True,
         'depth_feature_dim': 1024,
         'depth_grid_size': 16,
-        'num_latent_per_keyframe': 8,
+        'shared_latent_per_keyframe': 32,
+        'private_latent_per_keyframe': 32,
+        'branch_latent_per_keyframe': 64,
+        'total_unique_latent_per_keyframe': 96,
+        'latent_len': 384,
+        'query_layout': (
+            'keyframe_major__shared_dino_private_depth_private'
+        ),
         'plan_head_type': 'lingbot_dino',
         'planner_input_frame': 'fastwam_current_multicamera_composite',
         'plan_token_strings': [
-            f'<|sem_plan_{index}|>' for index in range(40)
+            f'<|sem_plan_{index}|>' for index in range(384)
         ],
         'token_order': 'keyframe_major_row_major',
     }
@@ -545,10 +737,9 @@ def valid_metadata():
 def test_validate_metadata_accepts_exact_fastwam_contract():
     module = load_provider_module()
     contract = module.validate_planner_metadata(valid_metadata())
-    assert contract.keyframe_offsets == (1, 3, 4, 6, 8)
+    assert contract.keyframe_offsets == (2, 4, 6, 8)
     assert contract.normalized_keyframe_times == (
-        0.125,
-        0.375,
+        0.25,
         0.5,
         0.75,
         1.0,
@@ -559,13 +750,17 @@ def test_validate_metadata_accepts_exact_fastwam_contract():
     ('field', 'value'),
     [
         ('sequence_length', 49),
-        ('num_keyframes', 6),
+        ('num_keyframes', 5),
         ('grid_size', 9),
         ('semantic_dim', 1152),
         ('target_tokens', 486),
-        ('keyframe_offsets', [1, 2, 3, 4, 8]),
+        ('keyframe_offsets', [1, 3, 6, 8]),
+        ('keyframe_scheme', 'uniform'),
         ('has_depth_head', False),
-        ('num_latent_per_keyframe', 4),
+        ('shared_latent_per_keyframe', 8),
+        ('private_latent_per_keyframe', 64),
+        ('query_layout', 'keyframe_major'),
+        ('latent_len', 256),
         ('planner_input_frame', 'legacy_single_current_frame'),
         ('token_order', 'spatial_major'),
     ],
@@ -606,15 +801,23 @@ from PIL import Image
 
 EXPECTED_METADATA = {
     'sequence_length': 9,
-    'num_keyframes': 5,
+    'num_keyframes': 4,
     'grid_size': 16,
     'semantic_dim': 1024,
-    'target_tokens': 1280,
-    'keyframe_offsets': [1, 3, 4, 6, 8],
+    'target_tokens': 1024,
+    'keyframe_offsets': [2, 4, 6, 8],
+    'keyframe_scheme': 'even_future',
     'has_depth_head': True,
     'depth_feature_dim': 1024,
     'depth_grid_size': 16,
-    'num_latent_per_keyframe': 8,
+    'shared_latent_per_keyframe': 32,
+    'private_latent_per_keyframe': 32,
+    'branch_latent_per_keyframe': 64,
+    'total_unique_latent_per_keyframe': 96,
+    'latent_len': 384,
+    'query_layout': (
+        'keyframe_major__shared_dino_private_depth_private'
+    ),
     'plan_head_type': 'lingbot_dino',
     'planner_input_frame': 'fastwam_current_multicamera_composite',
     'token_order': 'keyframe_major_row_major',
@@ -628,6 +831,10 @@ class PlannerContract:
     grid_size: int
     semantic_dim: int
     target_tokens: int
+    shared_latent_per_keyframe: int
+    private_latent_per_keyframe: int
+    branch_latent_per_keyframe: int
+    total_unique_latent_per_keyframe: int
     keyframe_offsets: tuple[int, ...]
     normalized_keyframe_times: tuple[float, ...]
     plan_token_strings: tuple[str, ...]
@@ -664,7 +871,7 @@ def validate_planner_metadata(metadata: dict) -> PlannerContract:
             f'expected {expected_times!r}, got {actual_times!r}'
         )
     expected_plan_tokens = tuple(
-        f'<|sem_plan_{index}|>' for index in range(5 * 8)
+        f'<|sem_plan_{index}|>' for index in range(4 * 96)
     )
     actual_plan_tokens = tuple(metadata.get('plan_token_strings', ()))
     if actual_plan_tokens != expected_plan_tokens:
@@ -674,11 +881,15 @@ def validate_planner_metadata(metadata: dict) -> PlannerContract:
         )
     return PlannerContract(
         sequence_length=9,
-        num_keyframes=5,
+        num_keyframes=4,
         grid_size=16,
         semantic_dim=1024,
-        target_tokens=1280,
-        keyframe_offsets=(1, 3, 4, 6, 8),
+        target_tokens=1024,
+        shared_latent_per_keyframe=32,
+        private_latent_per_keyframe=32,
+        branch_latent_per_keyframe=64,
+        total_unique_latent_per_keyframe=96,
+        keyframe_offsets=(2, 4, 6, 8),
         normalized_keyframe_times=expected_times,
         plan_token_strings=expected_plan_tokens,
     )
@@ -751,9 +962,9 @@ class FakeWrapper:
     def predict_dino_depth_plan(self, **inputs):
         self.calls += 1
         batch = inputs['input_ids'].shape[0]
-        dino = torch.ones(batch, 1280, 1024, requires_grad=True)
+        dino = torch.ones(batch, 1024, 1024, requires_grad=True)
         depth = torch.full(
-            (batch, 1280, 1024),
+            (batch, 1024, 1024),
             2.0,
             requires_grad=True,
         )
@@ -776,9 +987,9 @@ def test_predict_returns_detached_dual_branch_and_times():
 
     assert wrapper.calls == 1
     assert wrapper.training is False
-    assert result.dino_plan.shape == (2, 1280, 1024)
-    assert result.depth_plan.shape == (2, 1280, 1024)
-    assert result.semantic_plan_times.shape == (2, 5)
+    assert result.dino_plan.shape == (2, 1024, 1024)
+    assert result.depth_plan.shape == (2, 1024, 1024)
+    assert result.semantic_plan_times.shape == (2, 4)
     assert result.dino_plan.requires_grad is False
     assert result.depth_plan.requires_grad is False
     assert processor.instructions == ['open drawer', 'pick mug']
@@ -998,7 +1209,15 @@ def from_exported_checkpoint(
         target_len=int(metadata['target_tokens']),
         num_keyframes=int(metadata['num_keyframes']),
         grid_size=int(metadata['grid_size']),
-        num_latent_per_keyframe=int(metadata['num_latent_per_keyframe']),
+        num_latent_per_keyframe=int(
+            metadata['branch_latent_per_keyframe']
+        ),
+        shared_latent_per_keyframe=int(
+            metadata['shared_latent_per_keyframe']
+        ),
+        private_latent_per_keyframe=int(
+            metadata['private_latent_per_keyframe']
+        ),
         plan_head_type=str(metadata['plan_head_type']),
         plan_head_num_heads=int(metadata['plan_head_num_heads']),
         plan_head_dropout=float(metadata['plan_head_dropout']),
@@ -1107,12 +1326,12 @@ git commit -m 'feat: add frozen dino depth plan provider'
 
 ---
 
-## Task 3: Pin a Nine-Frame, Five-Keyframe DINO+Depth Training Entry Point
+## Task 3: Pin a Nine-Frame, Four-Keyframe DINO+Depth Training Entry Point
 
 **Files:**
 
 - Modify: `scripts/qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py`
-- Create: `scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_depth_fastwam_k5.sh`
+- Create: `scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_depth_fastwam_k4.sh`
 - Modify: `scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_4b.sh`
 - Modify: `third_party/FastWAM/src/fastwam/datasets/lerobot/robot_video_dataset.py`
 - Modify: `tests/test_lingbot_dino_depth_contract.py`
@@ -1148,9 +1367,9 @@ def test_fastwam_planner_dataset_uses_composed_nine_frame_video():
 
     assert item['image'].size == (16, 8)
     assert item['prompt'] == 'open the middle drawer'
-    assert item['keyframe_images'].shape == (5, 8, 16, 3)
+    assert item['keyframe_images'].shape == (4, 8, 16, 3)
     assert item['current_image'].shape == (8, 16, 3)
-    assert dataset.offsets == [1, 3, 4, 6, 8]
+    assert dataset.offsets == [2, 4, 6, 8]
 ```
 
 - [ ] **Step 2: Run the adapter test and confirm the dataset class is absent**
@@ -1172,7 +1391,7 @@ Implement:
 
 ```python
 class FastWAMOnlinePlannerDataset(Dataset):
-    offsets = [1, 3, 4, 6, 8]
+    offsets = [2, 4, 6, 8]
 
     def __init__(self, dataset, max_samples: int = 0):
         self.dataset = dataset
@@ -1249,7 +1468,7 @@ class FastWAMOnlinePlannerDataset(Dataset):
         }
 ```
 
-Add repeatable `--fastwam-dataset-dir` arguments and pass them to `from_config` so machine-local dataset locations can override the relative paths in the shared YAML. When `--online-plan-labels --fastwam-data-config PATH` is selected, construct this adapter instead of `OnlineSemanticPlanDataset`. Require `sequence_length=9`, `num_keyframes=5`, and the exact offsets. The DINO and depth teachers continue to run online over `current_image` and `keyframe_images`.
+Add repeatable `--fastwam-dataset-dir` arguments and pass them to `from_config` so machine-local dataset locations can override the relative paths in the shared YAML. When `--online-plan-labels --fastwam-data-config PATH` is selected, construct this adapter instead of `OnlineSemanticPlanDataset`. Require `sequence_length=9`, `num_keyframes=4`, and the exact offsets. The DINO and depth teachers continue to run online over `current_image` and `keyframe_images`.
 
 Add the raw instruction to the existing FastWAM sample dictionary in `robot_video_dataset.py`:
 
@@ -1279,15 +1498,17 @@ def test_fastwam_launcher_pins_nine_frame_dual_branch_contract():
     launcher = (
         ROOT
         / 'scripts/qwen3_vl_semantic_planner/lingbot_dino_4b'
-        / 'train_lingbot_dino_depth_fastwam_k5.sh'
+        / 'train_lingbot_dino_depth_fastwam_k4.sh'
     ).read_text()
     required_exports = (
         'export USE_DEPTH=1',
         'export SEQUENCE_LENGTH=9',
-        'export NUM_KEYFRAMES=5',
+        'export NUM_KEYFRAMES=4',
         'export GRID_SIZE=16',
         'export SEMANTIC_DIM=1024',
-        'export KEYFRAME_SCHEME=uniform',
+        'export KEYFRAME_SCHEME=even_future',
+        'export SHARED_LATENT_PER_KEYFRAME=32',
+        'export PRIVATE_LATENT_PER_KEYFRAME=32',
         'export FASTWAM_DATA_CONFIG=',
     )
     for export in required_exports:
@@ -1318,12 +1539,14 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 
 export USE_DEPTH=1
 export SEQUENCE_LENGTH=9
-export NUM_KEYFRAMES=5
+export NUM_KEYFRAMES=4
 export GRID_SIZE=16
 export SEMANTIC_DIM=1024
-export KEYFRAME_SCHEME=uniform
+export KEYFRAME_SCHEME=even_future
+export SHARED_LATENT_PER_KEYFRAME=32
+export PRIVATE_LATENT_PER_KEYFRAME=32
 export FASTWAM_DATA_CONFIG=${FASTWAM_DATA_CONFIG:-third_party/FastWAM/configs/data/libero_2cam_cosmos.yaml}
-export OUTPUT_DIR=${OUTPUT_DIR:-outputs/qwen3vl4b_lingbot_dino_depth_fastwam_k5}
+export OUTPUT_DIR=${OUTPUT_DIR:-outputs/qwen3vl4b_lingbot_dino_depth_fastwam_k4}
 
 exec "$SCRIPT_DIR/train_lingbot_dino_4b.sh" "$@"
 ```
@@ -1332,7 +1555,7 @@ Make it executable:
 
 ```bash
 chmod +x \
-  scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_depth_fastwam_k5.sh
+  scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_depth_fastwam_k4.sh
 ```
 
 Change the base launcher so `DATASET_ROOT` and `FASTWAM_DATA_CONFIG` are mutually exclusive inputs, with at least one required. When `FASTWAM_DATA_CONFIG` is set, append:
@@ -1343,6 +1566,8 @@ Change the base launcher so `DATASET_ROOT` and `FASTWAM_DATA_CONFIG` are mutuall
 
 and do not append `--dataset-root` or `--frame-ranges-json`. If the colon-separated `FASTWAM_DATASET_DIRS` variable is non-empty, split it and append one `--fastwam-dataset-dir` argument per directory. The base launcher must continue to honor environment overrides using `VAR=${VAR:-default}`.
 
+The base launcher must pass `--shared-latent-per-keyframe` and `--private-latent-per-keyframe` whenever those variables are positive. The resulting planner sequence is exactly 384 distinct `<|sem_plan_i|>` tokens; do not set the legacy `NUM_LATENT_PER_KEYFRAME` to 96 because each head consumes only 64.
+
 - [ ] **Step 8: Run the contract test and a shell syntax check**
 
 Run:
@@ -1351,7 +1576,7 @@ Run:
 pytest -q tests/test_lingbot_dino_depth_contract.py \
   -k fastwam_launcher
 bash -n \
-  scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_depth_fastwam_k5.sh
+  scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_depth_fastwam_k4.sh
 ```
 
 Expected: both commands PASS.
@@ -1363,7 +1588,7 @@ Run:
 ```bash
 git add \
   scripts/qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py \
-  scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_depth_fastwam_k5.sh \
+  scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_depth_fastwam_k4.sh \
   scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_4b.sh \
   third_party/FastWAM/src/fastwam/datasets/lerobot/robot_video_dataset.py \
   tests/test_lingbot_dino_depth_contract.py
@@ -1415,11 +1640,11 @@ def test_fusion_preserves_same_position_shape_and_initial_gate():
     module = load_fusion_module()
     fusion = module.DinoDepthPlanFusion(
         feature_dim=1024,
-        max_tokens=1280,
+        max_tokens=1024,
         initial_depth_gate=0.1,
     )
-    dino = torch.randn(2, 1280, 1024)
-    depth = torch.randn(2, 1280, 1024)
+    dino = torch.randn(2, 1024, 1024)
+    depth = torch.randn(2, 1024, 1024)
     output = fusion(dino, depth)
 
     assert output.shape == dino.shape
@@ -1433,10 +1658,10 @@ def test_fusion_preserves_same_position_shape_and_initial_gate():
 
 def test_fusion_trains_both_projections_and_gate():
     module = load_fusion_module()
-    fusion = module.DinoDepthPlanFusion(1024, 1280, 0.1)
+    fusion = module.DinoDepthPlanFusion(1024, 1024, 0.1)
     output = fusion(
-        torch.randn(1, 1280, 1024),
-        torch.randn(1, 1280, 1024),
+        torch.randn(1, 1024, 1024),
+        torch.randn(1, 1024, 1024),
     )
     output.square().mean().backward()
     assert fusion.dino_proj.weight.grad is not None
@@ -1447,9 +1672,9 @@ def test_fusion_trains_both_projections_and_gate():
 @pytest.mark.parametrize(
     ('dino_shape', 'depth_shape', 'message'),
     [
-        ((1, 1279, 1024), (1, 1279, 1024), '1280'),
-        ((1, 1280, 1023), (1, 1280, 1023), '1024'),
-        ((1, 1280, 1024), (2, 1280, 1024), 'same shape'),
+        ((1, 1023, 1024), (1, 1023, 1024), '1024'),
+        ((1, 1024, 1023), (1, 1024, 1023), '1024'),
+        ((1, 1024, 1024), (2, 1024, 1024), 'same shape'),
     ],
 )
 def test_fusion_rejects_contract_violations(
@@ -1458,7 +1683,7 @@ def test_fusion_rejects_contract_violations(
     message,
 ):
     module = load_fusion_module()
-    fusion = module.DinoDepthPlanFusion(1024, 1280, 0.1)
+    fusion = module.DinoDepthPlanFusion(1024, 1024, 0.1)
     with pytest.raises(ValueError, match=message):
         fusion(torch.zeros(dino_shape), torch.zeros(depth_shape))
 ```
@@ -1490,7 +1715,7 @@ class DinoDepthPlanFusion(nn.Module):
     def __init__(
         self,
         feature_dim: int = 1024,
-        max_tokens: int = 1280,
+        max_tokens: int = 1024,
         initial_depth_gate: float = 0.1,
     ):
         super().__init__()
@@ -1571,7 +1796,7 @@ Extend `from_pretrained` with:
 ```python
 semantic_plan_fusion_enabled: bool = False,
 semantic_plan_feature_dim: int = 1024,
-semantic_plan_max_tokens: int = 1280,
+semantic_plan_fusion_max_tokens: int = 1024,
 semantic_plan_initial_depth_gate: float = 0.1,
 ```
 
@@ -1782,10 +2007,10 @@ Use a plain fake provider and a fake video expert with a trainable fusion scalar
 ```python
 class FakeOnlinePlan:
     def __init__(self, batch):
-        self.dino_plan = torch.ones(batch, 1280, 1024)
-        self.depth_plan = torch.full((batch, 1280, 1024), 2.0)
+        self.dino_plan = torch.ones(batch, 1024, 1024)
+        self.depth_plan = torch.full((batch, 1024, 1024), 2.0)
         self.semantic_plan_times = torch.tensor(
-            [[0.125, 0.375, 0.5, 0.75, 1.0]]
+            [[0.25, 0.5, 0.75, 1.0]]
         ).expand(batch, -1)
 
 
@@ -1813,8 +2038,8 @@ def test_training_uses_current_rgb_and_raw_instruction_online(
     images, instructions = provider.calls[0]
     assert torch.equal(images, training_sample['video'][:, :, 0])
     assert instructions == ['open drawer']
-    assert fastwam_model._current_semantic_plan.shape == (1, 1280, 1024)
-    assert fastwam_model._current_semantic_plan_times.shape == (1, 5)
+    assert fastwam_model._current_semantic_plan.shape == (1, 1024, 1024)
+    assert fastwam_model._current_semantic_plan_times.shape == (1, 4)
     assert fastwam_model._current_video_fps.item() == pytest.approx(5.0)
 ```
 
@@ -1830,8 +2055,8 @@ def test_online_and_file_backed_semantics_are_mutually_exclusive(
     training_sample,
 ):
     fastwam_model._online_semantic_planner = FakeOnlineProvider()
-    training_sample['semantic_plan'] = torch.zeros(1, 1280, 1024)
-    training_sample['semantic_plan_times'] = torch.zeros(1, 5)
+    training_sample['semantic_plan'] = torch.zeros(1, 1024, 1024)
+    training_sample['semantic_plan_times'] = torch.zeros(1, 4)
     with pytest.raises(ValueError, match='mutually exclusive'):
         fastwam_model.training_loss(training_sample)
 
@@ -1937,7 +2162,7 @@ semantic_plan_initial_depth_gate: float = 0.1,
 
 Then make the factory:
 
-1. Enables the video-expert fusion module whenever `online_semantic_planner.enabled` is true.
+1. Enables the video-expert fusion module whenever the flat `online_semantic_planner` flag is true.
 2. Constructs the provider after resolving the local rank/device.
 3. Passes the plain provider into `FastWAMCosmos`.
 
@@ -1973,7 +2198,7 @@ video_expert = CosmosVideoExpert.from_pretrained(
     ),
     semantic_plan_fusion_enabled=online_enabled,
     semantic_plan_feature_dim=int(semantic_plan_in_dim),
-    semantic_plan_max_tokens=int(semantic_plan_max_tokens),
+    semantic_plan_fusion_max_tokens=int(semantic_plan_max_tokens),
     semantic_plan_initial_depth_gate=float(semantic_plan_initial_depth_gate),
 )
 
@@ -2107,7 +2332,7 @@ def _prepare_semantic_condition(self, sample, current_rgb):
             current_rgb.shape[0],
         )
         expected_times = self._current_semantic_plan_times.new_tensor(
-            [0.125, 0.375, 0.5, 0.75, 1.0]
+            [0.25, 0.5, 0.75, 1.0]
         ).unsqueeze(0).expand(current_rgb.shape[0], -1)
         if not torch.allclose(
             self._current_semantic_plan_times,
@@ -2117,7 +2342,7 @@ def _prepare_semantic_condition(self, sample, current_rgb):
         ):
             raise ValueError(
                 'online semantic_plan_times must equal '
-                '[0.125, 0.375, 0.5, 0.75, 1.0]'
+                '[0.25, 0.5, 0.75, 1.0]'
             )
         return
 
@@ -2138,7 +2363,7 @@ def build_inputs(self, sample, tiled: bool = False, video=None):
         )
 ```
 
-This replaces only the current unconditional first `video = sample['video'].to(...)` assignment; the existing context, action, padding, proprio, VAE encode, and return dictionary stay byte-for-byte unchanged.
+This replaces only the current unconditional device-transfer assignment for `video`; the existing context, action, padding, proprio, VAE encode, and return dictionary stay byte-for-byte unchanged.
 
 At the start of `training_loss`, invoke the planner before VAE encoding:
 
@@ -2155,7 +2380,7 @@ self._prepare_semantic_condition(
 inp = self.build_inputs(sample, tiled=tiled, video=raw_video)
 ```
 
-Delete the old `inp = self.build_inputs(...)` and `_set_current_semantic_plan(sample)` calls so each operation occurs once. The provider consumes the same horizontally composed current frame used by FastWAM, and the Wan VAE still receives all nine RGB frames.
+Delete the old `inp = self.build_inputs(sample, tiled=tiled)` and `_set_current_semantic_plan(sample)` calls so each operation occurs once. The provider consumes the same horizontally composed current frame used by FastWAM, and the Wan VAE still receives all nine RGB frames.
 
 - [ ] **Step 7: Add online inference to `infer_action`**
 
@@ -2308,10 +2533,10 @@ Replace the stale flat semantic fields in `fastwam_cosmos.yaml` with:
 semantic_plan_context: true
 semantic_plan_in_dim: 1024
 semantic_plan_hidden_dim: 2048
-semantic_plan_num_keyframes: 5
-semantic_plan_source_num_keyframes: 5
+semantic_plan_num_keyframes: 4
+semantic_plan_source_num_keyframes: 4
 semantic_plan_spatial_grid: 16
-semantic_plan_max_tokens: 1280
+semantic_plan_max_tokens: 1024
 semantic_plan_coord_hidden_dim: 256
 semantic_plan_use_rope: true
 semantic_plan_cross_attention_blocks: null
@@ -2338,7 +2563,7 @@ semantic_plan_source: none
 semantic_plan_dir: null
 semantic_plan_manifest: null
 semantic_plan_dim: 1024
-semantic_plan_max_tokens: 1280
+semantic_plan_max_tokens: 1024
 semantic_plan_default_to_zero: false
 ```
 
@@ -2377,10 +2602,10 @@ def test_cosmos_config_uses_fastwam_planner_geometry():
     assert config['semantic_plan_context'] is True
     assert config['semantic_plan_in_dim'] == 1024
     assert config['semantic_plan_hidden_dim'] == 2048
-    assert config['semantic_plan_num_keyframes'] == 5
-    assert config['semantic_plan_source_num_keyframes'] == 5
+    assert config['semantic_plan_num_keyframes'] == 4
+    assert config['semantic_plan_source_num_keyframes'] == 4
     assert config['semantic_plan_spatial_grid'] == 16
-    assert config['semantic_plan_max_tokens'] == 1280
+    assert config['semantic_plan_max_tokens'] == 1024
     assert config['semantic_plan_coord_hidden_dim'] == 256
     assert config['semantic_plan_use_rope'] is True
     assert config['semantic_plan_cross_attention_blocks'] is None
@@ -2462,7 +2687,7 @@ cfg.model.online_semantic_planner_checkpoint = str(
 ```
 
 4. Load one RGB image, normalize it to `[-1, 1]`, and call `infer_action` with the raw instruction and explicit sampled-video FPS.
-5. Register a temporary forward hook on `video_expert.semantic_plan_fusion` and assert its output shape is exactly `(1, 1280, 1024)`.
+5. Register a temporary forward hook on `video_expert.semantic_plan_fusion` and assert its output shape is exactly `(1, 1024, 1024)`.
 6. Assert the action output is finite and has a non-empty temporal dimension.
 7. Print only the verified checkpoint path, fused-plan shape, action shape, and sampled FPS.
 
@@ -2498,7 +2723,7 @@ def main():
     finally:
         handle.remove()
 
-    if captured.get('shape') != (1, 1280, 1024):
+    if captured.get('shape') != (1, 1024, 1024):
         raise RuntimeError(
             f'unexpected fused plan shape: {captured.get("shape")}'
         )
@@ -2543,7 +2768,7 @@ python -m compileall -q \
   third_party/FastWAM/src/fastwam/models/cosmos \
   third_party/FastWAM/scripts/smoke_online_dino_depth_semantic_plan.py
 bash -n \
-  scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_depth_fastwam_k5.sh
+  scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_depth_fastwam_k4.sh
 ```
 
 Expected: both commands exit with code 0.
@@ -2555,8 +2780,8 @@ Run with the actual dataset and output locations:
 ```bash
 FASTWAM_DATA_CONFIG=third_party/FastWAM/configs/data/libero_2cam_cosmos.yaml \
 FASTWAM_DATASET_DIRS=/data/LFT-W02_data/junjie/data/LIBERO-fastwam/libero_spatial_no_noops_lerobot:/data/LFT-W02_data/junjie/data/LIBERO-fastwam/libero_object_no_noops_lerobot:/data/LFT-W02_data/junjie/data/LIBERO-fastwam/libero_goal_no_noops_lerobot:/data/LFT-W02_data/junjie/data/LIBERO-fastwam/libero_10_no_noops_lerobot \
-OUTPUT_DIR=/data/LFT-W02_data/junjie/VLA_WM/VLM4WAM/outputs/qwen3vl4b_dino_depth_fastwam_k5 \
-scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_depth_fastwam_k5.sh
+OUTPUT_DIR=/data/LFT-W02_data/junjie/VLA_WM/VLM4WAM/outputs/qwen3vl4b_dino_depth_fastwam_k4 \
+scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_depth_fastwam_k4.sh
 ```
 
 Expected export under the step directory named by `OUTPUT_DIR/latest_checkpoint.txt`:
@@ -2574,7 +2799,7 @@ Resolve the per-step directory and validate its `planner_meta.json`:
 
 ```bash
 PLANNER_CHECKPOINT=$(tr -d '\n' < \
-  /data/LFT-W02_data/junjie/VLA_WM/VLM4WAM/outputs/qwen3vl4b_dino_depth_fastwam_k5/latest_checkpoint.txt)
+  /data/LFT-W02_data/junjie/VLA_WM/VLM4WAM/outputs/qwen3vl4b_dino_depth_fastwam_k4/latest_checkpoint.txt)
 test -d "$PLANNER_CHECKPOINT"
 ```
 
@@ -2583,11 +2808,16 @@ The metadata must report:
 ```json
 {
   "sequence_length": 9,
-  "num_keyframes": 5,
+  "num_keyframes": 4,
   "grid_size": 16,
   "semantic_dim": 1024,
-  "target_tokens": 1280,
-  "keyframe_offsets": [1, 3, 4, 6, 8],
+  "target_tokens": 1024,
+  "keyframe_offsets": [2, 4, 6, 8],
+  "shared_latent_per_keyframe": 32,
+  "private_latent_per_keyframe": 32,
+  "branch_latent_per_keyframe": 64,
+  "total_unique_latent_per_keyframe": 96,
+  "query_layout": "keyframe_major__shared_dino_private_depth_private",
   "has_depth_head": true,
   "token_order": "keyframe_major_row_major"
 }
@@ -2599,7 +2829,7 @@ Use an image whose horizontal composition matches the two-camera FastWAM input:
 
 ```bash
 PLANNER_CHECKPOINT=$(tr -d '\n' < \
-  /data/LFT-W02_data/junjie/VLA_WM/VLM4WAM/outputs/qwen3vl4b_dino_depth_fastwam_k5/latest_checkpoint.txt)
+  /data/LFT-W02_data/junjie/VLA_WM/VLM4WAM/outputs/qwen3vl4b_dino_depth_fastwam_k4/latest_checkpoint.txt)
 FASTWAM_PLANNER_CHECKPOINT="$PLANNER_CHECKPOINT" \
 python third_party/FastWAM/scripts/smoke_online_dino_depth_semantic_plan.py \
   --planner-checkpoint \
@@ -2613,7 +2843,7 @@ python third_party/FastWAM/scripts/smoke_online_dino_depth_semantic_plan.py \
   --video-fps 5.0
 ```
 
-Expected: one printed dictionary with `fused_plan_shape=(1, 1280, 1024)` and a finite, non-empty action shape.
+Expected: one printed dictionary with `fused_plan_shape=(1, 1024, 1024)` and a finite, non-empty action shape.
 
 - [ ] **Step 7: Inspect the final diff for scope and accidental placeholders**
 
@@ -2655,11 +2885,12 @@ git commit -m 'test: verify online dino depth fastwam path'
 ## Final Acceptance Checklist
 
 - [ ] A production planner checkpoint was trained or fine-tuned with `sequence_length=9` and exports both `plan_head.pt` and `depth_head.pt`.
-- [ ] The provider performs one Qwen forward for both branches and returns detached `[B,1280,1024]` DINO and depth tensors.
+- [ ] The provider performs one Qwen forward for both branches and returns detached `[B,1024,1024]` DINO and depth tensors.
+- [ ] Each keyframe has 32 shared plus 32 private queries per branch; each head receives 64 queries, and the full four-keyframe VLM query sequence contains exactly 384 distinct tokens.
 - [ ] FastWAM invokes the provider online in training and inference from the current composed RGB image and raw instruction.
 - [ ] The planner remains frozen and is not registered in `FastWAMCosmos.state_dict()`.
 - [ ] The fusion module is registered under the Cosmos video expert, receives gradients, and starts with a depth contribution gate of approximately `0.1`.
-- [ ] Semantic keyframe times are exactly `[0.125,0.375,0.5,0.75,1.0]` for offsets `[1,3,4,6,8]`.
+- [ ] Semantic keyframe times are exactly `[0.25,0.5,0.75,1.0]` for offsets `[2,4,6,8]`.
 - [ ] Effective sampled-video FPS is emitted by the dataset and reaches MoT, cross-attention, AGRA standalone video loss, AGRA foresight, and inference.
 - [ ] Online and file-backed sources cannot be active together.
 - [ ] The full CPU-safe test command, syntax checks, and checkpoint-backed GPU smoke test pass.
