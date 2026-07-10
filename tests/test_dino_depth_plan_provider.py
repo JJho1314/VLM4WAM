@@ -23,6 +23,55 @@ TRAINER_PATH = (
     / "train_qwen3vl4b_lingbot_dino_planner.py"
 )
 
+RECONSTRUCTION_METADATA_FIELDS = (
+    "semantic_dim",
+    "plan_token_ids",
+    "target_tokens",
+    "num_keyframes",
+    "grid_size",
+    "branch_latent_per_keyframe",
+    "shared_latent_per_keyframe",
+    "private_latent_per_keyframe",
+    "plan_head_type",
+    "plan_head_num_heads",
+    "plan_head_dropout",
+    "sem_mlp_hidden_size",
+    "mse_loss_weight",
+    "cosine_loss_weight",
+    "norm_loss_weight",
+    "variance_loss_weight",
+    "infonce_loss_weight",
+    "infonce_temperature",
+    "depth_feature_dim",
+    "depth_grid_size",
+    "depth_loss_weight",
+)
+
+NUMERIC_METADATA_FIELDS = (
+    "sequence_length",
+    "num_keyframes",
+    "grid_size",
+    "semantic_dim",
+    "target_tokens",
+    "depth_feature_dim",
+    "depth_grid_size",
+    "shared_latent_per_keyframe",
+    "private_latent_per_keyframe",
+    "branch_latent_per_keyframe",
+    "total_unique_latent_per_keyframe",
+    "latent_len",
+    "plan_head_num_heads",
+    "plan_head_dropout",
+    "sem_mlp_hidden_size",
+    "mse_loss_weight",
+    "cosine_loss_weight",
+    "norm_loss_weight",
+    "variance_loss_weight",
+    "infonce_loss_weight",
+    "infonce_temperature",
+    "depth_loss_weight",
+)
+
 
 def load_provider_module():
     spec = importlib.util.spec_from_file_location("dino_depth_provider", PROVIDER_PATH)
@@ -67,6 +116,17 @@ def valid_metadata():
         "latent_len": 384,
         "query_layout": ("keyframe_major__shared_dino_private_depth_private"),
         "plan_head_type": "lingbot_dino",
+        "plan_head_num_heads": 16,
+        "plan_head_dropout": 0.0,
+        "sem_mlp_hidden_size": 0,
+        "mse_loss_weight": 1.0,
+        "cosine_loss_weight": 0.0,
+        "norm_loss_weight": 0.0,
+        "variance_loss_weight": 0.0,
+        "infonce_loss_weight": 0.0,
+        "infonce_temperature": 0.07,
+        "depth_loss_weight": 0.004,
+        "plan_token_ids": list(range(3, 387)),
         "planner_input_frame": "fastwam_current_multicamera_composite",
         "plan_token_strings": [f"<|sem_plan_{index}|>" for index in range(384)],
         "token_order": "keyframe_major_row_major",
@@ -85,6 +145,24 @@ def test_validate_metadata_accepts_exact_fastwam_contract():
     )
 
 
+def test_validate_metadata_accepts_finite_informational_loss_values():
+    module = load_provider_module()
+    metadata = valid_metadata()
+    metadata.update(
+        {
+            "mse_loss_weight": 0.75,
+            "cosine_loss_weight": 0.25,
+            "norm_loss_weight": 0.125,
+            "variance_loss_weight": 0.0625,
+            "infonce_loss_weight": 0.03125,
+            "infonce_temperature": 0.2,
+            "depth_loss_weight": 0.01,
+        }
+    )
+
+    module.validate_planner_metadata(metadata)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -100,6 +178,9 @@ def test_validate_metadata_accepts_exact_fastwam_contract():
         ("private_latent_per_keyframe", 64),
         ("query_layout", "keyframe_major"),
         ("latent_len", 256),
+        ("plan_head_num_heads", 8),
+        ("plan_head_dropout", 0.1),
+        ("sem_mlp_hidden_size", 512),
         ("planner_input_frame", "legacy_single_current_frame"),
         ("token_order", "spatial_major"),
     ],
@@ -132,6 +213,54 @@ def test_validate_metadata_rejects_non_finite_keyframe_time():
 
     with pytest.raises(ValueError, match="normalized_keyframe_times"):
         module.validate_planner_metadata(metadata)
+
+
+@pytest.mark.parametrize(
+    "invalid_time",
+    [
+        pytest.param(True, id="boolean"),
+        pytest.param("1.0", id="wrong-type"),
+    ],
+)
+def test_from_checkpoint_rejects_malformed_keyframe_time_before_loading(
+    tmp_path,
+    monkeypatch,
+    invalid_time,
+):
+    module = load_provider_module()
+    metadata = valid_metadata()
+    metadata["normalized_keyframe_times"][-1] = invalid_time
+    write_complete_checkpoint_layout(tmp_path, metadata)
+    load_counts = install_forbidden_checkpoint_loaders(monkeypatch)
+
+    with pytest.raises(ValueError, match="normalized_keyframe_times"):
+        module.FrozenDinoDepthPlanProvider.from_checkpoint(
+            tmp_path,
+            device="cpu",
+            dtype=torch.float32,
+        )
+
+    assert load_counts == {"processor": 0, "model": 0}
+
+
+def test_from_checkpoint_rejects_non_integer_keyframe_offsets_before_loading(
+    tmp_path,
+    monkeypatch,
+):
+    module = load_provider_module()
+    metadata = valid_metadata()
+    metadata["keyframe_offsets"] = [2.0, 4.0, 6.0, 8.0]
+    write_complete_checkpoint_layout(tmp_path, metadata)
+    load_counts = install_forbidden_checkpoint_loaders(monkeypatch)
+
+    with pytest.raises(ValueError, match="keyframe_offsets"):
+        module.FrozenDinoDepthPlanProvider.from_checkpoint(
+            tmp_path,
+            device="cpu",
+            dtype=torch.float32,
+        )
+
+    assert load_counts == {"processor": 0, "model": 0}
 
 
 @pytest.mark.parametrize(
@@ -523,69 +652,61 @@ def write_complete_checkpoint_layout(checkpoint, metadata):
     )
 
 
-def test_from_checkpoint_validates_metadata_before_model_loading(
-    tmp_path,
-    monkeypatch,
-):
-    module = load_provider_module()
-    metadata = valid_metadata()
-    metadata["query_layout"] = "wrong_layout"
-    write_complete_checkpoint_layout(tmp_path, metadata)
-    load_calls = []
+def install_forbidden_checkpoint_loaders(monkeypatch):
+    load_counts = {"processor": 0, "model": 0}
 
-    class ForbiddenLoader:
+    class ForbiddenProcessorLoader:
         @classmethod
-        def from_pretrained(cls, *args, **kwargs):
-            load_calls.append((args, kwargs))
-            raise AssertionError("model loading must follow metadata validation")
+        def from_pretrained(cls, *_args, **_kwargs):
+            load_counts["processor"] += 1
+            raise AssertionError("processor loading must follow schema validation")
+
+    class ForbiddenModelLoader:
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            load_counts["model"] += 1
+            raise AssertionError("model loading must follow schema validation")
 
     transformers = ModuleType("transformers")
-    transformers.AutoProcessor = ForbiddenLoader
-    transformers.Qwen3VLForConditionalGeneration = ForbiddenLoader
+    transformers.AutoProcessor = ForbiddenProcessorLoader
+    transformers.Qwen3VLForConditionalGeneration = ForbiddenModelLoader
     monkeypatch.setitem(sys.modules, "transformers", transformers)
-
-    with pytest.raises(ValueError, match="query_layout"):
-        module.FrozenDinoDepthPlanProvider.from_checkpoint(
-            tmp_path,
-            device="cpu",
-            dtype=torch.float32,
-        )
-    assert load_calls == []
+    return load_counts
 
 
-def test_from_checkpoint_wires_local_frozen_components(
-    tmp_path,
-    monkeypatch,
-):
-    module = load_provider_module()
-    metadata = valid_metadata()
-    write_complete_checkpoint_layout(tmp_path, metadata)
-    processor = FakeProcessor()
-    model_load_calls = []
-    processor_load_calls = []
-    wrapper_load_calls = []
+def install_checkpoint_loading_fakes(monkeypatch, *, vocab_size=512):
+    state = SimpleNamespace(
+        processor=FakeProcessor(),
+        processor_load_calls=[],
+        model_load_calls=[],
+        wrapper_load_calls=[],
+    )
 
     class CheckpointModel:
         def __init__(self):
             self.device = None
+            self.embedding = torch.nn.Embedding(vocab_size, 8)
 
         def to(self, device):
             self.device = torch.device(device)
             return self
 
-    model = CheckpointModel()
+        def get_input_embeddings(self):
+            return self.embedding
+
+    state.model = CheckpointModel()
 
     class ProcessorLoader:
         @classmethod
         def from_pretrained(cls, path, **kwargs):
-            processor_load_calls.append((Path(path), kwargs))
-            return processor
+            state.processor_load_calls.append((Path(path), kwargs))
+            return state.processor
 
     class ModelLoader:
         @classmethod
         def from_pretrained(cls, path, **kwargs):
-            model_load_calls.append((Path(path), kwargs))
-            return model
+            state.model_load_calls.append((Path(path), kwargs))
+            return state.model
 
     class CheckpointWrapper(FakeWrapper):
         @classmethod
@@ -596,8 +717,15 @@ def test_from_checkpoint_wires_local_frozen_components(
             checkpoint_dir,
             metadata,
         ):
-            wrapper_load_calls.append((model, Path(checkpoint_dir), metadata))
-            return cls()
+            consumed_metadata = {
+                field: metadata[field] for field in RECONSTRUCTION_METADATA_FIELDS
+            }
+            wrapper = cls()
+            wrapper.reconstruction_metadata = consumed_metadata
+            state.wrapper_load_calls.append(
+                (model, Path(checkpoint_dir), consumed_metadata)
+            )
+            return wrapper
 
         def to(self, device):
             self.device = torch.device(device)
@@ -622,6 +750,159 @@ def test_from_checkpoint_wires_local_frozen_components(
         "train_qwen3vl4b_lingbot_dino_planner",
         trainer,
     )
+    return state
+
+
+@pytest.mark.parametrize("field", RECONSTRUCTION_METADATA_FIELDS)
+def test_from_checkpoint_rejects_missing_reconstruction_field_before_loading(
+    tmp_path,
+    monkeypatch,
+    field,
+):
+    module = load_provider_module()
+    metadata = valid_metadata()
+    del metadata[field]
+    write_complete_checkpoint_layout(tmp_path, metadata)
+    load_counts = install_forbidden_checkpoint_loaders(monkeypatch)
+
+    with pytest.raises(ValueError, match=field):
+        module.FrozenDinoDepthPlanProvider.from_checkpoint(
+            tmp_path,
+            device="cpu",
+            dtype=torch.float32,
+        )
+
+    assert load_counts == {"processor": 0, "model": 0}
+
+
+@pytest.mark.parametrize("field", NUMERIC_METADATA_FIELDS)
+@pytest.mark.parametrize(
+    "invalid_value",
+    [
+        pytest.param(None, id="null"),
+        pytest.param(True, id="bool"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+        pytest.param("not-numeric", id="wrong-type"),
+    ],
+)
+def test_from_checkpoint_rejects_malformed_numeric_field_before_loading(
+    tmp_path,
+    monkeypatch,
+    field,
+    invalid_value,
+):
+    module = load_provider_module()
+    metadata = valid_metadata()
+    metadata[field] = invalid_value
+    write_complete_checkpoint_layout(tmp_path, metadata)
+    load_counts = install_forbidden_checkpoint_loaders(monkeypatch)
+
+    with pytest.raises(ValueError, match=field):
+        module.FrozenDinoDepthPlanProvider.from_checkpoint(
+            tmp_path,
+            device="cpu",
+            dtype=torch.float32,
+        )
+
+    assert load_counts == {"processor": 0, "model": 0}
+
+
+def malformed_plan_token_ids():
+    valid_ids = list(range(3, 387))
+    duplicate_ids = valid_ids.copy()
+    duplicate_ids[-1] = duplicate_ids[0]
+    negative_ids = valid_ids.copy()
+    negative_ids[0] = -1
+    boolean_ids = valid_ids.copy()
+    boolean_ids[0] = False
+    float_ids = valid_ids.copy()
+    float_ids[0] = 3.0
+    nan_ids = valid_ids.copy()
+    nan_ids[0] = float("nan")
+    return [
+        pytest.param(None, id="null"),
+        pytest.param("not-a-list", id="wrong-container"),
+        pytest.param(valid_ids[:-1], id="wrong-length"),
+        pytest.param(duplicate_ids, id="duplicate"),
+        pytest.param(negative_ids, id="negative"),
+        pytest.param(boolean_ids, id="boolean"),
+        pytest.param(float_ids, id="float"),
+        pytest.param(nan_ids, id="non-finite"),
+    ]
+
+
+@pytest.mark.parametrize("invalid_ids", malformed_plan_token_ids())
+def test_from_checkpoint_rejects_malformed_plan_token_ids_before_loading(
+    tmp_path,
+    monkeypatch,
+    invalid_ids,
+):
+    module = load_provider_module()
+    metadata = valid_metadata()
+    metadata["plan_token_ids"] = invalid_ids
+    write_complete_checkpoint_layout(tmp_path, metadata)
+    load_counts = install_forbidden_checkpoint_loaders(monkeypatch)
+
+    with pytest.raises(ValueError, match="plan_token_ids"):
+        module.FrozenDinoDepthPlanProvider.from_checkpoint(
+            tmp_path,
+            device="cpu",
+            dtype=torch.float32,
+        )
+
+    assert load_counts == {"processor": 0, "model": 0}
+
+
+def test_from_checkpoint_validates_metadata_before_model_loading(
+    tmp_path,
+    monkeypatch,
+):
+    module = load_provider_module()
+    metadata = valid_metadata()
+    metadata["query_layout"] = "wrong_layout"
+    write_complete_checkpoint_layout(tmp_path, metadata)
+    load_counts = install_forbidden_checkpoint_loaders(monkeypatch)
+
+    with pytest.raises(ValueError, match="query_layout"):
+        module.FrozenDinoDepthPlanProvider.from_checkpoint(
+            tmp_path,
+            device="cpu",
+            dtype=torch.float32,
+        )
+    assert load_counts == {"processor": 0, "model": 0}
+
+
+def test_from_checkpoint_rejects_token_id_outside_model_vocabulary(
+    tmp_path,
+    monkeypatch,
+):
+    module = load_provider_module()
+    metadata = valid_metadata()
+    metadata["plan_token_ids"][-1] = 512
+    write_complete_checkpoint_layout(tmp_path, metadata)
+    state = install_checkpoint_loading_fakes(monkeypatch, vocab_size=512)
+
+    with pytest.raises(ValueError, match="plan_token_ids.*vocabulary"):
+        module.FrozenDinoDepthPlanProvider.from_checkpoint(
+            tmp_path,
+            device="cpu",
+            dtype=torch.float32,
+        )
+
+    assert len(state.processor_load_calls) == 1
+    assert len(state.model_load_calls) == 1
+    assert state.wrapper_load_calls == []
+
+
+def test_from_checkpoint_wires_local_frozen_components(
+    tmp_path,
+    monkeypatch,
+):
+    module = load_provider_module()
+    metadata = valid_metadata()
+    write_complete_checkpoint_layout(tmp_path, metadata)
+    state = install_checkpoint_loading_fakes(monkeypatch)
 
     provider = module.FrozenDinoDepthPlanProvider.from_checkpoint(
         tmp_path,
@@ -634,19 +915,22 @@ def test_from_checkpoint_wires_local_frozen_components(
     )
 
     assert result.dino_plan.shape == (1, 1024, 1024)
-    assert processor_load_calls == [
+    assert state.processor_load_calls == [
         (tmp_path / "processor", {"local_files_only": True})
     ]
-    assert model_load_calls == [
+    assert state.model_load_calls == [
         (
             tmp_path / "qwen3vl_lora_or_model",
             {"torch_dtype": torch.float32, "local_files_only": True},
         )
     ]
-    assert model.device == torch.device("cpu")
-    assert len(wrapper_load_calls) == 1
-    assert wrapper_load_calls[0][0] is model
-    assert wrapper_load_calls[0][1] == tmp_path
-    assert wrapper_load_calls[0][2] == metadata
+    assert state.model.device == torch.device("cpu")
+    assert len(state.wrapper_load_calls) == 1
+    assert state.wrapper_load_calls[0][0] is state.model
+    assert state.wrapper_load_calls[0][1] == tmp_path
+    assert state.wrapper_load_calls[0][2] == {
+        field: metadata[field] for field in RECONSTRUCTION_METADATA_FIELDS
+    }
+    assert provider.wrapper.reconstruction_metadata == state.wrapper_load_calls[0][2]
     assert provider.wrapper.training is False
     assert provider.wrapper.anchor.requires_grad is False

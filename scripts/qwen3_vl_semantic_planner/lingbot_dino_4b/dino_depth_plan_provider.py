@@ -31,9 +31,22 @@ EXPECTED_METADATA = {
     "latent_len": 384,
     "query_layout": ("keyframe_major__shared_dino_private_depth_private"),
     "plan_head_type": "lingbot_dino",
+    "plan_head_num_heads": 16,
+    "plan_head_dropout": 0.0,
+    "sem_mlp_hidden_size": 0,
     "planner_input_frame": "fastwam_current_multicamera_composite",
     "token_order": "keyframe_major_row_major",
 }
+
+REQUIRED_FINITE_NUMERIC_METADATA = (
+    "mse_loss_weight",
+    "cosine_loss_weight",
+    "norm_loss_weight",
+    "variance_loss_weight",
+    "infonce_loss_weight",
+    "infonce_temperature",
+    "depth_loss_weight",
+)
 
 
 @dataclass(frozen=True)
@@ -59,28 +72,77 @@ class DinoDepthPlan:
     semantic_plan_times: torch.Tensor
 
 
+def _is_finite_number(value) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+    )
+
+
+def _matches_expected_metadata_value(actual, expected) -> bool:
+    if isinstance(expected, bool):
+        return type(actual) is bool and actual == expected
+    if isinstance(expected, int):
+        return type(actual) is int and actual == expected
+    if isinstance(expected, float):
+        return _is_finite_number(actual) and float(actual) == expected
+    if isinstance(expected, list):
+        return (
+            isinstance(actual, list)
+            and len(actual) == len(expected)
+            and all(
+                _matches_expected_metadata_value(item, expected_item)
+                for item, expected_item in zip(actual, expected, strict=True)
+            )
+        )
+    return actual == expected
+
+
 def validate_planner_metadata(metadata: dict) -> PlannerContract:
     """Validate and freeze the exact planner geometry consumed by FastWAM."""
     for field, expected in EXPECTED_METADATA.items():
         actual = metadata.get(field)
-        if actual != expected:
+        if not _matches_expected_metadata_value(actual, expected):
             raise ValueError(
                 f"incompatible planner metadata field {field}: "
                 f"expected {expected!r}, got {actual!r}"
             )
+
+    for field in REQUIRED_FINITE_NUMERIC_METADATA:
+        actual = metadata.get(field)
+        if not _is_finite_number(actual):
+            raise ValueError(
+                f"incompatible planner metadata field {field}: "
+                f"expected a finite number, got {actual!r}"
+            )
+
+    plan_token_ids = metadata.get("plan_token_ids")
+    if (
+        not isinstance(plan_token_ids, list)
+        or len(plan_token_ids) != EXPECTED_METADATA["latent_len"]
+        or any(type(token_id) is not int or token_id < 0 for token_id in plan_token_ids)
+        or len(set(plan_token_ids)) != len(plan_token_ids)
+    ):
+        raise ValueError(
+            "incompatible planner metadata field plan_token_ids: expected "
+            f"{EXPECTED_METADATA['latent_len']} unique non-negative integers, "
+            f"got {plan_token_ids!r}"
+        )
 
     expected_times = tuple(
         offset / (EXPECTED_METADATA["sequence_length"] - 1)
         for offset in EXPECTED_METADATA["keyframe_offsets"]
     )
     raw_times = metadata.get("normalized_keyframe_times", ())
-    try:
-        actual_times = tuple(float(value) for value in raw_times)
-    except (TypeError, ValueError) as error:
+    if not isinstance(raw_times, list) or any(
+        not _is_finite_number(value) for value in raw_times
+    ):
         raise ValueError(
             "incompatible planner metadata field normalized_keyframe_times: "
             f"expected {expected_times!r}, got {raw_times!r}"
-        ) from error
+        )
+    actual_times = tuple(float(value) for value in raw_times)
     if len(actual_times) != len(expected_times) or any(
         not math.isfinite(actual) or abs(actual - expected) > 1e-7
         for actual, expected in zip(actual_times, expected_times, strict=True)
@@ -242,6 +304,14 @@ class FrozenDinoDepthPlanProvider:
             torch_dtype=dtype,
             local_files_only=True,
         ).to(target_device)
+        embedding_vocabulary_size = int(model.get_input_embeddings().weight.shape[0])
+        largest_plan_token_id = max(metadata["plan_token_ids"])
+        if largest_plan_token_id >= embedding_vocabulary_size:
+            raise ValueError(
+                "incompatible planner metadata field plan_token_ids: "
+                f"token id {largest_plan_token_id} is outside model embedding "
+                f"vocabulary size {embedding_vocabulary_size}"
+            )
         wrapper = PlannerWrapper.from_exported_checkpoint(
             model=model,
             checkpoint_dir=checkpoint_dir,
