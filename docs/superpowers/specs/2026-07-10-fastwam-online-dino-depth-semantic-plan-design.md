@@ -54,7 +54,7 @@ checkpoints. This design promotes the depth head to a required inference output.
 
 ## Decisions
 
-1. Use five semantic keyframes over the eight future RGB frames.
+1. Use four evenly spaced semantic keyframes over the eight future RGB frames.
 2. Retrain or fine-tune the 4B planner on the same nine-frame horizon and camera
    composition used by FastWAM.
 3. Run the planner online during both FastWAM training and inference.
@@ -68,14 +68,14 @@ checkpoints. This design promotes the depth head to a required inference output.
 
 ## Tensor Contract
 
-For batch size `B`, keyframe count `K=5`, grid side `G=16`, and modality
+For batch size `B`, keyframe count `K=4`, grid side `G=16`, and modality
 dimension `D=1024`:
 
 ```text
-dino_plan:          [B, K * G * G, D] = [B, 1280, 1024]
-depth_plan:         [B, K * G * G, D] = [B, 1280, 1024]
-semantic_plan_times:[B, K]            = [B, 5]
-fused_plan:         [B, K * G * G, D] = [B, 1280, 1024]
+dino_plan:          [B, K * G * G, D] = [B, 1024, 1024]
+depth_plan:         [B, K * G * G, D] = [B, 1024, 1024]
+semantic_plan_times:[B, K]            = [B, 4]
+fused_plan:         [B, K * G * G, D] = [B, 1024, 1024]
 vlm_query_hidden:   [B, K, 96, H]
 dino_query_hidden:  [B, K, 64, H]
 depth_query_hidden: [B, K, 64, H]
@@ -93,18 +93,21 @@ The 4B planner is trained or fine-tuned with:
 
 ```text
 sequence_length = 9
-num_keyframes = 5
+num_keyframes = 4
 grid_size = 16
 semantic_dim = 1024
 shared_latent_per_keyframe = 32
 private_latent_per_keyframe = 32
 branch_latent_per_keyframe = 64
 total_unique_latent_per_keyframe = 96
-keyframe_scheme = uniform
+keyframe_scheme = even_future
 ```
 
-The shared keyframe-offset helper produces future indices `[1, 3, 4, 6, 8]` for
-a nine-frame window. Both online teachers consume exactly those future frames.
+The FastWAM-aligned keyframe-offset helper produces future indices
+`[2, 4, 6, 8]` for a nine-frame window. This is exact two-frame spacing across
+the eight future RGB frames; it must not fall back to the legacy rounded
+`linspace(1, 8, 4) = [1, 3, 6, 8]` behavior. Both online teachers consume
+exactly those future frames.
 The planner input is the same current multi-camera composite seen by FastWAM,
 plus the task instruction.
 
@@ -121,20 +124,20 @@ The DINO head receives the 32 shared queries concatenated with the 32
 DINO-private queries. The depth head receives the same 32 shared queries
 concatenated with the 32 depth-private queries. Each branch therefore consumes
 64 query hidden states per keyframe, while the VLM sequence contains 96 unique
-query tokens per keyframe and 480 across all five keyframes.
+query tokens per keyframe and 384 across all four keyframes.
 
 The shared queries are the only query hidden states consumed by both heads.
 Private queries never cross into the other modality head. Query ordering is
 keyframe-major, then group-major in the exact shared/DINO/depth order above.
 This query layout does not change either dense output: each head still decodes
-256 spatial feature tokens per keyframe and returns `[B, 1280, 1024]`.
+256 spatial feature tokens per keyframe and returns `[B, 1024, 1024]`.
 
 ### Online targets
 
 No semantic feature files are read during planner training:
 
-- `DinoVideoTargetEncoder` produces `[B, 1280, 1024]` DINO-video targets.
-- `DepthTargetEncoder` produces `[B, 1280, 1024]` LingBot-Depth targets.
+- `DinoVideoTargetEncoder` produces `[B, 1024, 1024]` DINO-video targets.
+- `DepthTargetEncoder` produces `[B, 1024, 1024]` LingBot-Depth targets.
 
 The DINO and depth heads share one VLM forward and the 32-query shared subset
 for each keyframe, while retaining separate 32-query private subsets. Their
@@ -158,8 +161,8 @@ planner_meta.json
 `planner_meta.json` records at least the horizon, keyframe scheme and offsets,
 grid, modality dimensions, shared/private/branch/total query counts, query
 layout and ordering, presence of the depth head, feature types, and source
-checkpoint identifiers. The provider rejects legacy 8-query, DINO-only, or
-49-frame checkpoints.
+checkpoint identifiers. The provider rejects legacy 8-query, five-keyframe,
+DINO-only, or 49-frame checkpoints.
 
 ### Frozen online provider
 
@@ -211,7 +214,7 @@ fused_plan = LN_out(d + g * z)
 Both projections map 1024 features to 1024 features. The depth gate is a learned
 scalar initialized so `g` is approximately 0.1. This preserves a strong DINO
 baseline at initialization while allowing gradients to reach the depth branch
-from the first step. The fusion output remains `[B, 1280, 1024]`.
+from the first step. The fusion output remains `[B, 1024, 1024]`.
 
 The fusion module belongs to the Cosmos video expert. It is optimized with
 FastWAM and saved in the FastWAM checkpoint.
@@ -224,16 +227,16 @@ The existing adapter is configured as:
 semantic_plan_context: true
 semantic_plan_in_dim: 1024
 semantic_plan_hidden_dim: 2048
-semantic_plan_num_keyframes: 5
-semantic_plan_source_num_keyframes: 5
+semantic_plan_num_keyframes: 4
+semantic_plan_source_num_keyframes: 4
 semantic_plan_spatial_grid: 16
-semantic_plan_max_tokens: 1280
+semantic_plan_max_tokens: 1024
 semantic_plan_coord_hidden_dim: 256
 semantic_plan_use_rope: true
 semantic_plan_cross_attention_blocks: null
 ```
 
-Because source and target keyframe counts are both five, the adapter performs no
+Because source and target keyframe counts are both four, the adapter performs no
 temporal subsampling. It adds coordinate/type information, projects into the
 Cosmos context width, and supplies semantic context to all 28 video blocks by
 default.
@@ -251,11 +254,12 @@ video_fps = lerobot_fps / (global_sample_stride * action_video_freq_ratio)
 ```
 
 This is the RGB-frame FPS passed to Cosmos; it is not divided again by the VAE
-temporal compression factor. For the uniform nine-frame layout, the semantic
-times are:
+temporal compression factor. For the even-future nine-frame layout, the
+semantic times are:
 
 ```text
-semantic_plan_times = [1, 3, 4, 6, 8] / 8
+semantic_plan_times = [2, 4, 6, 8] / 8
+                    = [0.25, 0.5, 0.75, 1.0]
 ```
 
 The dataset emits `video_fps`, and FastWAM threads it through every video path:
@@ -270,7 +274,7 @@ Online DINO+Depth conditioning is opt-in and requires:
 - a compatible planner checkpoint path;
 - online planner enabled;
 - DINO+Depth fusion enabled;
-- the K5/grid16 semantic adapter settings above;
+- the K4/grid16 semantic adapter settings above;
 - a known LeRobot FPS.
 
 Legacy semantic-plan file loading remains available only when the online planner
@@ -300,24 +304,24 @@ behavior.
 
 ### Planner tests
 
-- Nine-frame/K5 uniform offsets equal `[1, 3, 4, 6, 8]`.
-- Online DINO and depth targets both have shape `[B, 1280, 1024]` and aligned
+- Nine-frame/K4 even-future offsets equal `[2, 4, 6, 8]`.
+- Online DINO and depth targets both have shape `[B, 1024, 1024]` and aligned
   ordering.
 - One VLM forward feeds both prediction heads.
 - Each keyframe contains 32 shared, 32 DINO-private, and 32 depth-private
   queries; each head receives exactly 64 and the full VLM query sequence is
-  exactly 480 tokens.
+  exactly 384 tokens.
 - Perturbing DINO-private queries cannot change the depth-head input, and
   perturbing depth-private queries cannot change the DINO-head input.
 - Checkpoint save/load round-trips both heads and required metadata.
-- Legacy 8-query, DINO-only, and 49-frame checkpoints are rejected by the
-  FastWAM provider.
+- Legacy 8-query, five-keyframe, DINO-only, and 49-frame checkpoints are
+  rejected by the FastWAM provider.
 - Provider parameters are frozen, the model is in evaluation mode, and outputs
   are detached.
 
 ### Fusion tests
 
-- Correct inputs produce `[B, 1280, 1024]`.
+- Correct inputs produce `[B, 1024, 1024]`.
 - DINO and depth use independent normalization/projection parameters.
 - The initial depth gate is approximately 0.1 and receives gradients.
 - Shape, dimension, and non-finite mismatches raise clear errors.
@@ -348,7 +352,7 @@ and backward smoke test. Verify:
 ## Rollout Order
 
 1. Extend and validate the 4B planner's depth output and checkpoint contract.
-2. Train or fine-tune a nine-frame/K5 DINO+Depth planner checkpoint.
+2. Train or fine-tune a nine-frame/K4 DINO+Depth planner checkpoint.
 3. Implement and unit-test the frozen online provider.
 4. Implement FastWAM fusion, FPS routing, and coupling plumbing.
 5. Run the single-GPU smoke test.
