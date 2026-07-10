@@ -76,6 +76,9 @@ dino_plan:          [B, K * G * G, D] = [B, 1280, 1024]
 depth_plan:         [B, K * G * G, D] = [B, 1280, 1024]
 semantic_plan_times:[B, K]            = [B, 5]
 fused_plan:         [B, K * G * G, D] = [B, 1280, 1024]
+vlm_query_hidden:   [B, K, 96, H]
+dino_query_hidden:  [B, K, 64, H]
+depth_query_hidden: [B, K, 64, H]
 ```
 
 The contract is keyframe-major, then row-major spatial order within each
@@ -93,7 +96,10 @@ sequence_length = 9
 num_keyframes = 5
 grid_size = 16
 semantic_dim = 1024
-num_latent_per_keyframe = 8
+shared_latent_per_keyframe = 32
+private_latent_per_keyframe = 32
+branch_latent_per_keyframe = 64
+total_unique_latent_per_keyframe = 96
 keyframe_scheme = uniform
 ```
 
@@ -102,6 +108,27 @@ a nine-frame window. Both online teachers consume exactly those future frames.
 The planner input is the same current multi-camera composite seen by FastWAM,
 plus the task instruction.
 
+### Shared/private VLM query layout
+
+For every future keyframe, the VLM emits three distinct query groups in this
+fixed order:
+
+```text
+[32 shared queries, 32 DINO-private queries, 32 depth-private queries]
+```
+
+The DINO head receives the 32 shared queries concatenated with the 32
+DINO-private queries. The depth head receives the same 32 shared queries
+concatenated with the 32 depth-private queries. Each branch therefore consumes
+64 query hidden states per keyframe, while the VLM sequence contains 96 unique
+query tokens per keyframe and 480 across all five keyframes.
+
+The shared queries are the only query hidden states consumed by both heads.
+Private queries never cross into the other modality head. Query ordering is
+keyframe-major, then group-major in the exact shared/DINO/depth order above.
+This query layout does not change either dense output: each head still decodes
+256 spatial feature tokens per keyframe and returns `[B, 1280, 1024]`.
+
 ### Online targets
 
 No semantic feature files are read during planner training:
@@ -109,10 +136,11 @@ No semantic feature files are read during planner training:
 - `DinoVideoTargetEncoder` produces `[B, 1280, 1024]` DINO-video targets.
 - `DepthTargetEncoder` produces `[B, 1280, 1024]` LingBot-Depth targets.
 
-The DINO and depth heads share one VLM forward and the same plan-token hidden
-states. Their losses remain independently measurable. The depth loss weight is
-configurable and retains the LingBot-compatible default unless experiments
-justify changing it.
+The DINO and depth heads share one VLM forward and the 32-query shared subset
+for each keyframe, while retaining separate 32-query private subsets. Their
+losses remain independently measurable. The depth loss weight is configurable
+and retains the LingBot-compatible default unless experiments justify changing
+it.
 
 ### Checkpoint contract
 
@@ -128,9 +156,10 @@ planner_meta.json
 ```
 
 `planner_meta.json` records at least the horizon, keyframe scheme and offsets,
-grid, modality dimensions, latent count, presence of the depth head, feature
-types, and source checkpoint identifiers. The provider rejects legacy
-DINO-only or 49-frame checkpoints.
+grid, modality dimensions, shared/private/branch/total query counts, query
+layout and ordering, presence of the depth head, feature types, and source
+checkpoint identifiers. The provider rejects legacy 8-query, DINO-only, or
+49-frame checkpoints.
 
 ### Frozen online provider
 
@@ -275,9 +304,14 @@ behavior.
 - Online DINO and depth targets both have shape `[B, 1280, 1024]` and aligned
   ordering.
 - One VLM forward feeds both prediction heads.
+- Each keyframe contains 32 shared, 32 DINO-private, and 32 depth-private
+  queries; each head receives exactly 64 and the full VLM query sequence is
+  exactly 480 tokens.
+- Perturbing DINO-private queries cannot change the depth-head input, and
+  perturbing depth-private queries cannot change the DINO-head input.
 - Checkpoint save/load round-trips both heads and required metadata.
-- Legacy DINO-only and 49-frame checkpoints are rejected by the FastWAM
-  provider.
+- Legacy 8-query, DINO-only, and 49-frame checkpoints are rejected by the
+  FastWAM provider.
 - Provider parameters are frozen, the model is in evaluation mode, and outputs
   are detached.
 
