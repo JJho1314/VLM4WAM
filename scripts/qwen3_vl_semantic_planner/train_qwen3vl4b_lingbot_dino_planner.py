@@ -23,7 +23,7 @@ import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 # Per-rank torch.compile / Triton cache dirs. With N ranks sharing ONE cache dir, concurrent
 # flex_attention kernel compiles race on the same artifact (FileNotFoundError on
@@ -92,7 +92,9 @@ def _positive_int(value: str) -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=Path, required=True)
-    parser.add_argument("--dataset-root", type=Path, required=True)
+    parser.add_argument("--dataset-root", type=Path, default=None)
+    parser.add_argument("--fastwam-data-config", type=Path, default=None)
+    parser.add_argument("--fastwam-dataset-dir", action="append", default=[])
     parser.add_argument("--plan-label-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, required=True)
     # Online labels (cosmos-style episode sampling): instead of fixed precomputed .pt windows,
@@ -183,7 +185,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=20260622)
     parser.add_argument("--log-steps", type=int, default=10)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if (args.dataset_root is None) == (args.fastwam_data_config is None):
+        parser.error(
+            "exactly one of --dataset-root or --fastwam-data-config is required"
+        )
+    if args.fastwam_dataset_dir and args.fastwam_data_config is None:
+        parser.error("--fastwam-dataset-dir requires --fastwam-data-config")
+    if args.fastwam_data_config is not None:
+        if not args.online_plan_labels:
+            parser.error("--fastwam-data-config requires --online-plan-labels")
+        try:
+            offsets = keyframe_offsets(
+                args.sequence_length,
+                args.num_keyframes,
+                args.keyframe_scheme,
+                args.keyframe_gamma,
+            )
+        except ValueError as error:
+            parser.error(f"invalid FastWAM keyframe geometry: {error}")
+        if (
+            args.sequence_length != 9
+            or args.num_keyframes != 4
+            or offsets != [2, 4, 6, 8]
+        ):
+            parser.error(
+                "FastWAM planner training requires sequence_length=9, "
+                "num_keyframes=4, and keyframe offsets [2, 4, 6, 8]"
+            )
+    return args
 
 
 def ddp_info() -> tuple[int, int, int]:
@@ -413,6 +443,84 @@ class OnlineSemanticPlanDataset(Dataset):
             # current frame (frames[0]) as raw uint8 too — the DINO teacher needs it as the clip's
             # current/warmup frame (the PIL `image` above is consumed by the VLM processor).
             "current_image": torch.from_numpy(np.asarray(frames[0], dtype=np.uint8)),  # (H, W, 3) uint8
+        }
+
+
+class FastWAMOnlinePlannerDataset(Dataset):
+    offsets = [2, 4, 6, 8]
+
+    def __init__(self, dataset, max_samples: int = 0):
+        self.dataset = dataset
+        self.max_samples = int(max_samples)
+
+    @classmethod
+    def from_config(
+        cls,
+        config_path: Path,
+        *,
+        dataset_dirs: Sequence[str] | None = None,
+        max_samples: int = 0,
+    ):
+        from hydra.utils import instantiate
+        from omegaconf import OmegaConf
+
+        data_config = OmegaConf.load(config_path)
+        root_config = OmegaConf.create(
+            {
+                "data": OmegaConf.to_container(
+                    data_config,
+                    resolve=False,
+                )
+            }
+        )
+        if dataset_dirs:
+            root_config.data.train.dataset_dirs = [
+                str(path) for path in dataset_dirs
+            ]
+        dataset = instantiate(root_config.data.train)
+        return cls(dataset, max_samples=max_samples)
+
+    @classmethod
+    def from_dataset(cls, dataset, max_samples: int = 0):
+        return cls(dataset, max_samples=max_samples)
+
+    def __len__(self):
+        size = len(self.dataset)
+        return min(size, self.max_samples) if self.max_samples > 0 else size
+
+    def set_epoch(self, _epoch: int) -> None:
+        return None
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        sample = self.dataset[index]
+        video = sample["video"]
+        if tuple(video.shape[:2]) != (3, 9):
+            raise ValueError(
+                "FastWAM planner input must be [3, 9, H, W], got "
+                f"{tuple(video.shape)}"
+            )
+        instruction = sample.get("instruction")
+        if not isinstance(instruction, str) or not instruction:
+            raise ValueError(
+                "FastWAM planner sample needs a non-empty raw instruction"
+            )
+        selected = video[:, [0, *self.offsets]]
+        selected = (
+            ((selected.to(torch.float32) + 1.0) * 127.5)
+            .round()
+            .clamp(0, 255)
+            .to(torch.uint8)
+            .permute(1, 2, 3, 0)
+            .contiguous()
+        )
+        current = selected[0]
+        return {
+            "stem": f"fastwam_{index:09d}",
+            "sample_id": f"fastwam_{index:09d}",
+            "image": Image.fromarray(current.numpy()),
+            "prompt": instruction,
+            "keyframe_images": selected[1:],
+            "current_image": current,
         }
 
 
@@ -1503,7 +1611,7 @@ def main() -> None:
     if args.plan_head_type == "lingbot_dino":
         if not args.online_plan_labels:
             raise ValueError("lingbot_dino requires --online-plan-labels (online DINO-video targets)")
-        if args.frame_ranges_json is None:
+        if args.frame_ranges_json is None and args.fastwam_data_config is None:
             args.frame_ranges_json = args.dataset_root / "frame_ranges.json"
         dino_encoder = DinoVideoTargetEncoder(
             ckpt_path=args.dino_teacher_ckpt,
@@ -1529,7 +1637,7 @@ def main() -> None:
 
         if args.siglip2_encoder_path is None:
             raise ValueError("--online-plan-labels requires --siglip2-encoder-path")
-        if args.frame_ranges_json is None:
+        if args.frame_ranges_json is None and args.fastwam_data_config is None:
             args.frame_ranges_json = args.dataset_root / "frame_ranges.json"
         sig_model, sig_processor = load_siglip2(args.siglip2_encoder_path, device, "bf16")
         sig_model.requires_grad_(False)
@@ -1623,16 +1731,23 @@ def main() -> None:
         )
 
     if args.online_plan_labels:
-        dataset = OnlineSemanticPlanDataset(
-            dataset_root=args.dataset_root,
-            frame_ranges_json=args.frame_ranges_json,
-            num_keyframes=args.num_keyframes,
-            sequence_length=args.sequence_length,
-            keyframe_scheme=args.keyframe_scheme,
-            keyframe_gamma=args.keyframe_gamma,
-            max_samples=args.max_samples,
-            seed=args.seed,
-        )
+        if args.fastwam_data_config is not None:
+            dataset = FastWAMOnlinePlannerDataset.from_config(
+                args.fastwam_data_config,
+                dataset_dirs=args.fastwam_dataset_dir,
+                max_samples=args.max_samples,
+            )
+        else:
+            dataset = OnlineSemanticPlanDataset(
+                dataset_root=args.dataset_root,
+                frame_ranges_json=args.frame_ranges_json,
+                num_keyframes=args.num_keyframes,
+                sequence_length=args.sequence_length,
+                keyframe_scheme=args.keyframe_scheme,
+                keyframe_gamma=args.keyframe_gamma,
+                max_samples=args.max_samples,
+                seed=args.seed,
+            )
         if is_main(rank):
             print(
                 json.dumps(

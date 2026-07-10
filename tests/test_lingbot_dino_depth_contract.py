@@ -555,3 +555,56 @@ def test_save_checkpoint_writes_depth_and_fastwam_contract(tmp_path):
     assert metadata["plan_token_strings"] == [
         f"<|sem_plan_{index}|>" for index in range(384)
     ]
+
+
+def test_fastwam_planner_dataset_uses_composed_nine_frame_video():
+    module = load_trainer_module()
+
+    class FakeFastWAMDataset:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, _index):
+            video = torch.linspace(
+                -1.0,
+                1.0,
+                steps=3 * 9 * 8 * 16,
+            ).reshape(3, 9, 8, 16)
+            return {
+                'video': video,
+                'instruction': 'open the middle drawer',
+            }
+
+    dataset = module.FastWAMOnlinePlannerDataset.from_dataset(
+        FakeFastWAMDataset(),
+        max_samples=0,
+    )
+    item = dataset[0]
+
+    assert item['image'].size == (16, 8)
+    assert item['prompt'] == 'open the middle drawer'
+    assert item['keyframe_images'].shape == (4, 8, 16, 3)
+    assert item['current_image'].shape == (8, 16, 3)
+    assert dataset.offsets == [2, 4, 6, 8]
+
+
+def test_fastwam_launcher_pins_nine_frame_dual_branch_contract():
+    launcher = (
+        ROOT
+        / 'scripts/qwen3_vl_semantic_planner/lingbot_dino_4b'
+        / 'train_lingbot_dino_depth_fastwam_k4.sh'
+    ).read_text()
+    required_exports = (
+        'export USE_DEPTH=1',
+        'export SEQUENCE_LENGTH=9',
+        'export NUM_KEYFRAMES=4',
+        'export GRID_SIZE=16',
+        'export SEMANTIC_DIM=1024',
+        'export KEYFRAME_SCHEME=even_future',
+        'export SHARED_LATENT_PER_KEYFRAME=32',
+        'export PRIVATE_LATENT_PER_KEYFRAME=32',
+        'export FASTWAM_DATA_CONFIG=',
+    )
+    for export in required_exports:
+        assert export in launcher
+    assert 'train_lingbot_dino_4b.sh' in launcher

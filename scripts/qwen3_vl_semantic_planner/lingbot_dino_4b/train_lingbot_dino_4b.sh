@@ -3,7 +3,7 @@
 # Runs directly via torchrun in the box env we validated (torch 2.8+cu128, transformers 5.5.4,
 # flex_attention). All paths default to the downloaded/extracted weights on this box.
 #
-# Required:  DATASET_ROOT  (the DROID semantic-plan dataset — must exist wherever you run this)
+# Required: exactly one of DATASET_ROOT (legacy DROID data) or FASTWAM_DATA_CONFIG.
 # Smoke:     NUM_GPUS=1 BATCH_SIZE=1 GRAD_ACCUM=1 MAX_STEPS=2 FULL_FINETUNE=0 bash train_lingbot_dino_4b.sh
 set -uo pipefail
 
@@ -36,13 +36,25 @@ DEPTH_DIM=${DEPTH_DIM:-1024}
 LINGBOT_SRC_ROOT=${LINGBOT_SRC_ROOT:-/data/LFT-W02_data/junjie/VLA_WM/lingbot-vla-v2}
 UTILS3D_MOGE_PATH=${UTILS3D_MOGE_PATH:-/data/LFT-W02_data/junjie/weights/py_deps/utils3d_moge}
 
-DATASET_ROOT=${DATASET_ROOT:?set DATASET_ROOT to the DROID semantic-plan dataset dir}
+DATASET_ROOT=${DATASET_ROOT:-}
+FASTWAM_DATA_CONFIG=${FASTWAM_DATA_CONFIG:-}
+FASTWAM_DATASET_DIRS=${FASTWAM_DATASET_DIRS:-}
+if [[ -n "$DATASET_ROOT" && -n "$FASTWAM_DATA_CONFIG" ]]; then
+  echo "[launch] set only one of DATASET_ROOT or FASTWAM_DATA_CONFIG" >&2
+  exit 2
+fi
+if [[ -z "$DATASET_ROOT" && -z "$FASTWAM_DATA_CONFIG" ]]; then
+  echo "[launch] set DATASET_ROOT or FASTWAM_DATA_CONFIG" >&2
+  exit 2
+fi
 OUTPUT_DIR=${OUTPUT_DIR:-$REPO_ROOT/outputs/qwen3vl_semantic_planner/qwen3vl4b_lingbot_dino_uniform_k5}
 
 # plan geometry: DINO-video, 5 keyframes x 16^2=256 tokens x 1024 dim => target_len 1280
 NUM_KEYFRAMES=${NUM_KEYFRAMES:-5}
 GRID_SIZE=${GRID_SIZE:-16}
 NUM_LATENT_PER_KEYFRAME=${NUM_LATENT_PER_KEYFRAME:-8}   # matches lingbot num_task_tokens=8
+SHARED_LATENT_PER_KEYFRAME=${SHARED_LATENT_PER_KEYFRAME:-32}
+PRIVATE_LATENT_PER_KEYFRAME=${PRIVATE_LATENT_PER_KEYFRAME:-32}
 SEMANTIC_DIM=${SEMANTIC_DIM:-1024}
 SEQUENCE_LENGTH=${SEQUENCE_LENGTH:-49}
 KEYFRAME_SCHEME=${KEYFRAME_SCHEME:-uniform}
@@ -70,11 +82,11 @@ DTYPE=${DTYPE:-bf16}
 FULL_FINETUNE=${FULL_FINETUNE:-1}   # 1: tune LM+head; 0: head + plan-token embeddings only (fits small GPUs)
 
 mkdir -p "$OUTPUT_DIR" logs
-echo "[launch] gpus=$NUM_GPUS model=$MODEL_PATH dataset=$DATASET_ROOT out=$OUTPUT_DIR full_ft=$FULL_FINETUNE"
+DATA_SOURCE=${FASTWAM_DATA_CONFIG:-$DATASET_ROOT}
+echo "[launch] gpus=$NUM_GPUS model=$MODEL_PATH dataset=$DATA_SOURCE out=$OUTPUT_DIR full_ft=$FULL_FINETUNE"
 
 TRAIN_ARGS=(
   --model-path "$MODEL_PATH"
-  --dataset-root "$DATASET_ROOT"
   --output-dir "$OUTPUT_DIR"
   --max-steps "$MAX_STEPS"
   --batch-size "$BATCH_SIZE"
@@ -109,6 +121,23 @@ TRAIN_ARGS=(
   --dino-teacher-config "$DINO_TEACHER_CONFIG"
   --dino-input-size "$DINO_INPUT_SIZE"
 )
+if [[ -n "$FASTWAM_DATA_CONFIG" ]]; then
+  TRAIN_ARGS+=(--fastwam-data-config "$FASTWAM_DATA_CONFIG")
+  if [[ -n "$FASTWAM_DATASET_DIRS" ]]; then
+    IFS=':' read -r -a fastwam_dataset_dirs <<< "$FASTWAM_DATASET_DIRS"
+    for dataset_dir in "${fastwam_dataset_dirs[@]}"; do
+      [[ -n "$dataset_dir" ]] && TRAIN_ARGS+=(--fastwam-dataset-dir "$dataset_dir")
+    done
+  fi
+else
+  TRAIN_ARGS+=(--dataset-root "$DATASET_ROOT")
+fi
+if [[ "$SHARED_LATENT_PER_KEYFRAME" =~ ^[1-9][0-9]*$ ]]; then
+  TRAIN_ARGS+=(--shared-latent-per-keyframe "$SHARED_LATENT_PER_KEYFRAME")
+fi
+if [[ "$PRIVATE_LATENT_PER_KEYFRAME" =~ ^[1-9][0-9]*$ ]]; then
+  TRAIN_ARGS+=(--private-latent-per-keyframe "$PRIVATE_LATENT_PER_KEYFRAME")
+fi
 # warm-start only if the 6b model shards are actually present (skip gracefully, e.g. smoke on HPC3).
 if [[ -n "$HEAD_WARMSTART_CKPT" && -f "$HEAD_WARMSTART_CKPT/model.safetensors.index.json" ]]; then
   TRAIN_ARGS+=(--head-warmstart-ckpt "$HEAD_WARMSTART_CKPT")
