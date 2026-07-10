@@ -122,6 +122,7 @@ TRAIN_ARGS=(
   --dino-input-size "$DINO_INPUT_SIZE"
 )
 if [[ -n "$FASTWAM_DATA_CONFIG" ]]; then
+  export PYTHONPATH="$REPO_ROOT/third_party/FastWAM/src${PYTHONPATH:+:$PYTHONPATH}"
   TRAIN_ARGS+=(--fastwam-data-config "$FASTWAM_DATA_CONFIG")
   if [[ -n "$FASTWAM_DATASET_DIRS" ]]; then
     IFS=':' read -r -a fastwam_dataset_dirs <<< "$FASTWAM_DATASET_DIRS"

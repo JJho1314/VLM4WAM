@@ -608,3 +608,16 @@ def test_fastwam_launcher_pins_nine_frame_dual_branch_contract():
     for export in required_exports:
         assert export in launcher
     assert 'train_lingbot_dino_4b.sh' in launcher
+
+
+def test_base_launcher_exposes_in_repo_fastwam_package():
+    launcher = (
+        ROOT
+        / 'scripts/qwen3_vl_semantic_planner/lingbot_dino_4b'
+        / 'train_lingbot_dino_4b.sh'
+    ).read_text()
+
+    assert (
+        'export PYTHONPATH="$REPO_ROOT/third_party/FastWAM/src'
+        '${PYTHONPATH:+:$PYTHONPATH}"'
+    ) in launcher
