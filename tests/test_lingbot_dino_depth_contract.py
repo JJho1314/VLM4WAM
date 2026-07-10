@@ -417,35 +417,63 @@ def _make_checkpoint_args(**overrides):
 
 
 @pytest.mark.parametrize(
-    ("use_depth", "shared_latents", "private_latents"),
+    ("target", "field", "incompatible_value"),
     [
-        (False, 32, 32),
-        (True, 31, 32),
-        (True, 32, 31),
+        ("args", "use_depth", False),
+        ("args", "sequence_length", 49),
+        ("args", "num_keyframes", 6),
+        ("args", "keyframe_scheme", "uniform"),
+        ("args", "grid_size", 15),
+        ("args", "semantic_dim", 768),
+        ("args", "depth_grid_size", 15),
+        ("args", "depth_dim", 768),
+        ("wrapper", "num_keyframes", 5),
+        ("wrapper", "target_len", 1023),
+        ("wrapper", "shared_latent_per_keyframe", 31),
+        ("wrapper", "private_latent_per_keyframe", 31),
+        ("wrapper", "branch_latent_per_keyframe", 63),
+        ("wrapper", "total_unique_latent_per_keyframe", 95),
+        ("wrapper", "num_latent_per_keyframe", 63),
+        ("wrapper", "latent_len", 383),
+        ("wrapper", "plan_token_ids", list(range(3, 386))),
+        ("wrapper", "plan_token_ids", [3] * 384),
+        ("wrapper", "plan_head_type", "covt"),
+        ("wrapper", "depth_head", None),
+    ],
+    ids=[
+        "use-depth",
+        "sequence-length",
+        "args-num-keyframes",
+        "keyframe-scheme-and-offsets",
+        "grid-size",
+        "semantic-dim",
+        "depth-grid-size",
+        "depth-dim",
+        "wrapper-num-keyframes",
+        "target-len",
+        "shared-latents",
+        "private-latents",
+        "branch-latents",
+        "total-unique-latents",
+        "head-latents",
+        "latent-len",
+        "plan-token-count",
+        "unique-plan-token-count",
+        "plan-head-type",
+        "depth-head",
     ],
 )
-def test_save_fastwam_checkpoint_rejects_nonproduction_query_contract(
+def test_save_fastwam_checkpoint_preflight_rejects_incompatible_contract(
     tmp_path,
-    use_depth,
-    shared_latents,
-    private_latents,
+    target,
+    field,
+    incompatible_value,
 ):
     module = load_trainer_module()
     wrapper = _make_checkpoint_wrapper(module)
-    wrapper.depth_head = wrapper.depth_head if use_depth else None
-    wrapper.shared_latent_per_keyframe = shared_latents
-    wrapper.private_latent_per_keyframe = private_latents
-    wrapper.branch_latent_per_keyframe = shared_latents + private_latents
-    wrapper.total_unique_latent_per_keyframe = shared_latents + 2 * private_latents
-    wrapper.num_latent_per_keyframe = wrapper.branch_latent_per_keyframe
-    wrapper.latent_len = (
-        wrapper.num_keyframes * wrapper.total_unique_latent_per_keyframe
-    )
-    args = _make_checkpoint_args(
-        use_depth=use_depth,
-        shared_latent_per_keyframe=shared_latents,
-        private_latent_per_keyframe=private_latents,
-    )
+    args = _make_checkpoint_args()
+    setattr(args if target == "args" else wrapper, field, incompatible_value)
+    checkpoint = tmp_path / "step_000001"
 
     with pytest.raises(ValueError, match="FastWAM"):
         module.save_checkpoint(
@@ -456,6 +484,36 @@ def test_save_fastwam_checkpoint_rejects_nonproduction_query_contract(
             args,
             rank=0,
         )
+    assert not checkpoint.exists()
+
+
+def test_save_legacy_checkpoint_skips_fastwam_preflight(tmp_path):
+    module = load_trainer_module()
+    wrapper = _make_checkpoint_wrapper(module)
+    wrapper.depth_head = None
+    wrapper.plan_head_type = "covt"
+    args = _make_checkpoint_args(
+        fastwam_data_config=None,
+        use_depth=False,
+        sequence_length=49,
+        num_keyframes=6,
+        keyframe_scheme="uniform",
+        grid_size=9,
+        semantic_dim=768,
+        depth_grid_size=8,
+        depth_dim=512,
+    )
+
+    module.save_checkpoint(
+        tmp_path,
+        2,
+        wrapper,
+        FakeProcessor(),
+        args,
+        rank=0,
+    )
+
+    assert (tmp_path / "step_000002/planner_meta.json").is_file()
 
 
 def test_save_checkpoint_writes_depth_and_fastwam_contract(tmp_path):

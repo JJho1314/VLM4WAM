@@ -1100,6 +1100,99 @@ def count_trainable_parameters(module: nn.Module) -> tuple[int, int]:
     return trainable, total
 
 
+def validate_fastwam_export_contract(
+    module: PlannerWrapper,
+    args: argparse.Namespace,
+) -> list[int]:
+    """Reject any checkpoint geometry that the production FastWAM provider cannot load."""
+    try:
+        offsets = keyframe_offsets(
+            sequence_length=int(args.sequence_length),
+            n=int(args.num_keyframes),
+            scheme=str(args.keyframe_scheme),
+            gamma=float(args.keyframe_gamma),
+        )
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"FastWAM planner export contract has invalid keyframe geometry: {error}"
+        ) from error
+
+    plan_token_ids = getattr(module, "plan_token_ids", ())
+    try:
+        plan_token_count = len(plan_token_ids)
+        unique_plan_token_count = len({int(token_id) for token_id in plan_token_ids})
+    except (TypeError, ValueError):
+        plan_token_count = -1
+        unique_plan_token_count = -1
+
+    actual = {
+        "use_depth": bool(getattr(args, "use_depth", False)),
+        "sequence_length": getattr(args, "sequence_length", None),
+        "num_keyframes": getattr(args, "num_keyframes", None),
+        "wrapper_num_keyframes": getattr(module, "num_keyframes", None),
+        "keyframe_scheme": str(getattr(args, "keyframe_scheme", "")),
+        "keyframe_offsets": [int(offset) for offset in offsets],
+        "grid_size": getattr(args, "grid_size", None),
+        "semantic_dim": getattr(args, "semantic_dim", None),
+        "depth_grid_size": getattr(args, "depth_grid_size", None),
+        "depth_dim": getattr(args, "depth_dim", None),
+        "target_len": getattr(module, "target_len", None),
+        "shared_latent_per_keyframe": getattr(
+            module, "shared_latent_per_keyframe", None
+        ),
+        "private_latent_per_keyframe": getattr(
+            module, "private_latent_per_keyframe", None
+        ),
+        "branch_latent_per_keyframe": getattr(
+            module, "branch_latent_per_keyframe", None
+        ),
+        "total_unique_latent_per_keyframe": getattr(
+            module, "total_unique_latent_per_keyframe", None
+        ),
+        "num_latent_per_keyframe": getattr(
+            module, "num_latent_per_keyframe", None
+        ),
+        "latent_len": getattr(module, "latent_len", None),
+        "plan_token_count": plan_token_count,
+        "unique_plan_token_count": unique_plan_token_count,
+        "plan_head_type": getattr(module, "plan_head_type", None),
+        "has_depth_head": getattr(module, "depth_head", None) is not None,
+    }
+    expected = {
+        "use_depth": True,
+        "sequence_length": 9,
+        "num_keyframes": 4,
+        "wrapper_num_keyframes": 4,
+        "keyframe_scheme": "even_future",
+        "keyframe_offsets": [2, 4, 6, 8],
+        "grid_size": 16,
+        "semantic_dim": 1024,
+        "depth_grid_size": 16,
+        "depth_dim": 1024,
+        "target_len": 1024,
+        "shared_latent_per_keyframe": 32,
+        "private_latent_per_keyframe": 32,
+        "branch_latent_per_keyframe": 64,
+        "total_unique_latent_per_keyframe": 96,
+        "num_latent_per_keyframe": 64,
+        "latent_len": 384,
+        "plan_token_count": 384,
+        "unique_plan_token_count": 384,
+        "plan_head_type": "lingbot_dino",
+        "has_depth_head": True,
+    }
+    mismatches = [
+        f"{name}={actual[name]!r} (expected {expected_value!r})"
+        for name, expected_value in expected.items()
+        if actual[name] != expected_value
+    ]
+    if mismatches:
+        raise ValueError(
+            "FastWAM planner export contract mismatch: " + "; ".join(mismatches)
+        )
+    return offsets
+
+
 def save_checkpoint(
     output_dir: Path,
     step: int,
@@ -1111,22 +1204,11 @@ def save_checkpoint(
     if not is_main(rank):
         return
     module = wrapper.module if isinstance(wrapper, DDP) else wrapper
-    depth_head = getattr(module, "depth_head", None)
     fastwam_data_config = getattr(args, "fastwam_data_config", None)
+    fastwam_offsets = None
     if fastwam_data_config is not None:
-        if not bool(getattr(args, "use_depth", False)) or depth_head is None:
-            raise ValueError(
-                "FastWAM planner export requires use_depth=True and a configured depth head"
-            )
-        query_geometry = (
-            int(module.shared_latent_per_keyframe),
-            int(module.private_latent_per_keyframe),
-        )
-        if query_geometry != (32, 32):
-            raise ValueError(
-                "FastWAM planner export requires exactly 32 shared and 32 private "
-                f"latents per keyframe, got {query_geometry}"
-            )
+        fastwam_offsets = validate_fastwam_export_contract(module, args)
+    depth_head = getattr(module, "depth_head", None)
     ckpt = output_dir / f"step_{step:06d}"
     ckpt.mkdir(parents=True, exist_ok=True)
     module.model.save_pretrained(ckpt / "qwen3vl_lora_or_model")
@@ -1181,7 +1263,7 @@ def save_checkpoint(
         "freeze_vision": bool(args.freeze_vision),
         "freeze_lm_head": bool(args.freeze_lm_head),
     }
-    offsets = keyframe_offsets(
+    offsets = fastwam_offsets or keyframe_offsets(
         sequence_length=int(args.sequence_length),
         n=int(args.num_keyframes),
         scheme=str(args.keyframe_scheme),
