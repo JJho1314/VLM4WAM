@@ -1,0 +1,499 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+from argparse import Namespace
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch import nn
+
+
+ROOT = Path(__file__).resolve().parents[1]
+TRAINER_PATH = (
+    ROOT
+    / "scripts/qwen3_vl_semantic_planner"
+    / "train_qwen3vl4b_lingbot_dino_planner.py"
+)
+
+
+def load_trainer_module():
+    trainer_dir = str(TRAINER_PATH.parent)
+    if trainer_dir not in sys.path:
+        sys.path.insert(0, trainer_dir)
+    spec = importlib.util.spec_from_file_location(
+        "lingbot_planner_trainer", TRAINER_PATH
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class CountingHead(nn.Module):
+    def __init__(self, value: float):
+        super().__init__()
+        self.value = value
+        self.calls = 0
+        self.anchor = nn.Parameter(torch.tensor(value), requires_grad=False)
+
+    def forward(self, image_hidden, plan_hidden):
+        self.calls += 1
+        self.last_plan_hidden = plan_hidden.detach().clone()
+        batch = plan_hidden.shape[0]
+        return torch.full(
+            (batch, 4 * 16 * 16, 1024),
+            self.value,
+            device=plan_hidden.device,
+        )
+
+
+class RecordingProcessor:
+    def __init__(self):
+        self.conversations = []
+        self.processor_call = None
+
+    def apply_chat_template(self, conversation, **kwargs):
+        self.conversations.append((conversation, kwargs))
+        return f"rendered-{len(self.conversations)}"
+
+    def __call__(self, **kwargs):
+        self.processor_call = kwargs
+        return {"input_ids": torch.ones(len(kwargs["text"]), 2)}
+
+
+def test_build_planner_inputs_uses_one_shared_prompt_contract():
+    module = load_trainer_module()
+    processor = RecordingProcessor()
+    images = [object(), object()]
+
+    result = module.build_planner_inputs(
+        processor,
+        images,
+        ["pick up the cup", 17],
+        ["<plan-0>", "<plan-1>"],
+    )
+
+    assert result["input_ids"].shape == (2, 2)
+    assert processor.processor_call == {
+        "text": ["rendered-1", "rendered-2"],
+        "images": images,
+        "padding": True,
+        "return_tensors": "pt",
+    }
+    assert [entry[0][0]["content"][1]["text"] for entry in processor.conversations] == [
+        module.PLANNER_USER_TEMPLATE.format(instruction="pick up the cup"),
+        module.PLANNER_USER_TEMPLATE.format(instruction="17"),
+    ]
+    assert all(
+        entry[0][1]["content"] == "<plan-0> <plan-1>"
+        for entry in processor.conversations
+    )
+
+
+def test_build_planner_inputs_rejects_batch_mismatch():
+    module = load_trainer_module()
+    with pytest.raises(ValueError, match="batch mismatch"):
+        module.build_planner_inputs(RecordingProcessor(), [object()], [], "<plan>")
+
+
+def _make_lingbot_wrapper(*, use_depth: bool):
+    module = load_trainer_module()
+    model = nn.Linear(1, 1)
+    model.config = SimpleNamespace(image_token_id=42)
+    return module.PlannerWrapper(
+        model=model,
+        hidden_size=8,
+        semantic_dim=4,
+        plan_token_ids=[1],
+        target_len=2,
+        num_keyframes=2,
+        grid_size=1,
+        num_latent_per_keyframe=7,
+        shared_latent_per_keyframe=2,
+        private_latent_per_keyframe=3,
+        plan_head_type="lingbot_dino",
+        use_depth=use_depth,
+        depth_dim=4,
+        depth_grid_size=1,
+    )
+
+
+def test_lingbot_depth_wrapper_uses_shared_private_query_geometry():
+    wrapper = _make_lingbot_wrapper(use_depth=True)
+
+    assert wrapper.num_keyframes == 2
+    assert wrapper.shared_latent_per_keyframe == 2
+    assert wrapper.private_latent_per_keyframe == 3
+    assert wrapper.branch_latent_per_keyframe == 5
+    assert wrapper.total_unique_latent_per_keyframe == 8
+    assert wrapper.num_latent_per_keyframe == 5
+    assert wrapper.latent_len == 16
+    assert wrapper.plan_head.num_latent_per_keyframe == 5
+    assert wrapper.depth_head.num_latent_per_keyframe == 5
+
+
+def test_lingbot_without_depth_preserves_legacy_query_geometry():
+    wrapper = _make_lingbot_wrapper(use_depth=False)
+
+    assert wrapper.num_latent_per_keyframe == 7
+    assert wrapper.latent_len == 14
+    assert wrapper.plan_head.num_latent_per_keyframe == 7
+    assert wrapper.depth_head is None
+
+
+def test_split_lingbot_queries_shares_only_the_shared_group():
+    module = load_trainer_module()
+    wrapper = module.PlannerWrapper.__new__(module.PlannerWrapper)
+    nn.Module.__init__(wrapper)
+    wrapper.num_keyframes = 4
+    wrapper.shared_latent_per_keyframe = 32
+    wrapper.private_latent_per_keyframe = 32
+    wrapper.branch_latent_per_keyframe = 64
+    wrapper.total_unique_latent_per_keyframe = 96
+    hidden = torch.arange(4 * 96, dtype=torch.float32).reshape(1, 4 * 96, 1)
+
+    dino_hidden, depth_hidden = wrapper.split_lingbot_query_hidden(hidden)
+
+    grouped = hidden.reshape(1, 4, 96, 1)
+    expected_dino = torch.cat(
+        [grouped[:, :, :32], grouped[:, :, 32:64]],
+        dim=2,
+    ).reshape(1, 4 * 64, 1)
+    expected_depth = torch.cat(
+        [grouped[:, :, :32], grouped[:, :, 64:96]],
+        dim=2,
+    ).reshape(1, 4 * 64, 1)
+    assert torch.equal(dino_hidden, expected_dino)
+    assert torch.equal(depth_hidden, expected_depth)
+    assert not torch.equal(dino_hidden[:, 32:64], depth_hidden[:, 32:64])
+
+
+def test_even_future_offsets_cover_every_second_future_frame():
+    module = load_trainer_module()
+    assert module.keyframe_offsets(9, 4, "even_future", 0.6) == [
+        2,
+        4,
+        6,
+        8,
+    ]
+    with pytest.raises(ValueError, match="divisible"):
+        module.keyframe_offsets(9, 3, "even_future", 0.6)
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--shared-latent-per-keyframe", "0"),
+        ("--private-latent-per-keyframe", "-1"),
+    ],
+)
+def test_parser_rejects_nonpositive_dual_branch_latent_counts(
+    monkeypatch,
+    flag,
+    value,
+):
+    module = load_trainer_module()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "trainer",
+            "--model-path",
+            "model",
+            "--dataset-root",
+            "dataset",
+            "--output-dir",
+            "output",
+            flag,
+            value,
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        module.parse_args()
+
+
+def test_predict_dino_depth_plan_uses_one_vlm_forward():
+    module = load_trainer_module()
+    wrapper = module.PlannerWrapper.__new__(module.PlannerWrapper)
+    nn.Module.__init__(wrapper)
+    wrapper.plan_head = CountingHead(1.0)
+    wrapper.depth_head = CountingHead(2.0)
+    wrapper.plan_head_type = "lingbot_dino"
+    wrapper.num_keyframes = 4
+    wrapper.shared_latent_per_keyframe = 32
+    wrapper.private_latent_per_keyframe = 32
+    wrapper.branch_latent_per_keyframe = 64
+    wrapper.total_unique_latent_per_keyframe = 96
+    wrapper.vlm_forward_calls = 0
+
+    def fake_forward_hiddens(**_inputs):
+        wrapper.vlm_forward_calls += 1
+        plan_hidden = torch.arange(
+            2 * 4 * 96 * 64,
+            dtype=torch.float32,
+        ).reshape(2, 4 * 96, 64)
+        return torch.zeros(2, 6, 64), plan_hidden
+
+    wrapper._forward_hiddens = fake_forward_hiddens
+    dino, depth = wrapper.predict_dino_depth_plan(input_ids=torch.ones(2, 4))
+
+    assert wrapper.vlm_forward_calls == 1
+    assert wrapper.plan_head.calls == 1
+    assert wrapper.depth_head.calls == 1
+    assert wrapper.plan_head.last_plan_hidden.shape == (2, 4 * 64, 64)
+    assert wrapper.depth_head.last_plan_hidden.shape == (2, 4 * 64, 64)
+    assert dino.shape == depth.shape == (2, 1024, 1024)
+    assert torch.all(dino == 1)
+    assert torch.all(depth == 2)
+
+
+def test_predict_semantic_plan_uses_only_the_dino_query_branch():
+    module = load_trainer_module()
+    wrapper = module.PlannerWrapper.__new__(module.PlannerWrapper)
+    nn.Module.__init__(wrapper)
+    wrapper.plan_head = CountingHead(1.0)
+    wrapper.depth_head = CountingHead(2.0)
+    wrapper.plan_head_type = "lingbot_dino"
+    wrapper.use_depth = True
+    wrapper.num_keyframes = 4
+    wrapper.shared_latent_per_keyframe = 32
+    wrapper.private_latent_per_keyframe = 32
+    wrapper.branch_latent_per_keyframe = 64
+    wrapper.total_unique_latent_per_keyframe = 96
+    plan_hidden = torch.arange(4 * 96, dtype=torch.float32).reshape(1, 4 * 96, 1)
+    wrapper._forward_hiddens = lambda **_: (torch.zeros(1, 6, 1), plan_hidden)
+
+    wrapper.predict_semantic_plan(input_ids=torch.ones(1, 4))
+
+    expected_dino, _ = wrapper.split_lingbot_query_hidden(plan_hidden)
+    assert torch.equal(wrapper.plan_head.last_plan_hidden, expected_dino)
+    assert wrapper.depth_head.calls == 0
+
+
+def test_training_routes_branch_specific_queries_after_one_vlm_forward():
+    module = load_trainer_module()
+    wrapper = module.PlannerWrapper.__new__(module.PlannerWrapper)
+    nn.Module.__init__(wrapper)
+    wrapper.plan_head = CountingHead(1.0)
+    wrapper.depth_head = CountingHead(2.0)
+    wrapper.plan_head_type = "lingbot_dino"
+    wrapper.use_depth = True
+    wrapper.num_keyframes = 4
+    wrapper.shared_latent_per_keyframe = 32
+    wrapper.private_latent_per_keyframe = 32
+    wrapper.branch_latent_per_keyframe = 64
+    wrapper.total_unique_latent_per_keyframe = 96
+    wrapper.target_len = 1024
+    wrapper.depth_loss_weight = 0.004
+    wrapper.vlm_forward_calls = 0
+
+    def fake_forward_hiddens(**_inputs):
+        wrapper.vlm_forward_calls += 1
+        plan_hidden = torch.arange(
+            2 * 4 * 96 * 64,
+            dtype=torch.float32,
+        ).reshape(2, 4 * 96, 64)
+        return torch.zeros(2, 6, 64), plan_hidden
+
+    wrapper._forward_hiddens = fake_forward_hiddens
+    wrapper.compute_plan_losses = lambda pred, _target: {"loss": pred.mean()}
+
+    wrapper.forward(
+        semantic_plan_labels=torch.zeros(2, 1024, 1024),
+        depth_plan_labels=torch.zeros(2, 1024, 1024),
+        input_ids=torch.ones(2, 4),
+    )
+
+    assert wrapper.vlm_forward_calls == 1
+    assert wrapper.plan_head.last_plan_hidden.shape == (2, 4 * 64, 64)
+    assert wrapper.depth_head.last_plan_hidden.shape == (2, 4 * 64, 64)
+
+
+def test_predict_dino_depth_plan_requires_depth_head():
+    module = load_trainer_module()
+    wrapper = module.PlannerWrapper.__new__(module.PlannerWrapper)
+    nn.Module.__init__(wrapper)
+    wrapper.plan_head = CountingHead(1.0)
+    wrapper.depth_head = None
+    wrapper.plan_head_type = "lingbot_dino"
+    wrapper._forward_hiddens = lambda **_: (
+        torch.zeros(1, 6, 64),
+        torch.zeros(1, 4 * 96, 64),
+    )
+
+    try:
+        wrapper.predict_dino_depth_plan(input_ids=torch.ones(1, 4))
+    except RuntimeError as error:
+        assert "depth head" in str(error).lower()
+    else:
+        raise AssertionError("missing depth head must fail")
+
+
+class FakeSaveableModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(512, 8)
+
+    def get_input_embeddings(self):
+        return self.embedding
+
+    def save_pretrained(self, output_dir, **_kwargs):
+        path = Path(output_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "config.json").write_text("{}")
+
+
+class FakeProcessor:
+    def save_pretrained(self, output_dir):
+        path = Path(output_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "processor_config.json").write_text("{}")
+
+
+def _make_checkpoint_wrapper(module):
+    wrapper = module.PlannerWrapper.__new__(module.PlannerWrapper)
+    nn.Module.__init__(wrapper)
+    wrapper.model = FakeSaveableModel()
+    wrapper.plan_head = nn.Linear(8, 8)
+    wrapper.depth_head = nn.Linear(8, 8)
+    wrapper.plan_token_ids = list(range(3, 387))
+    wrapper.plan_head_type = "lingbot_dino"
+    wrapper.num_keyframes = 4
+    wrapper.shared_latent_per_keyframe = 32
+    wrapper.private_latent_per_keyframe = 32
+    wrapper.branch_latent_per_keyframe = 64
+    wrapper.total_unique_latent_per_keyframe = 96
+    wrapper.num_latent_per_keyframe = 64
+    wrapper.latent_len = 384
+    wrapper.target_len = 1024
+    wrapper.plan_head_num_heads = 16
+    wrapper.plan_head_dropout = 0.0
+    wrapper.sem_mlp_hidden_size = 0
+    wrapper.mse_loss_weight = 1.0
+    wrapper.cosine_loss_weight = 0.0
+    wrapper.norm_loss_weight = 0.0
+    wrapper.variance_loss_weight = 0.0
+    wrapper.infonce_loss_weight = 0.0
+    wrapper.infonce_temperature = 0.07
+    wrapper.depth_loss_weight = 0.004
+    return wrapper
+
+
+def _make_checkpoint_args(**overrides):
+    values = {
+        "sample_feature_type": "lingbot_dino_depth",
+        "plan_label_dir": None,
+        "sample_one_window_per_stem": False,
+        "online_plan_labels": True,
+        "keyframe_scheme": "even_future",
+        "keyframe_gamma": 0.6,
+        "sequence_length": 9,
+        "online_grid_size": 16,
+        "siglip2_encoder_path": None,
+        "frame_ranges_json": None,
+        "fastwam_data_config": Path("configs/data/libero_2cam_cosmos.yaml"),
+        "model_path": Path("Qwen3-VL-4B-lingbot-vlm"),
+        "num_keyframes": 4,
+        "shared_latent_per_keyframe": 32,
+        "private_latent_per_keyframe": 32,
+        "grid_size": 16,
+        "semantic_dim": 1024,
+        "train_plan_token_embedding": True,
+        "full_finetune": True,
+        "freeze_vision": True,
+        "freeze_lm_head": True,
+        "use_depth": True,
+        "depth_dim": 1024,
+        "depth_grid_size": 16,
+    }
+    values.update(overrides)
+    return Namespace(**values)
+
+
+@pytest.mark.parametrize(
+    ("use_depth", "shared_latents", "private_latents"),
+    [
+        (False, 32, 32),
+        (True, 31, 32),
+        (True, 32, 31),
+    ],
+)
+def test_save_fastwam_checkpoint_rejects_nonproduction_query_contract(
+    tmp_path,
+    use_depth,
+    shared_latents,
+    private_latents,
+):
+    module = load_trainer_module()
+    wrapper = _make_checkpoint_wrapper(module)
+    wrapper.depth_head = wrapper.depth_head if use_depth else None
+    wrapper.shared_latent_per_keyframe = shared_latents
+    wrapper.private_latent_per_keyframe = private_latents
+    wrapper.branch_latent_per_keyframe = shared_latents + private_latents
+    wrapper.total_unique_latent_per_keyframe = shared_latents + 2 * private_latents
+    wrapper.num_latent_per_keyframe = wrapper.branch_latent_per_keyframe
+    wrapper.latent_len = (
+        wrapper.num_keyframes * wrapper.total_unique_latent_per_keyframe
+    )
+    args = _make_checkpoint_args(
+        use_depth=use_depth,
+        shared_latent_per_keyframe=shared_latents,
+        private_latent_per_keyframe=private_latents,
+    )
+
+    with pytest.raises(ValueError, match="FastWAM"):
+        module.save_checkpoint(
+            tmp_path,
+            1,
+            wrapper,
+            FakeProcessor(),
+            args,
+            rank=0,
+        )
+
+
+def test_save_checkpoint_writes_depth_and_fastwam_contract(tmp_path):
+    module = load_trainer_module()
+    wrapper = _make_checkpoint_wrapper(module)
+    args = _make_checkpoint_args()
+
+    module.save_checkpoint(
+        tmp_path,
+        7,
+        wrapper,
+        FakeProcessor(),
+        args,
+        rank=0,
+    )
+
+    checkpoint = tmp_path / "step_000007"
+    assert (checkpoint / "qwen3vl_lora_or_model/config.json").is_file()
+    assert (checkpoint / "processor/processor_config.json").is_file()
+    assert (checkpoint / "plan_head.pt").is_file()
+    assert (checkpoint / "depth_head.pt").is_file()
+    assert (checkpoint / "plan_token_embedding.pt").is_file()
+    metadata = json.loads((checkpoint / "planner_meta.json").read_text())
+    assert metadata["sequence_length"] == 9
+    assert metadata["num_keyframes"] == 4
+    assert metadata["grid_size"] == 16
+    assert metadata["semantic_dim"] == 1024
+    assert metadata["target_tokens"] == 1024
+    assert metadata["keyframe_offsets"] == [2, 4, 6, 8]
+    assert metadata["has_depth_head"] is True
+    assert metadata["token_order"] == "keyframe_major_row_major"
+    assert metadata["query_layout"] == (
+        "keyframe_major__shared_dino_private_depth_private"
+    )
+    assert metadata["shared_latent_per_keyframe"] == 32
+    assert metadata["private_latent_per_keyframe"] == 32
+    assert metadata["branch_latent_per_keyframe"] == 64
+    assert metadata["total_unique_latent_per_keyframe"] == 96
+    assert metadata["plan_token_strings"] == [
+        f"<|sem_plan_{index}|>" for index in range(384)
+    ]

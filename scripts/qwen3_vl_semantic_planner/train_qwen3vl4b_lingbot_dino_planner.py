@@ -82,6 +82,13 @@ def _load_lingbot_head_state(src_6b_dir: Path) -> dict:
 PLAN_TOKEN = "<|sem_plan|>"
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value}")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=Path, required=True)
@@ -96,7 +103,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-ranges-json", type=Path, default=None)
     parser.add_argument("--siglip2-encoder-path", type=Path, default=None)
     parser.add_argument("--sequence-length", type=int, default=49)
-    parser.add_argument("--keyframe-scheme", choices=["uniform", "late"], default="uniform")
+    parser.add_argument(
+        "--keyframe-scheme",
+        choices=["uniform", "late", "even_future"],
+        default="uniform",
+    )
     parser.add_argument("--keyframe-gamma", type=float, default=0.6)
     parser.add_argument("--online-grid-size", type=int, default=0, help="<=0 keeps the native SigLIP2 grid")
     parser.add_argument("--max-samples", type=int, default=0)
@@ -135,6 +146,8 @@ def parse_args() -> argparse.Namespace:
     # keyframe (a compact "visual thought"), and a decoder reconstructs the dense SigLIP grid
     # from them. Decouples the LM sequence length from the target grid resolution.
     parser.add_argument("--num-latent-per-keyframe", type=int, default=4)
+    parser.add_argument("--shared-latent-per-keyframe", type=_positive_int, default=32)
+    parser.add_argument("--private-latent-per-keyframe", type=_positive_int, default=32)
     parser.add_argument("--plan-head-num-heads", type=int, default=16)
     parser.add_argument("--plan-head-dropout", type=float, default=0.0)
     parser.add_argument("--sem-mlp-hidden-size", type=int, default=0)
@@ -304,6 +317,15 @@ def keyframe_offsets(sequence_length: int, n: int, scheme: str, gamma: float) ->
     n = max(min(n, sequence_length), 1)
     if sequence_length <= 1:
         return [0] * n
+    if scheme == "even_future":
+        future_frames = sequence_length - 1
+        if future_frames % n != 0:
+            raise ValueError(
+                f"even_future requires {future_frames} future frames "
+                f"to be divisible by {n} keyframes"
+            )
+        step = future_frames // n
+        return [step * (index + 1) for index in range(n)]
     if scheme == "late" and n > 1:
         u = torch.linspace(0.0, 1.0, n) ** float(gamma)
         idx = (1.0 + (sequence_length - 1 - 1) * u).round().long()
@@ -394,6 +416,60 @@ class OnlineSemanticPlanDataset(Dataset):
         }
 
 
+PLANNER_USER_TEMPLATE = (
+    "You are a robot video semantic planner. Given the first frame and instruction, "
+    "predict future spatial semantic plan tokens for the manipulation video.\n"
+    "Instruction: {instruction}"
+)
+
+
+def build_planner_inputs(
+    processor: Any,
+    images: list[Any],
+    instructions: list[Any],
+    plan_sequence: str | list[str],
+) -> Any:
+    if len(images) != len(instructions):
+        raise ValueError(
+            f"images/instructions batch mismatch: {len(images)} != {len(instructions)}"
+        )
+    plan_text = plan_sequence if isinstance(plan_sequence, str) else " ".join(plan_sequence)
+    conversations = []
+    for image, instruction in zip(images, instructions, strict=True):
+        conversations.append(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {
+                            "type": "text",
+                            "text": PLANNER_USER_TEMPLATE.format(instruction=str(instruction)),
+                        },
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": plan_text,
+                },
+            ]
+        )
+    texts = [
+        processor.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        for conversation in conversations
+    ]
+    return processor(
+        text=texts,
+        images=list(images),
+        padding=True,
+        return_tensors="pt",
+    )
+
+
 @dataclass
 class Collator:
     processor: Any
@@ -410,26 +486,12 @@ class Collator:
             keyframes = torch.stack([x["keyframe_images"] for x in batch], dim=0)
             if "current_image" in batch[0]:
                 current = torch.stack([x["current_image"] for x in batch], dim=0)
-        texts = []
-        plan_text = " ".join(self.plan_sequence)
-        for item in batch:
-            user_text = (
-                "You are a robot video semantic planner. Given the first frame and instruction, "
-                "predict future spatial semantic plan tokens for the manipulation video.\n"
-                f"Instruction: {item['prompt']}"
-            )
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": user_text},
-                    ],
-                },
-                {"role": "assistant", "content": plan_text},
-            ]
-            texts.append(self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False))
-        inputs = self.processor(text=texts, images=images, padding=True, return_tensors="pt")
+        inputs = build_planner_inputs(
+            self.processor,
+            images,
+            [item["prompt"] for item in batch],
+            self.plan_sequence,
+        )
         if labels is not None:
             inputs["semantic_plan_labels"] = labels
         if keyframes is not None:
@@ -615,6 +677,8 @@ class PlannerWrapper(nn.Module):
         depth_dim: int = 1024,
         depth_grid_size: int = 16,
         depth_loss_weight: float = 0.004,
+        shared_latent_per_keyframe: int = 32,
+        private_latent_per_keyframe: int = 32,
     ) -> None:
         super().__init__()
         if sem_mlp_hidden_size < 0:
@@ -629,7 +693,27 @@ class PlannerWrapper(nn.Module):
         self.plan_head_type = plan_head_type
         self.plan_head_num_heads = int(plan_head_num_heads)
         self.plan_head_dropout = float(plan_head_dropout)
-        self.num_latent_per_keyframe = int(num_latent_per_keyframe)
+        self.num_keyframes = int(num_keyframes)
+        self.shared_latent_per_keyframe = int(shared_latent_per_keyframe)
+        self.private_latent_per_keyframe = int(private_latent_per_keyframe)
+        self.branch_latent_per_keyframe = (
+            self.shared_latent_per_keyframe + self.private_latent_per_keyframe
+        )
+        self.total_unique_latent_per_keyframe = (
+            self.shared_latent_per_keyframe + 2 * self.private_latent_per_keyframe
+        )
+        self.use_depth = bool(use_depth) and plan_head_type == "lingbot_dino"
+        if self.use_depth and (
+            self.shared_latent_per_keyframe <= 0 or self.private_latent_per_keyframe <= 0
+        ):
+            raise ValueError(
+                "DINO+depth mode requires positive shared/private latent counts"
+            )
+        self.num_latent_per_keyframe = (
+            self.branch_latent_per_keyframe
+            if self.use_depth
+            else int(num_latent_per_keyframe)
+        )
         # target_len = tokens the loss regresses (dense SigLIP grid). latent_len = <|sem_plan|>
         # tokens the LM actually emits. They differ only for the CoVT bottleneck head.
         self.target_len = int(target_len)
@@ -661,10 +745,14 @@ class PlannerWrapper(nn.Module):
             # lingbot-vla-v2 rich-KV head predicting DINO-video patches: shared TaskTokenResampler
             # (warm-startable from future_video_align_head) run per keyframe. grid_size**2 = the DINO
             # patch-token count per keyframe (16**2 = 256). semantic_dim is the DINO dim (1024).
-            self.latent_len = int(num_keyframes) * int(num_latent_per_keyframe)
+            self.latent_len = (
+                self.num_keyframes * self.total_unique_latent_per_keyframe
+                if self.use_depth
+                else self.num_keyframes * self.num_latent_per_keyframe
+            )
             self.plan_head = LingbotDinoPlanHead(
                 num_keyframes=num_keyframes,
-                num_latent_per_keyframe=num_latent_per_keyframe,
+                num_latent_per_keyframe=self.num_latent_per_keyframe,
                 num_backbone_tokens=int(grid_size) * int(grid_size),
                 llm_hidden=hidden_size,
                 dim_out=semantic_dim,
@@ -674,13 +762,12 @@ class PlannerWrapper(nn.Module):
         # Auxiliary future-DEPTH alignment head (lingbot-style, only for lingbot_dino): a second shared
         # TaskTokenResampler, warm-started from future_depth_align_head, reading the SAME image+latent
         # context and regressing LingBot-Depth features (MoGe-2 -> MoRGBD) with smooth_L1.
-        self.use_depth = bool(use_depth) and plan_head_type == "lingbot_dino"
         self.depth_loss_weight = float(depth_loss_weight)
         self.depth_head = None
         if self.use_depth:
             self.depth_head = LingbotDinoPlanHead(
                 num_keyframes=num_keyframes,
-                num_latent_per_keyframe=num_latent_per_keyframe,
+                num_latent_per_keyframe=self.branch_latent_per_keyframe,
                 num_backbone_tokens=int(depth_grid_size) * int(depth_grid_size),
                 llm_hidden=hidden_size,
                 dim_out=depth_dim,
@@ -729,10 +816,80 @@ class PlannerWrapper(nn.Module):
             image_hidden = self.collect_image_hidden(hidden, input_ids).detach()
         return image_hidden, plan_hidden
 
+    def split_lingbot_query_hidden(
+        self,
+        plan_hidden: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch, token_count, hidden_size = plan_hidden.shape
+        expected = self.num_keyframes * self.total_unique_latent_per_keyframe
+        if token_count != expected:
+            raise RuntimeError(
+                f"expected {expected} shared/private query tokens, got {token_count}"
+            )
+        grouped = plan_hidden.reshape(
+            batch,
+            self.num_keyframes,
+            self.total_unique_latent_per_keyframe,
+            hidden_size,
+        )
+        shared_end = self.shared_latent_per_keyframe
+        dino_end = shared_end + self.private_latent_per_keyframe
+        depth_end = dino_end + self.private_latent_per_keyframe
+        shared = grouped[:, :, :shared_end]
+        dino_private = grouped[:, :, shared_end:dino_end]
+        depth_private = grouped[:, :, dino_end:depth_end]
+        dino_hidden = torch.cat([shared, dino_private], dim=2)
+        depth_hidden = torch.cat([shared, depth_private], dim=2)
+        return (
+            dino_hidden.reshape(
+                batch,
+                self.num_keyframes * self.branch_latent_per_keyframe,
+                hidden_size,
+            ),
+            depth_hidden.reshape(
+                batch,
+                self.num_keyframes * self.branch_latent_per_keyframe,
+                hidden_size,
+            ),
+        )
+
+    def predict_dino_depth_plan(
+        self,
+        **model_inputs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.plan_head_type != "lingbot_dino":
+            raise RuntimeError(
+                "DINO+depth prediction requires plan_head_type=lingbot_dino"
+            )
+        if self.depth_head is None:
+            raise RuntimeError(
+                "DINO+depth prediction requires a configured depth head"
+            )
+        image_hidden, plan_hidden = self._forward_hiddens(**model_inputs)
+        dino_hidden, depth_hidden = self.split_lingbot_query_hidden(plan_hidden)
+        dino_dtype = next(self.plan_head.parameters()).dtype
+        depth_dtype = next(self.depth_head.parameters()).dtype
+        dino_plan = self.plan_head(
+            image_hidden.to(dtype=dino_dtype),
+            dino_hidden.to(dtype=dino_dtype),
+        ).float()
+        depth_plan = self.depth_head(
+            image_hidden.to(dtype=depth_dtype),
+            depth_hidden.to(dtype=depth_dtype),
+        ).float()
+        if dino_plan.shape != depth_plan.shape:
+            raise RuntimeError(
+                "DINO/depth head output mismatch: "
+                f"{tuple(dino_plan.shape)} != {tuple(depth_plan.shape)}"
+            )
+        return dino_plan, depth_plan
+
     def predict_semantic_plan(self, **inputs: Any) -> torch.Tensor:
         image_hidden, plan_hidden = self._forward_hiddens(**inputs)
         head_dtype = next(self.plan_head.parameters()).dtype
         if self.plan_head_type == "lingbot_dino":
+            if self.depth_head is not None:
+                plan_hidden, _ = self.split_lingbot_query_hidden(plan_hidden)
             return self.plan_head(
                 image_hidden.to(dtype=head_dtype), plan_hidden.to(dtype=head_dtype)
             ).float()
@@ -806,13 +963,24 @@ class PlannerWrapper(nn.Module):
         if self.plan_head_type == "lingbot_dino":
             # One VLM forward feeds BOTH the video head and (optionally) the auxiliary depth head.
             image_hidden, plan_hidden = self._forward_hiddens(**inputs)
-            head_dtype = next(self.plan_head.parameters()).dtype
-            pred = self.plan_head(image_hidden.to(head_dtype), plan_hidden.to(head_dtype)).float()
+            dino_hidden = plan_hidden
+            depth_hidden = None
+            if self.depth_head is not None:
+                dino_hidden, depth_hidden = self.split_lingbot_query_hidden(plan_hidden)
+            dino_dtype = next(self.plan_head.parameters()).dtype
+            pred = self.plan_head(
+                image_hidden.to(dino_dtype),
+                dino_hidden.to(dino_dtype),
+            ).float()
             if pred.shape[0] != batch or pred.shape[1] != self.target_len:
                 raise RuntimeError(f"Prediction {tuple(pred.shape[:2])} != ({batch}, {self.target_len})")
             out = self.compute_plan_losses(pred, semantic_plan_labels.to(device=pred.device, dtype=torch.float32))
             if self.depth_head is not None and depth_plan_labels is not None:
-                depth_pred = self.depth_head(image_hidden.to(head_dtype), plan_hidden.to(head_dtype)).float()
+                depth_dtype = next(self.depth_head.parameters()).dtype
+                depth_pred = self.depth_head(
+                    image_hidden.to(depth_dtype),
+                    depth_hidden.to(depth_dtype),
+                ).float()
                 depth_target = depth_plan_labels.to(device=pred.device, dtype=torch.float32)
                 depth_l = F.smooth_l1_loss(depth_pred, depth_target)  # lingbot depth loss (_emb_loss)
                 out["loss"] = out["loss"] + self.depth_loss_weight * depth_l
@@ -943,11 +1111,29 @@ def save_checkpoint(
     if not is_main(rank):
         return
     module = wrapper.module if isinstance(wrapper, DDP) else wrapper
+    depth_head = getattr(module, "depth_head", None)
+    fastwam_data_config = getattr(args, "fastwam_data_config", None)
+    if fastwam_data_config is not None:
+        if not bool(getattr(args, "use_depth", False)) or depth_head is None:
+            raise ValueError(
+                "FastWAM planner export requires use_depth=True and a configured depth head"
+            )
+        query_geometry = (
+            int(module.shared_latent_per_keyframe),
+            int(module.private_latent_per_keyframe),
+        )
+        if query_geometry != (32, 32):
+            raise ValueError(
+                "FastWAM planner export requires exactly 32 shared and 32 private "
+                f"latents per keyframe, got {query_geometry}"
+            )
     ckpt = output_dir / f"step_{step:06d}"
     ckpt.mkdir(parents=True, exist_ok=True)
     module.model.save_pretrained(ckpt / "qwen3vl_lora_or_model")
     processor.save_pretrained(ckpt / "processor")
     torch.save(module.plan_head.state_dict(), ckpt / "plan_head.pt")
+    if depth_head is not None:
+        torch.save(depth_head.state_dict(), ckpt / "depth_head.pt")
     plan_ids = torch.as_tensor(module.plan_token_ids)
     plan_embedding = module.model.get_input_embeddings().weight[plan_ids].detach().cpu()
     torch.save(plan_embedding, ckpt / "plan_token_embedding.pt")
@@ -995,7 +1181,62 @@ def save_checkpoint(
         "freeze_vision": bool(args.freeze_vision),
         "freeze_lm_head": bool(args.freeze_lm_head),
     }
-    (ckpt / "planner_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    offsets = keyframe_offsets(
+        sequence_length=int(args.sequence_length),
+        n=int(args.num_keyframes),
+        scheme=str(args.keyframe_scheme),
+        gamma=float(args.keyframe_gamma),
+    )
+    meta.update(
+        {
+            "sequence_length": int(args.sequence_length),
+            "num_keyframes": int(args.num_keyframes),
+            "grid_size": int(args.grid_size),
+            "semantic_dim": int(args.semantic_dim),
+            "target_tokens": int(module.target_len),
+            "keyframe_offsets": [int(offset) for offset in offsets],
+            "normalized_keyframe_times": [
+                float(offset) / float(args.sequence_length - 1)
+                for offset in offsets
+            ],
+            "has_depth_head": depth_head is not None,
+            "depth_feature_dim": (
+                int(args.depth_dim) if depth_head is not None else None
+            ),
+            "depth_grid_size": int(args.depth_grid_size),
+            "depth_loss_weight": float(module.depth_loss_weight),
+            "shared_latent_per_keyframe": int(
+                module.shared_latent_per_keyframe
+            ),
+            "private_latent_per_keyframe": int(
+                module.private_latent_per_keyframe
+            ),
+            "branch_latent_per_keyframe": int(
+                module.branch_latent_per_keyframe
+            ),
+            "total_unique_latent_per_keyframe": int(
+                module.total_unique_latent_per_keyframe
+            ),
+            "query_layout": (
+                "keyframe_major__shared_dino_private_depth_private"
+                if depth_head is not None
+                else "keyframe_major__legacy_single_branch"
+            ),
+            "plan_token_strings": [
+                f"<|sem_plan_{index}|>" for index in range(module.latent_len)
+            ],
+            "token_order": "keyframe_major_row_major",
+            "planner_input_frame": (
+                "fastwam_current_multicamera_composite"
+                if fastwam_data_config is not None
+                else "legacy_single_current_frame"
+            ),
+        }
+    )
+    (ckpt / "planner_meta.json").write_text(
+        json.dumps(meta, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     (output_dir / "latest_checkpoint.txt").write_text(str(ckpt), encoding="utf-8")
 
 
@@ -1003,6 +1244,13 @@ def main() -> None:
     args = parse_args()
     if args.full_finetune and args.lora_r > 0:
         raise ValueError("--full-finetune is mutually exclusive with LoRA; set --lora-r 0.")
+    if args.plan_head_type == "lingbot_dino" and args.use_depth and (
+        args.shared_latent_per_keyframe <= 0 or args.private_latent_per_keyframe <= 0
+    ):
+        raise ValueError(
+            "DINO+depth mode requires positive --shared-latent-per-keyframe and "
+            "--private-latent-per-keyframe"
+        )
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1025,9 +1273,20 @@ def main() -> None:
     # <|sem_plan|> — identical inputs differentiated by position alone tend to collapse
     # (all latents become the same -> keyframes stop evolving). mlp/baton keep the single
     # repeated token (their latent_len = target_len = thousands of tokens).
-    if args.plan_head_type in ("covt", "lingbot_dino"):
-        _latent_len = int(args.num_keyframes) * int(args.num_latent_per_keyframe)
-        plan_token_strs = [f"<|sem_plan_{i}|>" for i in range(_latent_len)]
+    if (
+        args.plan_head_type == "lingbot_dino"
+        and args.use_depth
+        and args.shared_latent_per_keyframe > 0
+    ):
+        latent_len = int(args.num_keyframes) * (
+            int(args.shared_latent_per_keyframe)
+            + 2 * int(args.private_latent_per_keyframe)
+        )
+        plan_token_strs = [f"<|sem_plan_{i}|>" for i in range(latent_len)]
+        plan_sequence = list(plan_token_strs)
+    elif args.plan_head_type in ("covt", "lingbot_dino"):
+        latent_len = int(args.num_keyframes) * int(args.num_latent_per_keyframe)
+        plan_token_strs = [f"<|sem_plan_{i}|>" for i in range(latent_len)]
         plan_sequence = list(plan_token_strs)
     else:
         plan_token_strs = [PLAN_TOKEN]
@@ -1131,6 +1390,8 @@ def main() -> None:
         num_keyframes=args.num_keyframes,
         grid_size=args.grid_size,
         num_latent_per_keyframe=args.num_latent_per_keyframe,
+        shared_latent_per_keyframe=args.shared_latent_per_keyframe,
+        private_latent_per_keyframe=args.private_latent_per_keyframe,
         plan_head_type=args.plan_head_type,
         plan_head_num_heads=args.plan_head_num_heads,
         plan_head_dropout=args.plan_head_dropout,
