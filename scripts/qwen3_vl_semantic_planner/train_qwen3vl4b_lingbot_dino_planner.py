@@ -777,6 +777,101 @@ class PlannerWrapper(nn.Module):
         # image-token id used by the lingbot_dino head to gather the LLM's image-token hiddens
         self.image_token_id = getattr(getattr(model, "config", None), "image_token_id", None)
 
+    @classmethod
+    def from_exported_checkpoint(
+        cls,
+        *,
+        model: nn.Module,
+        checkpoint_dir: str | Path,
+        metadata: dict[str, Any],
+    ) -> "PlannerWrapper":
+        """Rebuild and freeze a planner from the files written by ``save_checkpoint``."""
+        checkpoint_dir = Path(checkpoint_dir)
+        text_config = getattr(model.config, "text_config", model.config)
+        hidden_size = int(text_config.hidden_size)
+        wrapper = cls(
+            model=model,
+            hidden_size=hidden_size,
+            semantic_dim=int(metadata["semantic_dim"]),
+            plan_token_ids=[int(value) for value in metadata["plan_token_ids"]],
+            target_len=int(metadata["target_tokens"]),
+            num_keyframes=int(metadata["num_keyframes"]),
+            grid_size=int(metadata["grid_size"]),
+            num_latent_per_keyframe=int(
+                metadata["branch_latent_per_keyframe"]
+            ),
+            shared_latent_per_keyframe=int(
+                metadata["shared_latent_per_keyframe"]
+            ),
+            private_latent_per_keyframe=int(
+                metadata["private_latent_per_keyframe"]
+            ),
+            plan_head_type=str(metadata["plan_head_type"]),
+            plan_head_num_heads=int(metadata["plan_head_num_heads"]),
+            plan_head_dropout=float(metadata["plan_head_dropout"]),
+            sem_mlp_hidden_size=int(metadata["sem_mlp_hidden_size"]),
+            mse_loss_weight=float(metadata["mse_loss_weight"]),
+            cosine_loss_weight=float(metadata["cosine_loss_weight"]),
+            norm_loss_weight=float(metadata["norm_loss_weight"]),
+            variance_loss_weight=float(metadata["variance_loss_weight"]),
+            infonce_loss_weight=float(metadata["infonce_loss_weight"]),
+            infonce_temperature=float(metadata["infonce_temperature"]),
+            use_depth=True,
+            depth_dim=int(metadata["depth_feature_dim"]),
+            depth_grid_size=int(metadata["depth_grid_size"]),
+            depth_loss_weight=float(metadata["depth_loss_weight"]),
+        )
+        wrapper.plan_head.load_state_dict(
+            torch.load(
+                checkpoint_dir / "plan_head.pt",
+                map_location="cpu",
+                weights_only=True,
+            ),
+            strict=True,
+        )
+        wrapper.depth_head.load_state_dict(
+            torch.load(
+                checkpoint_dir / "depth_head.pt",
+                map_location="cpu",
+                weights_only=True,
+            ),
+            strict=True,
+        )
+        plan_embedding = torch.load(
+            checkpoint_dir / "plan_token_embedding.pt",
+            map_location="cpu",
+            weights_only=True,
+        )
+        embedding_weight = model.get_input_embeddings().weight
+        expected_embedding_shape = (
+            len(wrapper.plan_token_ids),
+            embedding_weight.shape[1],
+        )
+        if tuple(plan_embedding.shape) != expected_embedding_shape:
+            raise ValueError(
+                "incompatible plan token embedding shape: "
+                f"expected {expected_embedding_shape}, "
+                f"got {tuple(plan_embedding.shape)}"
+            )
+        plan_ids = torch.tensor(
+            wrapper.plan_token_ids,
+            device=embedding_weight.device,
+            dtype=torch.long,
+        )
+        with torch.no_grad():
+            embedding_weight.index_copy_(
+                0,
+                plan_ids,
+                plan_embedding.to(
+                    device=embedding_weight.device,
+                    dtype=embedding_weight.dtype,
+                ),
+            )
+        wrapper.eval()
+        for parameter in wrapper.parameters():
+            parameter.requires_grad_(False)
+        return wrapper
+
     def collect_plan_hidden(self, hidden: torch.Tensor, input_ids: torch.Tensor, plan_len: int) -> torch.Tensor:
         ids = torch.as_tensor(self.plan_token_ids, device=input_ids.device)
         # Distinct latent tokens each appear once, in emit order (keyframe-major); the single
