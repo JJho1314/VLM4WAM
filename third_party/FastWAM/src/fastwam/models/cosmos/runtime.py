@@ -60,6 +60,13 @@ def create_fastwam_cosmos(
     feature_layer: int = -1,
     atten_backend: str = "torch",
     train_video_expert: bool = True,
+    # Compatibility-only options inherited from the generic sim_libero model
+    # overlay. They configure the legacy Wan factory and have no Cosmos analogue;
+    # keeping them explicit lets Hydra compose either task without swallowing
+    # arbitrary misspelled arguments through **kwargs.
+    load_text_encoder: bool | None = None,
+    skip_dit_load_from_pretrain: bool | None = None,
+    action_dit_pretrained_path: str | None = None,
     # --- Cosmos video-DiT semantic-plan conditioning. Disabled by default; when
     # enabled, semantic tokens are injected only into the video backbone.
     semantic_plan_context: bool = False,
@@ -99,7 +106,20 @@ def create_fastwam_cosmos(
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
+    legacy_compatibility_options = {
+        "load_text_encoder": load_text_encoder,
+        "skip_dit_load_from_pretrain": skip_dit_load_from_pretrain,
+        "action_dit_pretrained_path": action_dit_pretrained_path,
+    }
+    if any(value is not None for value in legacy_compatibility_options.values()):
+        logger.debug(
+            "Ignoring legacy sim model options for Cosmos: %s",
+            legacy_compatibility_options,
+        )
+
     online_enabled = bool(online_semantic_planner)
+    resolved_online_code_dir = online_semantic_planner_code_dir
+    resolved_online_checkpoint = online_semantic_planner_checkpoint
     if online_enabled:
         if not online_semantic_planner_code_dir:
             raise ValueError(
@@ -141,10 +161,12 @@ def create_fastwam_cosmos(
                     f"{name}={expected}, got {actual!r}"
                 )
         # Resolve both roots before allocating either Cosmos or the 4B provider.
-        validate_online_semantic_planner_paths(
+        module_path, checkpoint_path = validate_online_semantic_planner_paths(
             code_dir=str(online_semantic_planner_code_dir),
             checkpoint_dir=str(online_semantic_planner_checkpoint),
         )
+        resolved_online_code_dir = str(module_path.parent)
+        resolved_online_checkpoint = str(checkpoint_path)
 
     # Pin the CUDA *current device* to this rank's GPU BEFORE building any submodule,
     # so that anything created with a bare "cuda" lands on this rank's GPU and not on
@@ -249,8 +271,8 @@ def create_fastwam_cosmos(
     online_provider = None
     if online_enabled:
         online_provider = load_online_semantic_planner(
-            code_dir=str(online_semantic_planner_code_dir),
-            checkpoint_dir=str(online_semantic_planner_checkpoint),
+            code_dir=str(resolved_online_code_dir),
+            checkpoint_dir=str(resolved_online_checkpoint),
             device=device,
             dtype=model_dtype,
         )

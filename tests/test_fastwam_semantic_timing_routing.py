@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import importlib.util
 import inspect
+import math
 import sys
 import types
+from numbers import Real
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 import yaml
 from hydra import compose, initialize_config_dir
+from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from torch import nn
 
@@ -459,7 +464,171 @@ def test_online_task_composes_exact_checkpoint_source_and_eval_fps(
     ] == 4
 
 
-def _load_eval_helper(name: str):
+def test_sim_libero_online_model_keys_are_all_accepted_by_cosmos_factory(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("FASTWAM_PLANNER_CHECKPOINT", str(tmp_path / "planner"))
+    with initialize_config_dir(
+        config_dir=str((FASTWAM_ROOT / "configs").resolve()),
+        version_base=None,
+    ):
+        config = compose(
+            config_name="sim_libero",
+            overrides=["task=libero_cosmos_2cam224_online_dino_depth"],
+        )
+
+    factory = importlib.import_module(
+        "fastwam.models.cosmos.runtime"
+    ).create_fastwam_cosmos
+    parameters = inspect.signature(factory).parameters
+    model_config = OmegaConf.to_container(config.model, resolve=True)
+    unsupported = sorted(
+        key
+        for key in model_config
+        if key != "_target_" and key not in parameters
+    )
+
+    assert unsupported == []
+    assert config.model.load_text_encoder is True
+    assert config.model.skip_dit_load_from_pretrain is True
+    assert config.model.action_dit_pretrained_path is None
+
+
+def test_sim_libero_online_config_lightweight_instantiates_from_fastwam_cwd(
+    monkeypatch,
+    tmp_path,
+):
+    helpers = _load_online_planner_test_helpers()
+    checkpoint = tmp_path / "planner"
+    helpers._write_fake_checkpoint(checkpoint)
+    monkeypatch.setenv("FASTWAM_PLANNER_CHECKPOINT", str(checkpoint))
+    with initialize_config_dir(
+        config_dir=str((FASTWAM_ROOT / "configs").resolve()),
+        version_base=None,
+    ):
+        config = compose(
+            config_name="sim_libero",
+            overrides=["task=libero_cosmos_2cam224_online_dino_depth"],
+        )
+    config.model.vae = None
+    config.model.video_dit_pretrained_path = "unused"
+
+    runtime = importlib.import_module("fastwam.models.cosmos.runtime")
+    capture = {}
+
+    class Video:
+        net = types.SimpleNamespace(
+            model_channels=8,
+            blocks=[types.SimpleNamespace(self_attn=types.SimpleNamespace(n_heads=1))],
+        )
+
+    class Action(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            capture["action"] = kwargs
+            self.blocks = nn.ModuleList([nn.Linear(1, 1)])
+
+        def copy_init_from_video(self, _net):
+            return None
+
+    class Model:
+        proprio_encoder = None
+
+        def __init__(self, **kwargs):
+            capture["model"] = kwargs
+            self.dit = nn.Linear(1, 1)
+
+    monkeypatch.setattr(
+        runtime.CosmosVideoExpert,
+        "from_pretrained",
+        lambda **kwargs: capture.setdefault("video", kwargs) and Video(),
+    )
+    monkeypatch.setattr(runtime, "CosmosActionExpert", Action)
+    monkeypatch.setattr(runtime, "FastWAMCosmos", Model)
+    monkeypatch.setattr(
+        runtime,
+        "load_online_semantic_planner",
+        lambda **kwargs: capture.setdefault("loader", kwargs) and object(),
+    )
+    monkeypatch.chdir(FASTWAM_ROOT)
+
+    model = instantiate(config.model, model_dtype=torch.float32, device="cpu")
+
+    assert isinstance(model, Model)
+    assert capture["loader"]["code_dir"] == str(
+        (
+            ROOT
+            / "scripts/qwen3_vl_semantic_planner/lingbot_dino_4b"
+        ).resolve()
+    )
+    assert capture["loader"]["checkpoint_dir"] == str(checkpoint.resolve())
+    assert capture["model"]["online_semantic_planner"] is not None
+
+
+def _load_online_planner_test_helpers():
+    path = ROOT / "tests/test_fastwam_online_semantic_planner.py"
+    spec = importlib.util.spec_from_file_location(
+        "fastwam_online_planner_helpers_for_timing_routing",
+        path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_relative_planner_code_dir_resolves_from_fastwam_working_directory(
+    monkeypatch,
+    tmp_path,
+):
+    helpers = _load_online_planner_test_helpers()
+    loader = helpers._load_loader_module()
+    checkpoint = tmp_path / "checkpoint"
+    helpers._write_fake_checkpoint(checkpoint)
+    monkeypatch.chdir(FASTWAM_ROOT)
+
+    module_path, checkpoint_path = loader.validate_online_semantic_planner_paths(
+        code_dir="scripts/qwen3_vl_semantic_planner/lingbot_dino_4b",
+        checkpoint_dir=str(checkpoint),
+    )
+
+    assert module_path == (
+        ROOT
+        / "scripts/qwen3_vl_semantic_planner/lingbot_dino_4b"
+        / "dino_depth_plan_provider.py"
+    ).resolve()
+    assert checkpoint_path == checkpoint.resolve()
+
+
+def test_relative_planner_code_dir_honors_explicit_vlm4wam_root(
+    monkeypatch,
+    tmp_path,
+):
+    helpers = _load_online_planner_test_helpers()
+    loader = helpers._load_loader_module()
+    vlm_root = tmp_path / "explicit-vlm-root"
+    relative_code = Path("custom/planner")
+    code_dir = vlm_root / relative_code
+    checkpoint = tmp_path / "checkpoint"
+    helpers._write_fake_provider(code_dir)
+    helpers._write_fake_checkpoint(checkpoint)
+    working_dir = tmp_path / "working-dir"
+    working_dir.mkdir()
+    # An explicit root is an override, so it must beat a stale checkout in cwd.
+    helpers._write_fake_provider(working_dir / relative_code)
+    monkeypatch.chdir(working_dir)
+    monkeypatch.setenv("VLM4WAM_ROOT", str(vlm_root))
+
+    module_path, _ = loader.validate_online_semantic_planner_paths(
+        code_dir=str(relative_code),
+        checkpoint_dir=str(checkpoint),
+    )
+
+    assert module_path == (code_dir / "dino_depth_plan_provider.py").resolve()
+
+
+def _load_eval_helper(name: str, extra_namespace=None):
     source = EVAL_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(EVAL_PATH))
     node = next(
@@ -468,8 +637,15 @@ def _load_eval_helper(name: str):
         if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
         and item.name == name
     )
+    for item in ast.walk(node):
+        if isinstance(item, ast.arg):
+            item.annotation = None
+        elif isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            item.returns = None
     module = ast.Module(body=[node], type_ignores=[])
-    namespace = {"inspect": inspect}
+    namespace = {"inspect": inspect, "math": math, "Real": Real, "torch": torch}
+    if extra_namespace is not None:
+        namespace.update(extra_namespace)
     exec(compile(module, str(EVAL_PATH), "exec"), namespace)
     return namespace[name]
 
@@ -482,6 +658,16 @@ class _OnlineInferenceAPI:
 class _LegacyInferenceAPI:
     def infer_action(self, *, prompt):
         del prompt
+
+
+class _InstructionOnlyInferenceAPI:
+    def infer_action(self, *, prompt, instruction=None):
+        del prompt, instruction
+
+
+class _VideoFpsOnlyInferenceAPI:
+    def infer_action(self, *, prompt, video_fps=None):
+        del prompt, video_fps
 
 
 def test_eval_helper_passes_raw_instruction_and_explicit_five_fps():
@@ -526,6 +712,53 @@ def test_eval_helper_fails_before_online_call_without_explicit_fps():
 
 
 @pytest.mark.parametrize(
+    "model",
+    [_InstructionOnlyInferenceAPI(), _VideoFpsOnlyInferenceAPI()],
+)
+def test_eval_helper_rejects_partial_online_inference_apis(model):
+    helper = _load_eval_helper("_add_online_semantic_inference_inputs")
+    config = OmegaConf.create(
+        {
+            "model": {"online_semantic_planner": True},
+            "EVALUATION": {"video_fps": 5.0},
+        }
+    )
+    kwargs = {"prompt": "formatted prompt"}
+
+    with pytest.raises(ValueError, match="instruction.*video_fps.*together"):
+        helper(
+            kwargs,
+            task_description="raw libero task",
+            model=model,
+            cfg=config,
+        )
+
+    assert kwargs == {"prompt": "formatted prompt"}
+
+
+@pytest.mark.parametrize(
+    "video_fps",
+    [True, "5.0", 0, -1.0, math.nan, math.inf, -math.inf],
+)
+def test_eval_helper_rejects_invalid_explicit_video_fps(video_fps):
+    helper = _load_eval_helper("_add_online_semantic_inference_inputs")
+    config = OmegaConf.create(
+        {
+            "model": {"online_semantic_planner": True},
+            "EVALUATION": {"video_fps": video_fps},
+        }
+    )
+
+    with pytest.raises(ValueError, match="finite positive real"):
+        helper(
+            {"prompt": "formatted prompt"},
+            task_description="raw libero task",
+            model=_OnlineInferenceAPI(),
+            cfg=config,
+        )
+
+
+@pytest.mark.parametrize(
     ("model", "online"),
     [(_LegacyInferenceAPI(), True), (_OnlineInferenceAPI(), False)],
 )
@@ -545,3 +778,137 @@ def test_eval_helper_leaves_unsupported_or_offline_apis_unchanged(model, online)
         model=model,
         cfg=config,
     ) == {"prompt": "formatted prompt"}
+
+
+def _eval_config(*, visualize_future_video=False):
+    return OmegaConf.create(
+        {
+            "model": {"online_semantic_planner": True},
+            "data": {"train": {"num_frames": 33, "action_video_freq_ratio": 4}},
+            "EVALUATION": {
+                "video_fps": 5.0,
+                "visualize_future_video": visualize_future_video,
+                "num_inference_steps": 1,
+                "negative_prompt": "",
+                "text_cfg_scale": 1.0,
+                "sigma_shift": None,
+                "rand_device": "cpu",
+                "tiled": False,
+            },
+            "seed": 7,
+            "eval_num_inference_steps": 1,
+        }
+    )
+
+
+class _CallThroughOnlineModel:
+    torch_dtype = torch.float32
+
+    def __init__(self):
+        self.infer_action_calls = []
+        self.infer_joint_calls = []
+
+    def infer_action(
+        self,
+        *,
+        prompt,
+        instruction=None,
+        video_fps=None,
+        num_video_frames=None,
+        **kwargs,
+    ):
+        self.infer_action_calls.append(
+            {
+                "prompt": prompt,
+                "instruction": instruction,
+                "video_fps": video_fps,
+                "num_video_frames": num_video_frames,
+                **kwargs,
+            }
+        )
+        return {"action": torch.zeros(2, 2)}
+
+    def infer_joint(self, **kwargs):
+        self.infer_joint_calls.append(kwargs)
+        return {"action": torch.zeros(2, 2), "video": [object()]}
+
+
+def _load_predict_action_chunk(observation_calls):
+    try:
+        validate_mode = _load_eval_helper(
+            "_validate_online_semantic_eval_mode"
+        )
+    except StopIteration:
+        def validate_mode(_cfg):
+            return None
+    add_inputs = _load_eval_helper("_add_online_semantic_inference_inputs")
+
+    def obs_to_model_input(*_args, **_kwargs):
+        observation_calls.append(True)
+        return torch.zeros(1, 3, 2, 2), torch.zeros(1, 1), {"camera": []}
+
+    namespace = {
+        "DEFAULT_PROMPT": (
+            "A video recorded from a robot's point of view executing the "
+            "following instruction: {task}"
+        ),
+        "_validate_online_semantic_eval_mode": validate_mode,
+        "_add_online_semantic_inference_inputs": add_inputs,
+        "_obs_to_model_input": obs_to_model_input,
+        "_get_num_video_frames": lambda _cfg: 9,
+        "_select_predicted_future_frames": lambda frames, _cfg: frames,
+        "_denormalize_action": lambda action, _processor: action.unsqueeze(0).numpy(),
+        "invert_gripper_action": lambda action: action,
+        "np": np,
+    }
+    return _load_eval_helper("_predict_action_chunk", namespace)
+
+
+def test_predict_action_chunk_calls_online_api_with_raw_task_and_five_fps():
+    observation_calls = []
+    predict = _load_predict_action_chunk(observation_calls)
+    model = _CallThroughOnlineModel()
+
+    predict(
+        {},
+        "raw libero task",
+        model,
+        object(),
+        _eval_config(),
+        action_horizon=2,
+        input_w=2,
+        input_h=2,
+        model_device="cpu",
+    )
+
+    assert observation_calls == [True]
+    assert model.infer_joint_calls == []
+    assert len(model.infer_action_calls) == 1
+    call = model.infer_action_calls[0]
+    assert call["instruction"] == "raw libero task"
+    assert call["video_fps"] == pytest.approx(5.0)
+    assert call["prompt"].endswith("instruction: raw libero task")
+    assert call["prompt"] != call["instruction"]
+
+
+def test_predict_action_chunk_rejects_online_future_video_before_any_call():
+    observation_calls = []
+    predict = _load_predict_action_chunk(observation_calls)
+    model = _CallThroughOnlineModel()
+
+    with pytest.raises(ValueError, match="online semantic.*infer_joint"):
+        predict(
+            {},
+            "raw libero task",
+            model,
+            object(),
+            _eval_config(visualize_future_video=True),
+            action_horizon=2,
+            input_w=2,
+            input_h=2,
+            model_device="cpu",
+        )
+
+    assert observation_calls == []
+    assert model.infer_action_calls == []
+    assert model.infer_joint_calls == []

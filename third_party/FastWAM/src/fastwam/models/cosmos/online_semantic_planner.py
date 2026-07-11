@@ -6,6 +6,7 @@ import importlib
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 import sys
 import uuid
@@ -58,6 +59,7 @@ _REQUIRED_FINITE_NUMERIC_METADATA = (
 _EXPECTED_PLAN_TOKEN_STRINGS = tuple(
     f"<|sem_plan_{index}|>" for index in range(384)
 )
+_PROVIDER_FILENAME = "dino_depth_plan_provider.py"
 
 
 def _is_finite_number(value) -> bool:
@@ -186,6 +188,30 @@ def _validate_checkpoint_export(checkpoint_path: Path) -> None:
         )
 
 
+def _online_planner_code_candidates(code_dir: str | Path) -> tuple[Path, ...]:
+    """Return deterministic code-root candidates for a relative config path."""
+    requested = Path(code_dir).expanduser()
+    if requested.is_absolute():
+        return (requested.resolve(),)
+
+    roots = []
+    explicit_root = os.environ.get("VLM4WAM_ROOT")
+    if explicit_root and explicit_root.strip():
+        roots.append(Path(explicit_root).expanduser())
+    roots.append(Path.cwd())
+    roots.extend(Path(__file__).resolve().parents)
+
+    candidates = []
+    seen = set()
+    for root in roots:
+        candidate = (root / requested).resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        candidates.append(candidate)
+    return tuple(candidates)
+
+
 def validate_online_semantic_planner_paths(
     *,
     code_dir: str,
@@ -197,11 +223,21 @@ def validate_online_semantic_planner_paths(
     if not isinstance(checkpoint_dir, (str, Path)) or not str(checkpoint_dir).strip():
         raise ValueError("online planner checkpoint_dir must be a non-empty path")
 
-    module_path = Path(code_dir).expanduser().resolve() / "dino_depth_plan_provider.py"
+    code_candidates = _online_planner_code_candidates(code_dir)
+    module_candidates = tuple(
+        candidate / _PROVIDER_FILENAME for candidate in code_candidates
+    )
+    module_path = next(
+        (candidate for candidate in module_candidates if candidate.is_file()),
+        None,
+    )
     checkpoint_path = Path(checkpoint_dir).expanduser().resolve()
-    if not module_path.is_file():
+    if module_path is None:
+        searched = "\n".join(f"  - {candidate}" for candidate in module_candidates)
         raise FileNotFoundError(
-            f"online planner provider not found: {module_path}"
+            "online planner provider not found; searched:\n"
+            f"{searched}\n"
+            "Set VLM4WAM_ROOT or pass an absolute online planner code_dir."
         )
     if not checkpoint_path.is_dir():
         raise FileNotFoundError(

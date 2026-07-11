@@ -1,9 +1,11 @@
 import json
 import inspect
 import logging
+import math
 import os
 import sys
 import time
+from numbers import Real
 from pathlib import Path
 from typing import Any, Optional
 
@@ -373,17 +375,40 @@ def _add_online_semantic_inference_inputs(
         return infer_kwargs
 
     parameters = inspect.signature(model.infer_action).parameters
-    if "instruction" in parameters:
-        infer_kwargs["instruction"] = task_description
-    if "video_fps" in parameters:
-        video_fps = cfg.EVALUATION.get("video_fps", None)
-        if video_fps is None:
-            raise ValueError(
-                "Online semantic-planner evaluation requires an explicit "
-                "EVALUATION.video_fps."
-            )
-        infer_kwargs["video_fps"] = float(video_fps)
+    has_instruction = "instruction" in parameters
+    has_video_fps = "video_fps" in parameters
+    if has_instruction != has_video_fps:
+        raise ValueError(
+            "Online semantic-planner infer_action must expose instruction and "
+            "video_fps together."
+        )
+    if not has_instruction:
+        return infer_kwargs
+
+    video_fps = cfg.EVALUATION.get("video_fps", None)
+    if (
+        isinstance(video_fps, bool)
+        or not isinstance(video_fps, Real)
+        or not math.isfinite(float(video_fps))
+        or float(video_fps) <= 0
+    ):
+        raise ValueError(
+            "Online semantic-planner evaluation requires EVALUATION.video_fps "
+            f"to be a finite positive real number, got {video_fps!r}."
+        )
+    infer_kwargs["instruction"] = task_description
+    infer_kwargs["video_fps"] = float(video_fps)
     return infer_kwargs
+
+
+def _validate_online_semantic_eval_mode(cfg) -> None:
+    if bool(cfg.model.get("online_semantic_planner", False)) and bool(
+        cfg.EVALUATION.get("visualize_future_video", False)
+    ):
+        raise ValueError(
+            "online semantic-planner evaluation does not support infer_joint / "
+            "visualize_future_video; use infer_action with visualization disabled."
+        )
 
 
 def _predict_action_chunk(
@@ -398,6 +423,7 @@ def _predict_action_chunk(
     input_h: int,
     model_device: str,
 ) -> tuple[np.ndarray, dict, Optional[list[Image.Image]]]:
+    _validate_online_semantic_eval_mode(cfg)
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
     if num_inference_steps_cfg is None:
         num_inference_steps = int(cfg.get("eval_num_inference_steps", 20))
@@ -726,6 +752,7 @@ def eval_single_process(cfg: DictConfig):
 
     if cfg.ckpt is None:
         raise ValueError("cfg.ckpt must not be None.")
+    _validate_online_semantic_eval_mode(cfg)
     _validate_visualize_future_video_cfg(cfg)
 
     env_num = int(cfg.EVALUATION.get("env_num", 1))
