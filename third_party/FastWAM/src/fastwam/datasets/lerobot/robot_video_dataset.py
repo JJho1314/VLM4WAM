@@ -34,7 +34,9 @@ def _get_work_dir():
     except ModuleNotFoundError as error:
         if error.name != "boto3":
             raise
-        return os.environ.get("FASTWAM_WORK_DIR", "./runs")
+        work_dir = os.environ.get("FASTWAM_WORK_DIR") or "./runs"
+        Path(work_dir).mkdir(parents=True, exist_ok=True)
+        return work_dir
     return misc.get_work_dir()
 
 

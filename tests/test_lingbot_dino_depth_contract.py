@@ -870,7 +870,7 @@ def test_base_launcher_exposes_in_repo_fastwam_package():
     ) in launcher
 
 
-def test_fastwam_hydra_target_imports_in_launcher_python():
+def test_fastwam_hydra_target_imports_in_launcher_python(tmp_path):
     fastwam_src = ROOT / "third_party/FastWAM/src"
     starvla_python = Path(
         "/data/LFT-W02_data/.conda/envs/starVLA/bin/python"
@@ -880,29 +880,40 @@ def test_fastwam_hydra_target_imports_in_launcher_python():
     env["PYTHONPATH"] = os.pathsep.join(
         [str(fastwam_src), env.get("PYTHONPATH", "")]
     ).rstrip(os.pathsep)
+    fallback_dir = tmp_path / "missing" / "nested" / "runs"
+    env["FASTWAM_WORK_DIR"] = str(fallback_dir)
+    assert not fallback_dir.exists()
 
     result = subprocess.run(
         [
             str(python),
             "-c",
             (
-                "import importlib.machinery, os, shutil, sys, tempfile, types; "
+                "import builtins, importlib.machinery, json, os, shutil, sys, "
+                "tempfile, types; from pathlib import Path; "
                 "from fastwam.datasets.lerobot.robot_video_dataset "
-                "import RobotVideoDataset, _get_work_dir; "
+                "import RobotVideoDataset, _get_work_dir, "
+                "save_dataset_stats_to_json; "
                 "assert RobotVideoDataset.__name__ == 'RobotVideoDataset'; "
-                "os.environ['FASTWAM_WORK_DIR'] = '/tmp/fastwam-fallback'; "
-                "assert _get_work_dir() == '/tmp/fastwam-fallback'; "
-                "os.environ.pop('FASTWAM_WORK_DIR'); "
-                "assert _get_work_dir() == './runs'; "
+                "real_import = builtins.__import__; "
+                "builtins.__import__ = lambda name, *args, **kwargs: "
+                "(_ for _ in ()).throw(ModuleNotFoundError("
+                "\"No module named 'boto3'\", name='boto3')) "
+                "if name == 'boto3' else real_import(name, *args, **kwargs); "
+                "work_dir = _get_work_dir(); "
+                "stats_path = Path(work_dir) / 'dataset_stats.json'; "
+                "save_dataset_stats_to_json({'count': 1}, stats_path); "
+                "assert json.loads(stats_path.read_text()) == {'count': 1}; "
+                "builtins.__import__ = real_import; "
                 "boto3 = types.ModuleType('boto3'); "
                 "boto3.__spec__ = importlib.machinery.ModuleSpec("
                 "'boto3', loader=None); "
                 "sys.modules['boto3'] = boto3; "
                 "from fastwam.utils import misc; "
-                "work_dir = tempfile.mkdtemp(); "
-                "misc.register_work_dir(work_dir); "
-                "assert _get_work_dir() == work_dir; "
-                "shutil.rmtree(work_dir)"
+                "registered_dir = tempfile.mkdtemp(); "
+                "misc.register_work_dir(registered_dir); "
+                "assert _get_work_dir() == registered_dir; "
+                "shutil.rmtree(registered_dir)"
             ),
         ],
         cwd=ROOT,
