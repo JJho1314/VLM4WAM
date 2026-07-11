@@ -653,21 +653,74 @@ def test_fastwam_config_preparation_rebases_yaml_paths_without_instantiation():
     overridden = module.prepare_fastwam_data_config(
         config_path,
         dataset_dirs=explicit_dirs,
+        text_embedding_cache_dir=Path("machine/relative/cache"),
+        pretrained_norm_stats=Path("machine/relative/stats.json"),
     )
 
-    assert list(overridden.data.train.dataset_dirs) == explicit_dirs
+    assert list(overridden.data.train.dataset_dirs) == [
+        str((Path.cwd() / explicit_dirs[0]).resolve()),
+        explicit_dirs[1],
+    ]
     assert overridden.data.train.text_embedding_cache_dir == str(
-        (fastwam_root / "data/text_embeds_cache/libero_qwen").resolve()
+        (Path.cwd() / "machine/relative/cache").resolve()
     )
+    assert overridden.data.train.pretrained_norm_stats == str(
+        (Path.cwd() / "machine/relative/stats.json").resolve()
+    )
+
+
+def _write_fastwam_data_config(tmp_path, *, target="builtins.dict"):
+    fastwam_root = tmp_path / "FastWAM"
+    config_dir = fastwam_root / "configs/data"
+    dataset_dir = fastwam_root / "data/dataset"
+    cache_dir = fastwam_root / "cache"
+    stats_path = fastwam_root / "stats.json"
+    config_dir.mkdir(parents=True)
+    dataset_dir.mkdir(parents=True)
+    cache_dir.mkdir()
+    stats_path.write_text("{}\n", encoding="utf-8")
+    config_path = config_dir / "data.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "train:",
+                f"  _target_: {target}",
+                "  dataset_dirs:",
+                "    - ./data/dataset",
+                "  text_embedding_cache_dir: ./cache",
+                "  pretrained_norm_stats: ./stats.json",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "root": fastwam_root,
+        "config": config_path,
+        "dataset": dataset_dir,
+        "cache": cache_dir,
+        "stats": stats_path,
+    }
+
+
+def test_fastwam_config_preparation_rebases_yaml_pretrained_stats(tmp_path):
+    module = load_trainer_module()
+    paths = _write_fastwam_data_config(tmp_path)
+
+    prepared = module.prepare_fastwam_data_config(paths["config"])
+
+    assert list(prepared.data.train.dataset_dirs) == [str(paths["dataset"])]
+    assert prepared.data.train.text_embedding_cache_dir == str(paths["cache"])
+    assert prepared.data.train.pretrained_norm_stats == str(paths["stats"])
 
 
 def test_fastwam_config_preflight_imports_target_without_instantiating_dataset(
     monkeypatch,
+    tmp_path,
 ):
     module = load_trainer_module()
-    config_path = (
-        ROOT / "third_party/FastWAM/configs/data/libero_2cam_cosmos.yaml"
-    )
+    paths = _write_fastwam_data_config(tmp_path)
+    config_path = paths["config"]
     monkeypatch.syspath_prepend(str(ROOT / "third_party/FastWAM/src"))
 
     import hydra.utils
@@ -681,10 +734,100 @@ def test_fastwam_config_preflight_imports_target_without_instantiating_dataset(
 
     prepared = module.preflight_fastwam_data_config(config_path)
 
-    assert prepared.data.train._target_ == (
-        "fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset"
-    )
+    assert prepared.data.train._target_ == "builtins.dict"
     assert imported_targets == [prepared.data.train._target_]
+
+
+@pytest.mark.parametrize(
+    ("asset", "expected"),
+    [
+        ("dataset", "FastWAM dataset directory"),
+        ("cache", "FastWAM text-embedding cache"),
+        ("stats", "FastWAM pretrained normalization stats"),
+    ],
+)
+def test_fastwam_config_preflight_rejects_missing_assets(
+    tmp_path,
+    asset,
+    expected,
+):
+    module = load_trainer_module()
+    paths = _write_fastwam_data_config(tmp_path)
+    path = paths[asset]
+    if path.is_dir():
+        path.rmdir()
+    else:
+        path.unlink()
+
+    with pytest.raises(FileNotFoundError, match=expected):
+        module.preflight_fastwam_data_config(paths["config"])
+
+
+@pytest.mark.parametrize(
+    ("asset", "expected"),
+    [
+        ("dataset", "FastWAM dataset directory"),
+        ("cache", "FastWAM text-embedding cache"),
+        ("stats", "FastWAM pretrained normalization stats"),
+    ],
+)
+def test_fastwam_config_preflight_rejects_wrong_asset_types(
+    tmp_path,
+    asset,
+    expected,
+):
+    module = load_trainer_module()
+    paths = _write_fastwam_data_config(tmp_path)
+    path = paths[asset]
+    if path.is_dir():
+        path.rmdir()
+        path.write_text("not a directory\n", encoding="utf-8")
+    else:
+        path.unlink()
+        path.mkdir()
+
+    with pytest.raises(ValueError, match=expected):
+        module.preflight_fastwam_data_config(paths["config"])
+
+
+def test_fastwam_dataset_config_overrides_reach_hydra_instantiation(
+    monkeypatch,
+    tmp_path,
+):
+    module = load_trainer_module()
+    paths = _write_fastwam_data_config(tmp_path)
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    for relative in ("data-a", "data-b", "cache"):
+        (caller / relative).mkdir()
+    (caller / "stats.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.chdir(caller)
+
+    import hydra.utils
+
+    instantiated = []
+
+    def record_instantiation(config):
+        instantiated.append(config)
+        return []
+
+    monkeypatch.setattr(hydra.utils, "instantiate", record_instantiation)
+
+    module.FastWAMOnlinePlannerDataset.from_config(
+        paths["config"],
+        dataset_dirs=["data-a", "data-b"],
+        text_embedding_cache_dir=Path("cache"),
+        pretrained_norm_stats=Path("stats.json"),
+    )
+
+    assert len(instantiated) == 1
+    config = instantiated[0]
+    assert list(config.dataset_dirs) == [
+        str((caller / "data-a").resolve()),
+        str((caller / "data-b").resolve()),
+    ]
+    assert config.text_embedding_cache_dir == str((caller / "cache").resolve())
+    assert config.pretrained_norm_stats == str((caller / "stats.json").resolve())
 
 
 def test_main_preflights_fastwam_before_loading_qwen(monkeypatch, tmp_path):
@@ -706,14 +849,21 @@ def test_main_preflights_fastwam_before_loading_qwen(monkeypatch, tmp_path):
         private_latent_per_keyframe=32,
         fastwam_data_config=tmp_path / "data.yaml",
         fastwam_dataset_dir=[],
+        fastwam_text_embedding_cache_dir=tmp_path / "cache",
+        fastwam_pretrained_norm_stats=tmp_path / "stats.json",
         seed=1,
         output_dir=tmp_path / "output",
         model_path=tmp_path / "model",
         dtype="bf16",
     )
 
-    def fail_preflight(*_args, **_kwargs):
+    def fail_preflight(*_args, **kwargs):
         events.append("fastwam_preflight")
+        assert kwargs == {
+            "dataset_dirs": [],
+            "text_embedding_cache_dir": tmp_path / "cache",
+            "pretrained_norm_stats": tmp_path / "stats.json",
+        }
         raise ExpectedPreflightFailure("bad FastWAM config")
 
     def fail_model_load(*_args, **_kwargs):
@@ -761,6 +911,10 @@ def test_fastwam_parser_accepts_only_aligned_source_and_geometry(monkeypatch):
             "machine/relative/data",
             "--fastwam-dataset-dir",
             "/mnt/absolute/data",
+            "--fastwam-text-embedding-cache-dir",
+            "/tmp/text-cache",
+            "--fastwam-pretrained-norm-stats",
+            "/tmp/stats.json",
         ),
     )
 
@@ -774,6 +928,44 @@ def test_fastwam_parser_accepts_only_aligned_source_and_geometry(monkeypatch):
         "machine/relative/data",
         "/mnt/absolute/data",
     ]
+    assert args.fastwam_text_embedding_cache_dir == Path("/tmp/text-cache")
+    assert args.fastwam_pretrained_norm_stats == Path("/tmp/stats.json")
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "--fastwam-text-embedding-cache-dir",
+        "--fastwam-pretrained-norm-stats",
+    ],
+)
+def test_fastwam_parser_rejects_overrides_without_fastwam_config(
+    monkeypatch,
+    capsys,
+    option,
+):
+    module = load_trainer_module()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(TRAINER_PATH),
+            "--model-path",
+            "/tmp/model",
+            "--output-dir",
+            "/tmp/output",
+            "--dataset-root",
+            "/tmp/data",
+            option,
+            "/tmp/override",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as error:
+        module.parse_args()
+
+    assert error.value.code == 2
+    assert f"{option} requires --fastwam-data-config" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("source_mode", ["both", "neither", "not_online"])
@@ -868,6 +1060,70 @@ def test_base_launcher_exposes_in_repo_fastwam_package():
         'export PYTHONPATH="$REPO_ROOT/third_party/FastWAM/src'
         '${PYTHONPATH:+:$PYTHONPATH}"'
     ) in launcher
+
+
+def _capture_base_launcher_args(tmp_path, *, cache, stats):
+    launcher = (
+        ROOT
+        / "scripts/qwen3_vl_semantic_planner/lingbot_dino_4b"
+        / "train_lingbot_dino_4b.sh"
+    )
+    fake_python = tmp_path / "fake-python"
+    captured = tmp_path / "args.txt"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$FAKE_ARGS_FILE\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PY": str(fake_python),
+            "FAKE_ARGS_FILE": str(captured),
+            "NUM_GPUS": "1",
+            "FULL_FINETUNE": "0",
+            "HEAD_WARMSTART_CKPT": "",
+            "DATASET_ROOT": "",
+            "FASTWAM_DATA_CONFIG": str(
+                ROOT / "third_party/FastWAM/configs/data/libero_2cam_cosmos.yaml"
+            ),
+            "FASTWAM_TEXT_EMBEDDING_CACHE_DIR": cache,
+            "FASTWAM_PRETRAINED_NORM_STATS": stats,
+            "OUTPUT_DIR": str(tmp_path / "output"),
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(launcher)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return captured.read_text(encoding="utf-8").splitlines()
+
+
+def test_base_launcher_emits_nonempty_fastwam_cache_and_stats_overrides(tmp_path):
+    args = _capture_base_launcher_args(
+        tmp_path,
+        cache="relative/text-cache",
+        stats="relative/stats.json",
+    )
+
+    assert args[args.index("--fastwam-text-embedding-cache-dir") + 1] == (
+        "relative/text-cache"
+    )
+    assert args[args.index("--fastwam-pretrained-norm-stats") + 1] == (
+        "relative/stats.json"
+    )
+
+
+def test_base_launcher_omits_empty_fastwam_cache_and_stats_overrides(tmp_path):
+    args = _capture_base_launcher_args(tmp_path, cache="", stats="")
+
+    assert "--fastwam-text-embedding-cache-dir" not in args
+    assert "--fastwam-pretrained-norm-stats" not in args
 
 
 def test_fastwam_hydra_target_imports_in_launcher_python(tmp_path):

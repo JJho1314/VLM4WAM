@@ -95,6 +95,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-root", type=Path, default=None)
     parser.add_argument("--fastwam-data-config", type=Path, default=None)
     parser.add_argument("--fastwam-dataset-dir", action="append", default=[])
+    parser.add_argument(
+        "--fastwam-text-embedding-cache-dir",
+        type=Path,
+        default=None,
+    )
+    parser.add_argument(
+        "--fastwam-pretrained-norm-stats",
+        type=Path,
+        default=None,
+    )
     parser.add_argument("--plan-label-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, required=True)
     # Online labels (cosmos-style episode sampling): instead of fixed precomputed .pt windows,
@@ -192,6 +202,20 @@ def parse_args() -> argparse.Namespace:
         )
     if args.fastwam_dataset_dir and args.fastwam_data_config is None:
         parser.error("--fastwam-dataset-dir requires --fastwam-data-config")
+    if (
+        args.fastwam_text_embedding_cache_dir is not None
+        and args.fastwam_data_config is None
+    ):
+        parser.error(
+            "--fastwam-text-embedding-cache-dir requires --fastwam-data-config"
+        )
+    if (
+        args.fastwam_pretrained_norm_stats is not None
+        and args.fastwam_data_config is None
+    ):
+        parser.error(
+            "--fastwam-pretrained-norm-stats requires --fastwam-data-config"
+        )
     if args.fastwam_data_config is not None:
         if not args.online_plan_labels:
             parser.error("--fastwam-data-config requires --online-plan-labels")
@@ -446,16 +470,26 @@ class OnlineSemanticPlanDataset(Dataset):
         }
 
 
+def _resolve_fastwam_path(path: str | os.PathLike, *, base_dir: Path) -> str:
+    expanded = Path(os.fspath(path)).expanduser()
+    if not expanded.is_absolute():
+        expanded = base_dir / expanded
+    return str(expanded.resolve())
+
+
 def prepare_fastwam_data_config(
     config_path: Path,
     *,
     dataset_dirs: Sequence[str] | None = None,
+    text_embedding_cache_dir: Path | None = None,
+    pretrained_norm_stats: Path | None = None,
 ):
-    """Load a FastWAM data config and anchor its YAML-local data paths."""
+    """Load FastWAM data config with explicit, cwd-independent data paths."""
     from omegaconf import OmegaConf
 
     resolved_config_path = Path(config_path).expanduser().resolve()
     fastwam_root = resolved_config_path.parents[2]
+    caller_cwd = Path.cwd()
     data_config = OmegaConf.load(resolved_config_path)
     root_config = OmegaConf.create(
         {
@@ -467,18 +501,42 @@ def prepare_fastwam_data_config(
     )
     train_config = root_config.data.train
     if dataset_dirs:
-        train_config.dataset_dirs = [os.fspath(path) for path in dataset_dirs]
+        train_config.dataset_dirs = [
+            _resolve_fastwam_path(path, base_dir=caller_cwd)
+            for path in dataset_dirs
+        ]
     else:
         train_config.dataset_dirs = [
-            os.fspath(path)
-            if Path(os.fspath(path)).is_absolute()
-            else str((fastwam_root / os.fspath(path)).resolve())
+            _resolve_fastwam_path(path, base_dir=fastwam_root)
             for path in train_config.dataset_dirs
         ]
-    text_cache_dir = train_config.get("text_embedding_cache_dir")
-    if text_cache_dir is not None and not Path(os.fspath(text_cache_dir)).is_absolute():
-        train_config.text_embedding_cache_dir = str(
-            (fastwam_root / os.fspath(text_cache_dir)).resolve()
+    selected_text_cache = (
+        text_embedding_cache_dir
+        if text_embedding_cache_dir is not None
+        else train_config.get("text_embedding_cache_dir")
+    )
+    if selected_text_cache is not None:
+        train_config.text_embedding_cache_dir = _resolve_fastwam_path(
+            selected_text_cache,
+            base_dir=(
+                caller_cwd
+                if text_embedding_cache_dir is not None
+                else fastwam_root
+            ),
+        )
+    selected_norm_stats = (
+        pretrained_norm_stats
+        if pretrained_norm_stats is not None
+        else train_config.get("pretrained_norm_stats")
+    )
+    if selected_norm_stats is not None:
+        train_config.pretrained_norm_stats = _resolve_fastwam_path(
+            selected_norm_stats,
+            base_dir=(
+                caller_cwd
+                if pretrained_norm_stats is not None
+                else fastwam_root
+            ),
         )
     return root_config
 
@@ -487,14 +545,60 @@ def preflight_fastwam_data_config(
     config_path: Path,
     *,
     dataset_dirs: Sequence[str] | None = None,
+    text_embedding_cache_dir: Path | None = None,
+    pretrained_norm_stats: Path | None = None,
 ):
-    """Validate the FastWAM data YAML and import its Hydra target only."""
+    """Validate FastWAM assets and import its Hydra target without allocation."""
     from hydra.utils import get_class
 
     root_config = prepare_fastwam_data_config(
         config_path,
         dataset_dirs=dataset_dirs,
+        text_embedding_cache_dir=text_embedding_cache_dir,
+        pretrained_norm_stats=pretrained_norm_stats,
     )
+    train_config = root_config.data.train
+    selected_dataset_dirs = list(train_config.get("dataset_dirs") or [])
+    if not selected_dataset_dirs:
+        raise ValueError("FastWAM dataset directories are not configured")
+    for dataset_dir in selected_dataset_dirs:
+        dataset_path = Path(os.fspath(dataset_dir))
+        if not dataset_path.exists():
+            raise FileNotFoundError(
+                f"FastWAM dataset directory does not exist: {dataset_path}"
+            )
+        if not dataset_path.is_dir():
+            raise ValueError(
+                f"FastWAM dataset directory is not a directory: {dataset_path}"
+            )
+
+    text_cache_dir = train_config.get("text_embedding_cache_dir")
+    if text_cache_dir is None:
+        raise ValueError("FastWAM text-embedding cache is not configured")
+    text_cache_path = Path(os.fspath(text_cache_dir))
+    if not text_cache_path.exists():
+        raise FileNotFoundError(
+            f"FastWAM text-embedding cache does not exist: {text_cache_path}"
+        )
+    if not text_cache_path.is_dir():
+        raise ValueError(
+            f"FastWAM text-embedding cache is not a directory: {text_cache_path}"
+        )
+
+    norm_stats = train_config.get("pretrained_norm_stats")
+    if norm_stats is not None:
+        norm_stats_path = Path(os.fspath(norm_stats))
+        if not norm_stats_path.exists():
+            raise FileNotFoundError(
+                "FastWAM pretrained normalization stats do not exist: "
+                f"{norm_stats_path}"
+            )
+        if not norm_stats_path.is_file():
+            raise ValueError(
+                "FastWAM pretrained normalization stats are not a regular file: "
+                f"{norm_stats_path}"
+            )
+
     target = root_config.data.train.get("_target_")
     if not isinstance(target, str) or not target.strip():
         raise ValueError("FastWAM train data config requires a non-empty _target_")
@@ -515,6 +619,8 @@ class FastWAMOnlinePlannerDataset(Dataset):
         config_path: Path,
         *,
         dataset_dirs: Sequence[str] | None = None,
+        text_embedding_cache_dir: Path | None = None,
+        pretrained_norm_stats: Path | None = None,
         max_samples: int = 0,
     ):
         from hydra.utils import instantiate
@@ -522,6 +628,8 @@ class FastWAMOnlinePlannerDataset(Dataset):
         root_config = prepare_fastwam_data_config(
             config_path,
             dataset_dirs=dataset_dirs,
+            text_embedding_cache_dir=text_embedding_cache_dir,
+            pretrained_norm_stats=pretrained_norm_stats,
         )
         dataset = instantiate(root_config.data.train)
         return cls(dataset, max_samples=max_samples)
@@ -1586,6 +1694,8 @@ def main() -> None:
         preflight_fastwam_data_config(
             args.fastwam_data_config,
             dataset_dirs=args.fastwam_dataset_dir,
+            text_embedding_cache_dir=args.fastwam_text_embedding_cache_dir,
+            pretrained_norm_stats=args.fastwam_pretrained_norm_stats,
         )
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     random.seed(args.seed)
@@ -1786,6 +1896,10 @@ def main() -> None:
             dataset = FastWAMOnlinePlannerDataset.from_config(
                 args.fastwam_data_config,
                 dataset_dirs=args.fastwam_dataset_dir,
+                text_embedding_cache_dir=(
+                    args.fastwam_text_embedding_cache_dir
+                ),
+                pretrained_norm_stats=args.fastwam_pretrained_norm_stats,
                 max_samples=args.max_samples,
             )
         else:

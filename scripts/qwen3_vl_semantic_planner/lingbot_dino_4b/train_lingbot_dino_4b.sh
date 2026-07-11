@@ -39,6 +39,8 @@ UTILS3D_MOGE_PATH=${UTILS3D_MOGE_PATH:-/data/LFT-W02_data/junjie/weights/py_deps
 DATASET_ROOT=${DATASET_ROOT:-}
 FASTWAM_DATA_CONFIG=${FASTWAM_DATA_CONFIG:-}
 FASTWAM_DATASET_DIRS=${FASTWAM_DATASET_DIRS:-}
+FASTWAM_TEXT_EMBEDDING_CACHE_DIR=${FASTWAM_TEXT_EMBEDDING_CACHE_DIR:-}
+FASTWAM_PRETRAINED_NORM_STATS=${FASTWAM_PRETRAINED_NORM_STATS:-}
 if [[ -n "$DATASET_ROOT" && -n "$FASTWAM_DATA_CONFIG" ]]; then
   echo "[launch] set only one of DATASET_ROOT or FASTWAM_DATA_CONFIG" >&2
   exit 2
@@ -129,6 +131,16 @@ if [[ -n "$FASTWAM_DATA_CONFIG" ]]; then
     for dataset_dir in "${fastwam_dataset_dirs[@]}"; do
       [[ -n "$dataset_dir" ]] && TRAIN_ARGS+=(--fastwam-dataset-dir "$dataset_dir")
     done
+  fi
+  if [[ -n "$FASTWAM_TEXT_EMBEDDING_CACHE_DIR" ]]; then
+    TRAIN_ARGS+=(
+      --fastwam-text-embedding-cache-dir "$FASTWAM_TEXT_EMBEDDING_CACHE_DIR"
+    )
+  fi
+  if [[ -n "$FASTWAM_PRETRAINED_NORM_STATS" ]]; then
+    TRAIN_ARGS+=(
+      --fastwam-pretrained-norm-stats "$FASTWAM_PRETRAINED_NORM_STATS"
+    )
   fi
 else
   TRAIN_ARGS+=(--dataset-root "$DATASET_ROOT")
