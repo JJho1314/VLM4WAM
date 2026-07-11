@@ -17,11 +17,19 @@ class DinoDepthPlanFusion(nn.Module):
         initial_depth_gate: float = 0.1,
     ):
         super().__init__()
+        for name, value in (
+            ("feature_dim", feature_dim),
+            ("max_tokens", max_tokens),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(
+                    f"{name} must be a strictly positive integer, got {value!r}"
+                )
         if not 0.0 < initial_depth_gate < 1.0:
             raise ValueError("initial_depth_gate must be strictly between 0 and 1")
 
-        self.feature_dim = int(feature_dim)
-        self.max_tokens = int(max_tokens)
+        self.feature_dim = feature_dim
+        self.max_tokens = max_tokens
         self.dino_norm = nn.LayerNorm(self.feature_dim)
         self.depth_norm = nn.LayerNorm(self.feature_dim)
         self.dino_proj = nn.Linear(self.feature_dim, self.feature_dim)

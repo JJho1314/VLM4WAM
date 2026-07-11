@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import math
-import sys
 from pathlib import Path
 
 import pytest
@@ -97,6 +96,36 @@ def test_fusion_rejects_invalid_initial_gate(initial_gate):
 
     with pytest.raises(ValueError, match="strictly between 0 and 1"):
         module.DinoDepthPlanFusion(4, 3, initial_gate)
+
+
+@pytest.mark.parametrize(
+    ("argument", "invalid_value"),
+    [
+        ("feature_dim", 0),
+        ("feature_dim", -1),
+        ("feature_dim", 4.5),
+        ("feature_dim", "4"),
+        ("feature_dim", True),
+        ("max_tokens", 0),
+        ("max_tokens", -1),
+        ("max_tokens", 3.5),
+        ("max_tokens", "3"),
+        ("max_tokens", True),
+    ],
+)
+def test_fusion_rejects_non_positive_or_non_integer_geometry(
+    argument,
+    invalid_value,
+):
+    module = load_fusion_module()
+    kwargs = {"feature_dim": 4, "max_tokens": 3}
+    kwargs[argument] = invalid_value
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{argument} must be a strictly positive integer",
+    ):
+        module.DinoDepthPlanFusion(**kwargs)
 
 
 @pytest.mark.parametrize(
