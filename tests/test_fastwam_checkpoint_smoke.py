@@ -1,3 +1,4 @@
+import importlib
 import importlib.util
 import json
 from pathlib import Path
@@ -10,10 +11,9 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 SMOKE_PATH = (
-    ROOT
-    / "third_party/FastWAM/scripts"
-    / "smoke_online_dino_depth_semantic_plan.py"
+    ROOT / "third_party/FastWAM/scripts" / "smoke_online_dino_depth_semantic_plan.py"
 )
+COSMOS_REPO = ROOT / "third_party/cosmos-predict2.5"
 
 
 def _load_smoke_module():
@@ -57,6 +57,7 @@ def test_online_smoke_script_requires_real_checkpoint_and_config():
     assert "--instruction" in source
     assert "--image" in source
     assert "--video-fps" in source
+    assert "--cosmos-repo" in source
     assert "torch.inference_mode()" in source
 
 
@@ -81,6 +82,8 @@ def test_parse_args_resolves_all_paths_before_runtime_chdir(monkeypatch, tmp_pat
             "weights/vae.pt",
             "--text-cache-dir",
             "text-cache",
+            "--cosmos-repo",
+            "cosmos-checkout",
         ]
     )
 
@@ -90,9 +93,35 @@ def test_parse_args_resolves_all_paths_before_runtime_chdir(monkeypatch, tmp_pat
     assert args.video_dit_checkpoint == (tmp_path / "weights/dit.pt").resolve()
     assert args.vae_checkpoint == (tmp_path / "weights/vae.pt").resolve()
     assert args.text_cache_dir == (tmp_path / "text-cache").resolve()
+    assert args.cosmos_repo == (tmp_path / "cosmos-checkout").resolve()
     assert args.task == "libero_cosmos_2cam224_online_dino_depth"
     assert args.num_inference_steps == 1
     assert args.action_horizon == 1
+
+
+def test_parse_args_uses_cwd_independent_default_cosmos_repo(monkeypatch, tmp_path):
+    module = _load_smoke_module()
+    monkeypatch.delenv("COSMOS_REPO", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    args = module.parse_args(_required_cli(tmp_path))
+
+    assert args.cosmos_repo == COSMOS_REPO.resolve()
+
+
+def test_parse_args_cosmos_cli_override_wins_over_environment(monkeypatch, tmp_path):
+    module = _load_smoke_module()
+    env_repo = tmp_path / "from-env"
+    cli_repo = tmp_path / "from-cli"
+    monkeypatch.setenv("COSMOS_REPO", str(env_repo))
+
+    env_args = module.parse_args(_required_cli(tmp_path))
+    cli_args = module.parse_args(
+        _required_cli(tmp_path) + ["--cosmos-repo", str(cli_repo)]
+    )
+
+    assert env_args.cosmos_repo == env_repo.resolve()
+    assert cli_args.cosmos_repo == cli_repo.resolve()
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
@@ -152,14 +181,12 @@ def test_validate_checkpoint_uses_exported_provider_contract(monkeypatch, tmp_pa
     events = []
 
     provider = types.SimpleNamespace(
-        validate_checkpoint_files=lambda path: events.append(
-            ("files", Path(path))
-        )
-        or Path(path).resolve(),
-        validate_planner_metadata=lambda payload: events.append(
-            ("metadata", payload)
-        )
-        or object(),
+        validate_checkpoint_files=lambda path: (
+            events.append(("files", Path(path))) or Path(path).resolve()
+        ),
+        validate_planner_metadata=lambda payload: (
+            events.append(("metadata", payload)) or object()
+        ),
     )
     monkeypatch.setattr(module, "_load_provider_module", lambda: provider)
 
@@ -205,6 +232,9 @@ def test_validate_cli_paths_checks_config_image_and_optional_overrides(tmp_path)
     vae.touch()
     text_cache = tmp_path / "text-cache"
     text_cache.mkdir()
+    cosmos_repo = tmp_path / "cosmos"
+    (cosmos_repo / "cosmos_predict2").mkdir(parents=True)
+    (cosmos_repo / "cosmos_predict2/__init__.py").touch()
     args = types.SimpleNamespace(
         config_dir=config_dir,
         config_name="train",
@@ -212,12 +242,38 @@ def test_validate_cli_paths_checks_config_image_and_optional_overrides(tmp_path)
         video_dit_checkpoint=dit,
         vae_checkpoint=vae,
         text_cache_dir=text_cache,
+        cosmos_repo=cosmos_repo,
     )
 
     module.validate_cli_paths(args)
 
     args.video_dit_checkpoint = text_cache
     with pytest.raises(FileNotFoundError, match="video DiT checkpoint"):
+        module.validate_cli_paths(args)
+
+
+def test_validate_cli_paths_rejects_missing_or_malformed_cosmos_repo(tmp_path):
+    module = _load_smoke_module()
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    (config_dir / "train.yaml").touch()
+    image = tmp_path / "current.png"
+    image.touch()
+    args = types.SimpleNamespace(
+        config_dir=config_dir,
+        config_name="train",
+        image=image,
+        video_dit_checkpoint=None,
+        vae_checkpoint=None,
+        text_cache_dir=None,
+        cosmos_repo=tmp_path / "missing-cosmos",
+    )
+
+    with pytest.raises(FileNotFoundError, match="Cosmos repository"):
+        module.validate_cli_paths(args)
+
+    args.cosmos_repo.mkdir()
+    with pytest.raises(FileNotFoundError, match="cosmos_predict2 package"):
         module.validate_cli_paths(args)
 
 
@@ -258,7 +314,13 @@ def test_runtime_preflight_runs_before_hydra_model_allocation(monkeypatch):
             online_semantic_planner_checkpoint="/planner/checkpoint",
         ),
     )
-    args = types.SimpleNamespace(device="cuda:0")
+    args = types.SimpleNamespace(device="cuda:0", cosmos_repo=COSMOS_REPO)
+
+    monkeypatch.setattr(
+        module,
+        "_ensure_runtime_paths",
+        lambda cosmos_repo=None: events.append(("paths", cosmos_repo)),
+    )
 
     monkeypatch.setattr(
         module,
@@ -286,20 +348,25 @@ def test_runtime_preflight_runs_before_hydra_model_allocation(monkeypatch):
     model = module.create_fastwam_cosmos(cfg, args)
 
     assert isinstance(model, Model)
-    assert events[0] == ("preflight", cfg)
-    assert events[1][0] == "instantiate"
-    assert events[1][1] is cfg.model
-    assert events[1][2] == {
+    assert events[0] == ("paths", COSMOS_REPO)
+    assert events[1] == ("preflight", cfg)
+    assert events[2][0] == "instantiate"
+    assert events[2][1] is cfg.model
+    assert events[2][2] == {
         "model_dtype": torch.bfloat16,
         "device": "cuda:0",
     }
-    assert events[2][0] == "eval"
+    assert events[3][0] == "eval"
 
 
 def test_runtime_preflight_uses_configured_code_and_checkpoint(monkeypatch):
     module = _load_smoke_module()
     calls = []
-    validator = lambda **kwargs: calls.append(kwargs) or (Path("code"), Path("ckpt"))
+
+    def validator(**kwargs):
+        calls.append(kwargs)
+        return Path("code"), Path("ckpt")
+
     monkeypatch.setattr(module, "_load_fastwam_runtime_validator", lambda: validator)
     cfg = types.SimpleNamespace(
         model=types.SimpleNamespace(
@@ -317,6 +384,51 @@ def test_runtime_preflight_uses_configured_code_and_checkpoint(monkeypatch):
             "checkpoint_dir": "/planner/checkpoint",
         }
     ]
+
+
+def test_runtime_paths_prioritize_selected_cosmos_repo_over_stale_path(tmp_path):
+    module = _load_smoke_module()
+    selected = tmp_path / "selected"
+    stale = tmp_path / "stale"
+    for repo in (selected, stale):
+        package = repo / "cosmos_predict2"
+        package.mkdir(parents=True)
+        (package / "__init__.py").touch()
+    original_path = list(__import__("sys").path)
+    try:
+        __import__("sys").path.insert(0, str(stale))
+        module._ensure_runtime_paths(selected)
+
+        assert __import__("sys").path[0] == str(selected.resolve())
+    finally:
+        __import__("sys").path[:] = original_path
+        importlib.invalidate_caches()
+
+
+def test_runtime_paths_make_vendored_cosmos_package_discoverable(monkeypatch):
+    module = _load_smoke_module()
+    original_path = list(__import__("sys").path)
+    monkeypatch.delitem(__import__("sys").modules, "cosmos_predict2", raising=False)
+    try:
+        __import__("sys").path[:] = [
+            entry
+            for entry in __import__("sys").path
+            if Path(entry or ".").resolve() != COSMOS_REPO.resolve()
+        ]
+        importlib.invalidate_caches()
+        assert importlib.util.find_spec("cosmos_predict2") is None
+
+        module._ensure_runtime_paths(COSMOS_REPO)
+
+        spec = importlib.util.find_spec("cosmos_predict2")
+        assert spec is not None
+        assert (
+            Path(spec.origin).resolve()
+            == (COSMOS_REPO / "cosmos_predict2/__init__.py").resolve()
+        )
+    finally:
+        __import__("sys").path[:] = original_path
+        importlib.invalidate_caches()
 
 
 def test_load_rgb_tensor_returns_finite_normalized_bchw(tmp_path):
@@ -503,10 +615,9 @@ def test_main_preflights_then_prints_one_json_summary(
     args.video_dit_checkpoint = None
     args.vae_checkpoint = None
     args.text_cache_dir = None
+    args.cosmos_repo = COSMOS_REPO
     cfg = types.SimpleNamespace(
-        data=types.SimpleNamespace(
-            train=types.SimpleNamespace(video_size=[224, 448])
-        )
+        data=types.SimpleNamespace(train=types.SimpleNamespace(video_size=[224, 448]))
     )
     image = torch.zeros(1, 3, 224, 448)
     model = object()
@@ -551,9 +662,7 @@ def test_main_preflights_then_prints_one_json_summary(
     monkeypatch.setattr(
         module,
         "validate_image_tensor",
-        lambda value, expected_hw: events.append(
-            ("geometry", value, expected_hw)
-        ),
+        lambda value, expected_hw: events.append(("geometry", value, expected_hw)),
     )
     monkeypatch.setattr(
         module,

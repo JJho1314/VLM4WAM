@@ -18,9 +18,8 @@ DEFAULT_TASK = "libero_cosmos_2cam224_online_dino_depth"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 FASTWAM_ROOT = Path(__file__).resolve().parents[1]
 FASTWAM_SRC = FASTWAM_ROOT / "src"
-PLANNER_CODE_DIR = (
-    REPO_ROOT / "scripts/qwen3_vl_semantic_planner/lingbot_dino_4b"
-)
+PLANNER_CODE_DIR = REPO_ROOT / "scripts/qwen3_vl_semantic_planner/lingbot_dino_4b"
+DEFAULT_COSMOS_REPO = REPO_ROOT / "third_party/cosmos-predict2.5"
 
 
 def _resolved_path(value: str) -> Path:
@@ -31,9 +30,7 @@ def _positive_finite_float(value: str) -> float:
     try:
         parsed = validate_video_fps(float(value))
     except ValueError as error:
-        raise argparse.ArgumentTypeError(
-            "expected a positive finite number"
-        ) from error
+        raise argparse.ArgumentTypeError("expected a positive finite number") from error
     return parsed
 
 
@@ -64,6 +61,13 @@ def _non_empty_string(value: str) -> str:
     return value
 
 
+def _default_cosmos_repo() -> Path:
+    configured = os.environ.get("COSMOS_REPO")
+    if configured is not None and configured.strip():
+        return _resolved_path(configured)
+    return DEFAULT_COSMOS_REPO.resolve()
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--planner-checkpoint", type=_resolved_path, required=True)
@@ -78,6 +82,11 @@ def parse_args(argv=None):
     parser.add_argument("--vae-checkpoint", type=_resolved_path)
     parser.add_argument("--text-cache-dir", type=_resolved_path)
     parser.add_argument(
+        "--cosmos-repo",
+        type=_resolved_path,
+        default=_default_cosmos_repo(),
+    )
+    parser.add_argument(
         "--num-inference-steps",
         type=_positive_int,
         default=1,
@@ -89,8 +98,7 @@ def parse_args(argv=None):
 def _load_provider_module():
     _ensure_runtime_paths()
     return importlib.import_module(
-        "scripts.qwen3_vl_semantic_planner.lingbot_dino_4b."
-        "dino_depth_plan_provider"
+        "scripts.qwen3_vl_semantic_planner.lingbot_dino_4b.dino_depth_plan_provider"
     )
 
 
@@ -102,7 +110,9 @@ def validate_checkpoint(checkpoint_dir: str | Path) -> Path:
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError(f"invalid planner metadata {metadata_path}: {error}") from error
+        raise ValueError(
+            f"invalid planner metadata {metadata_path}: {error}"
+        ) from error
     if not isinstance(metadata, dict):
         raise ValueError(
             f"invalid planner metadata {metadata_path}: expected an object"
@@ -120,6 +130,17 @@ def _config_file_candidates(config_dir: Path, config_name: str):
 
 def validate_cli_paths(args) -> None:
     """Reject invalid runtime assets before Hydra or model imports."""
+    if not args.cosmos_repo.is_dir():
+        raise FileNotFoundError(
+            f"Cosmos repository directory not found: {args.cosmos_repo}"
+        )
+    cosmos_package = args.cosmos_repo / "cosmos_predict2"
+    cosmos_marker = cosmos_package / "__init__.py"
+    if not cosmos_package.is_dir() or not cosmos_marker.is_file():
+        raise FileNotFoundError(
+            "Cosmos repository must contain an importable cosmos_predict2 "
+            f"package with {cosmos_marker}"
+        )
     if not args.config_dir.is_dir():
         raise FileNotFoundError(f"Hydra config directory not found: {args.config_dir}")
     config_candidates = _config_file_candidates(args.config_dir, args.config_name)
@@ -142,11 +163,20 @@ def validate_cli_paths(args) -> None:
         )
 
 
-def _ensure_runtime_paths() -> None:
+def _ensure_runtime_paths(cosmos_repo: str | Path | None = None) -> None:
     for path in (REPO_ROOT, FASTWAM_SRC):
         resolved = str(path.resolve())
         if resolved not in sys.path:
             sys.path.insert(0, resolved)
+    if cosmos_repo is not None:
+        resolved_cosmos_repo = str(Path(cosmos_repo).expanduser().resolve())
+        sys.path[:] = [
+            entry
+            for entry in sys.path
+            if str(Path(entry or ".").expanduser().resolve()) != resolved_cosmos_repo
+        ]
+        sys.path.insert(0, resolved_cosmos_repo)
+    importlib.invalidate_caches()
 
 
 def load_config(args):
@@ -224,6 +254,7 @@ def _model_dtype(mixed_precision: str):
 
 def create_fastwam_cosmos(cfg, args):
     """Preflight and instantiate the real Hydra model on the requested device."""
+    _ensure_runtime_paths(args.cosmos_repo)
     preflight_fastwam_runtime(cfg)
     from hydra.utils import instantiate
 
@@ -246,9 +277,7 @@ def preflight_model_assets(cfg) -> None:
     """Validate model assets selected by the composed config."""
     video_checkpoint = _resolve_config_path(cfg.model.video_dit_pretrained_path)
     if not video_checkpoint.is_file():
-        raise FileNotFoundError(
-            f"video DiT checkpoint not found: {video_checkpoint}"
-        )
+        raise FileNotFoundError(f"video DiT checkpoint not found: {video_checkpoint}")
     vae = cfg.model.vae
     if vae is not None:
         vae_checkpoint = _resolve_config_path(vae.vae_pth)
@@ -270,9 +299,7 @@ def text_cache_entry(
     context_len: int,
 ) -> Path:
     digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-    return Path(cache_dir) / (
-        f"{digest}.t5_len{context_len}.wan22ti2v5b.pt"
-    )
+    return Path(cache_dir) / (f"{digest}.t5_len{context_len}.wan22ti2v5b.pt")
 
 
 def configure_text_cache(args, cfg, prompt: str) -> Path:
@@ -331,7 +358,9 @@ def validate_image_tensor(image, *, expected_hw=None) -> None:
             f"input image must have shape [1, 3, H, W], got {tuple(image.shape)}"
         )
     if image.shape[2] <= 0 or image.shape[3] <= 0:
-        raise ValueError(f"input image has empty spatial dimensions: {tuple(image.shape)}")
+        raise ValueError(
+            f"input image has empty spatial dimensions: {tuple(image.shape)}"
+        )
     if not torch.isfinite(image).all():
         raise ValueError("input image contains non-finite values")
     if image.min().item() < -1.0001 or image.max().item() > 1.0001:
@@ -356,8 +385,7 @@ def configured_video_hw(cfg) -> tuple[int, int]:
         for value in (height, width)
     ):
         raise ValueError(
-            "data.train.video_size must contain positive integers, "
-            f"got {raw_size!r}"
+            f"data.train.video_size must contain positive integers, got {raw_size!r}"
         )
     return int(height), int(width)
 
@@ -387,9 +415,7 @@ def run_smoke(model, image, args) -> dict:
     video_fps = validate_video_fps(args.video_fps)
     video_expert = getattr(model, "video_expert", None)
     fusion = getattr(video_expert, "semantic_plan_fusion", None)
-    if fusion is None or not callable(
-        getattr(fusion, "register_forward_hook", None)
-    ):
+    if fusion is None or not callable(getattr(fusion, "register_forward_hook", None)):
         raise RuntimeError("online semantic fusion is missing from the video expert")
 
     captured_shapes = []
