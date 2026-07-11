@@ -203,7 +203,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
         )
-    
+
         self.num_frames = num_frames
         self.global_sample_stride = global_sample_stride
         self.action_video_freq_ratio = action_video_freq_ratio
@@ -232,7 +232,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 action_video_freq_ratio=self.action_video_freq_ratio,
             )
         )
-        
+
         assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
             f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
         assert ((num_frames - 1) // self.action_video_freq_ratio) % 4 == 0, \
@@ -417,7 +417,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             data["semantic_plan_times"] = semantic_times
         if semantic_record is not None:
             data["semantic_plan_meta"] = dict(semantic_record)
-        
+
     def __len__(self):
         return len(self.semantic_plan_records) if self.semantic_plan_records else len(self.lerobot_dataset)
 
@@ -452,7 +452,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 sample_idx = self._semantic_sample_idx(semantic_record, query_idx)
             else:
                 sample_idx = int(np.random.randint(len(self.lerobot_dataset)))
-        
+
         image_is_pad = sample["image_is_pad"]
 
         video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
@@ -515,7 +515,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
         video = video.permute(1, 0, 2, 3) # [C, T_video, H, W], range [-1, 1]
 
-        # Proxy (from lerobot): 
+        # Proxy (from lerobot):
         #   action: [num_frames-1, action_dim] # start from t0, except the last frame
         #   proprio: [num_frames, proprio_dim] # start from t0 to the last frame, aligned with video frames
         action = sample["action"] # [T-1, action_dim]
@@ -528,7 +528,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             )
 
         task = sample["instruction"]
-        
+
         # FIXME
         if self.override_instruction is not None:
             task = self.override_instruction
@@ -538,7 +538,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         # NOTE: to keep consistent with wan2.2's behavior
         context[~context_mask] = 0.0
         context_mask = torch.ones_like(context_mask)
-        
+
         data = {
             "video": video,
             "action": action,
