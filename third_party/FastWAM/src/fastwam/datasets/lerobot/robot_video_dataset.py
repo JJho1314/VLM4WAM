@@ -5,12 +5,10 @@ import json
 import os
 from pathlib import Path
 from typing import Optional
-import time
 import numpy as np
 import traceback
 import torch
 import torchvision.transforms.functional as transforms_F
-from contextlib import contextmanager
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -20,7 +18,6 @@ from .lerobot.datasets.video_utils import set_frame_cache_dir
 from .utils.normalizer import save_dataset_stats_to_json, load_dataset_stats_from_json
 from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Normalize
 from fastwam.utils.logging_config import get_logger
-from fastwam.utils import misc, pytorch_utils
 from accelerate import PartialState
 logger = get_logger(__name__)
 
@@ -28,6 +25,17 @@ logger = get_logger(__name__)
 DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
 
 _SEMANTIC_PLAN_UTILS = None
+
+
+def _get_work_dir():
+    """Use FastWAM's registered work dir without requiring its S3 dependency."""
+    try:
+        from fastwam.utils import misc
+    except ModuleNotFoundError as error:
+        if error.name != "boto3":
+            raise
+        return os.environ.get("FASTWAM_WORK_DIR", "./runs")
+    return misc.get_work_dir()
 
 
 def _load_semantic_plan_utils():
@@ -171,7 +179,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 if PartialState().is_main_process:
                     logger.info("Calculating dataset stats for normalization...")
                     dataset_stats = self.lerobot_dataset.get_dataset_stats(processor)
-                    work_dir = misc.get_work_dir()
+                    work_dir = _get_work_dir()
                     save_dataset_stats_to_json(dataset_stats, os.path.join(work_dir, "dataset_stats.json"))
                 else:
                     dataset_stats = None
@@ -183,7 +191,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 dataset_stats = load_dataset_stats_from_json(pretrained_norm_stats)
                 logger.info(f"Using dataset stats: {pretrained_norm_stats}")
                 if PartialState().is_main_process:
-                    work_dir = misc.get_work_dir()
+                    work_dir = _get_work_dir()
                     save_dataset_stats_to_json(dataset_stats, os.path.join(work_dir, "dataset_stats.json"))
 
             processor.set_normalizer_from_stats(dataset_stats)

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -559,19 +562,20 @@ def test_save_checkpoint_writes_depth_and_fastwam_contract(tmp_path):
 
 def test_fastwam_planner_dataset_uses_composed_nine_frame_video():
     module = load_trainer_module()
+    source_pixels = (
+        torch.arange(3, dtype=torch.uint8)[:, None, None, None] * 80
+        + torch.arange(9, dtype=torch.uint8)[None, :, None, None] * 8
+        + torch.arange(2, dtype=torch.uint8)[None, None, :, None] * 3
+        + torch.arange(3, dtype=torch.uint8)[None, None, None, :]
+    )
 
     class FakeFastWAMDataset:
         def __len__(self):
             return 1
 
         def __getitem__(self, _index):
-            video = torch.linspace(
-                -1.0,
-                1.0,
-                steps=3 * 9 * 8 * 16,
-            ).reshape(3, 9, 8, 16)
             return {
-                'video': video,
+                'video': source_pixels.to(torch.float32) / 127.5 - 1.0,
                 'instruction': 'open the middle drawer',
             }
 
@@ -581,11 +585,254 @@ def test_fastwam_planner_dataset_uses_composed_nine_frame_video():
     )
     item = dataset[0]
 
-    assert item['image'].size == (16, 8)
+    expected = source_pixels[:, [0, 2, 4, 6, 8]].permute(1, 2, 3, 0)
+    assert item['image'].size == (3, 2)
     assert item['prompt'] == 'open the middle drawer'
-    assert item['keyframe_images'].shape == (4, 8, 16, 3)
-    assert item['current_image'].shape == (8, 16, 3)
+    assert item['keyframe_images'].shape == (4, 2, 3, 3)
+    assert item['current_image'].shape == (2, 3, 3)
+    assert np.array_equal(np.asarray(item['image']), expected[0].numpy())
+    assert torch.equal(item['current_image'], expected[0])
+    assert torch.equal(item['keyframe_images'], expected[1:])
     assert dataset.offsets == [2, 4, 6, 8]
+
+
+@pytest.mark.parametrize("shape", [(3, 8, 2, 2), (3, 9, 2)])
+def test_fastwam_planner_dataset_rejects_malformed_video_shape(shape):
+    module = load_trainer_module()
+    wrapped = [
+        {
+            "video": torch.zeros(shape),
+            "instruction": "pick up the cup",
+        }
+    ]
+    dataset = module.FastWAMOnlinePlannerDataset.from_dataset(wrapped)
+
+    with pytest.raises(ValueError, match=r"must be \[3, 9, H, W\]"):
+        dataset[0]
+
+
+@pytest.mark.parametrize("instruction", [None, "", "   ", 7])
+def test_fastwam_planner_dataset_rejects_malformed_instruction(instruction):
+    module = load_trainer_module()
+    wrapped = [
+        {
+            "video": torch.zeros(3, 9, 2, 2),
+            "instruction": instruction,
+        }
+    ]
+    dataset = module.FastWAMOnlinePlannerDataset.from_dataset(wrapped)
+
+    with pytest.raises(ValueError, match="non-empty raw instruction"):
+        dataset[0]
+
+
+def test_fastwam_config_preparation_rebases_yaml_paths_without_instantiation():
+    module = load_trainer_module()
+    config_path = (
+        ROOT / "third_party/FastWAM/configs/data/libero_2cam_cosmos.yaml"
+    )
+    fastwam_root = config_path.resolve().parents[2]
+
+    prepared = module.prepare_fastwam_data_config(config_path)
+
+    expected_dataset_dirs = [
+        str((fastwam_root / relative).resolve())
+        for relative in (
+            "data/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot",
+            "data/libero_mujoco3.3.2/libero_object_no_noops_lerobot",
+            "data/libero_mujoco3.3.2/libero_goal_no_noops_lerobot",
+            "data/libero_mujoco3.3.2/libero_10_no_noops_lerobot",
+        )
+    ]
+    assert list(prepared.data.train.dataset_dirs) == expected_dataset_dirs
+    assert prepared.data.train.text_embedding_cache_dir == str(
+        (fastwam_root / "data/text_embeds_cache/libero_qwen").resolve()
+    )
+
+    explicit_dirs = ["machine/relative/data", "/mnt/absolute/data"]
+    overridden = module.prepare_fastwam_data_config(
+        config_path,
+        dataset_dirs=explicit_dirs,
+    )
+
+    assert list(overridden.data.train.dataset_dirs) == explicit_dirs
+    assert overridden.data.train.text_embedding_cache_dir == str(
+        (fastwam_root / "data/text_embeds_cache/libero_qwen").resolve()
+    )
+
+
+def test_fastwam_config_preflight_imports_target_without_instantiating_dataset(
+    monkeypatch,
+):
+    module = load_trainer_module()
+    config_path = (
+        ROOT / "third_party/FastWAM/configs/data/libero_2cam_cosmos.yaml"
+    )
+    monkeypatch.syspath_prepend(str(ROOT / "third_party/FastWAM/src"))
+
+    import hydra.utils
+
+    def reject_instantiation(*_args, **_kwargs):
+        raise AssertionError("preflight must not instantiate the FastWAM dataset")
+
+    imported_targets = []
+    monkeypatch.setattr(hydra.utils, "instantiate", reject_instantiation)
+    monkeypatch.setattr(hydra.utils, "get_class", imported_targets.append)
+
+    prepared = module.preflight_fastwam_data_config(config_path)
+
+    assert prepared.data.train._target_ == (
+        "fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset"
+    )
+    assert imported_targets == [prepared.data.train._target_]
+
+
+def test_main_preflights_fastwam_before_loading_qwen(monkeypatch, tmp_path):
+    module = load_trainer_module()
+    events = []
+
+    class ExpectedPreflightFailure(RuntimeError):
+        pass
+
+    class UnexpectedModelLoad(RuntimeError):
+        pass
+
+    args = Namespace(
+        full_finetune=False,
+        lora_r=0,
+        plan_head_type="lingbot_dino",
+        use_depth=False,
+        shared_latent_per_keyframe=32,
+        private_latent_per_keyframe=32,
+        fastwam_data_config=tmp_path / "data.yaml",
+        fastwam_dataset_dir=[],
+        seed=1,
+        output_dir=tmp_path / "output",
+        model_path=tmp_path / "model",
+        dtype="bf16",
+    )
+
+    def fail_preflight(*_args, **_kwargs):
+        events.append("fastwam_preflight")
+        raise ExpectedPreflightFailure("bad FastWAM config")
+
+    def fail_model_load(*_args, **_kwargs):
+        events.append("qwen_load")
+        raise UnexpectedModelLoad("Qwen load happened before preflight")
+
+    monkeypatch.setattr(module, "parse_args", lambda: args)
+    monkeypatch.setattr(module, "preflight_fastwam_data_config", fail_preflight)
+    monkeypatch.setattr(module, "load_qwen3vl_model_and_processor", fail_model_load)
+    monkeypatch.setattr(module, "ddp_info", lambda: (0, 1, 0))
+
+    with pytest.raises(ExpectedPreflightFailure, match="bad FastWAM config"):
+        module.main()
+
+    assert events == ["fastwam_preflight"]
+
+
+def _fastwam_parser_argv(*extra: str) -> list[str]:
+    return [
+        str(TRAINER_PATH),
+        "--model-path",
+        "/tmp/model",
+        "--output-dir",
+        "/tmp/output",
+        "--fastwam-data-config",
+        str(ROOT / "third_party/FastWAM/configs/data/libero_2cam_cosmos.yaml"),
+        "--online-plan-labels",
+        "--sequence-length",
+        "9",
+        "--num-keyframes",
+        "4",
+        "--keyframe-scheme",
+        "even_future",
+        *extra,
+    ]
+
+
+def test_fastwam_parser_accepts_only_aligned_source_and_geometry(monkeypatch):
+    module = load_trainer_module()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        _fastwam_parser_argv(
+            "--fastwam-dataset-dir",
+            "machine/relative/data",
+            "--fastwam-dataset-dir",
+            "/mnt/absolute/data",
+        ),
+    )
+
+    args = module.parse_args()
+
+    assert args.dataset_root is None
+    assert args.sequence_length == 9
+    assert args.num_keyframes == 4
+    assert args.keyframe_scheme == "even_future"
+    assert args.fastwam_dataset_dir == [
+        "machine/relative/data",
+        "/mnt/absolute/data",
+    ]
+
+
+@pytest.mark.parametrize("source_mode", ["both", "neither", "not_online"])
+def test_fastwam_parser_rejects_invalid_source_mode(
+    monkeypatch,
+    capsys,
+    source_mode,
+):
+    module = load_trainer_module()
+    argv = _fastwam_parser_argv()
+    if source_mode == "both":
+        argv.extend(["--dataset-root", "/tmp/legacy"])
+    elif source_mode == "neither":
+        config_index = argv.index("--fastwam-data-config")
+        del argv[config_index : config_index + 2]
+    else:
+        argv.remove("--online-plan-labels")
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(SystemExit) as error:
+        module.parse_args()
+
+    assert error.value.code == 2
+    stderr = capsys.readouterr().err
+    if source_mode in {"both", "neither"}:
+        assert "exactly one of --dataset-root or --fastwam-data-config" in stderr
+    else:
+        assert "--fastwam-data-config requires --online-plan-labels" in stderr
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--sequence-length", "13"),
+        ("--num-keyframes", "3"),
+        ("--keyframe-scheme", "uniform"),
+    ],
+)
+def test_fastwam_parser_rejects_misaligned_geometry(
+    monkeypatch,
+    capsys,
+    flag,
+    value,
+):
+    module = load_trainer_module()
+    argv = _fastwam_parser_argv()
+    value_index = argv.index(flag) + 1
+    argv[value_index] = value
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(SystemExit) as error:
+        module.parse_args()
+
+    assert error.value.code == 2
+    stderr = capsys.readouterr().err
+    assert (
+        "keyframe offsets [2, 4, 6, 8]" in stderr
+        or "invalid FastWAM keyframe geometry" in stderr
+    )
 
 
 def test_fastwam_launcher_pins_nine_frame_dual_branch_contract():
@@ -621,3 +868,48 @@ def test_base_launcher_exposes_in_repo_fastwam_package():
         'export PYTHONPATH="$REPO_ROOT/third_party/FastWAM/src'
         '${PYTHONPATH:+:$PYTHONPATH}"'
     ) in launcher
+
+
+def test_fastwam_hydra_target_imports_in_launcher_python():
+    fastwam_src = ROOT / "third_party/FastWAM/src"
+    starvla_python = Path(
+        "/data/LFT-W02_data/.conda/envs/starVLA/bin/python"
+    )
+    python = starvla_python if starvla_python.is_file() else Path(sys.executable)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(fastwam_src), env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+
+    result = subprocess.run(
+        [
+            str(python),
+            "-c",
+            (
+                "import importlib.machinery, os, shutil, sys, tempfile, types; "
+                "from fastwam.datasets.lerobot.robot_video_dataset "
+                "import RobotVideoDataset, _get_work_dir; "
+                "assert RobotVideoDataset.__name__ == 'RobotVideoDataset'; "
+                "os.environ['FASTWAM_WORK_DIR'] = '/tmp/fastwam-fallback'; "
+                "assert _get_work_dir() == '/tmp/fastwam-fallback'; "
+                "os.environ.pop('FASTWAM_WORK_DIR'); "
+                "assert _get_work_dir() == './runs'; "
+                "boto3 = types.ModuleType('boto3'); "
+                "boto3.__spec__ = importlib.machinery.ModuleSpec("
+                "'boto3', loader=None); "
+                "sys.modules['boto3'] = boto3; "
+                "from fastwam.utils import misc; "
+                "work_dir = tempfile.mkdtemp(); "
+                "misc.register_work_dir(work_dir); "
+                "assert _get_work_dir() == work_dir; "
+                "shutil.rmtree(work_dir)"
+            ),
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr

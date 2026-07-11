@@ -446,6 +446,62 @@ class OnlineSemanticPlanDataset(Dataset):
         }
 
 
+def prepare_fastwam_data_config(
+    config_path: Path,
+    *,
+    dataset_dirs: Sequence[str] | None = None,
+):
+    """Load a FastWAM data config and anchor its YAML-local data paths."""
+    from omegaconf import OmegaConf
+
+    resolved_config_path = Path(config_path).expanduser().resolve()
+    fastwam_root = resolved_config_path.parents[2]
+    data_config = OmegaConf.load(resolved_config_path)
+    root_config = OmegaConf.create(
+        {
+            "data": OmegaConf.to_container(
+                data_config,
+                resolve=False,
+            )
+        }
+    )
+    train_config = root_config.data.train
+    if dataset_dirs:
+        train_config.dataset_dirs = [os.fspath(path) for path in dataset_dirs]
+    else:
+        train_config.dataset_dirs = [
+            os.fspath(path)
+            if Path(os.fspath(path)).is_absolute()
+            else str((fastwam_root / os.fspath(path)).resolve())
+            for path in train_config.dataset_dirs
+        ]
+    text_cache_dir = train_config.get("text_embedding_cache_dir")
+    if text_cache_dir is not None and not Path(os.fspath(text_cache_dir)).is_absolute():
+        train_config.text_embedding_cache_dir = str(
+            (fastwam_root / os.fspath(text_cache_dir)).resolve()
+        )
+    return root_config
+
+
+def preflight_fastwam_data_config(
+    config_path: Path,
+    *,
+    dataset_dirs: Sequence[str] | None = None,
+):
+    """Validate the FastWAM data YAML and import its Hydra target only."""
+    from hydra.utils import get_class
+
+    root_config = prepare_fastwam_data_config(
+        config_path,
+        dataset_dirs=dataset_dirs,
+    )
+    target = root_config.data.train.get("_target_")
+    if not isinstance(target, str) or not target.strip():
+        raise ValueError("FastWAM train data config requires a non-empty _target_")
+    get_class(target)
+    return root_config
+
+
 class FastWAMOnlinePlannerDataset(Dataset):
     offsets = [2, 4, 6, 8]
 
@@ -462,21 +518,11 @@ class FastWAMOnlinePlannerDataset(Dataset):
         max_samples: int = 0,
     ):
         from hydra.utils import instantiate
-        from omegaconf import OmegaConf
 
-        data_config = OmegaConf.load(config_path)
-        root_config = OmegaConf.create(
-            {
-                "data": OmegaConf.to_container(
-                    data_config,
-                    resolve=False,
-                )
-            }
+        root_config = prepare_fastwam_data_config(
+            config_path,
+            dataset_dirs=dataset_dirs,
         )
-        if dataset_dirs:
-            root_config.data.train.dataset_dirs = [
-                str(path) for path in dataset_dirs
-            ]
         dataset = instantiate(root_config.data.train)
         return cls(dataset, max_samples=max_samples)
 
@@ -494,13 +540,13 @@ class FastWAMOnlinePlannerDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         sample = self.dataset[index]
         video = sample["video"]
-        if tuple(video.shape[:2]) != (3, 9):
+        if video.ndim != 4 or tuple(video.shape[:2]) != (3, 9):
             raise ValueError(
                 "FastWAM planner input must be [3, 9, H, W], got "
                 f"{tuple(video.shape)}"
             )
         instruction = sample.get("instruction")
-        if not isinstance(instruction, str) or not instruction:
+        if not isinstance(instruction, str) or not instruction.strip():
             raise ValueError(
                 "FastWAM planner sample needs a non-empty raw instruction"
             )
@@ -1535,6 +1581,11 @@ def main() -> None:
         raise ValueError(
             "DINO+depth mode requires positive --shared-latent-per-keyframe and "
             "--private-latent-per-keyframe"
+        )
+    if args.fastwam_data_config is not None:
+        preflight_fastwam_data_config(
+            args.fastwam_data_config,
+            dataset_dirs=args.fastwam_dataset_dir,
         )
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     random.seed(args.seed)
