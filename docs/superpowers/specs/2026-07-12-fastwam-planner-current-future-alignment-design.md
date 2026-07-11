@@ -5,14 +5,14 @@
 ## Goal
 
 Retrain the FastWAM-aligned Qwen3-VL 4B planner with LingBot-VLA 2.0-style
-current-frame DINO and depth alignment in addition to the existing four future
-keyframes. Preserve the FastWAM runtime output contract: inference still returns
-only the four future DINO and depth plans, each shaped `[B, 1024, 1024]`.
+current-frame DINO and depth alignment plus one near-future keyframe. Preserve
+the FastWAM video horizon while simplifying semantic guidance: inference returns
+one future DINO plan and one future depth plan, each shaped `[B, 256, 1024]`.
 
 ## Alternatives Considered
 
 1. **Dedicated current query group and current heads — selected.** Add one
-   current group before the four future groups and use separate current-DINO and
+   current group before the future group and use separate current-DINO and
    current-depth heads. This matches LingBot's separation of current and future
    heads and avoids conflicting targets.
 2. **Reuse the first future group and future heads — rejected.** The same hidden
@@ -24,23 +24,20 @@ only the four future DINO and depth plans, each shaped `[B, 1024, 1024]`.
 
 ## Query Geometry
 
-The Qwen input contains five temporal groups in this order:
+The Qwen input contains two temporal groups in this order:
 
 1. current frame
 2. future offset 2
-3. future offset 4
-4. future offset 6
-5. future offset 8
 
 Every group contains 96 unique query tokens in
 `[32 shared, 32 DINO-private, 32 depth-private]` order. Each modality head sees
 64 tokens per group: the 32 shared tokens plus its 32 private tokens.
 
 - Current query tokens: `1 * 96 = 96`
-- Future query tokens: `4 * 96 = 384`
-- Total unique Qwen query tokens: `480`
+- Future query tokens: `1 * 96 = 96`
+- Total unique Qwen query tokens: `192`
 - Current output per branch: `[B, 256, 1024]`
-- Future output per branch: `[B, 4 * 256, 1024] = [B, 1024, 1024]`
+- Future output per branch: `[B, 256, 1024]`
 
 The current group participates in the same single Qwen forward as all future
 groups. Current heads are training-only auxiliaries. The online FastWAM provider
@@ -65,11 +62,11 @@ starts; it does not resume the incompatible 384-query future-only checkpoint.
 
 ## Online Teacher Targets
 
-For DINO, build the same `[warmup=current, current, future]` clips already used
-by the future teacher. Return the `current_index=1` patch target once and all
-four future patch targets without an extra teacher forward.
+For DINO, build one `[warmup=current, current, future@offset2]` clip. Return the
+`current_index=1` patch target and the final-frame future patch target from the
+same teacher forward.
 
-For depth, encode the current frame and four future keyframes through the same
+For depth, encode the current frame and the one future keyframe through the same
 frozen MoGe-2 to MoRGBD pipeline. Batch them together where possible. All
 teacher operations remain frozen, under `torch.no_grad()`, and detached.
 
@@ -80,34 +77,34 @@ future-only run:
 
 ```text
 total_loss =
-    0.8    * future_dino_mse
-  + 0.2    * current_dino_mse
-  + 0.0064 * future_depth_smooth_l1
-  + 0.0016 * current_depth_smooth_l1
+    0.9    * future_dino_mse
+  + 0.1    * current_dino_mse
+  + 0.0072 * future_depth_smooth_l1
+  + 0.0008 * current_depth_smooth_l1
 ```
 
-The four future frames jointly receive 80% and the single current frame receives
-20%, so each of the five time points has equal aggregate weight. Total DINO
-weight remains `1.0`; total depth weight becomes `0.008`. Cosine, norm,
-variance, and InfoNCE weights remain zero.
+The future frame receives 90% and the current frame remains a 10% alignment
+anchor. Total DINO weight remains `1.0`; total depth weight is `0.008`. Cosine,
+norm, variance, and InfoNCE weights remain zero.
 
 Log all four raw losses, all four weighted losses, current/future norm ratios,
 and the final total loss separately.
 
 ## Checkpoint and Runtime Contract
 
-Current-enabled checkpoints save both current heads, both future heads, all 480
+Current-enabled checkpoints save both current heads, both future heads, all 192
 plan-token embeddings, and metadata describing:
 
 - current alignment enabled
-- five temporal query groups and ordering
+- two temporal query groups and ordering
 - 32 shared plus 32 private queries per branch
 - all four loss weights
-- future offsets `[2, 4, 6, 8]`
+- future offsets `[2]`
 
-The provider validates the 480-token checkpoint and discards current predictions
-at its public boundary. The FastWAM semantic fusion and cross-attention shapes
-remain unchanged.
+The provider validates the 192-token checkpoint and discards current predictions
+at its public boundary. FastWAM receives 256 semantic tokens at normalized time
+`0.25` (`offset 2 / original 8-frame future horizon`). Its video output remains
+the original current-plus-eight-future, nine-frame sequence.
 
 ## Training Configuration
 
@@ -134,7 +131,7 @@ checkpoint completeness, metadata rejection, and provider future-only output.
 
 Deployment uses a two-step full-finetune smoke with the exact production batch
 configuration. Missing current head weights, target shape mismatches, malformed
-480-token metadata, non-finite losses, or missing current targets fail fast.
+192-token metadata, non-finite losses, or missing current targets fail fast.
 Formal training is submitted only through a successful smoke dependency.
 
 At steps 1,000, 2,000, and every subsequent 1,000 steps, inspect all four loss
