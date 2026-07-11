@@ -2,7 +2,9 @@ import glob
 import hashlib
 import importlib.util
 import json
+import math
 import os
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Optional
 import numpy as np
@@ -25,6 +27,42 @@ logger = get_logger(__name__)
 DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
 
 _SEMANTIC_PLAN_UTILS = None
+
+
+def _normalize_positive_integral(value, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise TypeError(f"{name} must be a non-bool integer, got {value!r}")
+    value = int(value)
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return value
+
+
+def _normalize_positive_fps(value, *, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"{name} must be a real number, got {value!r}")
+    value = float(value)
+    if value <= 0 or not math.isfinite(value):
+        raise ValueError(f"{name} must be positive and finite, got {value}")
+    return value
+
+
+def compute_effective_video_fps(
+    *,
+    raw_fps: float,
+    global_sample_stride: int,
+    action_video_freq_ratio: int,
+) -> float:
+    raw_fps = _normalize_positive_fps(raw_fps, name="raw_fps")
+    global_sample_stride = _normalize_positive_integral(
+        global_sample_stride,
+        name="global_sample_stride",
+    )
+    action_video_freq_ratio = _normalize_positive_integral(
+        action_video_freq_ratio,
+        name="action_video_freq_ratio",
+    )
+    return raw_fps / (global_sample_stride * action_video_freq_ratio)
 
 
 def _get_work_dir():
@@ -112,6 +150,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         semantic_plan_max_tokens: int = 0,
         semantic_plan_default_to_zero: bool = False,
     ):
+        global_sample_stride = _normalize_positive_integral(
+            global_sample_stride,
+            name="global_sample_stride",
+        )
+        action_video_freq_ratio = _normalize_positive_integral(
+            action_video_freq_ratio,
+            name="action_video_freq_ratio",
+        )
+
         # Set the pre-decoded frame cache dir for this process/worker. This must run
         # before any video decode. The FASTWAM_FRAME_CACHE_DIR env var also works
         # standalone; an explicit arg here overrides it. Passing None leaves whatever
@@ -131,7 +178,23 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         )
     
         self.num_frames = num_frames
+        self.global_sample_stride = global_sample_stride
         self.action_video_freq_ratio = action_video_freq_ratio
+        raw_fps = getattr(self.lerobot_dataset, "fps", None)
+        if raw_fps is None:
+            logger.warning(
+                "BaseLerobotDataset does not expose `fps`; sampled video "
+                "timing is unavailable and `video_fps` will be omitted."
+            )
+        self.video_fps = (
+            None
+            if raw_fps is None
+            else compute_effective_video_fps(
+                raw_fps=raw_fps,
+                global_sample_stride=self.global_sample_stride,
+                action_video_freq_ratio=self.action_video_freq_ratio,
+            )
+        )
         
         assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
             f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
@@ -450,6 +513,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
+        if self.video_fps is not None:
+            data["video_fps"] = torch.tensor(self.video_fps, dtype=torch.float32)
         self._attach_semantic_plan(data, semantic_record, sample_idx)
         return data
 
