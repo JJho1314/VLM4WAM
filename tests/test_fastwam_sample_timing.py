@@ -17,6 +17,7 @@ FASTWAM_SRC = ROOT / "third_party/FastWAM/src"
 LEROBOT_DIR = FASTWAM_SRC / "fastwam/datasets/lerobot"
 BASE_DATASET_PATH = LEROBOT_DIR / "base_lerobot_dataset.py"
 ROBOT_DATASET_PATH = LEROBOT_DIR / "robot_video_dataset.py"
+FPS_ABSENT = object()
 
 
 def _install_package(monkeypatch, name: str, path: Path) -> None:
@@ -69,8 +70,15 @@ def _load_source_module(monkeypatch, name: str, path: Path):
     return module
 
 
-def _load_base_dataset_module(monkeypatch, *, raw_fps: float = 20.0):
+def _load_base_dataset_module(monkeypatch, *, raw_fps=20.0):
     _install_fastwam_packages(monkeypatch)
+
+    fps_values = (
+        list(raw_fps)
+        if isinstance(raw_fps, (list, tuple))
+        else [raw_fps]
+    )
+    metadata_count = 0
 
     lerobot_module = types.ModuleType(
         "fastwam.datasets.lerobot.lerobot.lerobot_dataset"
@@ -78,9 +86,11 @@ def _load_base_dataset_module(monkeypatch, *, raw_fps: float = 20.0):
 
     class FakeMetadata:
         def __init__(self, repo_id, root):
+            nonlocal metadata_count
             del root
             self.repo_id = repo_id
-            self.fps = raw_fps
+            self.fps = fps_values[metadata_count]
+            metadata_count += 1
             self.total_episodes = 1
 
     class FakeMultiLeRobotDataset:
@@ -122,7 +132,8 @@ def _load_base_dataset_module(monkeypatch, *, raw_fps: float = 20.0):
 def _load_robot_dataset_module(
     monkeypatch,
     *,
-    raw_fps: float | None = 20.0,
+    raw_fps=20.0,
+    provides_validated_fps=FPS_ABSENT,
 ):
     _install_fastwam_packages(monkeypatch)
 
@@ -175,8 +186,8 @@ def _load_robot_dataset_module(
         task_text = "pick up the cup"
 
         def __init__(self, *, global_sample_stride, **_kwargs):
-            if raw_fps is not None:
-                self.fps = float(raw_fps)
+            if raw_fps is not FPS_ABSENT:
+                self.fps = raw_fps
             self.global_sample_stride = global_sample_stride
             self.processor = None
             self.samples = [
@@ -206,6 +217,9 @@ def _load_robot_dataset_module(
 
         def get_dataset_stats(self, _processor):
             return {}
+
+    if provides_validated_fps is not FPS_ABSENT:
+        FakeBaseLerobotDataset.provides_validated_fps = provides_validated_fps
 
     base_module.BaseLerobotDataset = FakeBaseLerobotDataset
     monkeypatch.setitem(
@@ -254,6 +268,111 @@ def _load_robot_dataset_module(
     )
 
 
+def _load_actual_base_and_robot_modules(monkeypatch):
+    monkeypatch.syspath_prepend(str(FASTWAM_SRC))
+    importlib.import_module("fastwam.datasets.lerobot")
+
+    lerobot_module = types.ModuleType(
+        "fastwam.datasets.lerobot.lerobot.lerobot_dataset"
+    )
+
+    class IntegrationMetadata:
+        def __init__(self, repo_id, root):
+            del root
+            self.repo_id = repo_id
+            self.fps = 20.0
+            self.total_episodes = 1
+
+    class IntegrationMultiLeRobotDataset:
+        def __init__(self, **_kwargs):
+            episode_index = {
+                "from": torch.tensor([0]),
+                "to": torch.tensor([1]),
+            }
+            self._datasets = [
+                types.SimpleNamespace(episode_data_index=episode_index)
+            ]
+            self.num_frames = 1
+            self.num_episodes = 1
+            self.sample = {
+                "task": "pick up the cup",
+                "observation.images": torch.zeros(33, 3, 2, 2),
+                "observation.state": torch.zeros(33, 8),
+                "action": torch.zeros(32, 7),
+                "observation.images_is_pad": torch.zeros(
+                    33,
+                    dtype=torch.bool,
+                ),
+                "observation.state_is_pad": torch.zeros(
+                    33,
+                    dtype=torch.bool,
+                ),
+                "action_is_pad": torch.zeros(32, dtype=torch.bool),
+            }
+
+        def __len__(self):
+            return self.num_frames
+
+        def __getitem__(self, index):
+            assert int(index) == 0
+            return dict(self.sample)
+
+        def set_during_training(self, _flag):
+            return None
+
+    lerobot_module.LeRobotDatasetMetadata = IntegrationMetadata
+    lerobot_module.MultiLeRobotDataset = IntegrationMultiLeRobotDataset
+    monkeypatch.setitem(
+        sys.modules,
+        "fastwam.datasets.lerobot.lerobot.lerobot_dataset",
+        lerobot_module,
+    )
+
+    video_utils = types.ModuleType(
+        "fastwam.datasets.lerobot.lerobot.datasets.video_utils"
+    )
+    video_utils.set_frame_cache_dir = lambda _path: None
+    monkeypatch.setitem(
+        sys.modules,
+        "fastwam.datasets.lerobot.lerobot.datasets.video_utils",
+        video_utils,
+    )
+
+    base_module = _load_source_module(
+        monkeypatch,
+        "fastwam.datasets.lerobot.base_lerobot_dataset",
+        BASE_DATASET_PATH,
+    )
+    robot_module = _load_source_module(
+        monkeypatch,
+        "fastwam.datasets.lerobot.robot_video_dataset",
+        ROBOT_DATASET_PATH,
+    )
+    return base_module, robot_module
+
+
+class IntegrationProcessor:
+    def set_normalizer_from_stats(self, _stats):
+        return None
+
+    def train(self):
+        return None
+
+    def eval(self):
+        return None
+
+    def preprocess(self, sample):
+        return {
+            "pixel_values": sample["images"]["default"],
+            "image_is_pad": sample["image_is_pad"],
+            "action": sample["action"]["default"],
+            "proprio": sample["state"]["default"],
+            "instruction": sample["task"],
+            "action_is_pad": sample["action_is_pad"],
+            "proprio_is_pad": sample["state_is_pad"],
+        }
+
+
 def _shape_meta():
     return {"images": [], "state": [], "action": []}
 
@@ -274,6 +393,33 @@ def test_base_dataset_preserves_raw_fps_and_normalizes_global_stride(monkeypatch
     assert type(dataset.fps) is float
     assert dataset.global_sample_stride == 2
     assert type(dataset.global_sample_stride) is int
+    assert module.BaseLerobotDataset.provides_validated_fps is True
+
+
+def test_base_dataset_validates_every_metadata_fps_before_comparison(monkeypatch):
+    module = _load_base_dataset_module(monkeypatch, raw_fps=[1.0, True])
+
+    with pytest.raises(TypeError, match="fps.*real number"):
+        module.BaseLerobotDataset(
+            dataset_dirs=["valid", "invalid"],
+            shape_meta=_shape_meta(),
+            obs_size=1,
+            action_size=0,
+            val_set_proportion=0,
+        )
+
+
+def test_base_dataset_reports_normalized_fps_mismatch(monkeypatch):
+    module = _load_base_dataset_module(monkeypatch, raw_fps=[20, 30.0])
+
+    with pytest.raises(ValueError, match="same fps.*20.0.*30.0"):
+        module.BaseLerobotDataset(
+            dataset_dirs=["twenty", "thirty"],
+            shape_meta=_shape_meta(),
+            obs_size=1,
+            action_size=0,
+            val_set_proportion=0,
+        )
 
 
 @pytest.mark.parametrize("raw_fps", [0.0, -1.0, math.inf, -math.inf, math.nan])
@@ -454,12 +600,51 @@ def test_robot_video_dataset_rejects_present_but_invalid_base_fps(
         )
 
 
+def test_robot_video_dataset_rejects_present_none_fps(monkeypatch, tmp_path):
+    module = _load_robot_dataset_module(monkeypatch, raw_fps=None)
+
+    with pytest.raises(TypeError, match="raw_fps.*real number"):
+        module.RobotVideoDataset(
+            dataset_dirs=[str(tmp_path / "lerobot")],
+            shape_meta=_shape_meta(),
+            num_frames=33,
+            global_sample_stride=1,
+            action_video_freq_ratio=4,
+            video_size=[2, 2],
+            text_embedding_cache_dir=str(tmp_path / "text"),
+        )
+
+
+@pytest.mark.parametrize("capability_marker", [True, False])
+def test_marked_base_missing_fps_fails_instead_of_degrading(
+    monkeypatch,
+    tmp_path,
+    capability_marker,
+):
+    module = _load_robot_dataset_module(
+        monkeypatch,
+        raw_fps=FPS_ABSENT,
+        provides_validated_fps=capability_marker,
+    )
+
+    with pytest.raises(RuntimeError, match="validated FPS.*missing `fps`"):
+        module.RobotVideoDataset(
+            dataset_dirs=[str(tmp_path / "lerobot")],
+            shape_meta=_shape_meta(),
+            num_frames=33,
+            global_sample_stride=1,
+            action_video_freq_ratio=4,
+            video_size=[2, 2],
+            text_embedding_cache_dir=str(tmp_path / "text"),
+        )
+
+
 def test_robot_video_dataset_warns_when_injected_base_has_no_fps(
     monkeypatch,
     tmp_path,
     caplog,
 ):
-    module = _load_robot_dataset_module(monkeypatch, raw_fps=None)
+    module = _load_robot_dataset_module(monkeypatch, raw_fps=FPS_ABSENT)
 
     with caplog.at_level(logging.WARNING):
         dataset = module.RobotVideoDataset(
@@ -474,6 +659,15 @@ def test_robot_video_dataset_warns_when_injected_base_has_no_fps(
 
     assert dataset.video_fps is None
     assert "sampled video timing is unavailable" in caplog.text
+    monkeypatch.setattr(
+        dataset,
+        "_get_cached_text_context",
+        lambda _prompt: (
+            torch.zeros(2, 8),
+            torch.ones(2, dtype=torch.bool),
+        ),
+    )
+    assert "video_fps" not in dataset[0]
 
 
 def test_robot_video_sample_emits_fps_and_raw_instruction(monkeypatch, tmp_path):
@@ -510,3 +704,62 @@ def test_robot_video_sample_emits_fps_and_raw_instruction(monkeypatch, tmp_path)
         "A video recorded from a robot's point of view executing the following "
         "instruction: pick up the cup"
     )
+
+
+def test_actual_base_robot_pipeline_emits_collatable_libero_timing(
+    monkeypatch,
+    tmp_path,
+):
+    base_module, robot_module = _load_actual_base_and_robot_modules(monkeypatch)
+    stats_path = tmp_path / "stats.json"
+    stats_path.write_text("{}", encoding="utf-8")
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    monkeypatch.setattr(robot_module, "_get_work_dir", lambda: str(work_dir))
+    dataset = robot_module.RobotVideoDataset(
+        dataset_dirs=[str(tmp_path / "lerobot")],
+        shape_meta=robot_module.OmegaConf.create(
+            {
+                "images": [
+                    {"key": "default", "raw_shape": [3, 2, 2]},
+                ],
+                "state": [{"key": "default", "raw_shape": 8}],
+                "action": [{"key": "default", "raw_shape": 7}],
+            }
+        ),
+        num_frames=33,
+        global_sample_stride=1,
+        action_video_freq_ratio=4,
+        video_size=[2, 2],
+        processor=IntegrationProcessor(),
+        pretrained_norm_stats=str(stats_path),
+        text_embedding_cache_dir=str(tmp_path / "text"),
+    )
+    monkeypatch.setattr(
+        dataset,
+        "_get_cached_text_context",
+        lambda _prompt: (
+            torch.zeros(2, 8),
+            torch.ones(2, dtype=torch.bool),
+        ),
+    )
+
+    sample = dataset[0]
+    batch = next(iter(torch.utils.data.DataLoader(dataset, batch_size=1)))
+
+    assert base_module.BaseLerobotDataset.provides_validated_fps is True
+    assert type(dataset.lerobot_dataset) is base_module.BaseLerobotDataset
+    assert dataset.lerobot_dataset.fps == pytest.approx(20.0)
+    assert sample["video_fps"].shape == torch.Size([])
+    assert sample["video_fps"].dtype == torch.float32
+    assert sample["video_fps"].item() == pytest.approx(5.0)
+    assert batch["video_fps"].shape == (1,)
+    assert batch["video_fps"].dtype == torch.float32
+    assert batch["video_fps"].item() == pytest.approx(5.0)
+    assert sample["instruction"] == "pick up the cup"
+    assert sample["prompt"].endswith("instruction: pick up the cup")
+
+    dataset.override_instruction = "move to the drawer"
+    override_sample = dataset[0]
+    assert override_sample["instruction"] == "move to the drawer"
+    assert override_sample["prompt"].endswith("instruction: move to the drawer")

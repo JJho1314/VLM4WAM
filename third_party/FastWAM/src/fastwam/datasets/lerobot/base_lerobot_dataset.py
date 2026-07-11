@@ -4,7 +4,7 @@ from numbers import Integral, Real
 import torch
 import numpy as np
 from pathlib import Path
-from typing import List, Literal, Dict, Optional, Any, DefaultDict
+from typing import List, Dict, Optional, Any, DefaultDict
 from tqdm import tqdm
 from .lerobot.lerobot_dataset import LeRobotDatasetMetadata, MultiLeRobotDataset
 
@@ -37,6 +37,8 @@ def _normalize_positive_fps(value) -> float:
 
 
 class BaseLerobotDataset(torch.utils.data.Dataset):
+    provides_validated_fps = True
+
     def __init__(
         self,
         dataset_dirs: List[str],
@@ -79,9 +81,13 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             meta = LeRobotDatasetMetadata(repo_id=repo_id, root=ds_root)
             metas.append(meta)
 
-        fps_list = [m.fps for m in metas]
-        assert len(set(fps_list)) == 1, f"All dataset_dirs must have the same fps, got {fps_list}"
-        fps = _normalize_positive_fps(fps_list[0])
+        fps_list = [_normalize_positive_fps(meta.fps) for meta in metas]
+        if any(fps != fps_list[0] for fps in fps_list[1:]):
+            raise ValueError(
+                "All dataset_dirs must have the same fps after normalization, "
+                f"got {fps_list}"
+            )
+        fps = fps_list[0]
 
         self.fps = fps
         self.global_sample_stride = global_sample_stride
@@ -169,7 +175,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         return state
 
     def _get_image(self, meta, lerobot_sample) -> torch.Tensor:
-        key, lerobot_key, raw_shape = meta["key"], meta["lerobot_key"], meta["raw_shape"]
+        lerobot_key = meta["lerobot_key"]
         image: torch.Tensor = lerobot_sample[lerobot_key]
         if image.ndim == 3: # time dim will lost when obs_size is 1
             image = image.unsqueeze(0)

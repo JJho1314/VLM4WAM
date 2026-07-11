@@ -27,6 +27,7 @@ logger = get_logger(__name__)
 DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
 
 _SEMANTIC_PLAN_UTILS = None
+_MISSING_FPS = object()
 
 
 def _normalize_positive_integral(value, *, name: str) -> int:
@@ -180,15 +181,25 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.num_frames = num_frames
         self.global_sample_stride = global_sample_stride
         self.action_video_freq_ratio = action_video_freq_ratio
-        raw_fps = getattr(self.lerobot_dataset, "fps", None)
-        if raw_fps is None:
+        raw_fps = getattr(self.lerobot_dataset, "fps", _MISSING_FPS)
+        fps_capability = getattr(
+            type(self.lerobot_dataset),
+            "provides_validated_fps",
+            _MISSING_FPS,
+        )
+        if raw_fps is _MISSING_FPS:
+            if fps_capability is not _MISSING_FPS:
+                raise RuntimeError(
+                    "BaseLerobotDataset defines a validated FPS capability "
+                    "marker but is missing `fps`."
+                )
             logger.warning(
                 "BaseLerobotDataset does not expose `fps`; sampled video "
                 "timing is unavailable and `video_fps` will be omitted."
             )
         self.video_fps = (
             None
-            if raw_fps is None
+            if raw_fps is _MISSING_FPS
             else compute_effective_video_fps(
                 raw_fps=raw_fps,
                 global_sample_stride=self.global_sample_stride,
