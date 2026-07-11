@@ -741,6 +741,7 @@ class FastWAMCosmos(nn.Module):
             feats = self.video_expert.forward_foresight(
                 noise, ts1, crossattn, layers=self.agra_video_layers,
                 o0_latent=o0_latent, cond_frames=cond,
+                fps=self._current_video_fps,
                 semantic_plan_B_L_D=self._current_semantic_plan,
                 semantic_plan_times_B_N=self._current_semantic_plan_times)
             G = [proj(f.to(proj.weight.dtype)) for proj, f in zip(self.agra_video_projs, feats)]

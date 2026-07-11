@@ -6,7 +6,7 @@ import math
 import os
 from numbers import Integral, Real
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 import numpy as np
 import traceback
 import torch
@@ -145,12 +145,38 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         frame_cache_dir: Optional[str] = None, # pre-decoded frame cache dir; None = decode mp4 at runtime (back-compatible)
         condition_frame_augmentation: Optional[dict] = None,
         video_augmentation: Optional[dict] = None,
+        semantic_plan_source: Literal["none", "online", "file"] = "none",
         semantic_plan_dir: Optional[str] = None,
         semantic_plan_manifest: Optional[str] = None,
         semantic_plan_dim: int = 1152,
         semantic_plan_max_tokens: int = 0,
         semantic_plan_default_to_zero: bool = False,
     ):
+        valid_semantic_plan_sources = {"none", "online", "file"}
+        if (
+            not isinstance(semantic_plan_source, str)
+            or semantic_plan_source not in valid_semantic_plan_sources
+        ):
+            raise ValueError(
+                "semantic_plan_source must be one of "
+                f"{sorted(valid_semantic_plan_sources)}, got "
+                f"{semantic_plan_source!r}"
+            )
+        if semantic_plan_source in {"none", "online"} and (
+            semantic_plan_dir is not None or semantic_plan_manifest is not None
+        ):
+            raise ValueError(
+                f"semantic_plan_source={semantic_plan_source!r} requires "
+                "semantic_plan_dir and semantic_plan_manifest to be null."
+            )
+        if semantic_plan_source == "file" and (
+            semantic_plan_dir is None or semantic_plan_manifest is None
+        ):
+            raise ValueError(
+                "semantic_plan_source='file' requires both semantic_plan_dir "
+                "and semantic_plan_manifest."
+            )
+
         global_sample_stride = _normalize_positive_integral(
             global_sample_stride,
             name="global_sample_stride",
@@ -223,6 +249,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.max_padding_retry = max_padding_retry
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
+        self.semantic_plan_source = semantic_plan_source
         self.semantic_plan_dir = None if semantic_plan_dir is None else os.fspath(semantic_plan_dir)
         self.semantic_plan_dim = int(semantic_plan_dim)
         self.semantic_plan_max_tokens = int(semantic_plan_max_tokens)
@@ -363,7 +390,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         return fallback_times if record_times is None else record_times
 
     def _attach_semantic_plan(self, data, semantic_record, sample_idx):
-        if self.semantic_plan_dir is None:
+        if self.semantic_plan_source != "file":
             return
         load_semantic_plan_payload, _ = _load_semantic_plan_utils()
         sample_id = (
