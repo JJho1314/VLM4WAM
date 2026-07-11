@@ -1,7 +1,9 @@
+import hashlib
 import importlib
 import importlib.util
 import json
 from pathlib import Path
+import sys
 import types
 
 import pytest
@@ -197,6 +199,62 @@ def test_validate_checkpoint_uses_exported_provider_contract(monkeypatch, tmp_pa
         ("files", checkpoint),
         ("metadata", metadata),
     ]
+
+
+def test_load_provider_isolated_from_conflicting_regular_scripts(monkeypatch):
+    module = _load_smoke_module()
+    conflict = types.ModuleType("scripts")
+    conflict.__file__ = "/site-packages/scripts/__init__.py"
+    conflict.__path__ = ["/site-packages/scripts"]
+    monkeypatch.setitem(sys.modules, "scripts", conflict)
+    expected_path = module.PLANNER_CODE_DIR / "dino_depth_plan_provider.py"
+
+    provider = module._load_provider_module()
+
+    assert Path(provider.__file__).resolve() == expected_path.resolve()
+    assert callable(provider.validate_checkpoint_files)
+    assert callable(provider.validate_planner_metadata)
+    assert sys.modules["scripts"] is conflict
+    assert sys.modules[provider.__name__] is provider
+    assert not any(
+        name.startswith("scripts.qwen3_vl_semantic_planner") for name in sys.modules
+    )
+
+
+def test_load_provider_rejects_missing_canonical_file_before_execution(
+    monkeypatch, tmp_path
+):
+    module = _load_smoke_module()
+    monkeypatch.setattr(module, "PLANNER_CODE_DIR", tmp_path / "missing-planner")
+
+    with pytest.raises(FileNotFoundError, match="planner provider file not found"):
+        module._load_provider_module()
+
+
+def test_load_provider_restores_or_cleans_private_mapping_on_failure(
+    monkeypatch, tmp_path
+):
+    module = _load_smoke_module()
+    planner_dir = tmp_path / "planner"
+    planner_dir.mkdir()
+    provider_path = planner_dir / "dino_depth_plan_provider.py"
+    provider_path.write_text(
+        "raise RuntimeError('broken provider')\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(module, "PLANNER_CODE_DIR", planner_dir)
+    path_digest = hashlib.sha256(str(provider_path).encode("utf-8")).hexdigest()[:16]
+    module_name = f"_fastwam_smoke_planner_provider_{path_digest}"
+    previous = types.ModuleType(module_name)
+    monkeypatch.setitem(sys.modules, module_name, previous)
+
+    with pytest.raises(ImportError, match="failed to import planner provider"):
+        module._load_provider_module()
+    assert sys.modules[module_name] is previous
+
+    monkeypatch.delitem(sys.modules, module_name)
+    with pytest.raises(ImportError, match="failed to import planner provider"):
+        module._load_provider_module()
+    assert module_name not in sys.modules
 
 
 def test_validate_checkpoint_rejects_non_object_metadata_before_contract(

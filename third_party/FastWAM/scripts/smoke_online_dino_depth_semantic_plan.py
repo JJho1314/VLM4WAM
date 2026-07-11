@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import importlib.util
 import hashlib
 import json
 import math
@@ -97,9 +98,29 @@ def parse_args(argv=None):
 
 def _load_provider_module():
     _ensure_runtime_paths()
-    return importlib.import_module(
-        "scripts.qwen3_vl_semantic_planner.lingbot_dino_4b.dino_depth_plan_provider"
-    )
+    provider_path = PLANNER_CODE_DIR / "dino_depth_plan_provider.py"
+    if not provider_path.is_file():
+        raise FileNotFoundError(f"planner provider file not found: {provider_path}")
+    path_digest = hashlib.sha256(str(provider_path).encode("utf-8")).hexdigest()[:16]
+    module_name = f"_fastwam_smoke_planner_provider_{path_digest}"
+    spec = importlib.util.spec_from_file_location(module_name, provider_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot create planner provider spec for {provider_path}")
+    provider = importlib.util.module_from_spec(spec)
+    had_previous = module_name in sys.modules
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = provider
+    try:
+        spec.loader.exec_module(provider)
+    except Exception as error:
+        if had_previous:
+            sys.modules[module_name] = previous
+        else:
+            sys.modules.pop(module_name, None)
+        raise ImportError(
+            f"failed to import planner provider from {provider_path}: {error}"
+        ) from error
+    return provider
 
 
 def validate_checkpoint(checkpoint_dir: str | Path) -> Path:
