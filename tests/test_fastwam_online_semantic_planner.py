@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -170,13 +171,63 @@ def _write_fake_provider(code_dir: Path) -> None:
     )
 
 
+def _write_fake_checkpoint(checkpoint_dir: Path, **metadata_overrides) -> None:
+    checkpoint_dir.mkdir(parents=True)
+    for name in (
+        "plan_head.pt",
+        "depth_head.pt",
+        "plan_token_embedding.pt",
+    ):
+        (checkpoint_dir / name).write_bytes(b"test")
+    for name in ("qwen3vl_lora_or_model", "processor"):
+        (checkpoint_dir / name).mkdir()
+    metadata = {
+        "sequence_length": 9,
+        "num_keyframes": 4,
+        "grid_size": 16,
+        "semantic_dim": 1024,
+        "target_tokens": 1024,
+        "keyframe_offsets": [2, 4, 6, 8],
+        "keyframe_scheme": "even_future",
+        "has_depth_head": True,
+        "depth_feature_dim": 1024,
+        "depth_grid_size": 16,
+        "shared_latent_per_keyframe": 32,
+        "private_latent_per_keyframe": 32,
+        "branch_latent_per_keyframe": 64,
+        "total_unique_latent_per_keyframe": 96,
+        "latent_len": 384,
+        "query_layout": "keyframe_major__shared_dino_private_depth_private",
+        "plan_head_type": "lingbot_dino",
+        "plan_head_num_heads": 16,
+        "plan_head_dropout": 0.0,
+        "sem_mlp_hidden_size": 0,
+        "planner_input_frame": "fastwam_current_multicamera_composite",
+        "token_order": "keyframe_major_row_major",
+        "mse_loss_weight": 1.0,
+        "cosine_loss_weight": 1.0,
+        "norm_loss_weight": 1.0,
+        "variance_loss_weight": 1.0,
+        "infonce_loss_weight": 1.0,
+        "infonce_temperature": 0.1,
+        "depth_loss_weight": 1.0,
+        "plan_token_ids": list(range(384)),
+        "plan_token_strings": [f"<|sem_plan_{index}|>" for index in range(384)],
+        "normalized_keyframe_times": [0.25, 0.5, 0.75, 1.0],
+    }
+    metadata.update(metadata_overrides)
+    (checkpoint_dir / "planner_meta.json").write_text(
+        json.dumps(metadata), encoding="utf-8"
+    )
+
+
 def test_loader_imports_provider_without_reusing_a_colliding_module(
     monkeypatch, tmp_path
 ):
     loader = _load_loader_module()
     code_dir = tmp_path / "planner/lingbot_dino_4b"
     checkpoint_dir = tmp_path / "checkpoint"
-    checkpoint_dir.mkdir()
+    _write_fake_checkpoint(checkpoint_dir)
     _write_fake_provider(code_dir)
     sentinel = types.ModuleType("fastwam_dino_depth_plan_provider")
     monkeypatch.setitem(sys.modules, "fastwam_dino_depth_plan_provider", sentinel)
@@ -202,7 +253,7 @@ def test_loader_preflight_reports_missing_paths_before_import(tmp_path, missing)
     if missing != "code":
         _write_fake_provider(code_dir)
     if missing != "checkpoint":
-        checkpoint_dir.mkdir()
+        _write_fake_checkpoint(checkpoint_dir)
 
     with pytest.raises(FileNotFoundError, match="online planner"):
         loader.validate_online_semantic_planner_paths(
@@ -215,7 +266,7 @@ def test_loader_wraps_external_import_failure_with_provider_path(tmp_path):
     code_dir = tmp_path / "planner/lingbot_dino_4b"
     checkpoint_dir = tmp_path / "checkpoint"
     code_dir.mkdir(parents=True)
-    checkpoint_dir.mkdir()
+    _write_fake_checkpoint(checkpoint_dir)
     module_path = code_dir / "dino_depth_plan_provider.py"
     module_path.write_text("raise RuntimeError('boom')\n", encoding="utf-8")
 
@@ -226,6 +277,93 @@ def test_loader_wraps_external_import_failure_with_provider_path(tmp_path):
             device="cpu",
             dtype=torch.float32,
         )
+
+
+def test_loader_isolates_same_named_siblings_and_restores_import_state(
+    monkeypatch, tmp_path
+):
+    loader = _load_loader_module()
+    checkpoint_dir = tmp_path / "checkpoint"
+    _write_fake_checkpoint(checkpoint_dir)
+    sibling_name = "fastwam_test_checkout_local_helper"
+    unrelated_name = "fastwam_test_new_unrelated_dependency"
+    preexisting = types.ModuleType(sibling_name)
+    preexisting.__file__ = str(tmp_path / "preexisting" / f"{sibling_name}.py")
+    preexisting.__path__ = [str(tmp_path / "preexisting" / sibling_name)]
+    preexisting_child = types.ModuleType(f"{sibling_name}.value")
+    preexisting_child.__file__ = str(
+        tmp_path / "preexisting" / sibling_name / "value.py"
+    )
+    preexisting_child.VALUE = "stale"
+    monkeypatch.setitem(sys.modules, sibling_name, preexisting)
+    monkeypatch.setitem(
+        sys.modules,
+        f"{sibling_name}.value",
+        preexisting_child,
+    )
+    monkeypatch.delitem(sys.modules, unrelated_name, raising=False)
+    original_sys_path = list(sys.path)
+
+    def write_checkout(checkout: Path, value: str) -> Path:
+        trainer_dir = checkout / "planner"
+        code_dir = trainer_dir / "lingbot_dino_4b"
+        code_dir.mkdir(parents=True)
+        package_dir = trainer_dir / sibling_name
+        package_dir.mkdir()
+        (package_dir / "__init__.py").write_text("", encoding="utf-8")
+        (package_dir / "value.py").write_text(
+            f"VALUE = {value!r}\n", encoding="utf-8"
+        )
+        (code_dir / "dino_depth_plan_provider.py").write_text(
+            "import sys\n"
+            "import types\n"
+            "class FrozenDinoDepthPlanProvider:\n"
+            "    @classmethod\n"
+            "    def from_checkpoint(cls, checkpoint_dir, *, device, dtype):\n"
+            f"        from {sibling_name} import value as sibling\n"
+            "        sys.path[:] = ['provider-mutated-path']\n"
+            f"        module = types.ModuleType({unrelated_name!r})\n"
+            f"        module.__file__ = {str(tmp_path / 'outside_dependency.py')!r}\n"
+            f"        sys.modules[{unrelated_name!r}] = module\n"
+            "        return sibling.VALUE\n",
+            encoding="utf-8",
+        )
+        return code_dir
+
+    first_code = write_checkout(tmp_path / "checkout_a", "first")
+    second_code = write_checkout(tmp_path / "checkout_b", "second")
+    try:
+        first = loader.load_online_semantic_planner(
+            code_dir=str(first_code),
+            checkpoint_dir=str(checkpoint_dir),
+            device="cpu",
+            dtype=torch.float32,
+        )
+        assert first == "first"
+        assert sys.path == original_sys_path
+        assert sys.modules[sibling_name] is preexisting
+        assert sys.modules[f"{sibling_name}.value"] is preexisting_child
+        assert sys.modules[unrelated_name].__file__.endswith(
+            "outside_dependency.py"
+        )
+
+        second = loader.load_online_semantic_planner(
+            code_dir=str(second_code),
+            checkpoint_dir=str(checkpoint_dir),
+            device="cpu",
+            dtype=torch.float32,
+        )
+        assert second == "second"
+        assert sys.path == original_sys_path
+        assert sys.modules[sibling_name] is preexisting
+        assert sys.modules[f"{sibling_name}.value"] is preexisting_child
+        assert not any(
+            name.startswith("_fastwam_online_planner_")
+            for name in sys.modules
+        )
+    finally:
+        sys.path[:] = original_sys_path
+        sys.modules.pop(unrelated_name, None)
 
 
 def test_training_calls_provider_once_with_current_normalized_rgb_and_raw_task(
@@ -271,6 +409,18 @@ def test_module_provider_is_outside_state_parameters_and_train_traversal(
     assert provider not in list(model.modules())
     assert not any("online_semantic_planner" in key for key in model.state_dict())
     assert not any("online_semantic_planner" in key for key in model.state_payload())
+
+    replacement = ModuleProvider()
+    model._online_semantic_planner = replacement
+    model.eval()
+    assert model._online_semantic_planner is replacement
+    assert replacement.training
+    assert replacement not in list(model.modules())
+    assert all(
+        parameter is not replacement.weight for parameter in model.parameters()
+    )
+    assert "_online_semantic_planner" not in model._modules
+    assert not any("online_semantic_planner" in key for key in model.state_dict())
 
 
 def test_online_and_offline_semantics_are_mutually_exclusive(cosmos_module):
@@ -371,14 +521,14 @@ def test_offline_semantic_tensors_are_strictly_validated(
 
 @pytest.mark.parametrize(
     "fps",
-        [
-            torch.ones(2, 1),
-            torch.tensor([5.0]),
-            torch.tensor([5.0, 0.0]),
-            torch.tensor([5.0, float("nan")]),
-            torch.tensor([True, True]),
-            True,
-        ],
+    [
+        torch.ones(2, 1),
+        torch.tensor([5.0]),
+        torch.tensor([5.0, 0.0]),
+        torch.tensor([5.0, float("nan")]),
+        torch.tensor([True, True]),
+        True,
+    ],
 )
 def test_video_fps_shape_and_values_are_strictly_validated(cosmos_module, fps):
     model = _make_model(cosmos_module, provider=_FakeProvider())
@@ -387,6 +537,17 @@ def test_video_fps_shape_and_values_are_strictly_validated(cosmos_module, fps):
 
     with pytest.raises(ValueError, match="video_fps"):
         model.training_loss(sample)
+
+
+def test_video_fps_must_be_uniform_within_a_batch(cosmos_module):
+    provider = _FakeProvider()
+    model = _make_model(cosmos_module, provider=provider)
+    sample = _training_sample()
+    sample["video_fps"] = torch.tensor([5.0, 4.0])
+
+    with pytest.raises(ValueError, match="uniform across the batch"):
+        model.training_loss(sample)
+    assert provider.calls == []
 
 
 def test_legacy_call_without_semantics_does_not_require_fps(cosmos_module):
@@ -440,7 +601,7 @@ def test_inference_routes_batched_image_instruction_and_fps_before_one_vae_encod
         input_image=image,
         context=torch.zeros(2, 2, 8),
         instruction=["open drawer", "pick mug"],
-        video_fps=torch.tensor([5.0, 4.0]),
+        video_fps=torch.tensor([5.0, 5.0]),
         action_horizon=3,
         num_inference_steps=1,
         rand_device="cpu",
@@ -452,7 +613,7 @@ def test_inference_routes_batched_image_instruction_and_fps_before_one_vae_encod
     assert len(vae_calls) == 1
     assert torch.equal(vae_calls[0], image.unsqueeze(2))
     assert result["action"].shape == (2, 3, 2)
-    assert torch.equal(model._current_video_fps, torch.tensor([5.0, 4.0]))
+    assert torch.equal(model._current_video_fps, torch.tensor([5.0, 5.0]))
 
 
 def test_online_inference_rejects_direct_offline_plan(cosmos_module):
@@ -516,7 +677,7 @@ def test_runtime_preflights_paths_and_exact_geometry_before_heavy_allocation(
     code_dir = tmp_path / "code"
     checkpoint_dir = tmp_path / "checkpoint"
     _write_fake_provider(code_dir)
-    checkpoint_dir.mkdir()
+    _write_fake_checkpoint(checkpoint_dir)
     with pytest.raises(ValueError, match="semantic_plan_context"):
         runtime.create_fastwam_cosmos(
             video_dit_pretrained_path="unused",
@@ -534,6 +695,62 @@ def test_runtime_preflights_paths_and_exact_geometry_before_heavy_allocation(
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    ("metadata_overrides", "message"),
+    [
+        ({"num_keyframes": 6}, "num_keyframes"),
+        (
+            {"normalized_keyframe_times": [0.2, 0.5, 0.75, 1.0]},
+            "normalized_keyframe_times",
+        ),
+        ({"shared_latent_per_keyframe": None}, "shared_latent_per_keyframe"),
+        ({"plan_token_strings": []}, "plan_token_strings"),
+    ],
+)
+def test_runtime_rejects_incomplete_or_incompatible_export_before_allocation(
+    monkeypatch, tmp_path, metadata_overrides, message
+):
+    runtime = importlib.import_module("fastwam.models.cosmos.runtime")
+    code_dir = tmp_path / "code"
+    _write_fake_provider(code_dir)
+    calls = []
+    monkeypatch.setattr(
+        runtime.CosmosVideoExpert,
+        "from_pretrained",
+        lambda **kwargs: calls.append(kwargs),
+    )
+    kwargs = {
+        "video_dit_pretrained_path": "unused",
+        "online_semantic_planner": True,
+        "online_semantic_planner_code_dir": str(code_dir),
+        "semantic_plan_context": True,
+        "semantic_plan_in_dim": 1024,
+        "semantic_plan_max_tokens": 1024,
+        "semantic_plan_num_keyframes": 4,
+        "semantic_plan_source_num_keyframes": 4,
+        "semantic_plan_spatial_grid": 16,
+        "device": "cpu",
+    }
+
+    incomplete = tmp_path / "incomplete"
+    incomplete.mkdir()
+    with pytest.raises(FileNotFoundError, match="plan_head.pt"):
+        runtime.create_fastwam_cosmos(
+            **kwargs,
+            online_semantic_planner_checkpoint=str(incomplete),
+        )
+    assert calls == []
+
+    incompatible = tmp_path / "incompatible"
+    _write_fake_checkpoint(incompatible, **metadata_overrides)
+    with pytest.raises(ValueError, match=message):
+        runtime.create_fastwam_cosmos(
+            **kwargs,
+            online_semantic_planner_checkpoint=str(incompatible),
+        )
+    assert calls == []
+
+
 @pytest.mark.parametrize("invalid", [1024.5, "1024", True])
 def test_runtime_rejects_coercible_but_non_integer_online_geometry(
     monkeypatch, tmp_path, invalid
@@ -542,7 +759,7 @@ def test_runtime_rejects_coercible_but_non_integer_online_geometry(
     code_dir = tmp_path / "code"
     checkpoint_dir = tmp_path / "checkpoint"
     _write_fake_provider(code_dir)
-    checkpoint_dir.mkdir()
+    _write_fake_checkpoint(checkpoint_dir)
     calls = []
     monkeypatch.setattr(
         runtime.CosmosVideoExpert,
@@ -591,7 +808,7 @@ def test_runtime_enables_fusion_and_passes_unregistered_provider(monkeypatch, tm
     code_dir = tmp_path / "planner/lingbot_dino_4b"
     checkpoint_dir = tmp_path / "checkpoint"
     _write_fake_provider(code_dir)
-    checkpoint_dir.mkdir()
+    _write_fake_checkpoint(checkpoint_dir)
     provider = object()
     capture = {}
 

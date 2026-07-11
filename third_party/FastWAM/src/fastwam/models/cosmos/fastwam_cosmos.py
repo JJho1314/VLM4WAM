@@ -29,6 +29,19 @@ logger = get_logger(__name__)
 
 
 class FastWAMCosmos(nn.Module):
+    def __setattr__(self, name, value):
+        if name == "_online_semantic_planner":
+            # This dependency is frozen runtime infrastructure even when a test or
+            # future implementation happens to subclass nn.Module. Keep replacement
+            # just as safe as constructor assignment.
+            for registry_name in ("_modules", "_parameters", "_buffers"):
+                registry = self.__dict__.get(registry_name)
+                if registry is not None:
+                    registry.pop(name, None)
+            object.__setattr__(self, name, value)
+            return
+        super().__setattr__(name, value)
+
     def __init__(
         self,
         video_expert,
@@ -328,6 +341,13 @@ class FastWAMCosmos(nn.Module):
             if not torch.isfinite(video_fps).all() or (video_fps <= 0).any():
                 raise ValueError(
                     "video_fps must contain finite positive values"
+                )
+            if video_fps.numel() > 1 and not torch.equal(
+                video_fps,
+                video_fps[:1].expand_as(video_fps),
+            ):
+                raise ValueError(
+                    "video_fps must be uniform across the batch for Cosmos"
                 )
 
         if has_online:
