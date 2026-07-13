@@ -15,21 +15,23 @@ from PIL import Image
 
 EXPECTED_METADATA = {
     "sequence_length": 9,
-    "num_keyframes": 4,
+    "num_keyframes": 1,
     "grid_size": 16,
     "semantic_dim": 1024,
-    "target_tokens": 1024,
-    "keyframe_offsets": [2, 4, 6, 8],
+    "target_tokens": 256,
+    "keyframe_offsets": [8],
     "keyframe_scheme": "even_future",
     "has_depth_head": True,
     "depth_feature_dim": 1024,
     "depth_grid_size": 16,
     "shared_latent_per_keyframe": 32,
     "private_latent_per_keyframe": 32,
-    "branch_latent_per_keyframe": 64,
-    "total_unique_latent_per_keyframe": 96,
-    "latent_len": 384,
-    "query_layout": ("keyframe_major__shared_dino_private_depth_private"),
+    "branch_latent_per_keyframe": 8,
+    "total_unique_latent_per_keyframe": 16,
+    "latent_len": 16,
+    "use_current_alignment": True,
+    "num_task_tokens": 8,
+    "query_layout": "current_8_then_future_8__dino_depth_shared_within_time",
     "plan_head_type": "lingbot_dino",
     "plan_head_num_heads": 16,
     "plan_head_dropout": 0.0,
@@ -46,6 +48,10 @@ REQUIRED_FINITE_NUMERIC_METADATA = (
     "infonce_loss_weight",
     "infonce_temperature",
     "depth_loss_weight",
+    "current_dino_loss_weight",
+    "future_dino_loss_weight",
+    "current_depth_loss_weight",
+    "future_depth_loss_weight",
 )
 
 
@@ -60,6 +66,8 @@ class PlannerContract:
     private_latent_per_keyframe: int
     branch_latent_per_keyframe: int
     total_unique_latent_per_keyframe: int
+    num_task_tokens: int
+    independent_modality_task_tokens: bool
     keyframe_offsets: tuple[int, ...]
     normalized_keyframe_times: tuple[float, ...]
     plan_token_strings: tuple[str, ...]
@@ -101,7 +109,46 @@ def _matches_expected_metadata_value(actual, expected) -> bool:
 
 def validate_planner_metadata(metadata: dict) -> PlannerContract:
     """Validate and freeze the exact planner geometry consumed by FastWAM."""
-    for field, expected in EXPECTED_METADATA.items():
+    independent = metadata.get("independent_modality_task_tokens", False)
+    if type(independent) is not bool:
+        raise ValueError(
+            "incompatible planner metadata field "
+            "independent_modality_task_tokens: expected a boolean, "
+            f"got {independent!r}"
+        )
+    num_task_tokens = metadata.get("num_task_tokens", 8)
+    if type(num_task_tokens) is not int or num_task_tokens <= 0:
+        raise ValueError(
+            "incompatible planner metadata field num_task_tokens: "
+            f"expected a positive integer, got {num_task_tokens!r}"
+        )
+    expected_metadata = dict(EXPECTED_METADATA)
+    expected_metadata.update(
+        {
+            "num_task_tokens": num_task_tokens,
+            "branch_latent_per_keyframe": num_task_tokens,
+            "total_unique_latent_per_keyframe": 2 * num_task_tokens,
+            "latent_len": 2 * num_task_tokens,
+            "query_layout": (
+                f"current_{num_task_tokens}_then_future_{num_task_tokens}__"
+                "dino_depth_shared_within_time"
+            ),
+        }
+    )
+    if independent:
+        expected_metadata.update(
+            {
+                "total_unique_latent_per_keyframe": 4 * num_task_tokens,
+                "latent_len": 4 * num_task_tokens,
+                "query_layout": (
+                    f"current_dino_{num_task_tokens}_then_"
+                    f"future_dino_{num_task_tokens}_then_"
+                    f"current_depth_{num_task_tokens}_then_"
+                    f"future_depth_{num_task_tokens}"
+                ),
+            }
+        )
+    for field, expected in expected_metadata.items():
         actual = metadata.get(field)
         if not _matches_expected_metadata_value(actual, expected):
             raise ValueError(
@@ -120,13 +167,13 @@ def validate_planner_metadata(metadata: dict) -> PlannerContract:
     plan_token_ids = metadata.get("plan_token_ids")
     if (
         not isinstance(plan_token_ids, list)
-        or len(plan_token_ids) != EXPECTED_METADATA["latent_len"]
+        or len(plan_token_ids) != expected_metadata["latent_len"]
         or any(type(token_id) is not int or token_id < 0 for token_id in plan_token_ids)
         or len(set(plan_token_ids)) != len(plan_token_ids)
     ):
         raise ValueError(
             "incompatible planner metadata field plan_token_ids: expected "
-            f"{EXPECTED_METADATA['latent_len']} unique non-negative integers, "
+            f"{expected_metadata['latent_len']} unique non-negative integers, "
             f"got {plan_token_ids!r}"
         )
 
@@ -152,7 +199,10 @@ def validate_planner_metadata(metadata: dict) -> PlannerContract:
             f"expected {expected_times!r}, got {actual_times!r}"
         )
 
-    expected_plan_tokens = tuple(f"<|sem_plan_{index}|>" for index in range(4 * 96))
+    expected_plan_tokens = tuple(
+        f"<|sem_plan_{index}|>"
+        for index in range(expected_metadata["latent_len"])
+    )
     raw_plan_tokens = metadata.get("plan_token_strings", ())
     try:
         actual_plan_tokens = tuple(raw_plan_tokens)
@@ -170,15 +220,21 @@ def validate_planner_metadata(metadata: dict) -> PlannerContract:
 
     return PlannerContract(
         sequence_length=9,
-        num_keyframes=4,
+        num_keyframes=1,
         grid_size=16,
         semantic_dim=1024,
-        target_tokens=1024,
+        target_tokens=256,
         shared_latent_per_keyframe=32,
         private_latent_per_keyframe=32,
-        branch_latent_per_keyframe=64,
-        total_unique_latent_per_keyframe=96,
-        keyframe_offsets=(2, 4, 6, 8),
+        branch_latent_per_keyframe=expected_metadata[
+            "branch_latent_per_keyframe"
+        ],
+        total_unique_latent_per_keyframe=expected_metadata[
+            "total_unique_latent_per_keyframe"
+        ],
+        num_task_tokens=num_task_tokens,
+        independent_modality_task_tokens=independent,
+        keyframe_offsets=(8,),
         normalized_keyframe_times=expected_times,
         plan_token_strings=expected_plan_tokens,
     )
@@ -190,6 +246,8 @@ def validate_checkpoint_files(checkpoint_dir: str | Path) -> Path:
     required_files = (
         "plan_head.pt",
         "depth_head.pt",
+        "current_plan_head.pt",
+        "current_depth_head.pt",
         "plan_token_embedding.pt",
         "planner_meta.json",
     )

@@ -24,15 +24,26 @@ head's weak per-token identity (low retrieval / small norm). Same SigLIP target 
 
 Kept flat (not in a subdir) because it reuses the sibling shared infra (`qwen3vl_wrapper`, SigLIP builder).
 
-### 3. lingbot-DINO · 4B  (new)
+### 3. lingbot-DINO · 4B  (current FastWAM configuration)
 Full lingbot-vla-v2 recipe: base = Qwen3-VL-4B **extracted from the open `robbyant/lingbot-vla-v2-6b`**;
 target = **DINO-video** (1024-d, 256 tokens/keyframe), not SigLIP; head = faithful `TaskTokenResampler`
-warm-started from lingbot's `future_video_align_head`; loss = plain MSE. Plan = 5 keyframes × 256 =
-[B, 1280, 1024]. Trainer `train_qwen3vl4b_lingbot_dino_planner.py` (flat, reuses the shared data infra);
-4B-specific modules + launcher live in `lingbot_dino_4b/`.
+warm-started from lingbot's alignment heads; loss = plain MSE. Trainer
+`train_qwen3vl4b_lingbot_dino_planner.py` is flat because it reuses the shared data infrastructure;
+4B-specific modules and launchers live in `lingbot_dino_4b/`.
+
+Qwen3-VL 4B LingBot FastWAM current configuration:
+- frames: current 0 and future 8 from a 9-frame sample
+- VLM queries: 4 independent groups × 64 = 256 tokens
+- outputs: current/future DINO and current/future depth, each 256 × 1024
+- distributed runtime: Accelerate + DeepSpeed ZeRO-2
+- preferred batch: 8 GPUs × 8/GPU × accumulation 2 = global 128
+- generic launcher: `lingbot_dino_4b/train_lingbot_dino_4b.sh`
+- POD profile: `lingbot_dino_4b/train_lingbot_fastwam_pod.sh`
+- HPC3 profile: `lingbot_dino_4b/train_lingbot_fastwam_hpc3.sbatch`
+
 ```bash
-DATASET_ROOT=<droid dataset> bash lingbot_dino_4b/train_lingbot_dino_4b.sh          # full (2 GPU)
-NUM_GPUS=1 BATCH_SIZE=1 MAX_STEPS=2 FULL_FINETUNE=0 DATASET_ROOT=<...> \
+DATASET_ROOT=<droid dataset> bash lingbot_dino_4b/train_lingbot_dino_4b.sh          # generic
+USE_DEEPSPEED=0 NUM_GPUS=1 BATCH_SIZE=1 GRAD_ACCUM=1 EXPECTED_GLOBAL_BATCH=1 MAX_STEPS=2 SAVE_STEPS=2 FULL_FINETUNE=0 DATASET_ROOT=<...> \
   bash lingbot_dino_4b/train_lingbot_dino_4b.sh                                     # smoke
 ```
 Validated on this box: teacher import/build (parent-stub bypass for transformers 5.x), VLM extraction
@@ -59,9 +70,11 @@ qwen3_vl_semantic_planner/
 ├── sbatch_train_qwen3vl2b_*.sh               # launchers (lines 1-2)
 └── lingbot_dino_4b/                          # line 3 modules (lingbot-DINO 4B)
     ├── lingbot_resampler.py                  # verbatim TaskTokenResampler port (warm-start key-compat)
-    ├── lingbot_dino_head.py                  # 5-keyframe head [B,1280,1024]
+    ├── lingbot_dino_head.py                  # current/future DINO + depth heads
     ├── dino_video_target.py                  # DINO-video teacher target encoder (parent-stub import bypass)
     ├── extract_qwenvl_from_lingbot.py        # extract stock Qwen3-VL-4B from the 6b ckpt
-    ├── train_lingbot_dino_4b.sh              # self-contained torchrun launcher
+    ├── train_lingbot_dino_4b.sh              # generic Accelerate + ZeRO-2 launcher
+    ├── train_lingbot_fastwam_pod.sh           # POD profile
+    ├── train_lingbot_fastwam_hpc3.sbatch      # HPC3 profile
     └── LINGBOT_DINO_SPEC.md                   # spec + swap plan
 ```

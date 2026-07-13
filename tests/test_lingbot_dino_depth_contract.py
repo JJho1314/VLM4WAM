@@ -560,6 +560,45 @@ def test_save_checkpoint_writes_depth_and_fastwam_contract(tmp_path):
     ]
 
 
+def test_save_checkpoint_writes_dynamic_64_token_independent_contract(tmp_path):
+    module = load_trainer_module()
+    wrapper = _make_checkpoint_wrapper(module)
+    wrapper.num_keyframes = 1
+    wrapper.target_len = 256
+    wrapper.branch_latent_per_keyframe = 64
+    wrapper.total_unique_latent_per_keyframe = 256
+    wrapper.num_latent_per_keyframe = 64
+    wrapper.latent_len = 256
+    wrapper.plan_token_ids = list(range(3, 259))
+    wrapper.use_current_alignment = True
+    wrapper.independent_modality_task_tokens = True
+    wrapper.num_task_tokens = 64
+    wrapper.current_plan_head = nn.Linear(8, 8)
+    wrapper.current_depth_head = nn.Linear(8, 8)
+    args = _make_checkpoint_args(num_keyframes=1)
+
+    module.save_checkpoint(
+        tmp_path,
+        64,
+        wrapper,
+        FakeProcessor(),
+        args,
+        rank=0,
+    )
+
+    metadata = json.loads(
+        (tmp_path / "step_000064/planner_meta.json").read_text()
+    )
+    assert metadata["num_task_tokens"] == 64
+    assert metadata["latent_len"] == 256
+    assert metadata["total_unique_latent_per_keyframe"] == 256
+    assert metadata["query_layout"] == (
+        "current_dino_64_then_future_dino_64_then_"
+        "current_depth_64_then_future_depth_64"
+    )
+    assert len(metadata["plan_token_strings"]) == 256
+
+
 def test_fastwam_planner_dataset_uses_composed_nine_frame_video():
     module = load_trainer_module()
     source_pixels = (
@@ -873,7 +912,6 @@ def test_main_preflights_fastwam_before_loading_qwen(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "parse_args", lambda: args)
     monkeypatch.setattr(module, "preflight_fastwam_data_config", fail_preflight)
     monkeypatch.setattr(module, "load_qwen3vl_model_and_processor", fail_model_load)
-    monkeypatch.setattr(module, "ddp_info", lambda: (0, 1, 0))
 
     with pytest.raises(ExpectedPreflightFailure, match="bad FastWAM config"):
         module.main()
@@ -899,6 +937,82 @@ def _fastwam_parser_argv(*extra: str) -> list[str]:
         "even_future",
         *extra,
     ]
+
+
+def test_gradient_checkpointing_is_opt_in_and_configures_model(monkeypatch):
+    module = load_trainer_module()
+    monkeypatch.setattr(sys, "argv", _fastwam_parser_argv())
+
+    args = module.parse_args()
+
+    assert args.gradient_checkpointing is False
+
+    class FakeModel:
+        def __init__(self):
+            self.events = []
+
+        def gradient_checkpointing_enable(self, **kwargs):
+            self.events.append(("enable", kwargs))
+
+        def gradient_checkpointing_disable(self):
+            self.events.append(("disable", {}))
+
+        def enable_input_require_grads(self):
+            self.events.append(("input_grads", {}))
+
+    disabled_model = FakeModel()
+    module.configure_gradient_checkpointing(disabled_model, enabled=False)
+    assert disabled_model.events == [("disable", {})]
+
+    enabled_model = FakeModel()
+    module.configure_gradient_checkpointing(enabled_model, enabled=True)
+    assert enabled_model.events == [
+        ("enable", {"gradient_checkpointing_kwargs": {"use_reentrant": False}}),
+        ("input_grads", {}),
+    ]
+
+
+def test_gradient_checkpointing_cli_flag_enables_opt_in(monkeypatch):
+    module = load_trainer_module()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        _fastwam_parser_argv("--gradient-checkpointing"),
+    )
+
+    assert module.parse_args().gradient_checkpointing is True
+
+
+def test_expected_global_batch_cli_defaults_to_unconstrained_and_accepts_128(monkeypatch):
+    module = load_trainer_module()
+    monkeypatch.setattr(sys, "argv", _fastwam_parser_argv())
+    assert module.parse_args().expected_global_batch == 0
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        _fastwam_parser_argv("--expected-global-batch", "128"),
+    )
+    assert module.parse_args().expected_global_batch == 128
+
+
+def test_independent_modality_task_token_cli_flag_is_opt_in(monkeypatch):
+    module = load_trainer_module()
+    monkeypatch.setattr(sys, "argv", _fastwam_parser_argv())
+    assert module.parse_args().independent_modality_task_tokens is False
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        _fastwam_parser_argv(
+            "--use-depth",
+            "--use-current-alignment",
+            "--num-keyframes",
+            "1",
+            "--independent-modality-task-tokens",
+        ),
+    )
+    assert module.parse_args().independent_modality_task_tokens is True
 
 
 def test_fastwam_parser_accepts_only_aligned_source_and_geometry(monkeypatch):
@@ -1027,28 +1141,6 @@ def test_fastwam_parser_rejects_misaligned_geometry(
     )
 
 
-def test_fastwam_launcher_pins_nine_frame_dual_branch_contract():
-    launcher = (
-        ROOT
-        / 'scripts/qwen3_vl_semantic_planner/lingbot_dino_4b'
-        / 'train_lingbot_dino_depth_fastwam_k4.sh'
-    ).read_text()
-    required_exports = (
-        'export USE_DEPTH=1',
-        'export SEQUENCE_LENGTH=9',
-        'export NUM_KEYFRAMES=4',
-        'export GRID_SIZE=16',
-        'export SEMANTIC_DIM=1024',
-        'export KEYFRAME_SCHEME=even_future',
-        'export SHARED_LATENT_PER_KEYFRAME=32',
-        'export PRIVATE_LATENT_PER_KEYFRAME=32',
-        'export FASTWAM_DATA_CONFIG=',
-    )
-    for export in required_exports:
-        assert export in launcher
-    assert 'train_lingbot_dino_4b.sh' in launcher
-
-
 def test_base_launcher_exposes_in_repo_fastwam_package():
     launcher = (
         ROOT
@@ -1081,6 +1173,10 @@ def _capture_base_launcher_args(tmp_path, *, cache, stats):
             "PY": str(fake_python),
             "FAKE_ARGS_FILE": str(captured),
             "NUM_GPUS": "1",
+            "USE_DEEPSPEED": "0",
+            "BATCH_SIZE": "1",
+            "GRAD_ACCUM": "1",
+            "EXPECTED_GLOBAL_BATCH": "1",
             "FULL_FINETUNE": "0",
             "HEAD_WARMSTART_CKPT": "",
             "DATASET_ROOT": "",
@@ -1173,6 +1269,43 @@ def test_fastwam_hydra_target_imports_in_launcher_python(tmp_path):
             ),
         ],
         cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+def test_fastwam_default_work_dir_is_created_before_stats_write(tmp_path):
+    fastwam_src = ROOT / "third_party/FastWAM/src"
+    starvla_python = Path("/data/LFT-W02_data/.conda/envs/starVLA/bin/python")
+    python = starvla_python if starvla_python.is_file() else Path(sys.executable)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(fastwam_src), env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+
+    result = subprocess.run(
+        [
+            str(python),
+            "-c",
+            (
+                "import importlib.machinery, sys, types; "
+                "from pathlib import Path; "
+                "boto3 = types.ModuleType('boto3'); "
+                "boto3.__spec__ = importlib.machinery.ModuleSpec("
+                "'boto3', loader=None); "
+                "sys.modules['boto3'] = boto3; "
+                "from fastwam.datasets.lerobot.robot_video_dataset "
+                "import _get_work_dir, save_dataset_stats_to_json; "
+                "work_dir = Path(_get_work_dir()); "
+                "assert work_dir.is_dir(), work_dir; "
+                "save_dataset_stats_to_json({'count': 1}, "
+                "work_dir / 'dataset_stats.json')"
+            ),
+        ],
+        cwd=tmp_path,
         env=env,
         capture_output=True,
         text=True,

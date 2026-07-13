@@ -72,6 +72,7 @@ class DinoVideoTargetEncoder(nn.Module):
 
         self.input_size = int(input_size)
         self.device = torch.device(device)
+        self.effective_fps = float(effective_fps)
         self.teacher = build_dino_video_teacher(
             {
                 "ckpt_path": str(ckpt_path),
@@ -96,6 +97,11 @@ class DinoVideoTargetEncoder(nn.Module):
             x = F.interpolate(x, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False)
         return x
 
+    def _normalize_video(self, video: torch.Tensor) -> torch.Tensor:
+        mean = self.mean.to(device=video.device, dtype=video.dtype)
+        std = self.std.to(device=video.device, dtype=video.dtype)
+        return (video - mean) / std
+
     @torch.no_grad()
     def encode_future_keyframes(
         self,
@@ -116,8 +122,30 @@ class DinoVideoTargetEncoder(nn.Module):
             clip = torch.stack([cur, cur, fut], dim=2)
             clips.append(clip)
         video = torch.cat(clips, dim=0)  # (B*K,3,3,S,S)
-        video = (video - self.mean) / self.std
+        video = self._normalize_video(video)
         feats = self.teacher.get_future_feature(video, current_index=1)  # (B*K, 256, 1024)
         tok, dim = feats.shape[1], feats.shape[2]
         feats = feats.view(k, b, tok, dim).permute(1, 0, 2, 3).reshape(b, k * tok, dim)
         return feats.detach()
+
+    @torch.no_grad()
+    def encode_current_and_future(
+        self,
+        current_b3hw: torch.Tensor,
+        future_b3hw: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode LingBot's exact ``[warmup=current,current,future]`` target clip.
+
+        Returns ``(current_patch, future_patch)``, each ``[B,256,1024]``.
+        """
+        current = self._prep(current_b3hw)
+        future = self._prep(future_b3hw)
+        video = torch.stack([current, current, future], dim=2)
+        video = self._normalize_video(video)
+        future_patch, current_patch = self.teacher.get_future_feature(
+            video,
+            return_current=True,
+            current_index=1,
+            fps=self.effective_fps,
+        )
+        return current_patch.detach(), future_patch.detach()

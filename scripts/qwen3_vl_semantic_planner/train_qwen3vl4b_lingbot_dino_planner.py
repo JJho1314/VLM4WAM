@@ -37,12 +37,10 @@ if _local_rank is not None:
             os.environ[_cache_var] = os.path.join(_base, f"rank{_local_rank}")
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from qwen3vl_wrapper import load_qwen3vl_model_and_processor, move_qwen_inputs_to_device
@@ -53,21 +51,41 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lin
 from lingbot_dino_head import LingbotDinoPlanHead  # noqa: E402
 from dino_video_target import DinoVideoTargetEncoder  # noqa: E402
 from depth_target import DepthTargetEncoder  # noqa: E402
+from distributed_runtime import (  # noqa: E402
+    accumulation_context,
+    build_accelerator,
+    checkpoint_module,
+    is_deepspeed,
+    is_optimizer_update,
+    validate_runtime_contract,
+)
 
 
 def _load_lingbot_head_state(src_6b_dir: Path) -> dict:
-    """Stream the future-video AND future-depth align heads + query tensors from a lingbot-vla-v2 6b
-    checkpoint (one dict warm-starts both heads; each head picks its own keys by marker)."""
+    """Stream all LingBot current/future DINO/depth alignment heads and queries."""
     from collections import defaultdict
 
     from safetensors import safe_open
 
     src = Path(src_6b_dir)
     index = json.loads((src / "model.safetensors.index.json").read_text())["weight_map"]
+    head_names = (
+        "current_video_align_head",
+        "future_video_align_head",
+        "depth_align_head",
+        "future_depth_align_head",
+    )
+    query_names = (
+        "current_video_align_embs",
+        "future_video_align_embs",
+        "depth_align_embs",
+        "future_depth_align_embs",
+    )
     want = [
-        k for k in index
-        if any(m in k for m in ("future_video_align_head.", "future_depth_align_head."))
-        or k.endswith(("future_video_align_embs", "future_depth_align_embs"))
+        key
+        for key in index
+        if any(f"{name}." in key for name in head_names)
+        or key.endswith(query_names)
     ]
     by_file: dict[str, list[str]] = defaultdict(list)
     for k in want:
@@ -87,6 +105,22 @@ def _positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError(f"expected a positive integer, got {value}")
     return parsed
+
+
+def configure_gradient_checkpointing(model: nn.Module, *, enabled: bool) -> None:
+    if not enabled:
+        if hasattr(model, "gradient_checkpointing_disable"):
+            model.gradient_checkpointing_disable()
+        return
+    if hasattr(model, "gradient_checkpointing_enable"):
+        try:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            model.gradient_checkpointing_enable()
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
 
 
 def parse_args() -> argparse.Namespace:
@@ -131,6 +165,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--semantic-dim", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum", type=int, default=8)
+    parser.add_argument("--expected-global-batch", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--head-lr", type=float, default=1e-4)
@@ -150,6 +185,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depth-grid-size", type=int, default=16, help="depth teacher token grid side (16 -> 256)")
     parser.add_argument("--depth-dim", type=int, default=1024, help="MoRGBD feature dim")
     parser.add_argument("--depth-loss-weight", type=float, default=0.004, help="lingbot future_depth_loss_weight")
+    parser.add_argument(
+        "--use-current-alignment",
+        action="store_true",
+        help="LingBot-native current+one-future DINO/depth alignment",
+    )
+    parser.add_argument(
+        "--independent-modality-task-tokens",
+        action="store_true",
+        help=(
+            "use four private --num-task-tokens groups for current/future DINO/depth "
+            "instead of sharing one group between modalities"
+        ),
+    )
+    parser.add_argument("--num-task-tokens", type=_positive_int, default=8)
+    parser.add_argument("--current-dino-loss-weight", type=float, default=0.004)
+    parser.add_argument("--future-dino-loss-weight", type=float, default=0.004)
+    parser.add_argument("--current-depth-loss-weight", type=float, default=0.004)
+    parser.add_argument("--future-depth-loss-weight", type=float, default=0.004)
     parser.add_argument(
         "--head-warmstart-ckpt", type=Path, default=None,
         help="lingbot-vla-v2-6b dir: warm-start the head from future_video_align_head.*",
@@ -183,13 +236,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--full-finetune", action="store_true")
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help="enable non-reentrant gradient checkpointing (disabled by default)",
+    )
     parser.add_argument("--freeze-vision", action="store_true", default=True)
     parser.add_argument("--no-freeze-vision", action="store_false", dest="freeze_vision")
     parser.add_argument("--freeze-lm-head", action="store_true", default=True)
     parser.add_argument("--no-freeze-lm-head", action="store_false", dest="freeze_lm_head")
     parser.add_argument("--train-plan-token-embedding", action="store_true", default=True)
     parser.add_argument("--no-train-plan-token-embedding", action="store_false", dest="train_plan_token_embedding")
-    parser.add_argument("--ddp-find-unused-parameters", action="store_true")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--save-steps", type=int, default=500)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -228,27 +285,35 @@ def parse_args() -> argparse.Namespace:
             )
         except ValueError as error:
             parser.error(f"invalid FastWAM keyframe geometry: {error}")
+        expected_keyframes = 1 if args.use_current_alignment else 4
+        expected_offsets = [8] if args.use_current_alignment else [2, 4, 6, 8]
         if (
             args.sequence_length != 9
-            or args.num_keyframes != 4
-            or offsets != [2, 4, 6, 8]
+            or args.num_keyframes != expected_keyframes
+            or offsets != expected_offsets
         ):
             parser.error(
                 "FastWAM planner training requires sequence_length=9, "
-                "num_keyframes=4, and keyframe offsets [2, 4, 6, 8]"
+                f"num_keyframes={expected_keyframes}, and keyframe offsets "
+                f"{expected_offsets}"
             )
+    loss_weights = (
+        args.current_dino_loss_weight,
+        args.future_dino_loss_weight,
+        args.current_depth_loss_weight,
+        args.future_depth_loss_weight,
+    )
+    if any(not math.isfinite(weight) or weight < 0 for weight in loss_weights):
+        parser.error("current/future alignment loss weights must be finite and non-negative")
+    if args.use_current_alignment and not (
+        args.plan_head_type == "lingbot_dino" and args.use_depth
+    ):
+        parser.error("--use-current-alignment requires --plan-head-type lingbot_dino --use-depth")
+    if args.independent_modality_task_tokens and not args.use_current_alignment:
+        parser.error(
+            "--independent-modality-task-tokens requires --use-current-alignment"
+        )
     return args
-
-
-def ddp_info() -> tuple[int, int, int]:
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        rank = int(os.environ["RANK"])
-        world = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        dist.init_process_group("nccl")
-        torch.cuda.set_device(local_rank)
-        return rank, world, local_rank
-    return 0, 1, 0
 
 
 def is_main(rank: int) -> bool:
@@ -607,11 +672,15 @@ def preflight_fastwam_data_config(
 
 
 class FastWAMOnlinePlannerDataset(Dataset):
-    offsets = [2, 4, 6, 8]
-
-    def __init__(self, dataset, max_samples: int = 0):
+    def __init__(
+        self,
+        dataset,
+        max_samples: int = 0,
+        offsets: Sequence[int] | None = None,
+    ):
         self.dataset = dataset
         self.max_samples = int(max_samples)
+        self.offsets = [int(offset) for offset in (offsets or [2, 4, 6, 8])]
 
     @classmethod
     def from_config(
@@ -622,6 +691,7 @@ class FastWAMOnlinePlannerDataset(Dataset):
         text_embedding_cache_dir: Path | None = None,
         pretrained_norm_stats: Path | None = None,
         max_samples: int = 0,
+        offsets: Sequence[int] | None = None,
     ):
         from hydra.utils import instantiate
 
@@ -632,11 +702,16 @@ class FastWAMOnlinePlannerDataset(Dataset):
             pretrained_norm_stats=pretrained_norm_stats,
         )
         dataset = instantiate(root_config.data.train)
-        return cls(dataset, max_samples=max_samples)
+        return cls(dataset, max_samples=max_samples, offsets=offsets)
 
     @classmethod
-    def from_dataset(cls, dataset, max_samples: int = 0):
-        return cls(dataset, max_samples=max_samples)
+    def from_dataset(
+        cls,
+        dataset,
+        max_samples: int = 0,
+        offsets: Sequence[int] | None = None,
+    ):
+        return cls(dataset, max_samples=max_samples, offsets=offsets)
 
     def __len__(self):
         size = len(self.dataset)
@@ -941,6 +1016,13 @@ class PlannerWrapper(nn.Module):
         depth_loss_weight: float = 0.004,
         shared_latent_per_keyframe: int = 32,
         private_latent_per_keyframe: int = 32,
+        use_current_alignment: bool = False,
+        independent_modality_task_tokens: bool = False,
+        num_task_tokens: int = 8,
+        current_dino_loss_weight: float = 0.004,
+        future_dino_loss_weight: float = 0.004,
+        current_depth_loss_weight: float = 0.004,
+        future_depth_loss_weight: float = 0.004,
     ) -> None:
         super().__init__()
         if sem_mlp_hidden_size < 0:
@@ -956,6 +1038,15 @@ class PlannerWrapper(nn.Module):
         self.plan_head_num_heads = int(plan_head_num_heads)
         self.plan_head_dropout = float(plan_head_dropout)
         self.num_keyframes = int(num_keyframes)
+        self.use_current_alignment = bool(use_current_alignment)
+        self.independent_modality_task_tokens = bool(
+            independent_modality_task_tokens
+        )
+        self.num_task_tokens = int(num_task_tokens)
+        self.current_dino_loss_weight = float(current_dino_loss_weight)
+        self.future_dino_loss_weight = float(future_dino_loss_weight)
+        self.current_depth_loss_weight = float(current_depth_loss_weight)
+        self.future_depth_loss_weight = float(future_depth_loss_weight)
         self.shared_latent_per_keyframe = int(shared_latent_per_keyframe)
         self.private_latent_per_keyframe = int(private_latent_per_keyframe)
         self.branch_latent_per_keyframe = (
@@ -965,17 +1056,32 @@ class PlannerWrapper(nn.Module):
             self.shared_latent_per_keyframe + 2 * self.private_latent_per_keyframe
         )
         self.use_depth = bool(use_depth) and plan_head_type == "lingbot_dino"
-        if self.use_depth and (
+        if self.use_current_alignment and not self.use_depth:
+            raise ValueError("current alignment requires lingbot_dino with depth")
+        if self.use_current_alignment and self.num_keyframes != 1:
+            raise ValueError("current alignment predicts exactly one future keyframe")
+        if self.independent_modality_task_tokens and not self.use_current_alignment:
+            raise ValueError(
+                "independent modality task tokens require current alignment"
+            )
+        if self.use_depth and not self.use_current_alignment and (
             self.shared_latent_per_keyframe <= 0 or self.private_latent_per_keyframe <= 0
         ):
             raise ValueError(
                 "DINO+depth mode requires positive shared/private latent counts"
             )
-        self.num_latent_per_keyframe = (
-            self.branch_latent_per_keyframe
-            if self.use_depth
-            else int(num_latent_per_keyframe)
-        )
+        if getattr(self, "use_current_alignment", False):
+            self.branch_latent_per_keyframe = self.num_task_tokens
+            self.total_unique_latent_per_keyframe = (
+                4 if self.independent_modality_task_tokens else 2
+            ) * self.num_task_tokens
+            self.num_latent_per_keyframe = self.num_task_tokens
+        else:
+            self.num_latent_per_keyframe = (
+                self.branch_latent_per_keyframe
+                if self.use_depth
+                else int(num_latent_per_keyframe)
+            )
         # target_len = tokens the loss regresses (dense SigLIP grid). latent_len = <|sem_plan|>
         # tokens the LM actually emits. They differ only for the CoVT bottleneck head.
         self.target_len = int(target_len)
@@ -1008,9 +1114,14 @@ class PlannerWrapper(nn.Module):
             # (warm-startable from future_video_align_head) run per keyframe. grid_size**2 = the DINO
             # patch-token count per keyframe (16**2 = 256). semantic_dim is the DINO dim (1024).
             self.latent_len = (
-                self.num_keyframes * self.total_unique_latent_per_keyframe
-                if self.use_depth
-                else self.num_keyframes * self.num_latent_per_keyframe
+                (4 if self.independent_modality_task_tokens else 2)
+                * self.num_task_tokens
+                if self.use_current_alignment
+                else (
+                    self.num_keyframes * self.total_unique_latent_per_keyframe
+                    if self.use_depth
+                    else self.num_keyframes * self.num_latent_per_keyframe
+                )
             )
             self.plan_head = LingbotDinoPlanHead(
                 num_keyframes=num_keyframes,
@@ -1026,10 +1137,27 @@ class PlannerWrapper(nn.Module):
         # context and regressing LingBot-Depth features (MoGe-2 -> MoRGBD) with smooth_L1.
         self.depth_loss_weight = float(depth_loss_weight)
         self.depth_head = None
+        self.current_plan_head = None
+        self.current_depth_head = None
         if self.use_depth:
             self.depth_head = LingbotDinoPlanHead(
                 num_keyframes=num_keyframes,
                 num_latent_per_keyframe=self.branch_latent_per_keyframe,
+                num_backbone_tokens=int(depth_grid_size) * int(depth_grid_size),
+                llm_hidden=hidden_size,
+                dim_out=depth_dim,
+            )
+        if getattr(self, "use_current_alignment", False):
+            self.current_plan_head = LingbotDinoPlanHead(
+                num_keyframes=1,
+                num_latent_per_keyframe=self.num_task_tokens,
+                num_backbone_tokens=int(grid_size) * int(grid_size),
+                llm_hidden=hidden_size,
+                dim_out=semantic_dim,
+            )
+            self.current_depth_head = LingbotDinoPlanHead(
+                num_keyframes=1,
+                num_latent_per_keyframe=self.num_task_tokens,
                 num_backbone_tokens=int(depth_grid_size) * int(depth_grid_size),
                 llm_hidden=hidden_size,
                 dim_out=depth_dim,
@@ -1082,6 +1210,15 @@ class PlannerWrapper(nn.Module):
             depth_dim=int(metadata["depth_feature_dim"]),
             depth_grid_size=int(metadata["depth_grid_size"]),
             depth_loss_weight=float(metadata["depth_loss_weight"]),
+            use_current_alignment=bool(metadata.get("use_current_alignment", False)),
+            independent_modality_task_tokens=bool(
+                metadata.get("independent_modality_task_tokens", False)
+            ),
+            num_task_tokens=int(metadata.get("num_task_tokens", 8)),
+            current_dino_loss_weight=float(metadata.get("current_dino_loss_weight", 0.004)),
+            future_dino_loss_weight=float(metadata.get("future_dino_loss_weight", 0.004)),
+            current_depth_loss_weight=float(metadata.get("current_depth_loss_weight", 0.004)),
+            future_depth_loss_weight=float(metadata.get("future_depth_loss_weight", 0.004)),
         )
         wrapper.plan_head.load_state_dict(
             torch.load(
@@ -1099,6 +1236,23 @@ class PlannerWrapper(nn.Module):
             ),
             strict=True,
         )
+        if wrapper.use_current_alignment:
+            wrapper.current_plan_head.load_state_dict(
+                torch.load(
+                    checkpoint_dir / "current_plan_head.pt",
+                    map_location="cpu",
+                    weights_only=True,
+                ),
+                strict=True,
+            )
+            wrapper.current_depth_head.load_state_dict(
+                torch.load(
+                    checkpoint_dir / "current_depth_head.pt",
+                    map_location="cpu",
+                    weights_only=True,
+                ),
+                strict=True,
+            )
         plan_embedding = torch.load(
             checkpoint_dir / "plan_token_embedding.pt",
             map_location="cpu",
@@ -1210,6 +1364,76 @@ class PlannerWrapper(nn.Module):
             ),
         )
 
+    def split_current_future_task_hidden(
+        self,
+        plan_hidden: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        expected = 2 * int(self.num_task_tokens)
+        if plan_hidden.ndim != 3 or plan_hidden.shape[1] != expected:
+            raise RuntimeError(
+                f"expected {expected} current/future task tokens, got "
+                f"{tuple(plan_hidden.shape)}"
+            )
+        return (
+            plan_hidden[:, : self.num_task_tokens],
+            plan_hidden[:, self.num_task_tokens :],
+        )
+
+    def split_independent_current_future_task_hidden(
+        self,
+        plan_hidden: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        expected = 4 * int(self.num_task_tokens)
+        if plan_hidden.ndim != 3 or plan_hidden.shape[1] != expected:
+            raise RuntimeError(
+                f"expected {expected} independent modality task tokens, got "
+                f"{tuple(plan_hidden.shape)}"
+            )
+        width = self.num_task_tokens
+        return {
+            "current_dino": plan_hidden[:, 0 * width : 1 * width],
+            "future_dino": plan_hidden[:, 1 * width : 2 * width],
+            "current_depth": plan_hidden[:, 2 * width : 3 * width],
+            "future_depth": plan_hidden[:, 3 * width : 4 * width],
+        }
+
+    def compute_current_future_losses(
+        self,
+        plans: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        required = {
+            "current_dino",
+            "future_dino",
+            "current_depth",
+            "future_depth",
+        }
+        missing = sorted(required.difference(plans) | required.difference(targets))
+        if missing:
+            raise ValueError(f"missing current/future plan loss tensors: {missing}")
+        current_dino = F.mse_loss(plans["current_dino"], targets["current_dino"])
+        future_dino = F.mse_loss(plans["future_dino"], targets["future_dino"])
+        current_depth = F.smooth_l1_loss(
+            plans["current_depth"], targets["current_depth"]
+        )
+        future_depth = F.smooth_l1_loss(
+            plans["future_depth"], targets["future_depth"]
+        )
+        weighted = {
+            "current_dino_weighted": self.current_dino_loss_weight * current_dino,
+            "future_dino_weighted": self.future_dino_loss_weight * future_dino,
+            "current_depth_weighted": self.current_depth_loss_weight * current_depth,
+            "future_depth_weighted": self.future_depth_loss_weight * future_depth,
+        }
+        return {
+            "loss": sum(weighted.values()),
+            "current_dino_mse": current_dino.detach(),
+            "future_dino_mse": future_dino.detach(),
+            "current_depth_smooth_l1": current_depth.detach(),
+            "future_depth_smooth_l1": future_depth.detach(),
+            **{name: value.detach() for name, value in weighted.items()},
+        }
+
     def predict_dino_depth_plan(
         self,
         **model_inputs: Any,
@@ -1222,6 +1446,9 @@ class PlannerWrapper(nn.Module):
             raise RuntimeError(
                 "DINO+depth prediction requires a configured depth head"
             )
+        if getattr(self, "use_current_alignment", False):
+            plans = self.predict_current_future_plans(**model_inputs)
+            return plans["future_dino"], plans["future_depth"]
         image_hidden, plan_hidden = self._forward_hiddens(**model_inputs)
         dino_hidden, depth_hidden = self.split_lingbot_query_hidden(plan_hidden)
         dino_dtype = next(self.plan_head.parameters()).dtype
@@ -1241,7 +1468,49 @@ class PlannerWrapper(nn.Module):
             )
         return dino_plan, depth_plan
 
+    def predict_current_future_plans(
+        self,
+        **model_inputs: Any,
+    ) -> dict[str, torch.Tensor]:
+        if not self.use_current_alignment:
+            raise RuntimeError("current/future prediction requires current alignment mode")
+        if self.current_plan_head is None or self.current_depth_head is None:
+            raise RuntimeError("current alignment heads are not configured")
+        image_hidden, task_hidden = self._forward_hiddens(**model_inputs)
+        if self.independent_modality_task_tokens:
+            hidden_by_branch = self.split_independent_current_future_task_hidden(
+                task_hidden
+            )
+        else:
+            current_hidden, future_hidden = self.split_current_future_task_hidden(
+                task_hidden
+            )
+            hidden_by_branch = {
+                "current_dino": current_hidden,
+                "future_dino": future_hidden,
+                "current_depth": current_hidden,
+                "future_depth": future_hidden,
+            }
+        heads_and_hiddens = {
+            "current_dino": (self.current_plan_head, hidden_by_branch["current_dino"]),
+            "future_dino": (self.plan_head, hidden_by_branch["future_dino"]),
+            "current_depth": (self.current_depth_head, hidden_by_branch["current_depth"]),
+            "future_depth": (self.depth_head, hidden_by_branch["future_depth"]),
+        }
+        plans = {}
+        for name, (head, hidden) in heads_and_hiddens.items():
+            head_dtype = next(head.parameters()).dtype
+            plans[name] = head(
+                image_hidden.to(dtype=head_dtype),
+                hidden.to(dtype=head_dtype),
+            ).float()
+        return plans
+
     def predict_semantic_plan(self, **inputs: Any) -> torch.Tensor:
+        if self.plan_head_type == "lingbot_dino" and getattr(
+            self, "use_current_alignment", False
+        ):
+            return self.predict_current_future_plans(**inputs)["future_dino"]
         image_hidden, plan_hidden = self._forward_hiddens(**inputs)
         head_dtype = next(self.plan_head.parameters()).dtype
         if self.plan_head_type == "lingbot_dino":
@@ -1312,12 +1581,49 @@ class PlannerWrapper(nn.Module):
         self,
         semantic_plan_labels: torch.Tensor,
         depth_plan_labels: torch.Tensor | None = None,
+        current_dino_labels: torch.Tensor | None = None,
+        current_depth_labels: torch.Tensor | None = None,
         **inputs: Any,
     ) -> dict[str, torch.Tensor]:
         batch, target_len, _ = semantic_plan_labels.shape
         if target_len != self.target_len:
             raise RuntimeError(f"Batch has {target_len} target tokens, wrapper expects {self.target_len}")
         if self.plan_head_type == "lingbot_dino":
+            if getattr(self, "use_current_alignment", False):
+                if current_dino_labels is None or current_depth_labels is None:
+                    raise ValueError(
+                        "current alignment requires current DINO and depth labels"
+                    )
+                if depth_plan_labels is None:
+                    raise ValueError("current alignment requires future depth labels")
+                plans = self.predict_current_future_plans(**inputs)
+                targets = {
+                    "current_dino": current_dino_labels.to(
+                        device=plans["current_dino"].device, dtype=torch.float32
+                    ),
+                    "future_dino": semantic_plan_labels.to(
+                        device=plans["future_dino"].device, dtype=torch.float32
+                    ),
+                    "current_depth": current_depth_labels.to(
+                        device=plans["current_depth"].device, dtype=torch.float32
+                    ),
+                    "future_depth": depth_plan_labels.to(
+                        device=plans["future_depth"].device, dtype=torch.float32
+                    ),
+                }
+                out = self.compute_current_future_losses(plans, targets)
+                with torch.no_grad():
+                    for name in (
+                        "current_dino",
+                        "future_dino",
+                        "current_depth",
+                        "future_depth",
+                    ):
+                        out[f"{name}_norm_ratio"] = (
+                            plans[name].norm(dim=-1).mean()
+                            / targets[name].norm(dim=-1).mean().clamp_min(1e-6)
+                        ).detach()
+                return out
             # One VLM forward feeds BOTH the video head and (optionally) the auxiliary depth head.
             image_hidden, plan_hidden = self._forward_hiddens(**inputs)
             dino_hidden = plan_hidden
@@ -1399,16 +1705,22 @@ def register_plan_rows_hook(param: nn.Parameter, row_ids: list[int]) -> None:
 
 
 def build_optimizer(wrapper: PlannerWrapper, args: argparse.Namespace) -> torch.optim.Optimizer:
-    head_params = [p for p in wrapper.plan_head.parameters() if p.requires_grad]
-    if getattr(wrapper, "depth_head", None) is not None:
-        # the auxiliary depth head trains at head_lr alongside plan_head (both are fresh-ish resamplers)
-        head_params += [p for p in wrapper.depth_head.parameters() if p.requires_grad]
+    head_names = (
+        "plan_head",
+        "depth_head",
+        "current_plan_head",
+        "current_depth_head",
+    )
+    head_params = []
+    for name in head_names:
+        head = getattr(wrapper, name, None)
+        if head is not None:
+            head_params.extend(p for p in head.parameters() if p.requires_grad)
     other_params = [
         p
         for n, p in wrapper.named_parameters()
         if p.requires_grad
-        and not n.startswith("plan_head.")
-        and not n.startswith("depth_head.")
+        and not any(n.startswith(f"{name}.") for name in head_names)
     ]
     groups = []
     if other_params:
@@ -1514,8 +1826,19 @@ def validate_fastwam_export_contract(
         "unique_plan_token_count": unique_plan_token_count,
         "plan_head_type": getattr(module, "plan_head_type", None),
         "has_depth_head": getattr(module, "depth_head", None) is not None,
+        "use_current_alignment": bool(
+            getattr(module, "use_current_alignment", False)
+        ),
+        "num_task_tokens": getattr(module, "num_task_tokens", 8),
+        "has_current_plan_head": getattr(module, "current_plan_head", None)
+        is not None,
+        "has_current_depth_head": getattr(module, "current_depth_head", None)
+        is not None,
+        "independent_modality_task_tokens": bool(
+            getattr(module, "independent_modality_task_tokens", False)
+        ),
     }
-    expected = {
+    legacy_expected = {
         "use_depth": True,
         "sequence_length": 9,
         "num_keyframes": 4,
@@ -1537,7 +1860,62 @@ def validate_fastwam_export_contract(
         "unique_plan_token_count": 384,
         "plan_head_type": "lingbot_dino",
         "has_depth_head": True,
+        "use_current_alignment": False,
+        "num_task_tokens": 8,
+        "has_current_plan_head": False,
+        "has_current_depth_head": False,
+        "independent_modality_task_tokens": False,
     }
+    configured_task_tokens = actual["num_task_tokens"]
+    expected_task_tokens = (
+        configured_task_tokens
+        if type(configured_task_tokens) is int and configured_task_tokens > 0
+        else 8
+    )
+    current_expected = {
+        "use_depth": True,
+        "sequence_length": 9,
+        "num_keyframes": 1,
+        "wrapper_num_keyframes": 1,
+        "keyframe_scheme": "even_future",
+        "keyframe_offsets": [8],
+        "grid_size": 16,
+        "semantic_dim": 1024,
+        "depth_grid_size": 16,
+        "depth_dim": 1024,
+        "target_len": 256,
+        "shared_latent_per_keyframe": 32,
+        "private_latent_per_keyframe": 32,
+        "branch_latent_per_keyframe": expected_task_tokens,
+        "total_unique_latent_per_keyframe": 2 * expected_task_tokens,
+        "num_latent_per_keyframe": expected_task_tokens,
+        "latent_len": 2 * expected_task_tokens,
+        "plan_token_count": 2 * expected_task_tokens,
+        "unique_plan_token_count": 2 * expected_task_tokens,
+        "plan_head_type": "lingbot_dino",
+        "has_depth_head": True,
+        "use_current_alignment": True,
+        "num_task_tokens": expected_task_tokens,
+        "has_current_plan_head": True,
+        "has_current_depth_head": True,
+        "independent_modality_task_tokens": False,
+    }
+    independent_current_expected = {
+        **current_expected,
+        "total_unique_latent_per_keyframe": 4 * expected_task_tokens,
+        "latent_len": 4 * expected_task_tokens,
+        "plan_token_count": 4 * expected_task_tokens,
+        "unique_plan_token_count": 4 * expected_task_tokens,
+        "independent_modality_task_tokens": True,
+    }
+    if actual["use_current_alignment"]:
+        expected = (
+            independent_current_expected
+            if actual["independent_modality_task_tokens"]
+            else current_expected
+        )
+    else:
+        expected = legacy_expected
     mismatches = [
         f"{name}={actual[name]!r} (expected {expected_value!r})"
         for name, expected_value in expected.items()
@@ -1553,19 +1931,21 @@ def validate_fastwam_export_contract(
 def save_checkpoint(
     output_dir: Path,
     step: int,
-    wrapper: PlannerWrapper | DDP,
+    wrapper: PlannerWrapper,
     processor: Any,
     args: argparse.Namespace,
     rank: int,
 ) -> None:
     if not is_main(rank):
         return
-    module = wrapper.module if isinstance(wrapper, DDP) else wrapper
+    module = wrapper
     fastwam_data_config = getattr(args, "fastwam_data_config", None)
     fastwam_offsets = None
     if fastwam_data_config is not None:
         fastwam_offsets = validate_fastwam_export_contract(module, args)
     depth_head = getattr(module, "depth_head", None)
+    current_plan_head = getattr(module, "current_plan_head", None)
+    current_depth_head = getattr(module, "current_depth_head", None)
     ckpt = output_dir / f"step_{step:06d}"
     ckpt.mkdir(parents=True, exist_ok=True)
     module.model.save_pretrained(ckpt / "qwen3vl_lora_or_model")
@@ -1573,6 +1953,10 @@ def save_checkpoint(
     torch.save(module.plan_head.state_dict(), ckpt / "plan_head.pt")
     if depth_head is not None:
         torch.save(depth_head.state_dict(), ckpt / "depth_head.pt")
+    if current_plan_head is not None:
+        torch.save(current_plan_head.state_dict(), ckpt / "current_plan_head.pt")
+    if current_depth_head is not None:
+        torch.save(current_depth_head.state_dict(), ckpt / "current_depth_head.pt")
     plan_ids = torch.as_tensor(module.plan_token_ids)
     plan_embedding = module.model.get_input_embeddings().weight[plan_ids].detach().cpu()
     torch.save(plan_embedding, ckpt / "plan_token_embedding.pt")
@@ -1644,6 +2028,25 @@ def save_checkpoint(
             ),
             "depth_grid_size": int(args.depth_grid_size),
             "depth_loss_weight": float(module.depth_loss_weight),
+            "use_current_alignment": bool(
+                getattr(module, "use_current_alignment", False)
+            ),
+            "num_task_tokens": int(getattr(module, "num_task_tokens", 8)),
+            "independent_modality_task_tokens": bool(
+                getattr(module, "independent_modality_task_tokens", False)
+            ),
+            "current_dino_loss_weight": float(
+                getattr(module, "current_dino_loss_weight", 0.004)
+            ),
+            "future_dino_loss_weight": float(
+                getattr(module, "future_dino_loss_weight", 0.004)
+            ),
+            "current_depth_loss_weight": float(
+                getattr(module, "current_depth_loss_weight", 0.004)
+            ),
+            "future_depth_loss_weight": float(
+                getattr(module, "future_depth_loss_weight", 0.004)
+            ),
             "shared_latent_per_keyframe": int(
                 module.shared_latent_per_keyframe
             ),
@@ -1657,9 +2060,24 @@ def save_checkpoint(
                 module.total_unique_latent_per_keyframe
             ),
             "query_layout": (
-                "keyframe_major__shared_dino_private_depth_private"
-                if depth_head is not None
-                else "keyframe_major__legacy_single_branch"
+                (
+                    f"current_dino_{module.num_task_tokens}_then_"
+                    f"future_dino_{module.num_task_tokens}_then_"
+                    f"current_depth_{module.num_task_tokens}_then_"
+                    f"future_depth_{module.num_task_tokens}"
+                )
+                if getattr(module, "independent_modality_task_tokens", False)
+                else (
+                    f"current_{module.num_task_tokens}_then_"
+                    f"future_{module.num_task_tokens}__"
+                    "dino_depth_shared_within_time"
+                )
+                if getattr(module, "use_current_alignment", False)
+                else (
+                    "keyframe_major__shared_dino_private_depth_private"
+                    if depth_head is not None
+                    else "keyframe_major__legacy_single_branch"
+                )
             ),
             "plan_token_strings": [
                 f"<|sem_plan_{index}|>" for index in range(module.latent_len)
@@ -1683,7 +2101,7 @@ def main() -> None:
     args = parse_args()
     if args.full_finetune and args.lora_r > 0:
         raise ValueError("--full-finetune is mutually exclusive with LoRA; set --lora-r 0.")
-    if args.plan_head_type == "lingbot_dino" and args.use_depth and (
+    if args.plan_head_type == "lingbot_dino" and args.use_depth and not args.use_current_alignment and (
         args.shared_latent_per_keyframe <= 0 or args.private_latent_per_keyframe <= 0
     ):
         raise ValueError(
@@ -1698,12 +2116,36 @@ def main() -> None:
             pretrained_norm_stats=args.fastwam_pretrained_norm_stats,
         )
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
-
-    rank, world, local_rank = ddp_info()
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    accelerator = build_accelerator(grad_accum=args.grad_accum, dtype=args.dtype)
+    runtime_contract = validate_runtime_contract(
+        accelerator,
+        per_device_batch_size=args.batch_size,
+        grad_accum=args.grad_accum,
+        expected_global_batch=args.expected_global_batch,
+    )
+    rank = int(accelerator.process_index)
+    world = int(accelerator.num_processes)
+    device = accelerator.device
+    if accelerator.is_main_process:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        print(
+            json.dumps(
+                {
+                    "distributed_type": runtime_contract.distributed_type,
+                    "world_size": runtime_contract.world_size,
+                    "batch_size_per_gpu": runtime_contract.per_device_batch_size,
+                    "gradient_accumulation_steps": runtime_contract.gradient_accumulation_steps,
+                    "global_batch_size": runtime_contract.global_batch_size,
+                    "zero_stage": runtime_contract.zero_stage,
+                    "dtype": args.dtype,
+                    "gradient_checkpointing": bool(args.gradient_checkpointing),
+                }
+            ),
+            flush=True,
+        )
+    accelerator.wait_for_everyone()
+    random.seed(args.seed + rank)
+    torch.manual_seed(args.seed + rank)
 
     model, processor = load_qwen3vl_model_and_processor(
         args.model_path,
@@ -1719,7 +2161,13 @@ def main() -> None:
     # <|sem_plan|> — identical inputs differentiated by position alone tend to collapse
     # (all latents become the same -> keyframes stop evolving). mlp/baton keep the single
     # repeated token (their latent_len = target_len = thousands of tokens).
-    if (
+    if args.plan_head_type == "lingbot_dino" and args.use_current_alignment:
+        latent_len = (
+            4 if args.independent_modality_task_tokens else 2
+        ) * int(args.num_task_tokens)
+        plan_token_strs = [f"<|sem_plan_{i}|>" for i in range(latent_len)]
+        plan_sequence = list(plan_token_strs)
+    elif (
         args.plan_head_type == "lingbot_dino"
         and args.use_depth
         and args.shared_latent_per_keyframe > 0
@@ -1743,13 +2191,7 @@ def main() -> None:
         model.resize_token_embeddings(len(processor.tokenizer))
     plan_token_ids = [processor.tokenizer.convert_tokens_to_ids(t) for t in plan_token_strs]
     model.config.use_cache = False
-    if hasattr(model, "gradient_checkpointing_enable"):
-        try:
-            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        except TypeError:
-            model.gradient_checkpointing_enable()
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
+    configure_gradient_checkpointing(model, enabled=args.gradient_checkpointing)
     set_trainable(
         model,
         freeze_vision=args.freeze_vision,
@@ -1852,19 +2294,40 @@ def main() -> None:
         depth_dim=args.depth_dim,
         depth_grid_size=args.depth_grid_size,
         depth_loss_weight=args.depth_loss_weight,
+        use_current_alignment=args.use_current_alignment,
+        independent_modality_task_tokens=args.independent_modality_task_tokens,
+        num_task_tokens=args.num_task_tokens,
+        current_dino_loss_weight=args.current_dino_loss_weight,
+        future_dino_loss_weight=args.future_dino_loss_weight,
+        current_depth_loss_weight=args.current_depth_loss_weight,
+        future_depth_loss_weight=args.future_depth_loss_weight,
     )
     if args.plan_head_type == "lingbot_dino" and args.head_warmstart_ckpt is not None:
         head_state = _load_lingbot_head_state(args.head_warmstart_ckpt)
         report = wrapper.plan_head.load_lingbot_warmstart(head_state, head_name="future_video_align_head")
         if wrapper.depth_head is not None:
             depth_report = wrapper.depth_head.load_lingbot_warmstart(head_state, head_name="future_depth_align_head")
-        if is_main(rank):
+        current_report = None
+        current_depth_report = None
+        if wrapper.current_plan_head is not None:
+            current_report = wrapper.current_plan_head.load_lingbot_warmstart(
+                head_state, head_name="current_video_align_head"
+            )
+        if wrapper.current_depth_head is not None:
+            current_depth_report = wrapper.current_depth_head.load_lingbot_warmstart(
+                head_state, head_name="depth_align_head"
+            )
+        if accelerator.is_main_process:
             print(json.dumps({"head_warmstart": report}), flush=True)
             if wrapper.depth_head is not None:
                 print(json.dumps({"depth_head_warmstart": depth_report}), flush=True)
+            if current_report is not None:
+                print(json.dumps({"current_head_warmstart": current_report}), flush=True)
+            if current_depth_report is not None:
+                print(json.dumps({"current_depth_head_warmstart": current_depth_report}), flush=True)
     wrapper.to(device)
     wrapper.train()
-    if is_main(rank):
+    if accelerator.is_main_process:
         trainable, total = count_trainable_parameters(wrapper)
         print(
             json.dumps(
@@ -1883,13 +2346,6 @@ def main() -> None:
             ),
             flush=True,
         )
-    if world > 1:
-        wrapper = DDP(
-            wrapper,
-            device_ids=[local_rank],
-            find_unused_parameters=args.ddp_find_unused_parameters,
-            static_graph=not args.ddp_find_unused_parameters,
-        )
 
     if args.online_plan_labels:
         if args.fastwam_data_config is not None:
@@ -1901,6 +2357,12 @@ def main() -> None:
                 ),
                 pretrained_norm_stats=args.fastwam_pretrained_norm_stats,
                 max_samples=args.max_samples,
+                offsets=keyframe_offsets(
+                    args.sequence_length,
+                    args.num_keyframes,
+                    args.keyframe_scheme,
+                    args.keyframe_gamma,
+                ),
             )
         else:
             dataset = OnlineSemanticPlanDataset(
@@ -1913,7 +2375,7 @@ def main() -> None:
                 max_samples=args.max_samples,
                 seed=args.seed,
             )
-        if is_main(rank):
+        if accelerator.is_main_process:
             print(
                 json.dumps(
                     {
@@ -1936,12 +2398,10 @@ def main() -> None:
             max_samples=args.max_samples,
             sample_one_window_per_stem=args.sample_one_window_per_stem,
         )
-    sampler = DistributedSampler(dataset, num_replicas=world, rank=rank, shuffle=True) if world > 1 else None
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        sampler=sampler,
-        shuffle=sampler is None,
+        shuffle=True,
         num_workers=args.num_workers,
         collate_fn=Collator(
             processor=processor,
@@ -1950,10 +2410,11 @@ def main() -> None:
         pin_memory=True,
     )
 
-    optim = build_optimizer(wrapper.module if isinstance(wrapper, DDP) else wrapper, args)
+    optim = build_optimizer(wrapper, args)
     scheduler = build_scheduler(optim, args)
+    wrapper, optim, loader = accelerator.prepare(wrapper, optim, loader)
     wandb_run = None
-    if is_main(rank) and os.environ.get("PLANNER_WANDB", "1") == "1":
+    if accelerator.is_main_process and os.environ.get("PLANNER_WANDB", "1") == "1":
         try:
             import wandb
 
@@ -1967,12 +2428,17 @@ def main() -> None:
         except Exception as exc:  # missing wandb must not kill training; JSON stdout remains
             print(f"wandb disabled: {exc}", flush=True)
     step = 0
-    accum = 0
+    micro_step = 0
     running_loss = 0.0
-    pbar = tqdm(total=args.max_steps, disable=not is_main(rank), desc="qwen3vl planner")
+    deepspeed_enabled = is_deepspeed(accelerator)
+    if not deepspeed_enabled:
+        optim.zero_grad(set_to_none=True)
+    pbar = tqdm(
+        total=args.max_steps,
+        disable=not accelerator.is_local_main_process,
+        desc="qwen3vl planner",
+    )
     while step < args.max_steps:
-        if sampler is not None:
-            sampler.set_epoch(step)
         # Advance the dataset epoch too, else sample_one_window_per_stem never resamples the
         # window per stem (the new epoch is picked up when the DataLoader respawns workers).
         dataset.set_epoch(step)
@@ -1980,7 +2446,7 @@ def main() -> None:
             batch.pop("stems", None)
             keyframes = batch.pop("keyframe_images", None)
             current = batch.pop("current_image", None)
-            module = wrapper.module if isinstance(wrapper, DDP) else wrapper
+            module = accelerator.unwrap_model(wrapper)
             model_dtype = next(module.model.parameters()).dtype
             batch = move_qwen_inputs_to_device(batch, device, model_dtype=model_dtype)
             if keyframes is not None:
@@ -1990,54 +2456,106 @@ def main() -> None:
                         # -> [B, K*256, 1024], matching the LingbotDinoPlanHead output.
                         cur = current.permute(0, 3, 1, 2).contiguous()  # (B,3,H,W)
                         kfs = [keyframes[:, j].permute(0, 3, 1, 2).contiguous() for j in range(keyframes.shape[1])]
-                        batch["semantic_plan_labels"] = dino_encoder.encode_future_keyframes(cur, kfs).float()
-                        if depth_encoder is not None:
-                            # LingBot-Depth targets over the SAME future keyframes -> [B, K*256, 1024].
-                            batch["depth_plan_labels"] = depth_encoder.encode_future_keyframes(kfs).float()
+                        if args.use_current_alignment:
+                            current_dino, future_dino = dino_encoder.encode_current_and_future(
+                                cur, kfs[0]
+                            )
+                            batch["current_dino_labels"] = current_dino.float()
+                            batch["semantic_plan_labels"] = future_dino.float()
+                            current_depth, future_depth = depth_encoder.encode_current_and_future(
+                                cur, kfs[0]
+                            )
+                            batch["current_depth_labels"] = current_depth.float()
+                            batch["depth_plan_labels"] = future_depth.float()
+                        else:
+                            batch["semantic_plan_labels"] = dino_encoder.encode_future_keyframes(cur, kfs).float()
+                            if depth_encoder is not None:
+                                # LingBot-Depth targets over the SAME future keyframes -> [B, K*256, 1024].
+                                batch["depth_plan_labels"] = depth_encoder.encode_future_keyframes(kfs).float()
                     else:
                         # Online SigLIP2 targets (bit-consistent with the offline builder).
                         b, k = keyframes.shape[0], keyframes.shape[1]
-                        imgs = [keyframes[i, j].numpy() for i in range(b) for j in range(k)]
+                        imgs = [keyframes[i, j].detach().cpu().numpy() for i in range(b) for j in range(k)]
                         target = sig_encode(sig_model, sig_processor, imgs, args.online_grid_size, device, torch.float32)
                         batch["semantic_plan_labels"] = target.reshape(b, k * target.shape[1], target.shape[-1])
-            out = wrapper(**batch)
-            (out["loss"] / args.grad_accum).backward()
+            with accumulation_context(accelerator, wrapper):
+                out = wrapper(**batch)
+                accelerator.backward(out["loss"])
+                if not deepspeed_enabled:
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(
+                            (
+                                parameter
+                                for parameter in wrapper.parameters()
+                                if parameter.requires_grad
+                            ),
+                            1.0,
+                        )
+                    optim.step()
+                    optim.zero_grad(set_to_none=True)
             running_loss += float(out["loss"].detach())
-            accum += 1
-            if accum >= args.grad_accum:
-                torch.nn.utils.clip_grad_norm_([p for p in wrapper.parameters() if p.requires_grad], 1.0)
-                optim.step()
+            micro_step += 1
+            if is_optimizer_update(accelerator, micro_step, args.grad_accum):
                 if scheduler is not None:
                     scheduler.step()
-                optim.zero_grad(set_to_none=True)
                 step += 1
-                accum = 0
-                if is_main(rank):
+                if accelerator.is_main_process:
                     pbar.update(1)
                     if step % args.log_steps == 0:
-                        avg = running_loss / max(args.log_steps * args.grad_accum, 1)
-                        log_entry = {"step": step, "loss": avg, "lr": optim.param_groups[0]["lr"]}
+                        average_loss = running_loss / max(
+                            args.log_steps * args.grad_accum,
+                            1,
+                        )
+                        log_entry = {
+                            "step": step,
+                            "loss": average_loss,
+                            "lr": (
+                                scheduler.get_last_lr()[0]
+                                if scheduler is not None
+                                else args.lr
+                            ),
+                        }
                         log_entry.update(
                             {key: float(value) for key, value in out.items() if key != "loss"}
                         )
                         print(json.dumps(log_entry), flush=True)
                         if wandb_run is not None:
                             wandb_run.log(log_entry, step=step)
-                        running_loss = 0.0
-                    if step % args.save_steps == 0:
-                        save_checkpoint(args.output_dir, step, wrapper, processor, args, rank)
+                if step % args.log_steps == 0:
+                    running_loss = 0.0
+                if step % args.save_steps == 0:
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        save_checkpoint(
+                            args.output_dir,
+                            step,
+                            checkpoint_module(accelerator, wrapper),
+                            processor,
+                            args,
+                            rank=0,
+                        )
+                    accelerator.wait_for_everyone()
                 if step >= args.max_steps:
                     break
         if len(loader) == 0:
             break
 
-    save_checkpoint(args.output_dir, step, wrapper, processor, args, rank)
-    if is_main(rank):
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        save_checkpoint(
+            args.output_dir,
+            step,
+            checkpoint_module(accelerator, wrapper),
+            processor,
+            args,
+            rank=0,
+        )
+    accelerator.wait_for_everyone()
+    if accelerator.is_local_main_process:
         pbar.close()
-    if wandb_run is not None:
+    if accelerator.is_main_process and wandb_run is not None:
         wandb_run.finish()
-    if dist.is_available() and dist.is_initialized():
-        dist.destroy_process_group()
+    accelerator.end_training()
 
 
 if __name__ == "__main__":

@@ -45,6 +45,12 @@ RECONSTRUCTION_METADATA_FIELDS = (
     "depth_feature_dim",
     "depth_grid_size",
     "depth_loss_weight",
+    "use_current_alignment",
+    "num_task_tokens",
+    "current_dino_loss_weight",
+    "future_dino_loss_weight",
+    "current_depth_loss_weight",
+    "future_depth_loss_weight",
 )
 
 NUMERIC_METADATA_FIELDS = (
@@ -70,6 +76,11 @@ NUMERIC_METADATA_FIELDS = (
     "infonce_loss_weight",
     "infonce_temperature",
     "depth_loss_weight",
+    "num_task_tokens",
+    "current_dino_loss_weight",
+    "future_dino_loss_weight",
+    "current_depth_loss_weight",
+    "future_depth_loss_weight",
 )
 
 
@@ -99,22 +110,24 @@ def load_trainer_module():
 def valid_metadata():
     return {
         "sequence_length": 9,
-        "num_keyframes": 4,
+        "num_keyframes": 1,
         "grid_size": 16,
         "semantic_dim": 1024,
-        "target_tokens": 1024,
-        "keyframe_offsets": [2, 4, 6, 8],
+        "target_tokens": 256,
+        "keyframe_offsets": [8],
         "keyframe_scheme": "even_future",
-        "normalized_keyframe_times": [0.25, 0.5, 0.75, 1.0],
+        "normalized_keyframe_times": [1.0],
         "has_depth_head": True,
         "depth_feature_dim": 1024,
         "depth_grid_size": 16,
         "shared_latent_per_keyframe": 32,
         "private_latent_per_keyframe": 32,
-        "branch_latent_per_keyframe": 64,
-        "total_unique_latent_per_keyframe": 96,
-        "latent_len": 384,
-        "query_layout": ("keyframe_major__shared_dino_private_depth_private"),
+        "branch_latent_per_keyframe": 8,
+        "total_unique_latent_per_keyframe": 16,
+        "latent_len": 16,
+        "use_current_alignment": True,
+        "num_task_tokens": 8,
+        "query_layout": "current_8_then_future_8__dino_depth_shared_within_time",
         "plan_head_type": "lingbot_dino",
         "plan_head_num_heads": 16,
         "plan_head_dropout": 0.0,
@@ -126,23 +139,84 @@ def valid_metadata():
         "infonce_loss_weight": 0.0,
         "infonce_temperature": 0.07,
         "depth_loss_weight": 0.004,
-        "plan_token_ids": list(range(3, 387)),
+        "current_dino_loss_weight": 0.004,
+        "future_dino_loss_weight": 0.004,
+        "current_depth_loss_weight": 0.004,
+        "future_depth_loss_weight": 0.004,
+        "plan_token_ids": list(range(3, 19)),
         "planner_input_frame": "fastwam_current_multicamera_composite",
-        "plan_token_strings": [f"<|sem_plan_{index}|>" for index in range(384)],
+        "plan_token_strings": [f"<|sem_plan_{index}|>" for index in range(16)],
         "token_order": "keyframe_major_row_major",
     }
+
+
+def independent_query_metadata():
+    metadata = valid_metadata()
+    metadata.update(
+        {
+            "independent_modality_task_tokens": True,
+            "total_unique_latent_per_keyframe": 32,
+            "latent_len": 32,
+            "query_layout": (
+                "current_dino_8_then_future_dino_8_then_"
+                "current_depth_8_then_future_depth_8"
+            ),
+            "plan_token_ids": list(range(3, 35)),
+            "plan_token_strings": [
+                f"<|sem_plan_{index}|>" for index in range(32)
+            ],
+        }
+    )
+    return metadata
+
+
+def independent_64_query_metadata():
+    metadata = valid_metadata()
+    metadata.update(
+        {
+            "independent_modality_task_tokens": True,
+            "num_task_tokens": 64,
+            "branch_latent_per_keyframe": 64,
+            "total_unique_latent_per_keyframe": 256,
+            "latent_len": 256,
+            "query_layout": (
+                "current_dino_64_then_future_dino_64_then_"
+                "current_depth_64_then_future_depth_64"
+            ),
+            "plan_token_ids": list(range(3, 259)),
+            "plan_token_strings": [
+                f"<|sem_plan_{index}|>" for index in range(256)
+            ],
+        }
+    )
+    return metadata
 
 
 def test_validate_metadata_accepts_exact_fastwam_contract():
     module = load_provider_module()
     contract = module.validate_planner_metadata(valid_metadata())
-    assert contract.keyframe_offsets == (2, 4, 6, 8)
-    assert contract.normalized_keyframe_times == (
-        0.25,
-        0.5,
-        0.75,
-        1.0,
-    )
+    assert contract.keyframe_offsets == (8,)
+    assert contract.normalized_keyframe_times == (1.0,)
+
+
+def test_validate_metadata_accepts_independent_modality_query_contract():
+    module = load_provider_module()
+
+    contract = module.validate_planner_metadata(independent_query_metadata())
+
+    assert contract.total_unique_latent_per_keyframe == 32
+    assert len(contract.plan_token_strings) == 32
+
+
+def test_validate_metadata_accepts_64_tokens_per_independent_feature():
+    module = load_provider_module()
+
+    contract = module.validate_planner_metadata(independent_64_query_metadata())
+
+    assert contract.num_task_tokens == 64
+    assert contract.branch_latent_per_keyframe == 64
+    assert contract.total_unique_latent_per_keyframe == 256
+    assert len(contract.plan_token_strings) == 256
 
 
 def test_validate_metadata_accepts_finite_informational_loss_values():
@@ -249,7 +323,7 @@ def test_from_checkpoint_rejects_non_integer_keyframe_offsets_before_loading(
 ):
     module = load_provider_module()
     metadata = valid_metadata()
-    metadata["keyframe_offsets"] = [2.0, 4.0, 6.0, 8.0]
+    metadata["keyframe_offsets"] = [8.0]
     write_complete_checkpoint_layout(tmp_path, metadata)
     load_counts = install_forbidden_checkpoint_loaders(monkeypatch)
 
@@ -268,6 +342,8 @@ def test_from_checkpoint_rejects_non_integer_keyframe_offsets_before_loading(
     [
         "plan_head.pt",
         "depth_head.pt",
+        "current_plan_head.pt",
+        "current_depth_head.pt",
         "plan_token_embedding.pt",
         "planner_meta.json",
         "qwen3vl_lora_or_model",
@@ -282,6 +358,8 @@ def test_validate_checkpoint_files_names_every_missing_entry(
     required_files = (
         "plan_head.pt",
         "depth_head.pt",
+        "current_plan_head.pt",
+        "current_depth_head.pt",
         "plan_token_embedding.pt",
         "planner_meta.json",
     )
@@ -338,9 +416,9 @@ class FakeWrapper:
     def predict_dino_depth_plan(self, **inputs):
         self.calls += 1
         batch = inputs["input_ids"].shape[0]
-        dino = torch.ones(batch, 1024, 1024, requires_grad=True)
+        dino = torch.ones(batch, 256, 1024, requires_grad=True)
         depth = torch.full(
-            (batch, 1024, 1024),
+            (batch, 256, 1024),
             2.0,
             requires_grad=True,
         )
@@ -363,9 +441,9 @@ def test_predict_returns_detached_dual_branch_and_times():
 
     assert wrapper.calls == 1
     assert wrapper.training is False
-    assert result.dino_plan.shape == (2, 1024, 1024)
-    assert result.depth_plan.shape == (2, 1024, 1024)
-    assert result.semantic_plan_times.shape == (2, 4)
+    assert result.dino_plan.shape == (2, 256, 1024)
+    assert result.depth_plan.shape == (2, 256, 1024)
+    assert result.semantic_plan_times.shape == (2, 1)
     assert result.dino_plan.requires_grad is False
     assert result.depth_plan.requires_grad is False
     assert processor.instructions == ["open drawer", "pick mug"]
@@ -437,12 +515,12 @@ class InvalidOutputWrapper(FakeWrapper):
 
     def predict_dino_depth_plan(self, **inputs):
         batch = inputs["input_ids"].shape[0]
-        dino = torch.zeros(batch, 1024, 1024)
-        depth = torch.zeros(batch, 1024, 1024)
+        dino = torch.zeros(batch, 256, 1024)
+        depth = torch.zeros(batch, 256, 1024)
         if self.invalid_shape == "dino_plan":
-            dino = torch.zeros(batch, 1023, 1024)
+            dino = torch.zeros(batch, 255, 1024)
         elif self.invalid_shape == "depth_plan":
-            depth = torch.zeros(batch, 1023, 1024)
+            depth = torch.zeros(batch, 255, 1024)
         if self.non_finite == "dino_plan":
             dino[0, 0, 0] = float("nan")
         elif self.non_finite == "depth_plan":
@@ -641,6 +719,8 @@ def write_complete_checkpoint_layout(checkpoint, metadata):
     for name in (
         "plan_head.pt",
         "depth_head.pt",
+        "current_plan_head.pt",
+        "current_depth_head.pt",
         "plan_token_embedding.pt",
     ):
         (checkpoint / name).touch()
@@ -809,7 +889,7 @@ def test_from_checkpoint_rejects_malformed_numeric_field_before_loading(
 
 
 def malformed_plan_token_ids():
-    valid_ids = list(range(3, 387))
+    valid_ids = list(range(3, 19))
     duplicate_ids = valid_ids.copy()
     duplicate_ids[-1] = duplicate_ids[0]
     negative_ids = valid_ids.copy()
@@ -914,7 +994,7 @@ def test_from_checkpoint_wires_local_frozen_components(
         ["pick mug"],
     )
 
-    assert result.dino_plan.shape == (1, 1024, 1024)
+    assert result.dino_plan.shape == (1, 256, 1024)
     assert state.processor_load_calls == [
         (tmp_path / "processor", {"local_files_only": True})
     ]

@@ -86,9 +86,17 @@ class LingbotDinoPlanHead(nn.Module):
         """
         marker = f"{head_name}.projector."
         embs_suffix = head_name.replace("_head", "_embs")  # future_{video,depth}_align_embs
-        proj = {k.split(marker, 1)[1]: v for k, v in state.items() if marker in k}
+        proj = {
+            k.split(marker, 1)[1]: v
+            for k, v in state.items()
+            if k.startswith(marker) or f".{marker}" in k
+        }
         res = self.resampler.load_state_dict(proj, strict=False)
-        query = [v for k, v in state.items() if k.endswith(embs_suffix)]
+        query = [
+            v
+            for k, v in state.items()
+            if k == embs_suffix or k.endswith(f".{embs_suffix}")
+        ]
         query_loaded = False
         if query and query[0].shape == self.query_embs.shape:
             self.query_embs.data.copy_(query[0].to(self.query_embs.dtype))

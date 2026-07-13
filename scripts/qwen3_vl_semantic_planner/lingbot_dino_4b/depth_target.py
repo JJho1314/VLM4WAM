@@ -117,3 +117,17 @@ class DepthTargetEncoder(nn.Module):
         tok, dim = feats.shape[1], feats.shape[2]
         feats = feats.view(k, b, tok, dim).permute(1, 0, 2, 3).reshape(b, k * tok, dim)
         return feats.detach().to(torch.bfloat16)
+
+    @torch.no_grad()
+    def encode_current_and_future(
+        self,
+        current_b3hw: torch.Tensor,
+        future_b3hw: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode current and one future frame in a single frozen-teacher batch."""
+        current = self._prep(current_b3hw)
+        future = self._prep(future_b3hw)
+        batch_size = current.shape[0]
+        features = self._depth_target(torch.cat([current, future], dim=0))
+        features = features.detach().to(torch.bfloat16)
+        return features[:batch_size], features[batch_size:]

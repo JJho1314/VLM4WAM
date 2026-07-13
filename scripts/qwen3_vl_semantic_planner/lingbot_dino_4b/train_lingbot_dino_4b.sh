@@ -1,11 +1,11 @@
 #!/bin/bash
 # Self-contained launcher for the 4B lingbot-DINO planner line (independent of the 2B slurm base).
-# Runs directly via torchrun in the box env we validated (torch 2.8+cu128, transformers 5.5.4,
-# flex_attention). All paths default to the downloaded/extracted weights on this box.
+# Runs through Accelerate + DeepSpeed ZeRO-2 by default in the validated box env.
+# All paths default to the downloaded/extracted weights on this box.
 #
 # Required: exactly one of DATASET_ROOT (legacy DROID data) or FASTWAM_DATA_CONFIG.
-# Smoke:     NUM_GPUS=1 BATCH_SIZE=1 GRAD_ACCUM=1 MAX_STEPS=2 FULL_FINETUNE=0 bash train_lingbot_dino_4b.sh
-set -uo pipefail
+# Smoke:     USE_DEEPSPEED=0 NUM_GPUS=1 BATCH_SIZE=1 GRAD_ACCUM=1 EXPECTED_GLOBAL_BATCH=1 MAX_STEPS=2 SAVE_STEPS=2 FULL_FINETUNE=0 bash train_lingbot_dino_4b.sh
+set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLANNER_DIR="$(dirname "$HERE")"                       # scripts/qwen3_vl_semantic_planner
@@ -15,7 +15,8 @@ cd "$REPO_ROOT" || exit 2
 # covt/planner training env: transformers 4.57 (Qwen3-VL) + torch 2.6 flex_attention + mistral_common 1.9
 # (the box default python has transformers 5.x with a broken mistral_common, so pin this env).
 PY=${PY:-/data/LFT-W02_data/.conda/envs/starVLA/bin/python}
-NUM_GPUS=${NUM_GPUS:-2}
+NUM_GPUS=${NUM_GPUS:-8}
+USE_DEEPSPEED=${USE_DEEPSPEED:-1}
 
 WEIGHTS=${WEIGHTS:-/data/LFT-W02_data/junjie/weights}
 MODEL_PATH=${MODEL_PATH:-$WEIGHTS/Qwen3-VL-4B-lingbot-vlm}          # extracted 4B VLM (see extract_qwenvl_from_lingbot.py)
@@ -24,13 +25,20 @@ DINO_TEACHER_CKPT=${DINO_TEACHER_CKPT:-$LINGBOT_6B/dino_video/teacher_step_10000
 DINO_TEACHER_CONFIG=${DINO_TEACHER_CONFIG:-$LINGBOT_6B/dino_video/config.yaml}
 HEAD_WARMSTART_CKPT=${HEAD_WARMSTART_CKPT:-$LINGBOT_6B}             # warm-start head from future_video_align_head.*
 
-# --- auxiliary future-DEPTH alignment (lingbot-style: MoGe-2 -> MoRGBD, smooth_L1; OFF by default) ---
-USE_DEPTH=${USE_DEPTH:-0}
+# --- auxiliary future-DEPTH alignment (lingbot-style: MoGe-2 -> MoRGBD, smooth_L1) ---
+USE_DEPTH=${USE_DEPTH:-1}
 DEPTH_MOGE_PATH=${DEPTH_MOGE_PATH:-$WEIGHTS/moge-2-vitb-normal/model.pt}   # MoGe-2 (HF Ruicheng/moge-2-vitb-normal)
 DEPTH_MORGBD_PATH=${DEPTH_MORGBD_PATH:-$LINGBOT_6B/depth/model.pt}         # LingBot-Depth / MoRGBD
 DEPTH_LOSS_WEIGHT=${DEPTH_LOSS_WEIGHT:-0.004}   # lingbot future_depth_loss_weight
 DEPTH_GRID_SIZE=${DEPTH_GRID_SIZE:-16}          # 16 -> 256 depth tokens/keyframe
 DEPTH_DIM=${DEPTH_DIM:-1024}
+USE_CURRENT_ALIGNMENT=${USE_CURRENT_ALIGNMENT:-1}
+INDEPENDENT_MODALITY_TASK_TOKENS=${INDEPENDENT_MODALITY_TASK_TOKENS:-1}
+NUM_TASK_TOKENS=${NUM_TASK_TOKENS:-64}
+CURRENT_DINO_LOSS_WEIGHT=${CURRENT_DINO_LOSS_WEIGHT:-0.004}
+FUTURE_DINO_LOSS_WEIGHT=${FUTURE_DINO_LOSS_WEIGHT:-0.004}
+CURRENT_DEPTH_LOSS_WEIGHT=${CURRENT_DEPTH_LOSS_WEIGHT:-0.004}
+FUTURE_DEPTH_LOSS_WEIGHT=${FUTURE_DEPTH_LOSS_WEIGHT:-0.004}
 
 # lingbot source (moge/mdm/dino teacher code) + MoGe-pinned utils3d; override on non-box hosts (HPC3).
 LINGBOT_SRC_ROOT=${LINGBOT_SRC_ROOT:-/data/LFT-W02_data/junjie/VLA_WM/lingbot-vla-v2}
@@ -51,15 +59,15 @@ if [[ -z "$DATASET_ROOT" && -z "$FASTWAM_DATA_CONFIG" ]]; then
 fi
 OUTPUT_DIR=${OUTPUT_DIR:-$REPO_ROOT/outputs/qwen3vl_semantic_planner/qwen3vl4b_lingbot_dino_uniform_k5}
 
-# plan geometry: DINO-video, 5 keyframes x 16^2=256 tokens x 1024 dim => target_len 1280
-NUM_KEYFRAMES=${NUM_KEYFRAMES:-5}
+# plan geometry: one future keyframe at offset 8, 16^2=256 tokens x 1024 dim
+NUM_KEYFRAMES=${NUM_KEYFRAMES:-1}
 GRID_SIZE=${GRID_SIZE:-16}
-NUM_LATENT_PER_KEYFRAME=${NUM_LATENT_PER_KEYFRAME:-8}   # matches lingbot num_task_tokens=8
+NUM_LATENT_PER_KEYFRAME=${NUM_LATENT_PER_KEYFRAME:-8}   # legacy fallback; independent q64 uses NUM_TASK_TOKENS
 SHARED_LATENT_PER_KEYFRAME=${SHARED_LATENT_PER_KEYFRAME:-32}
 PRIVATE_LATENT_PER_KEYFRAME=${PRIVATE_LATENT_PER_KEYFRAME:-32}
 SEMANTIC_DIM=${SEMANTIC_DIM:-1024}
-SEQUENCE_LENGTH=${SEQUENCE_LENGTH:-49}
-KEYFRAME_SCHEME=${KEYFRAME_SCHEME:-uniform}
+SEQUENCE_LENGTH=${SEQUENCE_LENGTH:-9}
+KEYFRAME_SCHEME=${KEYFRAME_SCHEME:-even_future}
 KEYFRAME_GAMMA=${KEYFRAME_GAMMA:-0.6}
 DINO_INPUT_SIZE=${DINO_INPUT_SIZE:-256}
 
@@ -70,14 +78,15 @@ NORM_LOSS_WEIGHT=${NORM_LOSS_WEIGHT:-0.0}
 VARIANCE_LOSS_WEIGHT=${VARIANCE_LOSS_WEIGHT:-0.0}
 INFONCE_LOSS_WEIGHT=${INFONCE_LOSS_WEIGHT:-0.0}
 
-BATCH_SIZE=${BATCH_SIZE:-1}
-GRAD_ACCUM=${GRAD_ACCUM:-8}
-LR=${LR:-1e-5}
-HEAD_LR=${HEAD_LR:-1e-4}
-MAX_STEPS=${MAX_STEPS:-16000}
+BATCH_SIZE=${BATCH_SIZE:-8}
+GRAD_ACCUM=${GRAD_ACCUM:-2}
+EXPECTED_GLOBAL_BATCH=${EXPECTED_GLOBAL_BATCH:-128}
+LR=${LR:-3e-5}
+HEAD_LR=${HEAD_LR:-3e-4}
+MAX_STEPS=${MAX_STEPS:-12000}
 SAVE_STEPS=${SAVE_STEPS:-1000}
 LOG_STEPS=${LOG_STEPS:-10}
-WARMUP_STEPS=${WARMUP_STEPS:-400}
+WARMUP_STEPS=${WARMUP_STEPS:-1000}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.01}
 NUM_WORKERS=${NUM_WORKERS:-4}
 DTYPE=${DTYPE:-bf16}
@@ -93,6 +102,7 @@ TRAIN_ARGS=(
   --max-steps "$MAX_STEPS"
   --batch-size "$BATCH_SIZE"
   --grad-accum "$GRAD_ACCUM"
+  --expected-global-batch "$EXPECTED_GLOBAL_BATCH"
   --num-keyframes "$NUM_KEYFRAMES"
   --grid-size "$GRID_SIZE"
   --num-latent-per-keyframe "$NUM_LATENT_PER_KEYFRAME"
@@ -113,7 +123,6 @@ TRAIN_ARGS=(
   --num-workers "$NUM_WORKERS"
   --freeze-vision
   --train-plan-token-embedding
-  --ddp-find-unused-parameters
   --online-plan-labels
   --sequence-length "$SEQUENCE_LENGTH"
   --keyframe-scheme "$KEYFRAME_SCHEME"
@@ -166,14 +175,33 @@ fi
   --depth-grid-size "$DEPTH_GRID_SIZE"
   --depth-dim "$DEPTH_DIM"
 )
+[[ "$USE_CURRENT_ALIGNMENT" == "1" ]] && TRAIN_ARGS+=(
+  --use-current-alignment
+  --num-task-tokens "$NUM_TASK_TOKENS"
+  --current-dino-loss-weight "$CURRENT_DINO_LOSS_WEIGHT"
+  --future-dino-loss-weight "$FUTURE_DINO_LOSS_WEIGHT"
+  --current-depth-loss-weight "$CURRENT_DEPTH_LOSS_WEIGHT"
+  --future-depth-loss-weight "$FUTURE_DEPTH_LOSS_WEIGHT"
+)
+[[ "$INDEPENDENT_MODALITY_TASK_TOKENS" == "1" ]] && TRAIN_ARGS+=(
+  --independent-modality-task-tokens
+)
 
 TRAIN_SCRIPT="$PLANNER_DIR/train_qwen3vl4b_lingbot_dino_planner.py"
 export PYTHONUNBUFFERED=1
 export XFORMERS_DISABLED=1   # MoGe/MoRGBD dinov2 -> F.scaled_dot_product_attention (unbuilt xformers op)
 export LINGBOT_SRC_ROOT UTILS3D_MOGE_PATH
-if [[ "$NUM_GPUS" -gt 1 ]]; then
-  "$PY" -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node="$NUM_GPUS" \
+CONFIG_DIR="$OUTPUT_DIR/runtime_config"
+mkdir -p "$CONFIG_DIR"
+if [[ "$USE_DEEPSPEED" == "1" ]]; then
+  ACCELERATE_CONFIG=$(
+    "$PY" "$HERE/make_zero2_config.py" \
+      --grad-accum "$GRAD_ACCUM" \
+      --num-processes "$NUM_GPUS" \
+      --output-dir "$CONFIG_DIR"
+  )
+  exec "$PY" -m accelerate.commands.launch \
+    --config_file "$ACCELERATE_CONFIG" \
     "$TRAIN_SCRIPT" "${TRAIN_ARGS[@]}"
-else
-  "$PY" "$TRAIN_SCRIPT" "${TRAIN_ARGS[@]}"
 fi
+exec "$PY" "$TRAIN_SCRIPT" "${TRAIN_ARGS[@]}"
