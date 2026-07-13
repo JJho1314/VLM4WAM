@@ -145,6 +145,23 @@ def test_deepspeed_boundary_is_driven_by_microstep_count():
     ]
 
 
+def test_checkpoint_schedule_only_keeps_twenty_twenty_five_and_thirty_thousand():
+    module = load_runtime()
+
+    periodic_steps = [
+        step
+        for step in range(1, 30_001)
+        if module.should_save_periodic_checkpoint(
+            step=step,
+            max_steps=30_000,
+            save_steps=5_000,
+            save_start_step=20_000,
+        )
+    ]
+
+    assert periodic_steps + [30_000] == [20_000, 25_000, 30_000]
+
+
 def test_non_deepspeed_uses_accelerate_accumulation_and_sync_flag():
     module = load_runtime()
     accelerator = FakeAccelerator(
@@ -230,6 +247,17 @@ def test_only_canonical_launchers_are_referenced():
     assert "GRAD_ACCUM=${GRAD_ACCUM:-2}" in generic
     assert "train_lingbot_dino_4b.sh" in pod
     assert "train_lingbot_dino_4b.sh" in hpc
+
+
+def test_launchers_propagate_checkpoint_start_step():
+    generic = GENERIC_LAUNCHER.read_text(encoding="utf-8")
+    pod = POD_LAUNCHER.read_text(encoding="utf-8")
+    hpc = HPC_LAUNCHER.read_text(encoding="utf-8")
+
+    assert "SAVE_START_STEP=${SAVE_START_STEP:-0}" in generic
+    assert '--save-start-step "$SAVE_START_STEP"' in generic
+    assert 'SAVE_START_STEP="$SAVE_START_STEP"' in pod
+    assert 'SAVE_START_STEP="$SAVE_START_STEP"' in hpc
 
 
 def test_readme_smoke_command_matches_single_gpu_runtime_contract():

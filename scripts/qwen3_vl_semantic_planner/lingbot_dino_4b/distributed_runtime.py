@@ -99,5 +99,19 @@ def is_optimizer_update(accelerator: Any, micro_step: int, grad_accum: int) -> b
     return bool(accelerator.sync_gradients)
 
 
+def should_save_periodic_checkpoint(
+    *,
+    step: int,
+    max_steps: int,
+    save_steps: int,
+    save_start_step: int,
+) -> bool:
+    if save_steps <= 0:
+        raise ValueError("save_steps must be positive")
+    if save_start_step < 0:
+        raise ValueError("save_start_step must be non-negative")
+    return save_start_step <= step < max_steps and step % save_steps == 0
+
+
 def checkpoint_module(accelerator: Any, model: Any) -> Any:
     return accelerator.unwrap_model(model)

@@ -57,6 +57,7 @@ from distributed_runtime import (  # noqa: E402
     checkpoint_module,
     is_deepspeed,
     is_optimizer_update,
+    should_save_periodic_checkpoint,
     validate_runtime_contract,
 )
 
@@ -104,6 +105,15 @@ def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError(f"expected a positive integer, got {value}")
+    return parsed
+
+
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(
+            f"expected a non-negative integer, got {value}"
+        )
     return parsed
 
 
@@ -248,7 +258,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-plan-token-embedding", action="store_true", default=True)
     parser.add_argument("--no-train-plan-token-embedding", action="store_false", dest="train_plan_token_embedding")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
-    parser.add_argument("--save-steps", type=int, default=500)
+    parser.add_argument("--save-steps", type=_positive_int, default=500)
+    parser.add_argument(
+        "--save-start-step",
+        type=_nonnegative_int,
+        default=0,
+        help="do not write periodic checkpoints before this optimizer step",
+    )
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=20260622)
     parser.add_argument("--log-steps", type=int, default=10)
@@ -2523,7 +2539,12 @@ def main() -> None:
                             wandb_run.log(log_entry, step=step)
                 if step % args.log_steps == 0:
                     running_loss = 0.0
-                if step % args.save_steps == 0:
+                if should_save_periodic_checkpoint(
+                    step=step,
+                    max_steps=args.max_steps,
+                    save_steps=args.save_steps,
+                    save_start_step=args.save_start_step,
+                ):
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         save_checkpoint(

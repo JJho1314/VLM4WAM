@@ -85,6 +85,7 @@ LR=${LR:-3e-5}
 HEAD_LR=${HEAD_LR:-3e-4}
 MAX_STEPS=${MAX_STEPS:-12000}
 SAVE_STEPS=${SAVE_STEPS:-1000}
+SAVE_START_STEP=${SAVE_START_STEP:-0}
 LOG_STEPS=${LOG_STEPS:-10}
 WARMUP_STEPS=${WARMUP_STEPS:-1000}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.01}
@@ -119,6 +120,7 @@ TRAIN_ARGS=(
   --warmup-steps "$WARMUP_STEPS"
   --dtype "$DTYPE"
   --save-steps "$SAVE_STEPS"
+  --save-start-step "$SAVE_START_STEP"
   --log-steps "$LOG_STEPS"
   --num-workers "$NUM_WORKERS"
   --freeze-vision
