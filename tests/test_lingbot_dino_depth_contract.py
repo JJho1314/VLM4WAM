@@ -93,7 +93,7 @@ def test_build_planner_inputs_uses_one_shared_prompt_contract():
         module.PLANNER_USER_TEMPLATE.format(instruction="17"),
     ]
     assert all(
-        entry[0][1]["content"] == "<plan-0> <plan-1>"
+        entry[0][1]["content"] == "<plan-0><plan-1>"
         for entry in processor.conversations
     )
 
@@ -102,6 +102,90 @@ def test_build_planner_inputs_rejects_batch_mismatch():
     module = load_trainer_module()
     with pytest.raises(ValueError, match="batch mismatch"):
         module.build_planner_inputs(RecordingProcessor(), [object()], [], "<plan>")
+
+
+def test_plan_token_embedding_injector_only_trains_selected_rows():
+    module = load_trainer_module()
+    base_embedding = nn.Embedding(8, 4)
+    base_embedding.weight.requires_grad_(False)
+    base_before = base_embedding.weight.detach().clone()
+    injector = module.PlanTokenEmbeddingInjector(
+        base_embedding,
+        plan_token_ids=[2, 5],
+    )
+    input_ids = torch.tensor([[1, 2, 3, 5]])
+
+    output = injector(input_ids, base_embedding(input_ids))
+
+    assert torch.equal(output[0, 0], base_before[1])
+    assert torch.equal(output[0, 2], base_before[3])
+    assert torch.equal(output[0, 1], injector.weight[0])
+    assert torch.equal(output[0, 3], injector.weight[1])
+
+    optimizer = torch.optim.AdamW(injector.parameters(), lr=0.1, weight_decay=0.1)
+    output.sum().backward()
+    optimizer.step()
+
+    assert base_embedding.weight.grad is None
+    assert torch.equal(base_embedding.weight, base_before)
+    assert injector.weight.grad is not None
+    assert sum(parameter.numel() for parameter in injector.parameters()) == 8
+
+
+def test_plan_token_embedding_injector_forward_hook_replaces_plan_positions():
+    module = load_trainer_module()
+    base_embedding = nn.Embedding(8, 4)
+    base_embedding.weight.requires_grad_(False)
+    injector = module.PlanTokenEmbeddingInjector(
+        base_embedding,
+        plan_token_ids=[2, 5],
+    )
+    handle = base_embedding.register_forward_hook(injector.forward_hook)
+    input_ids = torch.tensor([[1, 2, 5]])
+
+    try:
+        output = base_embedding(input_ids)
+    finally:
+        handle.remove()
+
+    assert torch.equal(output[0, 0], base_embedding.weight[1])
+    assert torch.equal(output[0, 1], injector.weight[0])
+    assert torch.equal(output[0, 2], injector.weight[1])
+
+
+def test_planner_wrapper_installs_independent_plan_query_embeddings():
+    module = load_trainer_module()
+
+    class TinyEmbeddingModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = nn.Embedding(8, 4)
+            self.config = SimpleNamespace(image_token_id=7)
+
+        def get_input_embeddings(self):
+            return self.embedding
+
+    model = TinyEmbeddingModel()
+    wrapper = module.PlannerWrapper(
+        model=model,
+        hidden_size=4,
+        semantic_dim=2,
+        plan_token_ids=[2, 5],
+        target_len=2,
+        num_keyframes=1,
+        grid_size=1,
+        plan_head_type="mlp",
+        train_plan_token_embedding=True,
+    )
+    with torch.no_grad():
+        wrapper.plan_embedding_injector.weight.fill_(17.0)
+
+    output = model.get_input_embeddings()(torch.tensor([[1, 2, 5]]))
+
+    assert model.embedding.weight.requires_grad is False
+    assert torch.equal(output[0, 0], model.embedding.weight[1])
+    assert torch.equal(output[0, 1], torch.full((4,), 17.0))
+    assert torch.equal(output[0, 2], torch.full((4,), 17.0))
 
 
 def _make_lingbot_wrapper(*, use_depth: bool):
@@ -558,6 +642,37 @@ def test_save_checkpoint_writes_depth_and_fastwam_contract(tmp_path):
     assert metadata["plan_token_strings"] == [
         f"<|sem_plan_{index}|>" for index in range(384)
     ]
+
+
+def test_save_checkpoint_exports_independent_plan_query_embeddings(tmp_path):
+    module = load_trainer_module()
+    wrapper = _make_checkpoint_wrapper(module)
+    wrapper.plan_embedding_injector = module.PlanTokenEmbeddingInjector(
+        wrapper.model.get_input_embeddings(),
+        wrapper.plan_token_ids,
+    )
+    with torch.no_grad():
+        wrapper.model.get_input_embeddings().weight.fill_(-3.0)
+        wrapper.plan_embedding_injector.weight.fill_(11.0)
+
+    module.save_checkpoint(
+        tmp_path,
+        8,
+        wrapper,
+        FakeProcessor(),
+        _make_checkpoint_args(),
+        rank=0,
+    )
+
+    exported = torch.load(
+        tmp_path / "step_000008/plan_token_embedding.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert torch.equal(
+        exported,
+        wrapper.plan_embedding_injector.weight.detach().cpu(),
+    )
 
 
 def test_save_checkpoint_writes_dynamic_64_token_independent_contract(tmp_path):

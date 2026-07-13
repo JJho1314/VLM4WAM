@@ -596,6 +596,7 @@ def tiny_export_metadata():
         "depth_feature_dim": 4,
         "depth_grid_size": 1,
         "depth_loss_weight": 0.004,
+        "train_plan_token_embedding": True,
     }
 
 
@@ -674,6 +675,10 @@ def test_from_exported_checkpoint_restores_and_freezes_all_components(
     plan_ids = torch.tensor(metadata["plan_token_ids"], dtype=torch.long)
     assert torch.equal(
         target_model.embedding.weight[plan_ids],
+        plan_embedding,
+    )
+    assert torch.equal(
+        wrapper.plan_embedding_injector.weight,
         plan_embedding,
     )
     assert [name for name, _kwargs in load_calls] == [

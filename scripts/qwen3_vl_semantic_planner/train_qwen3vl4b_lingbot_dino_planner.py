@@ -786,7 +786,7 @@ def build_planner_inputs(
         raise ValueError(
             f"images/instructions batch mismatch: {len(images)} != {len(instructions)}"
         )
-    plan_text = plan_sequence if isinstance(plan_sequence, str) else " ".join(plan_sequence)
+    plan_text = plan_sequence if isinstance(plan_sequence, str) else "".join(plan_sequence)
     conversations = []
     for image, instruction in zip(images, instructions, strict=True):
         conversations.append(
@@ -1005,6 +1005,67 @@ class CoVTLatentDecoderHead(nn.Module):
         return attn_out.reshape(batch, self.num_keyframes * self.grid_tokens, attn_out.shape[-1])
 
 
+class PlanTokenEmbeddingInjector(nn.Module):
+    """Inject compact learned query embeddings at plan-token positions."""
+
+    def __init__(self, base_embedding: nn.Embedding, plan_token_ids: list[int]) -> None:
+        super().__init__()
+        if base_embedding.weight.ndim != 2:
+            raise ValueError(
+                "base embedding must be a matrix, got "
+                f"shape={tuple(base_embedding.weight.shape)}"
+            )
+        plan_ids = [int(token_id) for token_id in plan_token_ids]
+        if len(set(plan_ids)) != len(plan_ids):
+            raise ValueError("plan_token_ids must be unique")
+        num_embeddings = int(base_embedding.weight.shape[0])
+        invalid = [token_id for token_id in plan_ids if not 0 <= token_id < num_embeddings]
+        if invalid:
+            raise ValueError(
+                f"plan token ids outside embedding rows {num_embeddings}: {invalid}"
+            )
+
+        plan_ids_tensor = torch.tensor(
+            plan_ids,
+            device=base_embedding.weight.device,
+            dtype=torch.long,
+        )
+        self.weight = nn.Parameter(
+            base_embedding.weight.detach().index_select(0, plan_ids_tensor).clone()
+        )
+        id_to_row = torch.full(
+            (num_embeddings,),
+            -1,
+            device=base_embedding.weight.device,
+            dtype=torch.long,
+        )
+        id_to_row[plan_ids_tensor] = torch.arange(
+            len(plan_ids),
+            device=id_to_row.device,
+            dtype=torch.long,
+        )
+        self.register_buffer("id_to_row", id_to_row, persistent=False)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        base_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        rows = self.id_to_row[input_ids]
+        plan_mask = rows >= 0
+        output = base_embeddings.clone()
+        output[plan_mask] = self.weight[rows[plan_mask]].to(dtype=output.dtype)
+        return output
+
+    def forward_hook(
+        self,
+        _module: nn.Module,
+        inputs: tuple[torch.Tensor, ...],
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        return self(inputs[0], output)
+
+
 class PlannerWrapper(nn.Module):
     def __init__(
         self,
@@ -1039,6 +1100,7 @@ class PlannerWrapper(nn.Module):
         future_dino_loss_weight: float = 0.004,
         current_depth_loss_weight: float = 0.004,
         future_depth_loss_weight: float = 0.004,
+        train_plan_token_embedding: bool = False,
     ) -> None:
         super().__init__()
         if sem_mlp_hidden_size < 0:
@@ -1180,6 +1242,17 @@ class PlannerWrapper(nn.Module):
             )
         self.plan_token_ids = [int(x) for x in plan_token_ids]
         self.model = model
+        self.plan_embedding_injector = None
+        if train_plan_token_embedding:
+            base_embedding = model.get_input_embeddings()
+            base_embedding.weight.requires_grad_(False)
+            self.plan_embedding_injector = PlanTokenEmbeddingInjector(
+                base_embedding,
+                self.plan_token_ids,
+            )
+            base_embedding.register_forward_hook(
+                self.plan_embedding_injector.forward_hook
+            )
         # image-token id used by the lingbot_dino head to gather the LLM's image-token hiddens
         self.image_token_id = getattr(getattr(model, "config", None), "image_token_id", None)
 
@@ -1235,6 +1308,9 @@ class PlannerWrapper(nn.Module):
             future_dino_loss_weight=float(metadata.get("future_dino_loss_weight", 0.004)),
             current_depth_loss_weight=float(metadata.get("current_depth_loss_weight", 0.004)),
             future_depth_loss_weight=float(metadata.get("future_depth_loss_weight", 0.004)),
+            train_plan_token_embedding=bool(
+                metadata.get("train_plan_token_embedding", False)
+            ),
         )
         wrapper.plan_head.load_state_dict(
             torch.load(
@@ -1299,6 +1375,13 @@ class PlannerWrapper(nn.Module):
                     dtype=embedding_weight.dtype,
                 ),
             )
+            if wrapper.plan_embedding_injector is not None:
+                wrapper.plan_embedding_injector.weight.copy_(
+                    plan_embedding.to(
+                        device=wrapper.plan_embedding_injector.weight.device,
+                        dtype=wrapper.plan_embedding_injector.weight.dtype,
+                    )
+                )
         wrapper.eval()
         for parameter in wrapper.parameters():
             parameter.requires_grad_(False)
@@ -1704,22 +1787,6 @@ def set_trainable(model: nn.Module, *, freeze_vision: bool, freeze_lm_head: bool
             p.requires_grad_(False)
 
 
-def register_plan_rows_hook(param: nn.Parameter, row_ids: list[int]) -> None:
-    if param.ndim != 2:
-        raise RuntimeError(f"Expected embedding weight with ndim=2, got {tuple(param.shape)}")
-    row_mask = torch.zeros((param.shape[0], 1), dtype=torch.float32)
-    for row_id in row_ids:
-        if row_id < 0 or row_id >= param.shape[0]:
-            raise RuntimeError(f"Plan token id {row_id} outside embedding rows {param.shape[0]}")
-        row_mask[row_id] = 1.0
-
-    def hook(grad: torch.Tensor) -> torch.Tensor:
-        return grad * row_mask.to(device=grad.device, dtype=grad.dtype)
-
-    param.requires_grad_(True)
-    param.register_hook(hook)
-
-
 def build_optimizer(wrapper: PlannerWrapper, args: argparse.Namespace) -> torch.optim.Optimizer:
     head_names = (
         "plan_head",
@@ -1973,8 +2040,14 @@ def save_checkpoint(
         torch.save(current_plan_head.state_dict(), ckpt / "current_plan_head.pt")
     if current_depth_head is not None:
         torch.save(current_depth_head.state_dict(), ckpt / "current_depth_head.pt")
-    plan_ids = torch.as_tensor(module.plan_token_ids)
-    plan_embedding = module.model.get_input_embeddings().weight[plan_ids].detach().cpu()
+    plan_embedding_injector = getattr(module, "plan_embedding_injector", None)
+    if plan_embedding_injector is not None:
+        plan_embedding = plan_embedding_injector.weight.detach().cpu()
+    else:
+        plan_ids = torch.as_tensor(module.plan_token_ids)
+        plan_embedding = (
+            module.model.get_input_embeddings().weight[plan_ids].detach().cpu()
+        )
     torch.save(plan_embedding, ckpt / "plan_token_embedding.pt")
     feature_type = str(getattr(args, "sample_feature_type", "unknown"))
     summary_path = args.plan_label_dir / "summary.json" if args.plan_label_dir else None
@@ -2214,14 +2287,6 @@ def main() -> None:
         freeze_lm_head=args.freeze_lm_head,
         full_finetune=args.full_finetune,
     )
-    if args.train_plan_token_embedding:
-        embed_weight = model.get_input_embeddings().weight
-        if not embed_weight.requires_grad:
-            # Covers both LoRA (backbone frozen) and full-FT with tied embeddings
-            # (Qwen3-VL-2B has tie_word_embeddings=true, so freezing lm_head also
-            # froze the input embeddings). Re-enable ONLY the plan-token rows via a
-            # masked grad hook; with no LM text loss the lm_head side gets no grad.
-            register_plan_rows_hook(embed_weight, plan_token_ids)
     model = apply_lora(model, args)
 
     sig_model = sig_processor = sig_encode = None
@@ -2317,6 +2382,7 @@ def main() -> None:
         future_dino_loss_weight=args.future_dino_loss_weight,
         current_depth_loss_weight=args.current_depth_loss_weight,
         future_depth_loss_weight=args.future_depth_loss_weight,
+        train_plan_token_embedding=args.train_plan_token_embedding,
     )
     if args.plan_head_type == "lingbot_dino" and args.head_warmstart_ckpt is not None:
         head_state = _load_lingbot_head_state(args.head_warmstart_ckpt)
