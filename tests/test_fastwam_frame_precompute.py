@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +29,14 @@ def precompute_module():
     return _load_script_module(
         "fastwam_precompute_frames_for_test",
         "third_party/FastWAM/scripts/precompute_frames.py",
+    )
+
+
+@pytest.fixture
+def verify_module():
+    return _load_script_module(
+        "fastwam_verify_frame_cache_for_test",
+        "third_party/FastWAM/scripts/verify_frame_cache.py",
     )
 
 
@@ -118,3 +127,26 @@ def test_decode_all_frames_pyav_returns_uint8_nchw(
     assert fps == 20.0
     assert frames[0, :, 0, 0].tolist() == [1, 2, 3]
     assert frames[1, :, 1, 2].tolist() == [36, 37, 38]
+
+
+def test_apply_dataset_overrides_updates_hydra_node(
+    tmp_path: Path,
+    verify_module,
+):
+    suite = tmp_path / "suite"
+    stats = tmp_path / "stats.json"
+    node = OmegaConf.create(
+        {
+            "dataset_dirs": ["old"],
+            "pretrained_norm_stats": None,
+        }
+    )
+
+    verify_module.apply_dataset_overrides(
+        node,
+        [str(suite)],
+        str(stats),
+    )
+
+    assert list(node.dataset_dirs) == [str(suite.resolve())]
+    assert node.pretrained_norm_stats == str(stats.resolve())
