@@ -50,6 +50,8 @@ from qwen3vl_wrapper import load_qwen3vl_model_and_processor, move_qwen_inputs_t
 # 4B-specific modules live in the lingbot_dino_4b/ subpackage; add it to the path (flat import,
 # matching how lingbot_dino_head imports lingbot_resampler).
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lingbot_dino_4b"))
+# 2B DINOv3+DA3 line reuses the same head/query; only its teacher encoders differ (lazy-imported).
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "dinov3_da3_2b"))
 from lingbot_dino_head import LingbotDinoPlanHead  # noqa: E402
 
 import contextlib  # noqa: E402
@@ -176,6 +178,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depth-input-size", type=int, default=256)
     parser.add_argument("--depth-grid-size", type=int, default=16, help="depth teacher token grid side (16 -> 256)")
     parser.add_argument("--depth-dim", type=int, default=1024, help="MoRGBD feature dim")
+    # --- teacher swap for the 2B DINOv3+DA3 line (same query/head; different alignment targets) ---
+    parser.add_argument("--video-target-type", choices=["dino_video", "dinov3"], default="dino_video",
+                        help="video/appearance teacher: lingbot dino_video (default) or Meta DINOv3")
+    parser.add_argument("--dinov3-model-dir", type=Path, default=None,
+                        help="DINOv3 HF snapshot dir (default: env DINOV3_MODEL_DIR)")
+    parser.add_argument("--depth-target-type", choices=["morgbd", "da3"], default="morgbd",
+                        help="depth teacher: lingbot MoGe->MoRGBD (default) or Depth-Anything-3 encoder")
+    parser.add_argument("--da3-ckpt-dir", type=Path, default=None,
+                        help="DA3 HF-mixin ckpt dir (default: env DA3_CKPT_DIR)")
+    parser.add_argument("--da3-process-res", type=int, default=224,
+                        help="DA3 input square res (multiple of 14; 224 -> 16x16=256 tok)")
     parser.add_argument("--depth-loss-weight", type=float, default=0.004, help="lingbot future_depth_loss_weight")
     parser.add_argument(
         "--head-warmstart-ckpt", type=Path, default=None,
@@ -1234,25 +1247,49 @@ def main() -> None:
             raise ValueError("lingbot_dino requires --online-plan-labels (online DINO-video targets)")
         if args.frame_ranges_json is None:
             args.frame_ranges_json = args.dataset_root / "frame_ranges.json"
-        dino_encoder = DinoVideoTargetEncoder(
-            ckpt_path=args.dino_teacher_ckpt,
-            config_path=args.dino_teacher_config,
-            input_size=args.dino_input_size,
-            device=device,
-        )
-        args.sample_feature_type = "dino_video"
-        if args.semantic_dim <= 0:
-            args.semantic_dim = 1024
-        if args.use_depth:
-            if args.depth_moge_path is None or args.depth_morgbd_path is None:
-                raise ValueError("--use-depth requires --depth-moge-path and --depth-morgbd-path")
-            depth_encoder = DepthTargetEncoder(
-                moge_path=args.depth_moge_path,
-                morgbd_path=args.depth_morgbd_path,
-                input_size=args.depth_input_size,
-                num_tokens=args.depth_grid_size * args.depth_grid_size,
+        if args.video_target_type == "dinov3":
+            from dinov3_target import Dinov3TargetEncoder  # noqa: E402
+            _vkw = {"input_size": args.dino_input_size, "device": device}
+            if args.dinov3_model_dir is not None:
+                _vkw["model_dir"] = args.dinov3_model_dir
+            dino_encoder = Dinov3TargetEncoder(**_vkw)
+            args.sample_feature_type = "dinov3"
+            if args.semantic_dim <= 0:
+                args.semantic_dim = dino_encoder.feature_dim  # DINOv3 ViT-H+ -> 1280
+        else:
+            dino_encoder = DinoVideoTargetEncoder(
+                ckpt_path=args.dino_teacher_ckpt,
+                config_path=args.dino_teacher_config,
+                input_size=args.dino_input_size,
                 device=device,
             )
+            args.sample_feature_type = "dino_video"
+            if args.semantic_dim <= 0:
+                args.semantic_dim = 1024
+        if args.use_depth:
+            if args.depth_target_type == "da3":
+                from depth_anything3_target import DepthAnything3TargetEncoder  # noqa: E402
+                _dkw = {"process_res": args.da3_process_res, "device": device}
+                if args.da3_ckpt_dir is not None:
+                    _dkw["ckpt_dir"] = args.da3_ckpt_dir
+                depth_encoder = DepthAnything3TargetEncoder(**_dkw)
+                args.depth_dim = depth_encoder.feature_dim  # DA3-Large cat_token -> 2048
+                _da3_grid = args.da3_process_res // 14
+                if _da3_grid * _da3_grid != args.depth_grid_size * args.depth_grid_size:
+                    raise ValueError(
+                        f"--da3-process-res {args.da3_process_res} yields {_da3_grid}x{_da3_grid} tokens/keyframe, "
+                        f"but --depth-grid-size {args.depth_grid_size} expects {args.depth_grid_size}^2"
+                    )
+            else:
+                if args.depth_moge_path is None or args.depth_morgbd_path is None:
+                    raise ValueError("--use-depth (morgbd) requires --depth-moge-path and --depth-morgbd-path")
+                depth_encoder = DepthTargetEncoder(
+                    moge_path=args.depth_moge_path,
+                    morgbd_path=args.depth_morgbd_path,
+                    input_size=args.depth_input_size,
+                    num_tokens=args.depth_grid_size * args.depth_grid_size,
+                    device=device,
+                )
     elif args.online_plan_labels:
         from build_siglip2_semantic_plan_labels import encode_images, load_siglip2, semantic_feature_type
 
