@@ -81,6 +81,7 @@ class Dinov3TargetEncoder(nn.Module):
         self,
         current_b3hw: torch.Tensor,
         keyframes_b3hw: Sequence[torch.Tensor],
+        effective_fps=None,  # accepted for lingbot-encoder parity; DINOv3 is per-image, unused
     ) -> torch.Tensor:
         """current: (B,3,H,W) [unused — DINOv3 is per-image; kept for encoder-swap parity].
         keyframes: list of K x (B,3,H,W) future frames.
@@ -94,3 +95,11 @@ class Dinov3TargetEncoder(nn.Module):
         tok, dim = feats.shape[1], feats.shape[2]
         feats = feats.view(k, b, tok, dim).permute(1, 0, 2, 3).reshape(b, k * tok, dim)
         return feats.detach()
+
+    @torch.no_grad()
+    def encode_current_and_future(self, current_b3hw, keyframe_b3hw, effective_fps=None):
+        """LingBot current-alignment parity: encode the current frame AND one future keyframe.
+        Returns (current [B,N,D], future [B,N,D]) DINOv3 patch tokens (detached). effective_fps unused."""
+        cur = self._patch_tokens(self._prep(current_b3hw)).detach()   # (B, N, D)
+        fut = self._patch_tokens(self._prep(keyframe_b3hw)).detach()  # (B, N, D)
+        return cur, fut

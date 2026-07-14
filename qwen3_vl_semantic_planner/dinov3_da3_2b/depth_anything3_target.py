@@ -154,3 +154,11 @@ class DepthAnything3TargetEncoder(nn.Module):
         tok, dim = feats.shape[1], feats.shape[2]
         feats = feats.view(k, b, tok, dim).permute(1, 0, 2, 3).reshape(b, k * tok, dim)
         return feats.detach().to(torch.bfloat16)
+
+    @torch.no_grad()
+    def encode_current_and_future(self, current_b3hw, keyframe_b3hw):
+        """LingBot current-alignment parity: DA3 encoder features for the current frame AND one
+        future keyframe. Returns (current [B,tok,D], future [B,tok,D]) bf16 (detached)."""
+        cur = self._patch_tokens(self._prep(current_b3hw)).detach().to(torch.bfloat16)   # (B, tok, D)
+        fut = self._patch_tokens(self._prep(keyframe_b3hw)).detach().to(torch.bfloat16)  # (B, tok, D)
+        return cur, fut
