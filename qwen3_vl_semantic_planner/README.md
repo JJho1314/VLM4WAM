@@ -44,7 +44,7 @@ See `lingbot_dino_4b/LINGBOT_DINO_SPEC.md` for the full spec + the 9-step traini
 
 ## Stage-2: planner ⊗ Cosmos-WM (DIAL-style)
 - `planner_plan_provider.py` — load a trained planner ckpt, predict the plan in the WM's `semantic_plan` space
-- WM-side hook: `third_party/.../video2world_model_rectified_flow.py` (env-guarded, zero effect unless
+- WM-side hook: `cosmos-predict2.5/.../video2world_model_rectified_flow.py` (env-guarded, zero effect unless
   `SEMANTIC_PLAN_PLANNER_CKPT` is set)
 - `STAGE2_PLAN.md` — design doc
 
