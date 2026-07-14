@@ -42,11 +42,17 @@ OUTPUT_DIR=${OUTPUT_DIR:-$REPO_ROOT/outputs/qwen3vl_semantic_planner/qwen3vl4b_l
 # plan geometry: DINO-video, 5 keyframes x 16^2=256 tokens x 1024 dim => target_len 1280
 NUM_KEYFRAMES=${NUM_KEYFRAMES:-5}
 GRID_SIZE=${GRID_SIZE:-16}
-NUM_LATENT_PER_KEYFRAME=${NUM_LATENT_PER_KEYFRAME:-8}   # matches lingbot num_task_tokens=8
+NUM_LATENT_PER_KEYFRAME=${NUM_LATENT_PER_KEYFRAME:-8}   # SHARED latents/kf (lingbot num_task_tokens=8)
+NUM_HEAD_LATENT_PER_KEYFRAME=${NUM_HEAD_LATENT_PER_KEYFRAME:-0}  # per-head OWN latents/kf (0 = official fully-shared)
 SEMANTIC_DIM=${SEMANTIC_DIM:-1024}
 SEQUENCE_LENGTH=${SEQUENCE_LENGTH:-49}
 KEYFRAME_SCHEME=${KEYFRAME_SCHEME:-uniform}
 KEYFRAME_GAMMA=${KEYFRAME_GAMMA:-0.6}
+KEYFRAME_OFFSETS=${KEYFRAME_OFFSETS:-}       # explicit comma offsets (e.g. "48"); overrides scheme
+USE_CURRENT=${USE_CURRENT:-0}                # official-lingbot current alignment heads (aux)
+BIDIRECTIONAL_PLAN_ATTN=${BIDIRECTIONAL_PLAN_ATTN:-0}   # 1: official-parity bidirectional prefix attention (needs retrain)
+CURRENT_VIDEO_LOSS_WEIGHT=${CURRENT_VIDEO_LOSS_WEIGHT:-1.0}
+CURRENT_DEPTH_LOSS_WEIGHT=${CURRENT_DEPTH_LOSS_WEIGHT:-0.004}
 DINO_INPUT_SIZE=${DINO_INPUT_SIZE:-256}
 
 # plain MSE (lingbot's active video term); other terms off
@@ -68,6 +74,7 @@ WEIGHT_DECAY=${WEIGHT_DECAY:-0.01}
 NUM_WORKERS=${NUM_WORKERS:-4}
 DTYPE=${DTYPE:-bf16}
 FULL_FINETUNE=${FULL_FINETUNE:-1}   # 1: tune LM+head; 0: head + plan-token embeddings only (fits small GPUs)
+FREEZE_VISION=${FREEZE_VISION:-1}   # 0: also fine-tune the vision encoder (attacks the Qwen->DINO translation gap)
 
 mkdir -p "$OUTPUT_DIR" logs
 echo "[launch] gpus=$NUM_GPUS model=$MODEL_PATH dataset=$DATASET_ROOT out=$OUTPUT_DIR full_ft=$FULL_FINETUNE"
@@ -82,6 +89,7 @@ TRAIN_ARGS=(
   --num-keyframes "$NUM_KEYFRAMES"
   --grid-size "$GRID_SIZE"
   --num-latent-per-keyframe "$NUM_LATENT_PER_KEYFRAME"
+  --num-head-latent-per-keyframe "$NUM_HEAD_LATENT_PER_KEYFRAME"
   --lr "$LR"
   --head-lr "$HEAD_LR"
   --plan-head-type lingbot_dino
@@ -97,7 +105,6 @@ TRAIN_ARGS=(
   --save-steps "$SAVE_STEPS"
   --log-steps "$LOG_STEPS"
   --num-workers "$NUM_WORKERS"
-  --freeze-vision
   --train-plan-token-embedding
   --ddp-find-unused-parameters
   --online-plan-labels
@@ -116,6 +123,15 @@ else
   echo "[launch] skip head warm-start (no model.safetensors.index.json under '$HEAD_WARMSTART_CKPT')"
 fi
 [[ "$FULL_FINETUNE" == "1" ]] && TRAIN_ARGS+=(--full-finetune)
+# trainer default is freeze_vision=True, so unfreezing needs the explicit negative flag
+[[ "$FREEZE_VISION" == "1" ]] && TRAIN_ARGS+=(--freeze-vision) || TRAIN_ARGS+=(--no-freeze-vision)
+[[ -n "$KEYFRAME_OFFSETS" ]] && TRAIN_ARGS+=(--keyframe-offsets "$KEYFRAME_OFFSETS")
+[[ "$BIDIRECTIONAL_PLAN_ATTN" == "1" ]] && TRAIN_ARGS+=(--bidirectional-plan-attn)
+[[ "$USE_CURRENT" == "1" ]] && TRAIN_ARGS+=(
+  --use-current
+  --current-video-loss-weight "$CURRENT_VIDEO_LOSS_WEIGHT"
+  --current-depth-loss-weight "$CURRENT_DEPTH_LOSS_WEIGHT"
+)
 [[ "$USE_DEPTH" == "1" ]] && TRAIN_ARGS+=(
   --use-depth
   --depth-moge-path "$DEPTH_MOGE_PATH"

@@ -51,6 +51,38 @@ from qwen3vl_wrapper import load_qwen3vl_model_and_processor, move_qwen_inputs_t
 # matching how lingbot_dino_head imports lingbot_resampler).
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lingbot_dino_4b"))
 from lingbot_dino_head import LingbotDinoPlanHead  # noqa: E402
+
+import contextlib  # noqa: E402
+
+
+def _bidirectional_prefix_mask(config, input_embeds, attention_mask, cache_position,
+                               past_key_values, position_ids=None,
+                               or_mask_function=None, and_mask_function=None):
+    """Drop-in replacement for HF ``create_causal_mask`` yielding a BIDIRECTIONAL
+    (non-causal) prefix mask — only padding keys are blocked. Matches official lingbot
+    prefix attention: our whole prompt IS the prefix (image + instruction + plan queries)
+    and we read plan-token hidden states, never autoregressively generate. SDPA-compatible
+    4-D additive mask (model is loaded attn_implementation='sdpa')."""
+    b, s = input_embeds.shape[0], input_embeds.shape[1]
+    dtype, device = input_embeds.dtype, input_embeds.device
+    m = torch.zeros(b, 1, s, s, dtype=dtype, device=device)
+    if attention_mask is not None:
+        keep = attention_mask.to(device=device, dtype=torch.bool)  # [b, s] 1=keep, 0=pad
+        m = m.masked_fill(~keep[:, None, None, :], torch.finfo(dtype).min)
+    return m
+
+
+@contextlib.contextmanager
+def _bidirectional_prefix():
+    """Temporarily swap Qwen3-VL's ``create_causal_mask`` so the text backbone attends
+    bidirectionally over the full prompt (official-parity prefix attention)."""
+    from transformers.models.qwen3_vl import modeling_qwen3_vl as _q3
+    _orig = _q3.create_causal_mask
+    _q3.create_causal_mask = _bidirectional_prefix_mask
+    try:
+        yield
+    finally:
+        _q3.create_causal_mask = _orig
 from dino_video_target import DinoVideoTargetEncoder  # noqa: E402
 from depth_target import DepthTargetEncoder  # noqa: E402
 
@@ -64,11 +96,18 @@ def _load_lingbot_head_state(src_6b_dir: Path) -> dict:
 
     src = Path(src_6b_dir)
     index = json.loads((src / "model.safetensors.index.json").read_text())["weight_map"]
-    want = [
-        k for k in index
-        if any(m in k for m in ("future_video_align_head.", "future_depth_align_head."))
-        or k.endswith(("future_video_align_embs", "future_depth_align_embs"))
-    ]
+    # NOTE the leading dots: lingbot's current-depth head is plain "depth_align_head", which is a
+    # substring of "future_depth_align_head" — the dot pins the match to the exact head name
+    # (keys look like "model.depth_align_head.projector...").
+    markers = (
+        ".future_video_align_head.", ".future_depth_align_head.",
+        ".current_video_align_head.", ".depth_align_head.",
+    )
+    suffixes = (
+        ".future_video_align_embs", ".future_depth_align_embs",
+        ".current_video_align_embs", ".depth_align_embs",
+    )
+    want = [k for k in index if any(m in k for m in markers) or k.endswith(suffixes)]
     by_file: dict[str, list[str]] = defaultdict(list)
     for k in want:
         by_file[index[k]].append(k)
@@ -97,6 +136,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--siglip2-encoder-path", type=Path, default=None)
     parser.add_argument("--sequence-length", type=int, default=49)
     parser.add_argument("--keyframe-scheme", choices=["uniform", "late"], default="uniform")
+    # Explicit comma-separated keyframe offsets (e.g. "48" for a single official-lingbot-style
+    # future frame at the horizon end). Overrides --keyframe-scheme when set.
+    parser.add_argument("--keyframe-offsets", type=str, default="")
+    # Official-lingbot CURRENT alignment: extra current-time latent group + current_video /
+    # current_depth heads (warm-started from current_video_align_head / depth_align_head).
+    parser.add_argument("--use-current", action="store_true")
+    parser.add_argument("--bidirectional-plan-attn", action="store_true",
+                        help="official-parity: bidirectional prefix attention over image+instruction+plan "
+                             "tokens (vs default causal). Changes the backbone's attention pattern; needs retraining.")
+    parser.add_argument("--current-video-loss-weight", type=float, default=1.0)
+    parser.add_argument("--current-depth-loss-weight", type=float, default=0.004)
     parser.add_argument("--keyframe-gamma", type=float, default=0.6)
     parser.add_argument("--online-grid-size", type=int, default=0, help="<=0 keeps the native SigLIP2 grid")
     parser.add_argument("--max-samples", type=int, default=0)
@@ -135,6 +185,11 @@ def parse_args() -> argparse.Namespace:
     # keyframe (a compact "visual thought"), and a decoder reconstructs the dense SigLIP grid
     # from them. Decouples the LM sequence length from the target grid resolution.
     parser.add_argument("--num-latent-per-keyframe", type=int, default=4)
+    # lingbot_dino only: per-keyframe latents OWNED by each align head (video / depth), ON TOP of
+    # the SHARED --num-latent-per-keyframe group. Layout per keyframe in the LM sequence:
+    # [shared | video-own | depth-own(if --use-depth)]. Each head reads [shared + its own] latents.
+    # 0 = fully shared (official lingbot behavior).
+    parser.add_argument("--num-head-latent-per-keyframe", type=int, default=0)
     parser.add_argument("--plan-head-num-heads", type=int, default=16)
     parser.add_argument("--plan-head-dropout", type=float, default=0.0)
     parser.add_argument("--sem-mlp-hidden-size", type=int, default=0)
@@ -334,12 +389,17 @@ class OnlineSemanticPlanDataset(Dataset):
         keyframe_gamma: float,
         max_samples: int = 0,
         seed: int = 0,
+        offsets_override: list[int] | None = None,
     ) -> None:
         from build_siglip2_semantic_plan_labels import load_frame_ranges
 
         self.dataset_root = dataset_root
         self.sequence_length = int(sequence_length)
-        self.offsets = keyframe_offsets(self.sequence_length, num_keyframes, keyframe_scheme, keyframe_gamma)
+        self.offsets = (
+            [int(o) for o in offsets_override]
+            if offsets_override
+            else keyframe_offsets(self.sequence_length, num_keyframes, keyframe_scheme, keyframe_gamma)
+        )
         self.seed = int(seed)
         self.epoch = 0
         ranges = load_frame_ranges(frame_ranges_json)
@@ -601,6 +661,7 @@ class PlannerWrapper(nn.Module):
         num_keyframes: int,
         grid_size: int,
         num_latent_per_keyframe: int = 4,
+        num_head_latent_per_keyframe: int = 0,
         plan_head_type: str = "mlp",
         plan_head_num_heads: int = 16,
         plan_head_dropout: float = 0.0,
@@ -615,6 +676,10 @@ class PlannerWrapper(nn.Module):
         depth_dim: int = 1024,
         depth_grid_size: int = 16,
         depth_loss_weight: float = 0.004,
+        use_current: bool = False,
+        current_video_loss_weight: float = 1.0,
+        current_depth_loss_weight: float = 0.004,
+        bidirectional_plan_attn: bool = False,
     ) -> None:
         super().__init__()
         if sem_mlp_hidden_size < 0:
@@ -630,6 +695,9 @@ class PlannerWrapper(nn.Module):
         self.plan_head_num_heads = int(plan_head_num_heads)
         self.plan_head_dropout = float(plan_head_dropout)
         self.num_latent_per_keyframe = int(num_latent_per_keyframe)
+        self.num_head_latent_per_keyframe = int(num_head_latent_per_keyframe)
+        self.bidirectional_plan_attn = bool(bidirectional_plan_attn)
+        self.num_keyframes = int(num_keyframes)
         # target_len = tokens the loss regresses (dense SigLIP grid). latent_len = <|sem_plan|>
         # tokens the LM actually emits. They differ only for the CoVT bottleneck head.
         self.target_len = int(target_len)
@@ -661,10 +729,21 @@ class PlannerWrapper(nn.Module):
             # lingbot-vla-v2 rich-KV head predicting DINO-video patches: shared TaskTokenResampler
             # (warm-startable from future_video_align_head) run per keyframe. grid_size**2 = the DINO
             # patch-token count per keyframe (16**2 = 256). semantic_dim is the DINO dim (1024).
-            self.latent_len = int(num_keyframes) * int(num_latent_per_keyframe)
+            # Latent layout per keyframe: [shared | video-own | depth-own], own groups only when
+            # num_head_latent_per_keyframe > 0; each head reads shared + its own group.
+            # With use_current (official lingbot parity) ONE extra current-time group is PREPENDED:
+            # [current(shared) | future_kf1 | ... | future_kfK].
+            spec = self.num_head_latent_per_keyframe
+            self.use_current = bool(use_current)
+            if self.use_current and spec > 0:
+                raise ValueError("--use-current supports only fully-shared latents (num-head-latent-per-keyframe=0)")
+            own_groups = (2 if (bool(use_depth) and spec > 0) else (1 if spec > 0 else 0))
+            self.per_kf_latents = int(num_latent_per_keyframe) + spec * own_groups
+            self.head_latents_per_kf = int(num_latent_per_keyframe) + spec
+            self.latent_len = (int(num_keyframes) + (1 if self.use_current else 0)) * self.per_kf_latents
             self.plan_head = LingbotDinoPlanHead(
                 num_keyframes=num_keyframes,
-                num_latent_per_keyframe=num_latent_per_keyframe,
+                num_latent_per_keyframe=self.head_latents_per_kf,
                 num_backbone_tokens=int(grid_size) * int(grid_size),
                 llm_hidden=hidden_size,
                 dim_out=semantic_dim,
@@ -680,11 +759,34 @@ class PlannerWrapper(nn.Module):
         if self.use_depth:
             self.depth_head = LingbotDinoPlanHead(
                 num_keyframes=num_keyframes,
-                num_latent_per_keyframe=num_latent_per_keyframe,
+                num_latent_per_keyframe=self.head_latents_per_kf,
                 num_backbone_tokens=int(depth_grid_size) * int(depth_grid_size),
                 llm_hidden=hidden_size,
                 dim_out=depth_dim,
             )
+        # Official-lingbot CURRENT alignment heads (aux): same head class with num_keyframes=1,
+        # reading the prepended current latent group; warm-started from current_video_align_head /
+        # depth_align_head (lingbot's current-depth head is named plain "depth_align_head").
+        self.current_video_loss_weight = float(current_video_loss_weight)
+        self.current_depth_loss_weight = float(current_depth_loss_weight)
+        self.current_plan_head = None
+        self.current_depth_head = None
+        if getattr(self, "use_current", False) and plan_head_type == "lingbot_dino":
+            self.current_plan_head = LingbotDinoPlanHead(
+                num_keyframes=1,
+                num_latent_per_keyframe=self.head_latents_per_kf,
+                num_backbone_tokens=int(grid_size) * int(grid_size),
+                llm_hidden=hidden_size,
+                dim_out=semantic_dim,
+            )
+            if self.use_depth:
+                self.current_depth_head = LingbotDinoPlanHead(
+                    num_keyframes=1,
+                    num_latent_per_keyframe=self.head_latents_per_kf,
+                    num_backbone_tokens=int(depth_grid_size) * int(depth_grid_size),
+                    llm_hidden=hidden_size,
+                    dim_out=depth_dim,
+                )
         self.plan_token_ids = [int(x) for x in plan_token_ids]
         self.model = model
         # image-token id used by the lingbot_dino head to gather the LLM's image-token hiddens
@@ -720,7 +822,9 @@ class PlannerWrapper(nn.Module):
     def _forward_hiddens(self, **inputs: Any) -> tuple[torch.Tensor | None, torch.Tensor]:
         """One VLM forward -> (image_hidden|None, plan_hidden). Image tokens are DETACHED (lingbot
         detach_image_feats=True). Shared by the video head, the depth head, and inference."""
-        outputs = self.model(**inputs, output_hidden_states=True, use_cache=False)
+        ctx = _bidirectional_prefix() if getattr(self, "bidirectional_plan_attn", False) else contextlib.nullcontext()
+        with ctx:
+            outputs = self.model(**inputs, output_hidden_states=True, use_cache=False)
         hidden = outputs.hidden_states[-1]
         input_ids = inputs["input_ids"]
         plan_hidden = self.collect_plan_hidden(hidden, input_ids, self.latent_len)
@@ -729,12 +833,39 @@ class PlannerWrapper(nn.Module):
             image_hidden = self.collect_image_hidden(hidden, input_ids).detach()
         return image_hidden, plan_hidden
 
+    def _split_current(self, plan_hidden: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor]:
+        """Split off the PREPENDED current-time latent group -> (current latents | None, future latents)."""
+        if not getattr(self, "use_current", False):
+            return None, plan_hidden
+        g = self.per_kf_latents
+        return plan_hidden[:, :g], plan_hidden[:, g:]
+
+    def _split_latents(self, plan_hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Split grouped lingbot_dino latents into per-head views.
+
+        Per-keyframe layout: [shared | video-own | depth-own(if use_depth)]. Returns
+        (video latents, depth latents), each (B, K*(shared+own), H). With no own groups
+        (official fully-shared config) both heads read the same tensor."""
+        spec = self.num_head_latent_per_keyframe
+        if self.plan_head_type != "lingbot_dino" or spec <= 0:
+            return plan_hidden, (plan_hidden if self.use_depth else None)
+        b, _, h = plan_hidden.shape
+        s = self.num_latent_per_keyframe
+        lat = plan_hidden.reshape(b, self.num_keyframes, self.per_kf_latents, h)
+        video = torch.cat([lat[:, :, :s], lat[:, :, s:s + spec]], dim=2).reshape(b, -1, h)
+        depth = None
+        if self.use_depth:
+            depth = torch.cat([lat[:, :, :s], lat[:, :, s + spec:s + 2 * spec]], dim=2).reshape(b, -1, h)
+        return video, depth
+
     def predict_semantic_plan(self, **inputs: Any) -> torch.Tensor:
         image_hidden, plan_hidden = self._forward_hiddens(**inputs)
         head_dtype = next(self.plan_head.parameters()).dtype
         if self.plan_head_type == "lingbot_dino":
+            _, future_hidden = self._split_current(plan_hidden)
+            video_lat, _ = self._split_latents(future_hidden)
             return self.plan_head(
-                image_hidden.to(dtype=head_dtype), plan_hidden.to(dtype=head_dtype)
+                image_hidden.to(dtype=head_dtype), video_lat.to(dtype=head_dtype)
             ).float()
         return self.plan_head(plan_hidden.to(dtype=head_dtype)).float()
 
@@ -798,21 +929,25 @@ class PlannerWrapper(nn.Module):
         self,
         semantic_plan_labels: torch.Tensor,
         depth_plan_labels: torch.Tensor | None = None,
+        current_video_labels: torch.Tensor | None = None,
+        current_depth_labels: torch.Tensor | None = None,
         **inputs: Any,
     ) -> dict[str, torch.Tensor]:
         batch, target_len, _ = semantic_plan_labels.shape
         if target_len != self.target_len:
             raise RuntimeError(f"Batch has {target_len} target tokens, wrapper expects {self.target_len}")
         if self.plan_head_type == "lingbot_dino":
-            # One VLM forward feeds BOTH the video head and (optionally) the auxiliary depth head.
+            # One VLM forward feeds the future video/depth heads and (optionally) the current heads.
             image_hidden, plan_hidden = self._forward_hiddens(**inputs)
             head_dtype = next(self.plan_head.parameters()).dtype
-            pred = self.plan_head(image_hidden.to(head_dtype), plan_hidden.to(head_dtype)).float()
+            current_lat, future_hidden = self._split_current(plan_hidden)
+            video_lat, depth_lat = self._split_latents(future_hidden)
+            pred = self.plan_head(image_hidden.to(head_dtype), video_lat.to(head_dtype)).float()
             if pred.shape[0] != batch or pred.shape[1] != self.target_len:
                 raise RuntimeError(f"Prediction {tuple(pred.shape[:2])} != ({batch}, {self.target_len})")
             out = self.compute_plan_losses(pred, semantic_plan_labels.to(device=pred.device, dtype=torch.float32))
             if self.depth_head is not None and depth_plan_labels is not None:
-                depth_pred = self.depth_head(image_hidden.to(head_dtype), plan_hidden.to(head_dtype)).float()
+                depth_pred = self.depth_head(image_hidden.to(head_dtype), depth_lat.to(head_dtype)).float()
                 depth_target = depth_plan_labels.to(device=pred.device, dtype=torch.float32)
                 depth_l = F.smooth_l1_loss(depth_pred, depth_target)  # lingbot depth loss (_emb_loss)
                 out["loss"] = out["loss"] + self.depth_loss_weight * depth_l
@@ -820,6 +955,18 @@ class PlannerWrapper(nn.Module):
                 out["depth_norm_ratio"] = (
                     depth_pred.norm(dim=-1).mean() / depth_target.norm(dim=-1).mean().clamp_min(1e-6)
                 ).detach()
+            if self.current_plan_head is not None and current_video_labels is not None:
+                cur_pred = self.current_plan_head(image_hidden.to(head_dtype), current_lat.to(head_dtype)).float()
+                cur_target = current_video_labels.to(device=pred.device, dtype=torch.float32)
+                cur_l = F.mse_loss(cur_pred, cur_target)
+                out["loss"] = out["loss"] + self.current_video_loss_weight * cur_l
+                out["current_video_mse"] = cur_l.detach()
+            if self.current_depth_head is not None and current_depth_labels is not None:
+                cd_pred = self.current_depth_head(image_hidden.to(head_dtype), current_lat.to(head_dtype)).float()
+                cd_target = current_depth_labels.to(device=pred.device, dtype=torch.float32)
+                cd_l = F.smooth_l1_loss(cd_pred, cd_target)
+                out["loss"] = out["loss"] + self.current_depth_loss_weight * cd_l
+                out["current_depth_smooth_l1"] = cd_l.detach()
             return out
         pred = self.predict_semantic_plan(**inputs)
         if pred.shape[0] != batch:
@@ -875,15 +1022,16 @@ def register_plan_rows_hook(param: nn.Parameter, row_ids: list[int]) -> None:
 
 def build_optimizer(wrapper: PlannerWrapper, args: argparse.Namespace) -> torch.optim.Optimizer:
     head_params = [p for p in wrapper.plan_head.parameters() if p.requires_grad]
-    if getattr(wrapper, "depth_head", None) is not None:
-        # the auxiliary depth head trains at head_lr alongside plan_head (both are fresh-ish resamplers)
-        head_params += [p for p in wrapper.depth_head.parameters() if p.requires_grad]
+    for aux in ("depth_head", "current_plan_head", "current_depth_head"):
+        m = getattr(wrapper, aux, None)
+        if m is not None:
+            # all auxiliary align heads train at head_lr alongside plan_head (fresh-ish resamplers)
+            head_params += [p for p in m.parameters() if p.requires_grad]
     other_params = [
         p
         for n, p in wrapper.named_parameters()
         if p.requires_grad
-        and not n.startswith("plan_head.")
-        and not n.startswith("depth_head.")
+        and not n.startswith(("plan_head.", "depth_head.", "current_plan_head.", "current_depth_head."))
     ]
     groups = []
     if other_params:
@@ -948,6 +1096,13 @@ def save_checkpoint(
     module.model.save_pretrained(ckpt / "qwen3vl_lora_or_model")
     processor.save_pretrained(ckpt / "processor")
     torch.save(module.plan_head.state_dict(), ckpt / "plan_head.pt")
+    if getattr(module, "depth_head", None) is not None:
+        # aux head, but save it too: needed to visualize Depth-Pred from a checkpoint.
+        torch.save(module.depth_head.state_dict(), ckpt / "depth_head.pt")
+    if getattr(module, "current_plan_head", None) is not None:
+        torch.save(module.current_plan_head.state_dict(), ckpt / "current_plan_head.pt")
+    if getattr(module, "current_depth_head", None) is not None:
+        torch.save(module.current_depth_head.state_dict(), ckpt / "current_depth_head.pt")
     plan_ids = torch.as_tensor(module.plan_token_ids)
     plan_embedding = module.model.get_input_embeddings().weight[plan_ids].detach().cpu()
     torch.save(plan_embedding, ckpt / "plan_token_embedding.pt")
@@ -965,6 +1120,12 @@ def save_checkpoint(
         "num_keyframes": args.num_keyframes,
         "grid_size": args.grid_size,
         "semantic_dim": args.semantic_dim,
+        "num_latent_per_keyframe": args.num_latent_per_keyframe,
+        "num_head_latent_per_keyframe": int(getattr(args, "num_head_latent_per_keyframe", 0)),
+        "use_depth": bool(getattr(args, "use_depth", False)),
+        "use_current": bool(getattr(args, "use_current", False)),
+        "bidirectional_plan_attn": bool(getattr(args, "bidirectional_plan_attn", False)),
+        "keyframe_offsets": str(getattr(args, "keyframe_offsets", "")),
         "model_path": str(args.model_path),
         "objective": "continuous_semantic_blueprint_regression",
         "feature_type": feature_type,
@@ -1026,7 +1187,11 @@ def main() -> None:
     # (all latents become the same -> keyframes stop evolving). mlp/baton keep the single
     # repeated token (their latent_len = target_len = thousands of tokens).
     if args.plan_head_type in ("covt", "lingbot_dino"):
-        _latent_len = int(args.num_keyframes) * int(args.num_latent_per_keyframe)
+        _spec = int(args.num_head_latent_per_keyframe) if args.plan_head_type == "lingbot_dino" else 0
+        _own_groups = (2 if (args.use_depth and _spec > 0) else (1 if _spec > 0 else 0))
+        _per_kf = int(args.num_latent_per_keyframe) + _spec * _own_groups
+        _cur_groups = 1 if (args.use_current and args.plan_head_type == "lingbot_dino") else 0
+        _latent_len = (int(args.num_keyframes) + _cur_groups) * _per_kf
         plan_token_strs = [f"<|sem_plan_{i}|>" for i in range(_latent_len)]
         plan_sequence = list(plan_token_strs)
     else:
@@ -1131,6 +1296,11 @@ def main() -> None:
         num_keyframes=args.num_keyframes,
         grid_size=args.grid_size,
         num_latent_per_keyframe=args.num_latent_per_keyframe,
+        num_head_latent_per_keyframe=args.num_head_latent_per_keyframe,
+        use_current=args.use_current,
+        current_video_loss_weight=args.current_video_loss_weight,
+        current_depth_loss_weight=args.current_depth_loss_weight,
+        bidirectional_plan_attn=args.bidirectional_plan_attn,
         plan_head_type=args.plan_head_type,
         plan_head_num_heads=args.plan_head_num_heads,
         plan_head_dropout=args.plan_head_dropout,
@@ -1151,10 +1321,19 @@ def main() -> None:
         report = wrapper.plan_head.load_lingbot_warmstart(head_state, head_name="future_video_align_head")
         if wrapper.depth_head is not None:
             depth_report = wrapper.depth_head.load_lingbot_warmstart(head_state, head_name="future_depth_align_head")
+        if wrapper.current_plan_head is not None:
+            cur_report = wrapper.current_plan_head.load_lingbot_warmstart(head_state, head_name="current_video_align_head")
+        if wrapper.current_depth_head is not None:
+            # lingbot's current-depth head is named plain "depth_align_head"
+            cur_depth_report = wrapper.current_depth_head.load_lingbot_warmstart(head_state, head_name="depth_align_head")
         if is_main(rank):
             print(json.dumps({"head_warmstart": report}), flush=True)
             if wrapper.depth_head is not None:
                 print(json.dumps({"depth_head_warmstart": depth_report}), flush=True)
+            if wrapper.current_plan_head is not None:
+                print(json.dumps({"current_video_head_warmstart": cur_report}), flush=True)
+            if wrapper.current_depth_head is not None:
+                print(json.dumps({"current_depth_head_warmstart": cur_depth_report}), flush=True)
     wrapper.to(device)
     wrapper.train()
     if is_main(rank):
@@ -1185,6 +1364,10 @@ def main() -> None:
         )
 
     if args.online_plan_labels:
+        _offsets_override = (
+            [int(x) for x in str(args.keyframe_offsets).split(",") if str(x).strip()]
+            if getattr(args, "keyframe_offsets", "") else None
+        )
         dataset = OnlineSemanticPlanDataset(
             dataset_root=args.dataset_root,
             frame_ranges_json=args.frame_ranges_json,
@@ -1194,6 +1377,7 @@ def main() -> None:
             keyframe_gamma=args.keyframe_gamma,
             max_samples=args.max_samples,
             seed=args.seed,
+            offsets_override=_offsets_override,
         )
         if is_main(rank):
             print(
@@ -1276,6 +1460,12 @@ def main() -> None:
                         if depth_encoder is not None:
                             # LingBot-Depth targets over the SAME future keyframes -> [B, K*256, 1024].
                             batch["depth_plan_labels"] = depth_encoder.encode_future_keyframes(kfs).float()
+                        if getattr(module, "use_current", False):
+                            # Official-lingbot CURRENT targets: teacher on the current frame itself
+                            # (clip [cur, cur, cur] gives the current frame in the same temporal stats).
+                            batch["current_video_labels"] = dino_encoder.encode_future_keyframes(cur, [cur]).float()
+                            if depth_encoder is not None:
+                                batch["current_depth_labels"] = depth_encoder.encode_future_keyframes([cur]).float()
                     else:
                         # Online SigLIP2 targets (bit-consistent with the offline builder).
                         b, k = keyframes.shape[0], keyframes.shape[1]

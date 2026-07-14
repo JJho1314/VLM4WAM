@@ -84,8 +84,11 @@ class LingbotDinoPlanHead(nn.Module):
         default) or ``future_depth_align_head`` (LingBot-Depth). Returns a report
         ``{"resampler_missing":..., "resampler_unexpected":..., "query_loaded":bool}``.
         """
-        marker = f"{head_name}.projector."
-        embs_suffix = head_name.replace("_head", "_embs")  # future_{video,depth}_align_embs
+        # Dot-pinned matching: lingbot's current-depth head is plain "depth_align_head", a SUBSTRING
+        # of "future_depth_align_head" (keys look like "model.<head_name>.projector..."), so anchor
+        # both the projector marker and the embs suffix on the preceding ".".
+        marker = f".{head_name}.projector."
+        embs_suffix = "." + head_name.replace("_head", "_embs")  # .{future_video,depth,...}_align_embs
         proj = {k.split(marker, 1)[1]: v for k, v in state.items() if marker in k}
         res = self.resampler.load_state_dict(proj, strict=False)
         query = [v for k, v in state.items() if k.endswith(embs_suffix)]
