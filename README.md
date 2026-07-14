@@ -22,7 +22,7 @@ semantic_plan [B, L, 1152]
 ## Semantic planner (Qwen3-VL)
 
 The `semantic_plan` fed to the world model is produced by a Qwen3-VL planner trained under
-[`scripts/qwen3_vl_semantic_planner/`](scripts/qwen3_vl_semantic_planner/README.md). Three independent
+[`qwen3_vl_semantic_planner/`](qwen3_vl_semantic_planner/README.md). Three independent
 lines: **CoVT·SigLIP·2B** (baseline), **tasktoken·SigLIP·2B** (rich-KV head variant), and
 **lingbot-DINO·4B** (`lingbot_dino_4b/`, aligns to DINO-video via the open `robbyant/lingbot-vla-v2-6b`
 weights — needs a matching DINO-conditioned WM). See that README for details.
@@ -31,15 +31,15 @@ weights — needs a matching DINO-conditioned WM). See that README for details.
 
 Main files:
 
-- `third_party/cosmos-predict2.5/cosmos_predict2/_src/predict2/networks/semantic_plan_conditioning.py`
-- `third_party/cosmos-predict2.5/cosmos_predict2/_src/predict2/networks/minimal_v4_dit.py`
-- `third_party/cosmos-predict2.5/cosmos_predict2/experiments/base/semantic_plan.py`
-- `third_party/cosmos-predict2.5/scripts/sbatch_train_semantic_plan_cosmos_2b_320x576_93f.sh`
+- `cosmos-predict2.5/cosmos_predict2/_src/predict2/networks/semantic_plan_conditioning.py`
+- `cosmos-predict2.5/cosmos_predict2/_src/predict2/networks/minimal_v4_dit.py`
+- `cosmos-predict2.5/cosmos_predict2/experiments/base/semantic_plan.py`
+- `cosmos-predict2.5/scripts/sbatch_train_semantic_plan_cosmos_2b_320x576_93f.sh`
 
 Training entry:
 
 ```bash
-cd third_party/cosmos-predict2.5
+cd cosmos-predict2.5
 sbatch scripts/sbatch_train_semantic_plan_cosmos_2b_320x576_93f.sh
 ```
 

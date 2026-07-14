@@ -6,7 +6,7 @@ import torch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_PATH = REPO_ROOT / "third_party/cosmos-predict2.5/scripts/precompute_cosmos_vae_range_latents.py"
+SCRIPT_PATH = REPO_ROOT / "cosmos-predict2.5/scripts/precompute_cosmos_vae_range_latents.py"
 
 
 def _load_module():

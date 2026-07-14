@@ -8,7 +8,7 @@ import torch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-COSMOS_SRC = REPO_ROOT / "third_party/cosmos-predict2.5/cosmos_predict2/_src/predict2"
+COSMOS_SRC = REPO_ROOT / "cosmos-predict2.5/cosmos_predict2/_src/predict2"
 
 
 def _install_dataset_stubs(monkeypatch):

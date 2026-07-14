@@ -46,8 +46,8 @@ slurm-*.err
 data/
 datasets/
 visualizations/
-third_party/cosmos-predict2.5/assets/
-third_party/cosmos-predict2.5/docs/media/
+cosmos-predict2.5/assets/
+cosmos-predict2.5/docs/media/
 
 # Visualization artifacts
 vis/
