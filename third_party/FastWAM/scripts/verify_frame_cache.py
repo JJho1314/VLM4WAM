@@ -127,6 +127,12 @@ def get_video(ds, idx):
     return data["video"]
 
 
+def prepare_dataset_for_comparison(ds) -> None:
+    """Disable stochastic transforms so only decode paths differ."""
+    if hasattr(ds, "video_augmentation"):
+        ds.video_augmentation = None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=None, help="hydra data yaml (preferred; runs full processor pipeline)")
@@ -161,6 +167,8 @@ def main():
         assert args.dataset_dirs, "Provide --config or --dataset-dirs"
         print(f"Building minimal dataset (no processor) from: {args.dataset_dirs}")
         ds = build_dataset_minimal(args.dataset_dirs, args.text_cache_dir)
+
+    prepare_dataset_for_comparison(ds)
 
     n_total = len(ds)
     n = min(args.num_samples, n_total)

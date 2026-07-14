@@ -150,3 +150,13 @@ def test_apply_dataset_overrides_updates_hydra_node(
 
     assert list(node.dataset_dirs) == [str(suite.resolve())]
     assert node.pretrained_norm_stats == str(stats.resolve())
+
+
+def test_prepare_dataset_for_comparison_disables_random_video_augmentation(
+    verify_module,
+):
+    dataset = SimpleNamespace(video_augmentation=object())
+
+    verify_module.prepare_dataset_for_comparison(dataset)
+
+    assert dataset.video_augmentation is None
