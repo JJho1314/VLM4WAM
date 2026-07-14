@@ -70,3 +70,7 @@ eval_what_where_context_*/
 feature_guidance_analysis/
 feature_spatial_probe/
 maskfree_instructsam_cosmos_pipeline_*.png
+
+# Scratch / smoke-run outputs (regenerable; keep out of git)
+scratch/
+scratch_*/
