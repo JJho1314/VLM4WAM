@@ -393,6 +393,45 @@ def _dino_metrics(
     }
 
 
+def _sample_metrics(
+    *,
+    teacher_dino_current: torch.Tensor,
+    planner_dino_current: torch.Tensor,
+    teacher_dino_future: torch.Tensor,
+    planner_dino_future: torch.Tensor,
+    planner_log_current: torch.Tensor,
+    planner_log_future: torch.Tensor,
+    target_log_current: torch.Tensor,
+    target_log_future: torch.Tensor,
+    sample_index: int,
+) -> dict[str, float]:
+    index = slice(sample_index, sample_index + 1)
+    current_depth = compute_log_depth_metrics(
+        planner_log_current[index],
+        target_log_current[index],
+    )
+    future_depth = compute_log_depth_metrics(
+        planner_log_future[index],
+        target_log_future[index],
+    )
+    return {
+        "dino_current_mse": float(
+            F.mse_loss(
+                planner_dino_current[index].float(),
+                teacher_dino_current[index].float(),
+            )
+        ),
+        "dino_future_mse": float(
+            F.mse_loss(
+                planner_dino_future[index].float(),
+                teacher_dino_future[index].float(),
+            )
+        ),
+        "depth_current_abs_rel": float(current_depth["abs_rel"]),
+        "depth_future_abs_rel": float(future_depth["abs_rel"]),
+    }
+
+
 def _build_panels(
     *,
     item: dict[str, Any],
@@ -557,33 +596,17 @@ def main() -> None:
                 if visualized >= args.visualizations_per_suite:
                     break
                 sample_dir = args.output_dir / "samples" / suite / f"index{dataset_index:09d}"
-                camera = "main"
-                sample_metrics = {
-                    "dino_current_mse": float(
-                        F.mse_loss(
-                            dino_maps["planner_current"][camera][local_index],
-                            dino_maps["teacher_current"][camera][local_index],
-                        )
-                    ),
-                    "dino_future_mse": float(
-                        F.mse_loss(
-                            dino_maps["planner_future"][camera][local_index],
-                            dino_maps["teacher_future"][camera][local_index],
-                        )
-                    ),
-                    "depth_current_abs_rel": float(
-                        compute_log_depth_metrics(
-                            log_cameras["planner_current"][camera][local_index : local_index + 1],
-                            target_cameras["current"][camera][local_index : local_index + 1],
-                        )["abs_rel"]
-                    ),
-                    "depth_future_abs_rel": float(
-                        compute_log_depth_metrics(
-                            log_cameras["planner_future"][camera][local_index : local_index + 1],
-                            target_cameras["future"][camera][local_index : local_index + 1],
-                        )["abs_rel"]
-                    ),
-                }
+                sample_metrics = _sample_metrics(
+                    teacher_dino_current=teacher["current_dino"],
+                    planner_dino_current=planner["current_dino"],
+                    teacher_dino_future=teacher["future_dino"],
+                    planner_dino_future=planner["future_dino"],
+                    planner_log_current=log_depth["planner_current"],
+                    planner_log_future=log_depth["planner_future"],
+                    target_log_current=target_log["current"],
+                    target_log_future=target_log["future"],
+                    sample_index=local_index,
+                )
                 panels = _build_panels(
                     item=item,
                     sample_index=local_index,
