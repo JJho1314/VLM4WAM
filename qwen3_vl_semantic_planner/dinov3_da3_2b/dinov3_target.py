@@ -43,7 +43,7 @@ class Dinov3TargetEncoder(nn.Module):
         *,
         input_size: int = 256,
         device: str | torch.device = "cuda",
-        dtype: torch.dtype = torch.float32,
+        dtype: torch.dtype = torch.bfloat16,  # frozen teacher; bf16 halves ViT-H+ fwd on H100
     ) -> None:
         super().__init__()
         try:
