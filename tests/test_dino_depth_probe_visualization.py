@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 
 import torch
+from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,3 +56,42 @@ def test_global_dino_pca_does_not_renormalize_each_sample():
         probe.project_224(base),
         probe.project_224(shifted),
     )
+
+
+def test_decode_depth_output_is_exactly_224():
+    module = load_module()
+    generator = torch.Generator().manual_seed(17)
+    relative = torch.randn(2, 16, 16, generator=generator)
+    target = torch.rand(2, 256, 256, generator=generator).add_(0.1)
+
+    decoded = module.decode_depth_224(relative, target)
+
+    assert decoded.shape == (2, 224, 224)
+    assert torch.isfinite(decoded).all()
+    assert bool((decoded > 0).all())
+
+
+def test_sample_outputs_are_separate_and_exactly_224(tmp_path):
+    module = load_module()
+    paths = module.save_sample_outputs(
+        output_dir=tmp_path,
+        current_rgb=torch.zeros(224, 448, 3, dtype=torch.uint8),
+        future_rgb=torch.zeros(224, 448, 3, dtype=torch.uint8),
+        instruction="pick up the bowl",
+        dino_maps={
+            name: torch.zeros(3, 224, 224)
+            for name in module.DINO_OUTPUT_NAMES
+        },
+        depth_maps={
+            name: torch.ones(224, 224)
+            for name in module.DEPTH_OUTPUT_NAMES
+        },
+    )
+
+    assert {path.name for path in paths} == set(module.EXPECTED_SAMPLE_FILES)
+    assert (tmp_path / "instruction.txt").read_text() == "pick up the bowl\n"
+    assert not any("query" in path.name for path in paths)
+    for path in paths:
+        if path.suffix == ".png":
+            with Image.open(path) as image:
+                assert image.size == (224, 224)
