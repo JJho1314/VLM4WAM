@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
 import torch
 from PIL import Image
 
@@ -95,3 +96,38 @@ def test_sample_outputs_are_separate_and_exactly_224(tmp_path):
         if path.suffix == ".png":
             with Image.open(path) as image:
                 assert image.size == (224, 224)
+
+
+def test_training_cache_contains_both_modalities_and_current_future():
+    module = load_module()
+    cache = module.ProbeTrainingCache(
+        dino=torch.zeros(4, 256, 1024),
+        depth=torch.zeros(4, 256, 1024),
+        relative_depth=torch.zeros(4, 16, 16),
+    )
+
+    cache.validate()
+
+
+def test_training_cache_rejects_mismatched_frame_counts():
+    module = load_module()
+    cache = module.ProbeTrainingCache(
+        dino=torch.zeros(4, 256, 1024),
+        depth=torch.zeros(3, 256, 1024),
+        relative_depth=torch.zeros(4, 16, 16),
+    )
+
+    with pytest.raises(ValueError, match="shapes differ"):
+        cache.validate()
+
+
+def test_projected_dino_metrics_are_exact_for_equal_maps():
+    module = load_module()
+    generator = torch.Generator().manual_seed(19)
+    target = torch.rand(2, 3, 224, 224, generator=generator)
+
+    metrics = module.compute_dino_map_metrics(target, target.clone())
+
+    assert metrics["num_pixels"] == 2 * 224 * 224
+    assert metrics["mse"] == pytest.approx(0.0)
+    assert metrics["mean_cosine"] == pytest.approx(1.0)
