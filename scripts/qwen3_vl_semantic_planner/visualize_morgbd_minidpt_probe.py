@@ -144,6 +144,21 @@ def _turbo_image(value: torch.Tensor) -> Image.Image:
     )
 
 
+def _reference_suptitle(
+    *,
+    camera: str,
+    instruction: str,
+    metrics: dict[str, float],
+) -> str:
+    return (
+        f"[{camera} cam] {instruction[:80]}\n"
+        f"dino_mse cur={metrics['dino_current_mse']:.4f} "
+        f"fut={metrics['dino_future_mse']:.4f}  |  "
+        f"depth_absrel cur={metrics['depth_current_abs_rel']:.3f} "
+        f"fut={metrics['depth_future_abs_rel']:.3f}"
+    )
+
+
 def _render_grid(
     *,
     path: Path,
@@ -213,11 +228,11 @@ def _render_grid(
                 axes[row, column].set_title(titles[row][column], fontsize=9)
             axes[row, column].axis("off")
     figure.suptitle(
-        f"[{camera} cam] {instruction[:100]}\n"
-        f"dino_mse cur={metrics['dino_current_mse']:.4f} "
-        f"fut={metrics['dino_future_mse']:.4f} | "
-        f"depth_absrel cur={metrics['depth_current_abs_rel']:.3f} "
-        f"fut={metrics['depth_future_abs_rel']:.3f}",
+        _reference_suptitle(
+            camera=camera,
+            instruction=instruction,
+            metrics=metrics,
+        ),
         fontsize=11,
     )
     figure.tight_layout()
