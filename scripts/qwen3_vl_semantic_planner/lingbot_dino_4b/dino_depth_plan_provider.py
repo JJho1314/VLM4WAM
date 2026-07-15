@@ -142,8 +142,8 @@ def validate_planner_metadata(metadata: dict) -> PlannerContract:
                 "latent_len": 4 * num_task_tokens,
                 "query_layout": (
                     f"current_dino_{num_task_tokens}_then_"
-                    f"future_dino_{num_task_tokens}_then_"
                     f"current_depth_{num_task_tokens}_then_"
+                    f"future_dino_{num_task_tokens}_then_"
                     f"future_depth_{num_task_tokens}"
                 ),
             }

@@ -76,7 +76,9 @@ def _get_work_dir():
         work_dir = os.environ.get("FASTWAM_WORK_DIR") or "./runs"
         Path(work_dir).mkdir(parents=True, exist_ok=True)
         return work_dir
-    return misc.get_work_dir()
+    work_dir = misc.get_work_dir()
+    Path(work_dir).mkdir(parents=True, exist_ok=True)
+    return work_dir
 
 
 def _load_semantic_plan_utils():

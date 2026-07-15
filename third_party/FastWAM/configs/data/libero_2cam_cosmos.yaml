@@ -84,5 +84,5 @@ train:
   semantic_plan_dir: null
   semantic_plan_manifest: null
   semantic_plan_dim: 1024
-  semantic_plan_max_tokens: 1024  # 4 * 16 * 16, aligned with FastWAM planner export
+  semantic_plan_max_tokens: 256  # 1 * 16 * 16, aligned with FastWAM planner export
   semantic_plan_default_to_zero: false

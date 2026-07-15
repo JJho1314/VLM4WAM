@@ -352,9 +352,9 @@ class FastWAMCosmos(nn.Module):
 
         if has_online:
             self._require_semantic_geometry()
-            if self.semantic_plan_num_keyframes != 4:
+            if self.semantic_plan_num_keyframes != 1:
                 raise ValueError(
-                    "online semantic conditioning requires exactly 4 keyframes"
+                    "online semantic conditioning requires exactly 1 keyframe"
                 )
             if "instruction" not in sample or sample.get("instruction") is None:
                 raise KeyError(
@@ -397,7 +397,7 @@ class FastWAMCosmos(nn.Module):
                 batch_size,
             )
             expected_times = semantic_plan_times.new_tensor(
-                [0.25, 0.5, 0.75, 1.0]
+                [1.0]
             ).unsqueeze(0).expand(batch_size, -1)
             if not torch.allclose(
                 semantic_plan_times,
@@ -407,7 +407,7 @@ class FastWAMCosmos(nn.Module):
             ):
                 raise ValueError(
                     "online semantic_plan_times must equal "
-                    "[0.25, 0.5, 0.75, 1.0]"
+                    "[1.0]"
                 )
             self._current_semantic_plan = fused_plan
             self._current_semantic_plan_times = semantic_plan_times

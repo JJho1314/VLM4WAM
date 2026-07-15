@@ -6,7 +6,7 @@ positional embedding added to the query bank. Predicts ``[B, num_keyframes*num_b
 = ``[B, 5*256, 1024]`` = 1280 DINO-video patch tokens, matched to the teacher with plain MSE.
 
 Per keyframe k:
-    x        = cat( image_hidden(detached VLM image tokens),  latent_hidden_k(this kf's sem-plan latents) )
+    x        = cat( image_hidden, latent_hidden_k(this kf's sem-plan latents) )
     queries  = query_embs[256] + keyframe_embed[k]
     preds_k  = TaskTokenResampler(x, queries)                       # [B, 256, 1024]
 
@@ -60,7 +60,7 @@ class LingbotDinoPlanHead(nn.Module):
         self.keyframe_embed = nn.Parameter(torch.zeros(self.num_keyframes, llm_hidden))
 
     def forward(self, image_hidden: torch.Tensor, latent_hidden: torch.Tensor) -> torch.Tensor:
-        # image_hidden: (B, N_img, H) — VLM image tokens (detach upstream);
+        # image_hidden: (B, N_img, H) — live for current heads, detached by future-head callers;
         # latent_hidden: (B, num_keyframes*num_latent_per_keyframe, H) — this-episode sem-plan latents
         batch = image_hidden.shape[0]
         hidden = image_hidden.shape[-1]

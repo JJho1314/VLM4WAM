@@ -102,11 +102,48 @@ class DinoVideoTargetEncoder(nn.Module):
         std = self.std.to(device=video.device, dtype=video.dtype)
         return (video - mean) / std
 
+    @staticmethod
+    def _validated_effective_fps(
+        effective_fps: float | torch.Tensor,
+    ) -> float | torch.Tensor:
+        fps = torch.as_tensor(effective_fps, dtype=torch.float32)
+        if fps.numel() == 0 or not bool(torch.isfinite(fps).all()) or not bool((fps > 0).all()):
+            raise ValueError(
+                "effective_fps must contain only positive finite values, got "
+                f"{fps}"
+            )
+        if fps.ndim == 0:
+            return float(fps.item())
+        return fps
+
+    def _flatten_future_fps(
+        self,
+        effective_fps: float | torch.Tensor | None,
+        *,
+        batch_size: int,
+        num_keyframes: int,
+    ) -> float | torch.Tensor:
+        if effective_fps is None:
+            return self.effective_fps
+        fps = self._validated_effective_fps(effective_fps)
+        if isinstance(fps, float):
+            return fps
+        expected = (batch_size, num_keyframes)
+        if tuple(fps.shape) != expected:
+            raise ValueError(
+                "effective_fps for future keyframes must have shape "
+                f"{expected}, got {tuple(fps.shape)}"
+            )
+        # Clips are concatenated keyframe-major: all B samples for k=0, then all B for k=1.
+        return fps.transpose(0, 1).reshape(-1)
+
     @torch.no_grad()
     def encode_future_keyframes(
         self,
         current_b3hw: torch.Tensor,
         keyframes_b3hw: Sequence[torch.Tensor],
+        *,
+        effective_fps: float | torch.Tensor | None = None,
     ) -> torch.Tensor:
         """current: (B,3,H,W); keyframes: list of K x (B,3,H,W) future frames.
 
@@ -123,7 +160,16 @@ class DinoVideoTargetEncoder(nn.Module):
             clips.append(clip)
         video = torch.cat(clips, dim=0)  # (B*K,3,3,S,S)
         video = self._normalize_video(video)
-        feats = self.teacher.get_future_feature(video, current_index=1)  # (B*K, 256, 1024)
+        fps = self._flatten_future_fps(
+            effective_fps,
+            batch_size=b,
+            num_keyframes=k,
+        )
+        feats = self.teacher.get_future_feature(
+            video,
+            current_index=1,
+            fps=fps,
+        )  # (B*K, 256, 1024)
         tok, dim = feats.shape[1], feats.shape[2]
         feats = feats.view(k, b, tok, dim).permute(1, 0, 2, 3).reshape(b, k * tok, dim)
         return feats.detach()
@@ -133,6 +179,8 @@ class DinoVideoTargetEncoder(nn.Module):
         self,
         current_b3hw: torch.Tensor,
         future_b3hw: torch.Tensor,
+        *,
+        effective_fps: float | torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode LingBot's exact ``[warmup=current,current,future]`` target clip.
 
@@ -142,10 +190,20 @@ class DinoVideoTargetEncoder(nn.Module):
         future = self._prep(future_b3hw)
         video = torch.stack([current, current, future], dim=2)
         video = self._normalize_video(video)
+        fps = (
+            self.effective_fps
+            if effective_fps is None
+            else self._validated_effective_fps(effective_fps)
+        )
+        if isinstance(fps, torch.Tensor) and tuple(fps.shape) != (video.shape[0],):
+            raise ValueError(
+                "effective_fps for current/future encoding must have shape "
+                f"({video.shape[0]},), got {tuple(fps.shape)}"
+            )
         future_patch, current_patch = self.teacher.get_future_feature(
             video,
             return_current=True,
             current_index=1,
-            fps=self.effective_fps,
+            fps=fps,
         )
         return current_patch.detach(), future_patch.detach()

@@ -15,6 +15,8 @@ import uuid
 _REQUIRED_CHECKPOINT_FILES = (
     "plan_head.pt",
     "depth_head.pt",
+    "current_plan_head.pt",
+    "current_depth_head.pt",
     "plan_token_embedding.pt",
     "planner_meta.json",
 )
@@ -24,21 +26,23 @@ _REQUIRED_CHECKPOINT_DIRS = (
 )
 _EXPECTED_METADATA = {
     "sequence_length": 9,
-    "num_keyframes": 4,
+    "num_keyframes": 1,
     "grid_size": 16,
     "semantic_dim": 1024,
-    "target_tokens": 1024,
-    "keyframe_offsets": [2, 4, 6, 8],
+    "target_tokens": 256,
+    "keyframe_offsets": [8],
     "keyframe_scheme": "even_future",
     "has_depth_head": True,
     "depth_feature_dim": 1024,
     "depth_grid_size": 16,
     "shared_latent_per_keyframe": 32,
     "private_latent_per_keyframe": 32,
-    "branch_latent_per_keyframe": 64,
-    "total_unique_latent_per_keyframe": 96,
-    "latent_len": 384,
-    "query_layout": "keyframe_major__shared_dino_private_depth_private",
+    "branch_latent_per_keyframe": 8,
+    "total_unique_latent_per_keyframe": 16,
+    "latent_len": 16,
+    "use_current_alignment": True,
+    "num_task_tokens": 8,
+    "query_layout": "current_8_then_future_8__dino_depth_shared_within_time",
     "plan_head_type": "lingbot_dino",
     "plan_head_num_heads": 16,
     "plan_head_dropout": 0.0,
@@ -46,7 +50,7 @@ _EXPECTED_METADATA = {
     "planner_input_frame": "fastwam_current_multicamera_composite",
     "token_order": "keyframe_major_row_major",
 }
-_EXPECTED_NORMALIZED_TIMES = (0.25, 0.5, 0.75, 1.0)
+_EXPECTED_NORMALIZED_TIMES = (1.0,)
 _REQUIRED_FINITE_NUMERIC_METADATA = (
     "mse_loss_weight",
     "cosine_loss_weight",
@@ -55,9 +59,10 @@ _REQUIRED_FINITE_NUMERIC_METADATA = (
     "infonce_loss_weight",
     "infonce_temperature",
     "depth_loss_weight",
-)
-_EXPECTED_PLAN_TOKEN_STRINGS = tuple(
-    f"<|sem_plan_{index}|>" for index in range(384)
+    "current_dino_loss_weight",
+    "future_dino_loss_weight",
+    "current_depth_loss_weight",
+    "future_depth_loss_weight",
 )
 _PROVIDER_FILENAME = "dino_depth_plan_provider.py"
 
@@ -117,7 +122,46 @@ def _validate_checkpoint_export(checkpoint_path: Path) -> None:
         raise ValueError(
             f"invalid online planner metadata {metadata_path}: expected an object"
         )
-    for field, expected in _EXPECTED_METADATA.items():
+    independent = metadata.get("independent_modality_task_tokens", False)
+    if type(independent) is not bool:
+        raise ValueError(
+            "incompatible online planner metadata field "
+            "independent_modality_task_tokens: expected a boolean, "
+            f"got {independent!r}"
+        )
+    num_task_tokens = metadata.get("num_task_tokens", 8)
+    if type(num_task_tokens) is not int or num_task_tokens <= 0:
+        raise ValueError(
+            "incompatible online planner metadata field num_task_tokens: "
+            f"expected a positive integer, got {num_task_tokens!r}"
+        )
+    expected_metadata = dict(_EXPECTED_METADATA)
+    expected_metadata.update(
+        {
+            "num_task_tokens": num_task_tokens,
+            "branch_latent_per_keyframe": num_task_tokens,
+            "total_unique_latent_per_keyframe": 2 * num_task_tokens,
+            "latent_len": 2 * num_task_tokens,
+            "query_layout": (
+                f"current_{num_task_tokens}_then_future_{num_task_tokens}__"
+                "dino_depth_shared_within_time"
+            ),
+        }
+    )
+    if independent:
+        expected_metadata.update(
+            {
+                "total_unique_latent_per_keyframe": 4 * num_task_tokens,
+                "latent_len": 4 * num_task_tokens,
+                "query_layout": (
+                    f"current_dino_{num_task_tokens}_then_"
+                    f"current_depth_{num_task_tokens}_then_"
+                    f"future_dino_{num_task_tokens}_then_"
+                    f"future_depth_{num_task_tokens}"
+                ),
+            }
+        )
+    for field, expected in expected_metadata.items():
         actual = metadata.get(field)
         if not _metadata_value_matches(actual, expected):
             raise ValueError(
@@ -136,7 +180,7 @@ def _validate_checkpoint_export(checkpoint_path: Path) -> None:
     plan_token_ids = metadata.get("plan_token_ids")
     if (
         not isinstance(plan_token_ids, list)
-        or len(plan_token_ids) != 384
+        or len(plan_token_ids) != expected_metadata["latent_len"]
         or any(
             type(token_id) is not int or token_id < 0
             for token_id in plan_token_ids
@@ -145,7 +189,7 @@ def _validate_checkpoint_export(checkpoint_path: Path) -> None:
     ):
         raise ValueError(
             "incompatible online planner metadata field plan_token_ids: "
-            "expected 384 unique non-negative integers"
+            f"expected {expected_metadata['latent_len']} unique non-negative integers"
         )
 
     raw_plan_tokens = metadata.get("plan_token_strings", ())
@@ -154,12 +198,16 @@ def _validate_checkpoint_export(checkpoint_path: Path) -> None:
     except TypeError as error:
         raise ValueError(
             "incompatible online planner metadata field plan_token_strings: "
-            "expected the exact 384 exported query tokens"
+            "expected the exact exported query tokens"
         ) from error
-    if actual_plan_tokens != _EXPECTED_PLAN_TOKEN_STRINGS:
+    expected_plan_token_strings = tuple(
+        f"<|sem_plan_{index}|>"
+        for index in range(expected_metadata["latent_len"])
+    )
+    if actual_plan_tokens != expected_plan_token_strings:
         raise ValueError(
             "incompatible online planner metadata field plan_token_strings: "
-            "expected the exact 384 exported query tokens"
+            "expected the exact exported query tokens"
         )
 
     raw_times = metadata.get("normalized_keyframe_times")

@@ -13,15 +13,15 @@ atten_backend: torch       # SDPA so the MoT joint masked attention + no-CP work
 train_video_expert: true
 
 # Semantic-plan injection into the Cosmos VIDEO backbone only. The adapter uses
-# the FastWAM K4 dense geometry; source selection remains independently disabled
+# the FastWAM K1 dense geometry; source selection remains independently disabled
 # by default and is enabled by a dedicated task or explicit file-backed data mode.
 semantic_plan_context: true
 semantic_plan_in_dim: 1024
 semantic_plan_hidden_dim: 2048
-semantic_plan_num_keyframes: 4
-semantic_plan_source_num_keyframes: 4
+semantic_plan_num_keyframes: 1
+semantic_plan_source_num_keyframes: 1
 semantic_plan_spatial_grid: 16
-semantic_plan_max_tokens: 1024  # 4 * 16 * 16
+semantic_plan_max_tokens: 256  # 1 * 16 * 16
 semantic_plan_coord_hidden_dim: 256
 semantic_plan_use_rope: true
 semantic_plan_cross_attention_blocks: null

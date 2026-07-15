@@ -137,9 +137,9 @@ def create_fastwam_cosmos(
             )
         expected_geometry = {
             "semantic_plan_in_dim": 1024,
-            "semantic_plan_max_tokens": 1024,
-            "semantic_plan_num_keyframes": 4,
-            "semantic_plan_source_num_keyframes": 4,
+            "semantic_plan_max_tokens": 256,
+            "semantic_plan_num_keyframes": 1,
+            "semantic_plan_source_num_keyframes": 1,
             "semantic_plan_spatial_grid": 16,
         }
         actual_geometry = {
@@ -157,7 +157,7 @@ def create_fastwam_cosmos(
                 or actual != expected
             ):
                 raise ValueError(
-                    "online semantic planner requires exact K4 dense geometry: "
+                    "online semantic planner requires exact K1 dense geometry: "
                     f"{name}={expected}, got {actual!r}"
                 )
         # Resolve both roots before allocating either Cosmos or the 4B provider.

@@ -697,6 +697,10 @@ class FastWAMOnlinePlannerDataset(Dataset):
         self.dataset = dataset
         self.max_samples = int(max_samples)
         self.offsets = [int(offset) for offset in (offsets or [2, 4, 6, 8])]
+        if not self.offsets or any(offset <= 0 for offset in self.offsets):
+            raise ValueError(
+                f"FastWAM planner offsets must be positive, got {self.offsets}"
+            )
 
     @classmethod
     def from_config(
@@ -749,6 +753,28 @@ class FastWAMOnlinePlannerDataset(Dataset):
             raise ValueError(
                 "FastWAM planner sample needs a non-empty raw instruction"
             )
+        if "video_fps" not in sample:
+            raise KeyError(
+                "FastWAM planner sample needs sampled video_fps to derive "
+                "the DINO future-frame timing"
+            )
+        video_fps_tensor = torch.as_tensor(sample["video_fps"], dtype=torch.float32)
+        if video_fps_tensor.numel() != 1:
+            raise ValueError(
+                "FastWAM planner video_fps must be scalar, got "
+                f"shape={tuple(video_fps_tensor.shape)}"
+            )
+        video_fps = float(video_fps_tensor.item())
+        if not math.isfinite(video_fps) or video_fps <= 0:
+            raise ValueError(
+                f"FastWAM planner video_fps must be positive and finite, got {video_fps}"
+            )
+        invalid_offsets = [offset for offset in self.offsets if offset >= video.shape[1]]
+        if invalid_offsets:
+            raise ValueError(
+                "FastWAM planner offsets exceed the video horizon "
+                f"T={video.shape[1]}: {invalid_offsets}"
+            )
         selected = video[:, [0, *self.offsets]]
         selected = (
             ((selected.to(torch.float32) + 1.0) * 127.5)
@@ -766,6 +792,12 @@ class FastWAMOnlinePlannerDataset(Dataset):
             "prompt": instruction,
             "keyframe_images": selected[1:],
             "current_image": current,
+            # Each DINO clip represents [current, current, future@offset].  Its temporal
+            # RoPE therefore sees the sampled-video rate divided by that future offset.
+            "future_video_effective_fps": torch.tensor(
+                [video_fps / float(offset) for offset in self.offsets],
+                dtype=torch.float32,
+            ),
         }
 
 
@@ -833,12 +865,21 @@ class Collator:
         labels = None
         keyframes = None
         current = None
+        future_video_effective_fps = None
         if "semantic_plan" in batch[0]:
             labels = torch.stack([x["semantic_plan"] for x in batch], dim=0)
         else:  # online mode: raw keyframes (+ current frame for the DINO teacher), encoded in the loop
             keyframes = torch.stack([x["keyframe_images"] for x in batch], dim=0)
             if "current_image" in batch[0]:
                 current = torch.stack([x["current_image"] for x in batch], dim=0)
+            if "future_video_effective_fps" in batch[0]:
+                if not all("future_video_effective_fps" in item for item in batch):
+                    raise ValueError(
+                        "future_video_effective_fps must be present for every item in a batch"
+                    )
+                future_video_effective_fps = torch.stack(
+                    [x["future_video_effective_fps"] for x in batch], dim=0
+                )
         inputs = build_planner_inputs(
             self.processor,
             images,
@@ -851,6 +892,8 @@ class Collator:
             inputs["keyframe_images"] = keyframes
         if current is not None:
             inputs["current_image"] = current
+        if future_video_effective_fps is not None:
+            inputs["future_video_effective_fps"] = future_video_effective_fps
         inputs["stems"] = [x["stem"] for x in batch]
         return inputs
 
@@ -1101,6 +1144,7 @@ class PlannerWrapper(nn.Module):
         current_depth_loss_weight: float = 0.004,
         future_depth_loss_weight: float = 0.004,
         train_plan_token_embedding: bool = False,
+        share_head_query_embeddings: bool | None = None,
     ) -> None:
         super().__init__()
         if sem_mlp_hidden_size < 0:
@@ -1243,18 +1287,144 @@ class PlannerWrapper(nn.Module):
         self.plan_token_ids = [int(x) for x in plan_token_ids]
         self.model = model
         self.plan_embedding_injector = None
+        can_pool_head_queries = bool(
+            train_plan_token_embedding
+            and self.plan_head_type == "lingbot_dino"
+            and self.use_current_alignment
+            and self.independent_modality_task_tokens
+        )
+        self.uses_pooled_head_query_embeddings = (
+            can_pool_head_queries
+            if share_head_query_embeddings is None
+            else bool(share_head_query_embeddings)
+        )
+        if self.uses_pooled_head_query_embeddings and not can_pool_head_queries:
+            raise ValueError(
+                "shared head query embeddings require train_plan_token_embedding, "
+                "lingbot_dino, current alignment, and independent modality task tokens"
+            )
         if train_plan_token_embedding:
             base_embedding = model.get_input_embeddings()
             base_embedding.weight.requires_grad_(False)
-            self.plan_embedding_injector = PlanTokenEmbeddingInjector(
-                base_embedding,
-                self.plan_token_ids,
-            )
-            base_embedding.register_forward_hook(
-                self.plan_embedding_injector.forward_hook
-            )
+            if self.uses_pooled_head_query_embeddings:
+                plan_ids = torch.tensor(
+                    self.plan_token_ids,
+                    device=base_embedding.weight.device,
+                    dtype=torch.long,
+                )
+                if len(set(self.plan_token_ids)) != len(self.plan_token_ids):
+                    raise ValueError("plan_token_ids must be unique")
+                invalid = [
+                    token_id
+                    for token_id in self.plan_token_ids
+                    if not 0 <= token_id < base_embedding.weight.shape[0]
+                ]
+                if invalid:
+                    raise ValueError(
+                        "plan token ids outside embedding rows "
+                        f"{base_embedding.weight.shape[0]}: {invalid}"
+                    )
+                id_to_row = torch.full(
+                    (base_embedding.weight.shape[0],),
+                    -1,
+                    device=base_embedding.weight.device,
+                    dtype=torch.long,
+                )
+                id_to_row[plan_ids] = torch.arange(
+                    len(self.plan_token_ids),
+                    device=id_to_row.device,
+                    dtype=torch.long,
+                )
+                self.register_buffer(
+                    "pooled_plan_token_id_to_row",
+                    id_to_row,
+                    persistent=False,
+                )
+                # The hook calls back into the four canonical alignment heads, so no fifth
+                # independently trainable plan-token embedding table is registered.
+                base_embedding.register_forward_hook(
+                    self._pooled_head_query_embedding_forward_hook
+                )
+            else:
+                self.plan_embedding_injector = PlanTokenEmbeddingInjector(
+                    base_embedding,
+                    self.plan_token_ids,
+                )
+                base_embedding.register_forward_hook(
+                    self.plan_embedding_injector.forward_hook
+                )
         # image-token id used by the lingbot_dino head to gather the LLM's image-token hiddens
         self.image_token_id = getattr(getattr(model, "config", None), "image_token_id", None)
+
+    def pooled_lingbot_prefix_queries(self) -> torch.Tensor:
+        """Pool each canonical 256-query alignment bank into its 64-token LM prefix.
+
+        The order is current-first, matching LingBot-VLA v2:
+        current DINO, current depth, future DINO, future depth.
+        """
+        if not self.uses_pooled_head_query_embeddings:
+            raise RuntimeError("pooled head query embeddings are not enabled")
+        heads = (
+            ("current_dino", self.current_plan_head),
+            ("current_depth", self.current_depth_head),
+            ("future_dino", self.plan_head),
+            ("future_depth", self.depth_head),
+        )
+        pooled = []
+        pool_size = None
+        hidden_size = None
+        for name, head in heads:
+            if head is None or not hasattr(head, "query_embs"):
+                raise RuntimeError(f"{name} head has no canonical query_embs bank")
+            query_bank = head.query_embs
+            if query_bank.ndim != 2:
+                raise RuntimeError(
+                    f"{name} query bank must be 2-D, got {tuple(query_bank.shape)}"
+                )
+            if query_bank.shape[0] % self.num_task_tokens != 0:
+                raise RuntimeError(
+                    f"{name} query count {query_bank.shape[0]} is not divisible by "
+                    f"num_task_tokens={self.num_task_tokens}"
+                )
+            this_pool_size = query_bank.shape[0] // self.num_task_tokens
+            if pool_size is None:
+                pool_size = this_pool_size
+                hidden_size = query_bank.shape[1]
+            elif this_pool_size != pool_size or query_bank.shape[1] != hidden_size:
+                raise RuntimeError("all four alignment query banks must share one geometry")
+            pooled.append(
+                query_bank.reshape(
+                    self.num_task_tokens,
+                    this_pool_size,
+                    query_bank.shape[1],
+                ).mean(dim=1)
+            )
+        result = torch.cat(pooled, dim=0)
+        if result.shape[0] != len(self.plan_token_ids):
+            raise RuntimeError(
+                "pooled query count does not match plan token count: "
+                f"{result.shape[0]} != {len(self.plan_token_ids)}"
+            )
+        return result
+
+    def _pooled_head_query_embedding_forward_hook(
+        self,
+        _module: nn.Module,
+        inputs: tuple[torch.Tensor, ...],
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        input_ids = inputs[0]
+        rows = self.pooled_plan_token_id_to_row[input_ids]
+        plan_mask = rows >= 0
+        if not bool(plan_mask.any()):
+            return output
+        pooled = self.pooled_lingbot_prefix_queries().to(
+            device=output.device,
+            dtype=output.dtype,
+        )
+        injected = output.clone()
+        injected[plan_mask] = pooled[rows[plan_mask]]
+        return injected
 
     @classmethod
     def from_exported_checkpoint(
@@ -1268,6 +1438,17 @@ class PlannerWrapper(nn.Module):
         checkpoint_dir = Path(checkpoint_dir)
         text_config = getattr(model.config, "text_config", model.config)
         hidden_size = int(text_config.hidden_size)
+        query_embedding_source = metadata.get("query_embedding_source")
+        if query_embedding_source not in (
+            None,
+            "pooled_head_query_banks",
+            "independent_plan_token_embedding",
+            "base_model_token_embedding",
+        ):
+            raise ValueError(
+                "unsupported query_embedding_source in planner metadata: "
+                f"{query_embedding_source!r}"
+            )
         wrapper = cls(
             model=model,
             hidden_size=hidden_size,
@@ -1310,6 +1491,11 @@ class PlannerWrapper(nn.Module):
             future_depth_loss_weight=float(metadata.get("future_depth_loss_weight", 0.004)),
             train_plan_token_embedding=bool(
                 metadata.get("train_plan_token_embedding", False)
+            ),
+            # Metadata-less exports predate true sharing and must retain their independent
+            # plan-token embedding table when loaded.
+            share_head_query_embeddings=(
+                query_embedding_source == "pooled_head_query_banks"
             ),
         )
         wrapper.plan_head.load_state_dict(
@@ -1367,14 +1553,31 @@ class PlannerWrapper(nn.Module):
             dtype=torch.long,
         )
         with torch.no_grad():
-            embedding_weight.index_copy_(
-                0,
-                plan_ids,
-                plan_embedding.to(
-                    device=embedding_weight.device,
-                    dtype=embedding_weight.dtype,
-                ),
-            )
+            if wrapper.uses_pooled_head_query_embeddings:
+                expected_snapshot = (
+                    wrapper.pooled_lingbot_prefix_queries()
+                    .detach()
+                    .cpu()
+                    .to(dtype=plan_embedding.dtype)
+                )
+                if not torch.allclose(
+                    expected_snapshot.float(),
+                    plan_embedding.float(),
+                    rtol=1e-4,
+                    atol=1e-5,
+                ):
+                    raise ValueError(
+                        "plan token embedding snapshot does not match pooled head query banks"
+                    )
+            else:
+                embedding_weight.index_copy_(
+                    0,
+                    plan_ids,
+                    plan_embedding.to(
+                        device=embedding_weight.device,
+                        dtype=embedding_weight.dtype,
+                    ),
+                )
             if wrapper.plan_embedding_injector is not None:
                 wrapper.plan_embedding_injector.weight.copy_(
                     plan_embedding.to(
@@ -1415,16 +1618,30 @@ class PlannerWrapper(nn.Module):
         return hidden[mask].reshape(batch, n_img, hidden_dim)
 
     def _forward_hiddens(self, **inputs: Any) -> tuple[torch.Tensor | None, torch.Tensor]:
-        """One VLM forward -> (image_hidden|None, plan_hidden). Image tokens are DETACHED (lingbot
-        detach_image_feats=True). Shared by the video head, the depth head, and inference."""
+        """One VLM forward -> live ``(image_hidden|None, plan_hidden)`` tensors.
+
+        Current alignment follows LingBot-VLA v2 and keeps the image-token gradient.  Callers
+        detach the image context only when routing it into a future alignment head.
+        """
         outputs = self.model(**inputs, output_hidden_states=True, use_cache=False)
         hidden = outputs.hidden_states[-1]
         input_ids = inputs["input_ids"]
         plan_hidden = self.collect_plan_hidden(hidden, input_ids, self.latent_len)
         image_hidden = None
         if self.plan_head_type == "lingbot_dino":
-            image_hidden = self.collect_image_hidden(hidden, input_ids).detach()
+            image_hidden = self.collect_image_hidden(hidden, input_ids)
         return image_hidden, plan_hidden
+
+    @staticmethod
+    def image_hidden_for_alignment_branch(
+        image_hidden: torch.Tensor,
+        branch_name: str,
+    ) -> torch.Tensor:
+        if branch_name.startswith("current_"):
+            return image_hidden
+        if branch_name.startswith("future_"):
+            return image_hidden.detach()
+        raise ValueError(f"unknown current/future alignment branch: {branch_name}")
 
     def split_lingbot_query_hidden(
         self,
@@ -1491,8 +1708,8 @@ class PlannerWrapper(nn.Module):
         width = self.num_task_tokens
         return {
             "current_dino": plan_hidden[:, 0 * width : 1 * width],
-            "future_dino": plan_hidden[:, 1 * width : 2 * width],
-            "current_depth": plan_hidden[:, 2 * width : 3 * width],
+            "current_depth": plan_hidden[:, 1 * width : 2 * width],
+            "future_dino": plan_hidden[:, 2 * width : 3 * width],
             "future_depth": plan_hidden[:, 3 * width : 4 * width],
         }
 
@@ -1549,15 +1766,16 @@ class PlannerWrapper(nn.Module):
             plans = self.predict_current_future_plans(**model_inputs)
             return plans["future_dino"], plans["future_depth"]
         image_hidden, plan_hidden = self._forward_hiddens(**model_inputs)
+        future_image_hidden = image_hidden.detach()
         dino_hidden, depth_hidden = self.split_lingbot_query_hidden(plan_hidden)
         dino_dtype = next(self.plan_head.parameters()).dtype
         depth_dtype = next(self.depth_head.parameters()).dtype
         dino_plan = self.plan_head(
-            image_hidden.to(dtype=dino_dtype),
+            future_image_hidden.to(dtype=dino_dtype),
             dino_hidden.to(dtype=dino_dtype),
         ).float()
         depth_plan = self.depth_head(
-            image_hidden.to(dtype=depth_dtype),
+            future_image_hidden.to(dtype=depth_dtype),
             depth_hidden.to(dtype=depth_dtype),
         ).float()
         if dino_plan.shape != depth_plan.shape:
@@ -1599,8 +1817,12 @@ class PlannerWrapper(nn.Module):
         plans = {}
         for name, (head, hidden) in heads_and_hiddens.items():
             head_dtype = next(head.parameters()).dtype
+            branch_image_hidden = self.image_hidden_for_alignment_branch(
+                image_hidden,
+                name,
+            )
             plans[name] = head(
-                image_hidden.to(dtype=head_dtype),
+                branch_image_hidden.to(dtype=head_dtype),
                 hidden.to(dtype=head_dtype),
             ).float()
         return plans
@@ -1616,7 +1838,8 @@ class PlannerWrapper(nn.Module):
             if self.depth_head is not None:
                 plan_hidden, _ = self.split_lingbot_query_hidden(plan_hidden)
             return self.plan_head(
-                image_hidden.to(dtype=head_dtype), plan_hidden.to(dtype=head_dtype)
+                image_hidden.detach().to(dtype=head_dtype),
+                plan_hidden.to(dtype=head_dtype),
             ).float()
         return self.plan_head(plan_hidden.to(dtype=head_dtype)).float()
 
@@ -1729,9 +1952,10 @@ class PlannerWrapper(nn.Module):
             depth_hidden = None
             if self.depth_head is not None:
                 dino_hidden, depth_hidden = self.split_lingbot_query_hidden(plan_hidden)
+            future_image_hidden = image_hidden.detach()
             dino_dtype = next(self.plan_head.parameters()).dtype
             pred = self.plan_head(
-                image_hidden.to(dino_dtype),
+                future_image_hidden.to(dino_dtype),
                 dino_hidden.to(dino_dtype),
             ).float()
             if pred.shape[0] != batch or pred.shape[1] != self.target_len:
@@ -1740,7 +1964,7 @@ class PlannerWrapper(nn.Module):
             if self.depth_head is not None and depth_plan_labels is not None:
                 depth_dtype = next(self.depth_head.parameters()).dtype
                 depth_pred = self.depth_head(
-                    image_hidden.to(depth_dtype),
+                    future_image_hidden.to(depth_dtype),
                     depth_hidden.to(depth_dtype),
                 ).float()
                 depth_target = depth_plan_labels.to(device=pred.device, dtype=torch.float32)
@@ -2041,7 +2265,12 @@ def save_checkpoint(
     if current_depth_head is not None:
         torch.save(current_depth_head.state_dict(), ckpt / "current_depth_head.pt")
     plan_embedding_injector = getattr(module, "plan_embedding_injector", None)
-    if plan_embedding_injector is not None:
+    uses_pooled_head_queries = bool(
+        getattr(module, "uses_pooled_head_query_embeddings", False)
+    )
+    if uses_pooled_head_queries:
+        plan_embedding = module.pooled_lingbot_prefix_queries().detach().cpu()
+    elif plan_embedding_injector is not None:
         plan_embedding = plan_embedding_injector.weight.detach().cpu()
     else:
         plan_ids = torch.as_tensor(module.plan_token_ids)
@@ -2089,6 +2318,18 @@ def save_checkpoint(
         "infonce_loss_weight": float(module.infonce_loss_weight),
         "infonce_temperature": float(module.infonce_temperature),
         "train_plan_token_embedding": bool(args.train_plan_token_embedding),
+        "query_embedding_source": (
+            "pooled_head_query_banks"
+            if uses_pooled_head_queries
+            else "independent_plan_token_embedding"
+            if plan_embedding_injector is not None
+            else "base_model_token_embedding"
+        ),
+        "query_pool_size": (
+            int(module.plan_head.query_embs.shape[0] // module.num_task_tokens)
+            if uses_pooled_head_queries
+            else None
+        ),
         "full_finetune": bool(args.full_finetune),
         "freeze_vision": bool(args.freeze_vision),
         "freeze_lm_head": bool(args.freeze_lm_head),
@@ -2151,8 +2392,8 @@ def save_checkpoint(
             "query_layout": (
                 (
                     f"current_dino_{module.num_task_tokens}_then_"
-                    f"future_dino_{module.num_task_tokens}_then_"
                     f"current_depth_{module.num_task_tokens}_then_"
+                    f"future_dino_{module.num_task_tokens}_then_"
                     f"future_depth_{module.num_task_tokens}"
                 )
                 if getattr(module, "independent_modality_task_tokens", False)
@@ -2528,6 +2769,10 @@ def main() -> None:
             batch.pop("stems", None)
             keyframes = batch.pop("keyframe_images", None)
             current = batch.pop("current_image", None)
+            future_video_effective_fps = batch.pop(
+                "future_video_effective_fps",
+                None,
+            )
             module = accelerator.unwrap_model(wrapper)
             model_dtype = next(module.model.parameters()).dtype
             batch = move_qwen_inputs_to_device(batch, device, model_dtype=model_dtype)
@@ -2540,7 +2785,13 @@ def main() -> None:
                         kfs = [keyframes[:, j].permute(0, 3, 1, 2).contiguous() for j in range(keyframes.shape[1])]
                         if args.use_current_alignment:
                             current_dino, future_dino = dino_encoder.encode_current_and_future(
-                                cur, kfs[0]
+                                cur,
+                                kfs[0],
+                                effective_fps=(
+                                    future_video_effective_fps[:, 0]
+                                    if future_video_effective_fps is not None
+                                    else None
+                                ),
                             )
                             batch["current_dino_labels"] = current_dino.float()
                             batch["semantic_plan_labels"] = future_dino.float()
@@ -2550,7 +2801,11 @@ def main() -> None:
                             batch["current_depth_labels"] = current_depth.float()
                             batch["depth_plan_labels"] = future_depth.float()
                         else:
-                            batch["semantic_plan_labels"] = dino_encoder.encode_future_keyframes(cur, kfs).float()
+                            batch["semantic_plan_labels"] = dino_encoder.encode_future_keyframes(
+                                cur,
+                                kfs,
+                                effective_fps=future_video_effective_fps,
+                            ).float()
                             if depth_encoder is not None:
                                 # LingBot-Depth targets over the SAME future keyframes -> [B, K*256, 1024].
                                 batch["depth_plan_labels"] = depth_encoder.encode_future_keyframes(kfs).float()
