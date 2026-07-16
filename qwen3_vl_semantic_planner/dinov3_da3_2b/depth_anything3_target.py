@@ -95,6 +95,9 @@ class DepthAnything3TargetEncoder(nn.Module):
         process_res: int = 224,          # 224 -> 16x16=256 tok (grid 16); 504 -> 36x36 (native)
         out_layer_index: int = -1,       # which of the backbone's out_layers to align to (-1 = last)
         feature_slice: str = "full",     # "full" (2048), "global" (normed half, 1024), "local" (1024)
+        align_strategy: str = "last_layer",  # "last_layer" (default) | "wsa_multilayer"
+        teacher_layers: Sequence[int] | None = None,  # abs backbone layer numbers for wsa_multilayer
+        layer_weights: Sequence[float] | None = None, # per-layer loss weights for wsa_multilayer
         device: str | torch.device = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         code_root: str | Path = _DA3_CODE_ROOT,
@@ -106,6 +109,7 @@ class DepthAnything3TargetEncoder(nn.Module):
         self.process_res = int(process_res)
         self.out_layer_index = int(out_layer_index)
         self.feature_slice = str(feature_slice)
+        self.align_strategy = str(align_strategy)
         self.device = torch.device(device)
 
         wrapper = DepthAnything3.from_pretrained(str(ckpt_dir))
@@ -115,6 +119,39 @@ class DepthAnything3TargetEncoder(nn.Module):
         # concatenated patch-feature dim (cat_token doubles embed); halved when slicing to one half.
         _cat_dim = int(getattr(wrapper.config.head, "dim_in", 0)) or (2 * int(wrapper.config.net.embed_dim))
         self.feature_dim = _cat_dim if self.feature_slice == "full" else _cat_dim // 2
+
+        # --- multi-layer (WSA-style) alignment config ---
+        # `feats_per_layer[i]` from the backbone corresponds to absolute layer `out_layers[i]`. WSA aligns
+        # to the DINOv2 patch tokens at 4 depths [11,15,19,23] with per-layer cos+MSE(LayerNorm) losses.
+        if self.align_strategy == "wsa_multilayer":
+            requested = list(self.out_layers) if teacher_layers is None else [int(x) for x in teacher_layers]
+            self.layer_positions = []
+            for _l in requested:
+                if _l not in self.out_layers:
+                    raise ValueError(
+                        f"DA3 backbone exposes out_layers={self.out_layers}; "
+                        f"requested teacher layer {_l} is not available"
+                    )
+                self.layer_positions.append(self.out_layers.index(_l))
+            self.teacher_layers = tuple(requested)
+            self.num_layers = len(self.layer_positions)
+            if layer_weights is None:
+                self.layer_weights = tuple(1.0 for _ in range(self.num_layers))
+            else:
+                _lw = [float(x) for x in layer_weights]
+                if len(_lw) != self.num_layers:
+                    raise ValueError(
+                        f"layer_weights ({len(_lw)}) must match #teacher_layers ({self.num_layers})"
+                    )
+                self.layer_weights = tuple(_lw)
+        elif self.align_strategy == "last_layer":
+            self.layer_positions = [self.out_layer_index]
+            self.teacher_layers = (self.out_layers[self.out_layer_index],)
+            self.num_layers = 1
+            self.layer_weights = (1.0,)
+        else:
+            raise ValueError(f"unknown align_strategy: {self.align_strategy!r}")
+
         self.register_buffer("mean", torch.tensor(_IMAGENET_MEAN).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor(_IMAGENET_STD).view(1, 3, 1, 1))
 
@@ -134,9 +171,19 @@ class DepthAnything3TargetEncoder(nn.Module):
         return feats[..., :half] if self.feature_slice == "local" else feats[..., half:]
 
     def _patch_tokens(self, images_b3hw: torch.Tensor) -> torch.Tensor:
-        """(N,3,R,R) normalized -> (N, tok, D) DA3 encoder patch tokens for the selected out layer."""
+        """(N,3,R,R) normalized -> DA3 encoder patch tokens.
+
+        last_layer: (N, tok, D') for the selected out layer.
+        wsa_multilayer: (N, L, tok, D') stacked over the requested backbone layers."""
         x = images_b3hw.to(dtype=next(self.backbone.parameters()).dtype).unsqueeze(1)  # [N,V=1,3,R,R]
         feats_per_layer, _aux = self.backbone(x)
+        if self.align_strategy == "wsa_multilayer":
+            per_layer = []
+            for pos in self.layer_positions:
+                pt, _cam = feats_per_layer[pos]  # [N, V=1, tok, D]
+                n = pt.shape[0]
+                per_layer.append(self._slice(pt.reshape(n, -1, pt.shape[-1])))  # [N, tok, D']
+            return torch.stack(per_layer, dim=1)  # [N, L, tok, D']
         patch_tokens, _cam = feats_per_layer[self.out_layer_index]  # [N, V=1, tok, D]
         n = patch_tokens.shape[0]
         return self._slice(patch_tokens.reshape(n, -1, patch_tokens.shape[-1]))  # [N, tok, D']
@@ -146,6 +193,13 @@ class DepthAnything3TargetEncoder(nn.Module):
         """keyframes: list of K x (B,3,H,W) future frames. Returns (B, K*tok, D) bf16 (detached).
 
         Monocular per-frame (no warmup clip), mirroring the lingbot depth teacher."""
+        if self.align_strategy == "wsa_multilayer":
+            # wsa_multilayer is only wired through the current-alignment path (encode_current_and_future);
+            # this multi-keyframe helper would need a 5-d [B,K,L,tok,D] contract the callers don't expect.
+            raise NotImplementedError(
+                "wsa_multilayer DA3 alignment is only supported with use_current_alignment "
+                "(via encode_current_and_future), not encode_future_keyframes"
+            )
         prepped = [self._prep(kf) for kf in keyframes_b3hw]  # each (B,3,R,R)
         b = prepped[0].shape[0]
         k = len(prepped)
