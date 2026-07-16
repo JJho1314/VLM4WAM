@@ -1,0 +1,16 @@
+# @package _global_
+
+defaults:
+  - libero_cosmos_2cam224
+  - _self_
+
+model:
+  online_semantic_planner: true
+  online_semantic_planner_checkpoint: ${oc.env:FASTWAM_PLANNER_CHECKPOINT}
+
+data:
+  train:
+    semantic_plan_source: online
+
+EVALUATION:
+  video_fps: 5.0

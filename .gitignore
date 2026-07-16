@@ -49,6 +49,15 @@ visualizations/
 cosmos-predict2.5/assets/
 cosmos-predict2.5/docs/media/
 
+# ...but vendored FastWAM keeps real CODE at paths those two generic rules match:
+# configs/data/*.yaml are dataset *configs* (libero_2cam_cosmos.yaml is what training loads),
+# and src/fastwam/datasets/** is the dataset implementation (incl. the frame-cache mmap layer).
+# A parent directory that stays excluded can never have its children re-included, so these
+# negations must name the directories themselves — and must use ** because the names recur at
+# several depths (e.g. src/fastwam/datasets/lerobot/lerobot/datasets/).
+!third_party/FastWAM/**/data/
+!third_party/FastWAM/**/datasets/
+
 # Visualization artifacts
 vis/
 vis_demo/

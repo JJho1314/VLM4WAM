@@ -1,0 +1,63 @@
+_target_: fastwam.models.cosmos.runtime.create_fastwam_cosmos
+
+# Cosmos-Predict2.5-2B base/pre-trained EMA checkpoint (overridden by the sbatch).
+video_dit_pretrained_path: /data/user/jhe724/workspace/weights/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt
+
+action_dim: ${data.train.processor.action_output_dim}
+proprio_dim: ${data.train.processor.proprio_output_dim}
+crossattn_dim: 1024        # MiniTrainDIT crossattn_emb_channels (Qwen 3584 -> 1024 via model text_proj)
+coupling: mot              # "mot" (joint attention) | "cross_attn" (action cross-attends video) — A/B switch
+mot_bidirectional: false   # MoT: false = video independent of action (original FastWAM); true = video also sees action
+feature_layer: -1          # cross_attn: which video block's hidden state the action reads
+atten_backend: torch       # SDPA so the MoT joint masked attention + no-CP works
+train_video_expert: true
+
+# Semantic-plan injection into the Cosmos VIDEO backbone only. The adapter uses
+# the FastWAM K1 dense geometry; source selection remains independently disabled
+# by default and is enabled by a dedicated task or explicit file-backed data mode.
+semantic_plan_context: true
+semantic_plan_in_dim: 1024
+semantic_plan_hidden_dim: 2048
+semantic_plan_num_keyframes: 1
+semantic_plan_source_num_keyframes: 1
+semantic_plan_spatial_grid: 16
+semantic_plan_max_tokens: 256  # 1 * 16 * 16
+semantic_plan_coord_hidden_dim: 256
+semantic_plan_use_rope: true
+semantic_plan_cross_attention_blocks: null
+
+online_semantic_planner: false
+online_semantic_planner_code_dir: scripts/qwen3_vl_semantic_planner/lingbot_dino_4b
+online_semantic_planner_checkpoint: null
+semantic_plan_initial_depth_gate: 0.1
+
+# MoT/cross-attn action DiT width.  The previous implementation mirrored the
+# Cosmos video DiT (hidden=2048, ffn=8192) and made the action expert ~1.95B.
+# This Wan-style compact setting keeps MoT K/V compatible via 16x128 attention
+# width, but reduces the action residual/MLP width to ~0.80B total action params.
+# Set action_hidden_dim/action_ffn_dim to null to recover the old full-size mode.
+action_hidden_dim: 1024
+action_ffn_dim: 4096
+action_attention_head_dim: 128
+
+# AGRA-only (passed always but IGNORED unless coupling=agra). "gr00t" = the REAL
+# GR00T-N1.7 flow-matching action DiT (32-layer interleaved -> 16 cross blocks, inner
+# 1536, cross-attn 2048), initialised from the pretrained action_head.model.* weights
+# (the paper's "employ the action DiT from GR00T-N1"); its 16 cross blocks read the
+# 16-layer Cosmos foresight bridge. (This is the model config the launcher actually
+# loads via task=libero_cosmos_2cam224; fastwam_cosmos_agra.yaml is unused by it.)
+agra_head: gr00t
+gr00t_action_dit_ckpt: /data/users/junjie/weights/gr00t_n1d7_action_dit.pt
+
+vae:
+  vae_pth: /data/user/jhe724/workspace/weights/Cosmos-Predict2.5-2B/tokenizer.pth
+
+video_scheduler:
+  train_shift: 3.0          # Cosmos rectified-flow shift
+  num_train_timesteps: 1000
+action_scheduler:
+  train_shift: 3.0
+  num_train_timesteps: 1000
+loss:
+  lambda_video: 1.0
+  lambda_action: 1.0
