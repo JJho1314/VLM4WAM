@@ -57,11 +57,115 @@ from utils.data_utils import get_latents, get_text_conditions, gen_noise_from_co
 
 # ----------------------------------------------------
 from utils.extra_utils import act_metric
+from models.ltx_models.semantic_conditioning import (
+    OnlineSiglip2SemanticEncoder,
+    build_semantic_plan_times,
+    select_future_keyframes,
+)
 
 LOG_LEVEL = "INFO"
 # LOG_LEVEL = "DEBUG"
 logger = get_logger("wm_runner")
 logger.setLevel(LOG_LEVEL)
+
+
+def compute_effective_video_fps(data_config: Dict[str, Any], default_source_fps: float = 30.0) -> float:
+    """Convert source control FPS to the sampled video FPS used by GE-Act."""
+
+    source_fps = float(data_config.get("source_fps", default_source_fps))
+    chunk = int(data_config["chunk"])
+    action_chunk = int(data_config["action_chunk"])
+    if chunk <= 0 or action_chunk % chunk != 0:
+        raise ValueError("action_chunk must be an integer multiple of chunk")
+    return source_fps / (action_chunk // chunk)
+
+
+def compute_ltx_latent_frames(
+    raw_future_frames: int,
+    temporal_compression_ratio: int,
+    n_previous: int,
+) -> int:
+    """LTX temporal VAE keeps the first frame and then compresses intervals."""
+
+    if raw_future_frames < 1:
+        raise ValueError("at least one future frame is required")
+    return (raw_future_frames - 1) // temporal_compression_ratio + 1 + n_previous
+
+
+def sample_semantic_condition_mask(
+    batch_size: int,
+    n_view: int,
+    dropout_probability: float,
+    *,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype = torch.float32,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Sample one semantic keep/drop decision per scene and share it across views."""
+
+    if not 0 <= dropout_probability <= 1:
+        raise ValueError("semantic dropout probability must be in [0, 1]")
+    keep = torch.rand(batch_size, device=device, generator=generator) >= dropout_probability
+    return keep.to(dtype=dtype).repeat_interleave(n_view)
+
+
+def freeze_conditioning_modules(*components) -> None:
+    """Explicitly freeze and eval all condition-only neural networks."""
+
+    for component in components:
+        if component is None:
+            continue
+        module = getattr(component, "model", component)
+        if isinstance(module, torch.nn.Module):
+            module.requires_grad_(False)
+            module.eval()
+
+
+def _is_semantic_parameter(name: str) -> bool:
+    return name.startswith("semantic_") or ".semantic_" in name
+
+
+def build_optimizer_parameter_groups(
+    model: torch.nn.Module,
+    train_mode: str,
+    base_lr: float,
+    semantic_lr: float,
+) -> List[Dict[str, Any]]:
+    """Apply GE-Act train-mode filtering and split semantic parameters by LR."""
+
+    base_parameters = []
+    semantic_parameters = []
+    for name, parameter in model.named_parameters():
+        is_action = "action_" in name
+        if train_mode == "action_only":
+            trainable = is_action
+        elif train_mode == "video_only":
+            trainable = not is_action
+        elif train_mode in ("all", "action_full"):
+            trainable = True
+        else:
+            raise NotImplementedError(f"unknown train mode: {train_mode}")
+        parameter.requires_grad_(trainable)
+        if not trainable:
+            continue
+        if _is_semantic_parameter(name):
+            semantic_parameters.append(parameter)
+        else:
+            base_parameters.append(parameter)
+
+    groups = []
+    if base_parameters:
+        groups.append({"name": "base_ltx", "params": base_parameters, "lr": base_lr})
+    if semantic_parameters:
+        groups.append({"name": "semantic", "params": semantic_parameters, "lr": semantic_lr})
+    return groups
+
+
+def should_save_checkpoint(global_step: int, args: argparse.Namespace) -> bool:
+    explicit_steps = getattr(args, "save_steps", None)
+    if explicit_steps:
+        return global_step in {int(step) for step in explicit_steps}
+    return global_step > 0 and global_step % int(args.steps_to_save) == 0
 
 
 class State:
@@ -92,6 +196,7 @@ class Trainer:
         cd = load(open(config_file, "r"), Loader=Loader)
         args = argparse.Namespace(**cd)
         args.lr = float(args.lr)
+        args.semantic_lr = float(getattr(args, "semantic_lr", args.lr))
         args.epsilon = float(args.epsilon)
         args.weight_decay = float(args.weight_decay)
 
@@ -110,6 +215,8 @@ class Trainer:
         self.unet = None
         self.vae = None
         self.scheduler = None
+        self.semantic_encoder = None
+        self.video_frame_rate = compute_effective_video_fps(self.args.data["train"])
 
         self._init_distributed()
         self._init_logging()
@@ -231,8 +338,6 @@ class Trainer:
     def prepare_dataset(self) -> None:
 
         logger.info(f"Training Dataset: {self.args.train_data_class}")
-        local_rank = int(os.environ["LOCAL_RANK"])
-
         train_dataset_class = import_custom_class(
             self.args.train_data_class, self.args.train_data_class_path
         )
@@ -243,6 +348,13 @@ class Trainer:
             shuffle=True,
             batch_size=self.args.batch_size,
             num_workers=self.args.dataloader_num_workers,
+            pin_memory=getattr(self.args, "pin_memory", False),
+            persistent_workers=self.args.dataloader_num_workers > 0,
+            prefetch_factor=(
+                getattr(self.args, "dataloader_prefetch_factor", 2)
+                if self.args.dataloader_num_workers > 0
+                else None
+            ),
             multiprocessing_context=None,
         )
         logger.info(f">>>>>>>>>>>>>Total Train Eps: {len(self.train_dataset)}<<<<<<<<<<<<<<<<<<\n")
@@ -296,6 +408,7 @@ class Trainer:
         )
         self.tokenizer, text_encoder = cond_models["tokenizer"], cond_models["text_encoder"]
         self.text_encoder = text_encoder.to(device, dtype=dtype).eval()
+        self.text_encoder.requires_grad_(False)
         self.text_uncond = get_text_conditions(self.tokenizer, self.text_encoder, prompt="")
         self.uncond_prompt_embeds = self.text_uncond['prompt_embeds']
         self.uncond_prompt_attention_mask = self.text_uncond['prompt_attention_mask']
@@ -313,6 +426,7 @@ class Trainer:
         if isinstance(self.vae.latents_std, List):
             self.vae.latents_std = torch.FloatTensor(self.vae.latents_std)
         if self.vae is not None:
+            self.vae.requires_grad_(False)
             if self.args.enable_slicing:
                 self.vae.enable_slicing()
             if self.args.enable_tiling:
@@ -336,6 +450,17 @@ class Trainer:
         total_params = count_model_parameters(self.diffusion_model)
         logger.info(f'Total parameters for transformer model:{total_params}')
 
+        semantic_config = getattr(self.args, "semantic_plan", {})
+        if semantic_config.get("enabled", False):
+            self.semantic_encoder = OnlineSiglip2SemanticEncoder(
+                semantic_config["model_name_or_path"],
+                device=device,
+                dtype=dtype,
+                frame_microbatch_size=int(semantic_config.get("frame_microbatch_size", 32)),
+                expected_tokens=int(semantic_config.get("tokens_per_frame", 256)),
+                expected_feature_dim=int(semantic_config.get("feature_dim", 1024)),
+            )
+
 
         ### Load Diffuser Scheduler
         diffusion_scheduler_class = import_custom_class(
@@ -355,11 +480,7 @@ class Trainer:
     def prepare_trainable_parameters(self):
         logger.info("Initializing trainable parameters")
         
-        components_to_disable_grads = []
-            
-        for component in components_to_disable_grads:
-            if component is not None:
-                component.requires_grad_(False)
+        freeze_conditioning_modules(self.text_encoder, self.vae, self.semantic_encoder)
 
         if torch.backends.mps.is_available() and self.state.weight_dtype == torch.bfloat16:
             # due to pytorch#99272, MPS does not yet support bfloat16.
@@ -388,44 +509,31 @@ class Trainer:
             cast_training_params([self.diffusion_model], dtype=torch.float32)
 
         self.state.learning_rate = self.args.lr
+        semantic_learning_rate = self.args.semantic_lr
         if self.args.scale_lr:
-            self.state.learning_rate = (
-                self.state.learning_rate
-                * self.args.gradient_accumulation_steps
+            lr_scale = (
+                self.args.gradient_accumulation_steps
                 * self.args.batch_size
                 * self.state.accelerator.num_processes
             )
+            self.state.learning_rate *= lr_scale
+            semantic_learning_rate *= lr_scale
 
-        diffusion_model_trainable_params = []
-        if train_mode == 'action_only':
-            for name, param in self.diffusion_model.named_parameters():
-                if 'action_' in name:
-                    param.requires_grad = True
-                    diffusion_model_trainable_params.append(param)
-                else:
-                    param.requires_grad = False
-        elif train_mode == "video_only":
-            for name, param in self.diffusion_model.named_parameters():
-                if 'action_' not in name:
-                    param.requires_grad = True
-                    diffusion_model_trainable_params.append(param)
-                else:
-                    param.requires_grad = False
-        elif train_mode == "all" or train_mode == 'action_full':
-            for name, param in self.diffusion_model.named_parameters():
-                param.requires_grad = True
-                diffusion_model_trainable_params.append(param)
-        else:
-            raise NotImplementedError
-
-        num_trainable_params = sum(p.numel() for p in diffusion_model_trainable_params)
+        params_to_optimize = build_optimizer_parameter_groups(
+            self.diffusion_model,
+            train_mode=train_mode,
+            base_lr=self.state.learning_rate,
+            semantic_lr=semantic_learning_rate,
+        )
+        diffusion_model_trainable_params = [
+            parameter for group in params_to_optimize for parameter in group["params"]
+        ]
+        num_trainable_params = sum(parameter.numel() for parameter in diffusion_model_trainable_params)
         logger.info(f'Total trainable parameters: {num_trainable_params}')
-
-        diffusion_model_parameters_with_lr = {
-            "params": diffusion_model_trainable_params,
-            "lr": self.state.learning_rate,
-        }
-        params_to_optimize = [diffusion_model_parameters_with_lr]
+        logger.info(
+            "Optimizer groups: %s",
+            {group["name"]: {"lr": group["lr"], "params": sum(p.numel() for p in group["params"])} for group in params_to_optimize},
+        )
         self.state.num_trainable_parameters = sum(p.numel() for p in diffusion_model_trainable_params)
 
         optimizer = get_optimizer(
@@ -528,13 +636,24 @@ class Trainer:
                     # shape: {b, c, v, t, h, w}; ranging from -1 to 1
                     video = video.to(accelerator.device, dtype=weight_dtype).contiguous()
                     batch_size, c, n_view, _, h, w = video.shape
+                    mem_size = self.args.data['train']['n_previous']
+                    semantic_keyframes = None
+                    if self.semantic_encoder is not None:
+                        semantic_config = self.args.semantic_plan
+                        semantic_future = rearrange(
+                            video[:, :, :, mem_size:],
+                            'b c v t h w -> b v t c h w',
+                        )
+                        semantic_keyframes = select_future_keyframes(
+                            semantic_future,
+                            indices=tuple(semantic_config.get("keyframe_indices", (0, 3, 5, 8))),
+                        ).contiguous()
                     video = rearrange(video, 'b c v t h w -> (b v) c t h w')
 
                     # here we use color jitter to the video, with different views or different batches different jitter
                     if self.args.use_color_jitter:
                         video = apply_color_jitter_to_video(video)
 
-                    mem_size = self.args.data['train']['n_previous']
                     mem = video[:,:,:mem_size]
                     future_video = video[:,:,mem_size:]
 
@@ -544,9 +663,35 @@ class Trainer:
                     # get the shape params
                     _, _, raw_frames, raw_height, raw_width = future_video.shape
 
-                    latent_frames = raw_frames // self.TEMPORAL_DOWN_RATIO + 1 + mem_size
+                    latent_frames = compute_ltx_latent_frames(
+                        raw_frames,
+                        temporal_compression_ratio=self.TEMPORAL_DOWN_RATIO,
+                        n_previous=mem_size,
+                    )
                     latent_height = raw_height // self.SPATIAL_DOWN_RATIO
                     latent_width = raw_width // self.SPATIAL_DOWN_RATIO
+
+                    semantic_plan = None
+                    semantic_plan_times = None
+                    semantic_condition_mask = None
+                    if self.semantic_encoder is not None:
+                        semantic_plan = self.semantic_encoder.encode(semantic_keyframes)
+                        semantic_plan_times = build_semantic_plan_times(
+                            batch_size=batch_size,
+                            n_view=n_view,
+                            n_previous=mem_size,
+                            num_future_frames=raw_frames,
+                            num_latent_frames=latent_frames,
+                            indices=tuple(self.args.semantic_plan.get("keyframe_indices", (0, 3, 5, 8))),
+                            device=accelerator.device,
+                        )
+                        semantic_condition_mask = sample_semantic_condition_mask(
+                            batch_size=batch_size,
+                            n_view=n_view,
+                            dropout_probability=float(self.args.semantic_plan.get("dropout", 0.15)),
+                            device=accelerator.device,
+                            dtype=weight_dtype,
+                        )
 
                     dropout_factor = torch.rand(batch_size).to(accelerator.device, dtype=weight_dtype)
                     dropout_mask_prompt = dropout_factor < self.args.caption_dropout_p
@@ -671,6 +816,12 @@ class Trainer:
                         video_attention_mask=video_attention_mask,
                         history_action_state=act_state,
                         condition_mask=conditioning_mask,
+                        frame_rate=self.video_frame_rate,
+                        temporal_compression_ratio=self.TEMPORAL_DOWN_RATIO,
+                        spatial_compression_ratio=self.SPATIAL_DOWN_RATIO,
+                        semantic_plan=semantic_plan,
+                        semantic_plan_times=semantic_plan_times,
+                        semantic_condition_mask=semantic_condition_mask,
                     )['latents']
 
                     if self.args.train_mode == 'all' or self.args.train_mode == 'video_only':
@@ -736,14 +887,14 @@ class Trainer:
                                 self.writer.add_scalar("Video loss", loss_video.item(), global_step)
 
                 # global_step > 0 守卫: step 0 时 0 % N == 0 恒真会误触发 (grad_accum>1 时首步 global_step 停在 0)
-                if global_step > 0 and global_step % self.args.steps_to_val == 0:
+                if accelerator.sync_gradients and global_step > 0 and global_step % self.args.steps_to_val == 0:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         model_save_dir = os.path.join(self.save_folder,f'Validation_step_{global_step}')
                         self.validate(accelerator, model_save_dir, global_step, n_view=n_view, n_chunk=1)
 
                 
-                if global_step > 0 and global_step % self.args.steps_to_save == 0:
+                if accelerator.sync_gradients and should_save_checkpoint(global_step, self.args):
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         model_to_save = unwrap_model(accelerator, self.diffusion_model)
@@ -788,7 +939,24 @@ class Trainer:
         accelerator.end_training()
 
 
-    def validate(self, accelerator, model_save_dir, global_step, n_view=1, n_chunk=30, image=None, prompt=None, cap=None, path=None, gt_actions=None, to_log=True):
+    def validate(
+        self,
+        accelerator,
+        model_save_dir,
+        global_step,
+        n_view=1,
+        n_chunk=30,
+        image=None,
+        prompt=None,
+        cap=None,
+        path=None,
+        gt_actions=None,
+        to_log=True,
+        semantic_plan=None,
+        semantic_plan_times=None,
+        semantic_condition_mask=None,
+        semantic_mode=None,
+    ):
 
         os.makedirs(model_save_dir,exist_ok=True)
 
@@ -807,6 +975,50 @@ class Trainer:
         batch_size = 1
 
         image = image[:batch_size]
+
+        if self.semantic_encoder is not None:
+            semantic_mode = semantic_mode or self.args.semantic_plan.get("validation_mode", "gt")
+            if semantic_mode == "gt":
+                mem_size = self.args.data['train']['n_previous']
+                raw_future_frames = self.args.data['train']['chunk']
+                semantic_future = rearrange(
+                    gt_video[:batch_size, :, :, mem_size:mem_size + raw_future_frames],
+                    'b c v t h w -> b v t c h w',
+                ).to(accelerator.device, dtype=self.state.weight_dtype)
+                semantic_plan = self.semantic_encoder.encode(
+                    select_future_keyframes(
+                        semantic_future,
+                        indices=tuple(self.args.semantic_plan.get("keyframe_indices", (0, 3, 5, 8))),
+                    )
+                )
+                latent_num_frames = compute_ltx_latent_frames(
+                    raw_future_frames,
+                    temporal_compression_ratio=self.TEMPORAL_DOWN_RATIO,
+                    n_previous=mem_size,
+                )
+                semantic_plan_times = build_semantic_plan_times(
+                    batch_size=batch_size,
+                    n_view=v,
+                    n_previous=mem_size,
+                    num_future_frames=raw_future_frames,
+                    num_latent_frames=latent_num_frames,
+                    indices=tuple(self.args.semantic_plan.get("keyframe_indices", (0, 3, 5, 8))),
+                    device=accelerator.device,
+                )
+                semantic_condition_mask = torch.ones(
+                    batch_size * v,
+                    device=accelerator.device,
+                    dtype=self.state.weight_dtype,
+                )
+            elif semantic_mode == "external":
+                if semantic_plan is None or semantic_plan_times is None:
+                    raise ValueError("external semantic validation requires plan tensors and times")
+            elif semantic_mode == "none":
+                semantic_plan = None
+                semantic_plan_times = None
+                semantic_condition_mask = None
+            else:
+                raise ValueError(f"unknown semantic validation mode: {semantic_mode}")
 
         image = rearrange(image, 'b c v t h w -> (b v) c t h w')
         num_denois_steps = self.args.num_inference_step
@@ -842,6 +1054,10 @@ class Trainer:
             postprocess_video=False,  # keep raw (b v) c t h w tensor so preds['video'] works; LTX ignores via kwargs
             n_chunk=n_chunk,
             action_dim=self.args.diffusion_model["config"]["action_in_channels"] if self.args.return_action else None,
+            frame_rate=self.video_frame_rate,
+            semantic_plan=semantic_plan,
+            semantic_plan_times=semantic_plan_times,
+            semantic_condition_mask=semantic_condition_mask,
         )[0]
 
         cap = 'Validation'
@@ -870,4 +1086,3 @@ class Trainer:
             if to_log:
                 for key, value in action_logs.items():
                     self.writer.add_scalar(key, value, global_step)
-

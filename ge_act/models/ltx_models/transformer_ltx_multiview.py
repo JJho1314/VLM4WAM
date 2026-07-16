@@ -34,6 +34,7 @@ from diffusers.models.normalization import AdaLayerNormSingle, RMSNorm
 import torch.utils.checkpoint
 
 from models.ltx_models.ltx_attention_processor import Attention
+from models.ltx_models.semantic_conditioning import SemanticContextAdapter
 
 
 from models.action_patches.patches import preprocessing_action_states, add_action_expert
@@ -129,6 +130,67 @@ class LTXVideoAttentionProcessor2_0:
         return hidden_states
 
 
+class LTXVideoSemanticAttentionProcessor2_0:
+    """Same-camera semantic cross-attention with independent query/key RoPE."""
+
+    def __init__(self):
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError("semantic attention requires PyTorch 2.0 or newer")
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        query_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        key_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        if encoder_hidden_states is None:
+            raise ValueError("semantic cross-attention requires encoder_hidden_states")
+        batch_size, query_length, _ = hidden_states.shape
+        if encoder_hidden_states.shape[0] != batch_size:
+            raise ValueError(
+                "semantic context must be aligned per camera: "
+                f"query batch {batch_size}, context batch {encoder_hidden_states.shape[0]}"
+            )
+        key_length = encoder_hidden_states.shape[1]
+
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, key_length, batch_size)
+            attention_mask = attention_mask.view(batch_size, attn.heads, -1, key_length)
+
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+        if query_rotary_emb is not None:
+            query = apply_rotary_emb(query, query_rotary_emb)
+        if key_rotary_emb is not None:
+            key = apply_rotary_emb(key, key_rotary_emb)
+
+        query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+        key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+        value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+        hidden_states = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+        )
+        hidden_states = hidden_states.transpose(1, 2).flatten(2, 3).to(query.dtype)
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+        if hidden_states.shape[:2] != (batch_size, query_length):
+            raise RuntimeError("semantic attention changed the per-camera query layout")
+        return hidden_states
+
+
 class LTXVideoRotaryPosEmbed(nn.Module):
     def __init__(
         self,
@@ -159,14 +221,27 @@ class LTXVideoRotaryPosEmbed(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         batch_size = hidden_states.shape[0]
-
-        # Always compute rope in fp32
         grid_h = torch.arange(height, dtype=torch.float32, device=hidden_states.device)
         grid_w = torch.arange(width, dtype=torch.float32, device=hidden_states.device)
         grid_f = torch.arange(num_frames, dtype=torch.float32, device=hidden_states.device)
         grid = torch.meshgrid(grid_f, grid_h, grid_w, indexing="ij")
-        grid = torch.stack(grid, dim=0)
-        grid = grid.unsqueeze(0).repeat(batch_size, 1, 1, 1, 1)
+        positions = torch.stack(grid, dim=-1).reshape(1, -1, 3).repeat(batch_size, 1, 1)
+
+        return self.forward_positions(hidden_states, positions, rope_interpolation_scale)
+
+    def forward_positions(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        rope_interpolation_scale: Optional[Tuple[torch.Tensor, float, float]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build LTX RoPE from explicit continuous ``(t,y,x)`` positions."""
+
+        if positions.ndim != 3 or positions.shape[-1] != 3:
+            raise ValueError(f"positions must be [B,L,3], got {tuple(positions.shape)}")
+        if positions.shape[0] not in (1, hidden_states.shape[0]):
+            raise ValueError("position batch must be one or match hidden_states")
+        grid = positions.to(device=hidden_states.device, dtype=torch.float32).clone()
 
         """
         rope_interpolation_scale = (
@@ -177,11 +252,9 @@ class LTXVideoRotaryPosEmbed(nn.Module):
         """
 
         if rope_interpolation_scale is not None:
-            grid[:, 0:1] = grid[:, 0:1] * rope_interpolation_scale[0] * self.patch_size_t / self.base_num_frames
-            grid[:, 1:2] = grid[:, 1:2] * rope_interpolation_scale[1] * self.patch_size / self.base_height
-            grid[:, 2:3] = grid[:, 2:3] * rope_interpolation_scale[2] * self.patch_size / self.base_width
-
-        grid = grid.flatten(2, 4).transpose(1, 2)
+            grid[..., 0] = grid[..., 0] * rope_interpolation_scale[0] * self.patch_size_t / self.base_num_frames
+            grid[..., 1] = grid[..., 1] * rope_interpolation_scale[1] * self.patch_size / self.base_height
+            grid[..., 2] = grid[..., 2] * rope_interpolation_scale[2] * self.patch_size / self.base_width
 
         start = 1.0
         end = self.theta
@@ -239,6 +312,8 @@ class LTXVideoTransformerBlock(nn.Module):
         attention_out_bias: bool = True,
         eps: float = 1e-6,
         elementwise_affine: bool = False,
+        semantic_cross_attention: bool = False,
+        semantic_adaln_rank: int = 256,
     ):
         super().__init__()
 
@@ -270,6 +345,27 @@ class LTXVideoTransformerBlock(nn.Module):
 
         self.ff = FeedForward(dim, activation_fn=activation_fn)
 
+        self.semantic_cross_attention = semantic_cross_attention
+        if semantic_cross_attention:
+            self.semantic_norm = RMSNorm(dim, eps=eps, elementwise_affine=elementwise_affine)
+            self.semantic_attn = Attention(
+                query_dim=dim,
+                cross_attention_dim=dim,
+                heads=num_attention_heads,
+                kv_heads=num_attention_heads,
+                dim_head=attention_head_dim,
+                bias=attention_bias,
+                out_bias=attention_out_bias,
+                qk_norm=qk_norm,
+                processor=LTXVideoSemanticAttentionProcessor2_0(),
+            )
+            self.semantic_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(dim, semantic_adaln_rank, bias=False),
+                nn.Linear(semantic_adaln_rank, 3 * dim, bias=False),
+            )
+            nn.init.zeros_(self.semantic_modulation[-1].weight)
+
         self.scale_shift_table = nn.Parameter(torch.randn(6, dim) / dim**0.5)
 
     def forward(
@@ -282,6 +378,11 @@ class LTXVideoTransformerBlock(nn.Module):
         n_view: int = None,
         cross_view_attn: bool = False,
         self_attention_mask: Optional[torch.Tensor] = None,
+        embedded_timestep: Optional[torch.Tensor] = None,
+        semantic_hidden_states: Optional[torch.Tensor] = None,
+        semantic_query_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        semantic_key_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        semantic_condition_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size = hidden_states.size(0)
         norm_hidden_states = self.norm1(hidden_states)
@@ -310,6 +411,33 @@ class LTXVideoTransformerBlock(nn.Module):
             n_view=n_view,
         )
         hidden_states = hidden_states + attn_hidden_states
+
+        if self.semantic_cross_attention and semantic_hidden_states is not None:
+            if embedded_timestep is None:
+                raise ValueError("embedded_timestep is required for semantic conditioning")
+            semantic_shift, semantic_scale, semantic_gate = self.semantic_modulation(
+                embedded_timestep
+            ).chunk(3, dim=-1)
+            semantic_query = self.semantic_norm(hidden_states)
+            semantic_query = semantic_query * (1 + semantic_scale) + semantic_shift
+            semantic_output = self.semantic_attn(
+                semantic_query,
+                encoder_hidden_states=semantic_hidden_states,
+                query_rotary_emb=semantic_query_rotary_emb,
+                key_rotary_emb=semantic_key_rotary_emb,
+            )
+            if semantic_condition_mask is not None:
+                semantic_mask = semantic_condition_mask.to(
+                    device=semantic_output.device,
+                    dtype=semantic_output.dtype,
+                )
+                if semantic_mask.ndim == 1:
+                    semantic_mask = semantic_mask[:, None, None]
+                elif semantic_mask.ndim == 2:
+                    semantic_mask = semantic_mask[:, :, None]
+                semantic_output = semantic_output * semantic_mask
+            hidden_states = hidden_states + semantic_output * semantic_gate
+
         norm_hidden_states = self.norm2(hidden_states) * (1 + scale_mlp) + shift_mlp
 
         ff_output = self.ff(norm_hidden_states)
@@ -372,6 +500,13 @@ class LTXVideoTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin
         use_view_embed: bool = True,
         max_view: int = 3,
         action_expert: bool = False,
+        semantic_plan_context: bool = False,
+        semantic_plan_in_dim: int = 1024,
+        semantic_plan_coordinate_dim: int = 256,
+        semantic_plan_num_keyframes: int = 4,
+        semantic_plan_num_views: int = 3,
+        semantic_plan_cross_attention_blocks: Optional[Tuple[int, ...]] = None,
+        semantic_plan_adaln_rank: int = 256,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -404,6 +539,22 @@ class LTXVideoTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin
             theta=10000.0,
         )
 
+        self.semantic_plan_context = semantic_plan_context
+        self.semantic_plan_num_keyframes = semantic_plan_num_keyframes
+        if semantic_plan_cross_attention_blocks is None:
+            semantic_plan_cross_attention_blocks = tuple(range(num_layers))
+        self.semantic_plan_cross_attention_blocks = set(semantic_plan_cross_attention_blocks)
+        if semantic_plan_context:
+            invalid_blocks = self.semantic_plan_cross_attention_blocks.difference(range(num_layers))
+            if invalid_blocks:
+                raise ValueError(f"invalid semantic cross-attention blocks: {sorted(invalid_blocks)}")
+            self.semantic_adapter = SemanticContextAdapter(
+                input_dim=semantic_plan_in_dim,
+                hidden_dim=inner_dim,
+                coordinate_dim=semantic_plan_coordinate_dim,
+                num_views=semantic_plan_num_views,
+            )
+
         self.transformer_blocks = nn.ModuleList(
             [
                 LTXVideoTransformerBlock(
@@ -417,8 +568,12 @@ class LTXVideoTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin
                     attention_out_bias=attention_out_bias,
                     eps=norm_eps,
                     elementwise_affine=norm_elementwise_affine,
+                    semantic_cross_attention=(
+                        semantic_plan_context and block_idx in self.semantic_plan_cross_attention_blocks
+                    ),
+                    semantic_adaln_rank=semantic_plan_adaln_rank,
                 )
-                for _ in range(num_layers)
+                for block_idx in range(num_layers)
             ]
         )
 
@@ -446,9 +601,24 @@ class LTXVideoTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin
             )
 
 
-    def _set_gradient_checkpointing(self, module, value=False):
-        if hasattr(module, "gradient_checkpointing"):
-            module.gradient_checkpointing = value
+    def _set_gradient_checkpointing(
+        self,
+        module=None,
+        value=False,
+        enable=None,
+        gradient_checkpointing_func=torch.utils.checkpoint.checkpoint,
+    ):
+        """Support both legacy and current Diffusers checkpointing hooks."""
+
+        if enable is not None:
+            value = enable
+            modules = self.modules()
+        else:
+            modules = (module,) if module is not None else (self,)
+        for target in modules:
+            if hasattr(target, "gradient_checkpointing"):
+                target.gradient_checkpointing = value
+                target._gradient_checkpointing_func = gradient_checkpointing_func
 
 
     def forward(
@@ -471,6 +641,9 @@ class LTXVideoTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin
         num_frames: int = None,
         height: int = None,
         width: int = None,
+        semantic_plan: Optional[torch.Tensor] = None,
+        semantic_plan_times: Optional[torch.Tensor] = None,
+        semantic_condition_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -482,6 +655,48 @@ class LTXVideoTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin
             image_rotary_emb = self.rope(
                 hidden_states, rope_interpolation_scale, num_frames, height, width
             )
+
+            semantic_hidden_states = None
+            semantic_key_rotary_emb = None
+            if semantic_plan is not None:
+                if not self.semantic_plan_context:
+                    raise ValueError("semantic_plan was provided but semantic_plan_context is disabled")
+                if semantic_plan_times is None:
+                    raise ValueError("semantic_plan_times must be provided with semantic_plan")
+                if semantic_plan.ndim == 4:
+                    semantic_batch, semantic_views, semantic_length, semantic_dim = semantic_plan.shape
+                    if semantic_length % self.semantic_plan_num_keyframes != 0:
+                        raise ValueError(
+                            "flattened semantic token length must be divisible by the number of keyframes"
+                        )
+                    semantic_plan = semantic_plan.reshape(
+                        semantic_batch,
+                        semantic_views,
+                        self.semantic_plan_num_keyframes,
+                        semantic_length // self.semantic_plan_num_keyframes,
+                        semantic_dim,
+                    )
+                if semantic_plan.ndim != 5:
+                    raise ValueError("semantic_plan must be [B,V,K,P,D] or [B,V,K*P,D]")
+                if semantic_plan.shape[0] * semantic_plan.shape[1] != hidden_states.shape[0]:
+                    raise ValueError("semantic plan batch/view layout must match the video latents")
+                semantic_hidden_states, semantic_positions = self.semantic_adapter(
+                    semantic_plan,
+                    semantic_plan_times=semantic_plan_times,
+                    latent_height=height,
+                    latent_width=width,
+                    latent_num_frames=num_frames,
+                )
+                semantic_key_rotary_emb = self.rope.forward_positions(
+                    hidden_states,
+                    semantic_positions,
+                    rope_interpolation_scale,
+                )
+                if semantic_condition_mask is not None:
+                    if semantic_condition_mask.shape[0] == hidden_states.shape[0] // n_view:
+                        semantic_condition_mask = semantic_condition_mask.repeat_interleave(n_view, dim=0)
+                    if semantic_condition_mask.shape[0] != hidden_states.shape[0]:
+                        raise ValueError("semantic_condition_mask batch must be B or B*V")
 
             # convert encoder_attention_mask to a bias the same way we do for attention_mask
             if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
@@ -551,6 +766,11 @@ class LTXVideoTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin
                         # TODO: we always set cross_view_attn=True in this case
                         block_idx%3==0,
                         video_attention_mask,
+                        embedded_timestep,
+                        semantic_hidden_states,
+                        image_rotary_emb,
+                        semantic_key_rotary_emb,
+                        semantic_condition_mask,
                         **ckpt_kwargs,
                     )
                     if store_buffer:
@@ -585,6 +805,11 @@ class LTXVideoTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin
                         # TODO: we always set cross_view_attn=True in this case
                         cross_view_attn=block_idx%3==0,
                         self_attention_mask=video_attention_mask,
+                        embedded_timestep=embedded_timestep,
+                        semantic_hidden_states=semantic_hidden_states,
+                        semantic_query_rotary_emb=image_rotary_emb,
+                        semantic_key_rotary_emb=semantic_key_rotary_emb,
+                        semantic_condition_mask=semantic_condition_mask,
                     )
                     if store_buffer:
                         video_states_buffer.append(hidden_states.clone())
@@ -656,4 +881,3 @@ def apply_rotary_emb(x, freqs):
     x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(2)
     out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
     return out
-

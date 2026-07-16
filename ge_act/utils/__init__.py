@@ -128,4 +128,5 @@ def save_video(tensor, save_path, fps=30):
     torchvision.io.write_video(save_path, tensor, fps=fps)
 
 def zero_rank_print(s):
-    if (not dist.is_initialized()) and (dist.is_initialized() and dist.get_rank() == 0): print("### " + s)
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        print("### " + s)

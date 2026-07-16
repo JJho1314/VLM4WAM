@@ -75,6 +75,63 @@ def calculate_shift(
     return mu
 
 
+def prepare_pipeline_semantic_conditioning(
+    semantic_plan: Optional[torch.Tensor],
+    semantic_plan_times: Optional[torch.Tensor],
+    semantic_condition_mask: Optional[torch.Tensor],
+    *,
+    batch_size: int,
+    n_view: int,
+    num_keyframes: int,
+    do_classifier_free_guidance: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Validate semantic input and mirror the video CFG batch order."""
+
+    if semantic_plan is None:
+        if semantic_plan_times is not None or semantic_condition_mask is not None:
+            raise ValueError("semantic times/mask cannot be provided without semantic_plan")
+        return None, None, None
+    if semantic_plan_times is None:
+        raise ValueError("semantic_plan_times is required with semantic_plan")
+    if semantic_plan.ndim not in (4, 5):
+        raise ValueError("semantic_plan must be [B,V,L,D] or [B,V,K,P,D]")
+    if tuple(semantic_plan.shape[:2]) != (batch_size, n_view):
+        raise ValueError(
+            f"semantic batch/view layout {tuple(semantic_plan.shape[:2])} does not match {(batch_size, n_view)}"
+        )
+    if semantic_plan.ndim == 4 and semantic_plan.shape[2] % num_keyframes != 0:
+        raise ValueError("semantic token length must be divisible by num_keyframes")
+    if semantic_plan.ndim == 5 and semantic_plan.shape[2] != num_keyframes:
+        raise ValueError("semantic keyframe dimension does not match num_keyframes")
+
+    semantic_plan = semantic_plan.to(device=device, dtype=dtype)
+    if semantic_plan_times.ndim == 3:
+        if tuple(semantic_plan_times.shape) != (batch_size, n_view, num_keyframes):
+            raise ValueError("semantic_plan_times must align with semantic batch/view/keyframes")
+        semantic_plan_times = semantic_plan_times.reshape(batch_size * n_view, num_keyframes)
+    elif tuple(semantic_plan_times.shape) == (batch_size, num_keyframes):
+        semantic_plan_times = semantic_plan_times.repeat_interleave(n_view, dim=0)
+    elif tuple(semantic_plan_times.shape) != (batch_size * n_view, num_keyframes):
+        raise ValueError("semantic_plan_times must be [B,K], [B,V,K], or [B*V,K]")
+    semantic_plan_times = semantic_plan_times.to(device=device, dtype=torch.float32)
+
+    if semantic_condition_mask is None:
+        semantic_condition_mask = torch.ones(batch_size * n_view, device=device, dtype=dtype)
+    elif tuple(semantic_condition_mask.shape) == (batch_size,):
+        semantic_condition_mask = semantic_condition_mask.repeat_interleave(n_view)
+    elif tuple(semantic_condition_mask.shape) != (batch_size * n_view,):
+        raise ValueError("semantic_condition_mask must be [B] or [B*V]")
+    semantic_condition_mask = semantic_condition_mask.to(device=device, dtype=dtype)
+
+    if do_classifier_free_guidance:
+        semantic_plan = torch.cat((semantic_plan, semantic_plan), dim=0)
+        semantic_plan_times = torch.cat((semantic_plan_times, semantic_plan_times), dim=0)
+        semantic_condition_mask = torch.cat((semantic_condition_mask, semantic_condition_mask), dim=0)
+    return semantic_plan, semantic_plan_times, semantic_condition_mask
+
+
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
 def retrieve_timesteps(
     scheduler,
@@ -597,6 +654,9 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
         pixel_wise_timestep: bool = True,
         n_chunk: int = 1,
         show_progress: bool = False,
+        semantic_plan: Optional[torch.Tensor] = None,
+        semantic_plan_times: Optional[torch.Tensor] = None,
+        semantic_condition_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         r"""
@@ -682,6 +742,8 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
 
         if return_action:
             assert n_chunk==1, "action-inference pipeline only support single chunk prediction now"
+        if semantic_plan is not None and n_chunk != 1:
+            raise ValueError("semantic plans currently support one generated chunk per call")
         
 
         # pre-compute latent shape
@@ -736,6 +798,18 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
         if self.do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)  # b,l,c ?
             prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
+
+        semantic_plan, semantic_plan_times, semantic_condition_mask = prepare_pipeline_semantic_conditioning(
+            semantic_plan,
+            semantic_plan_times,
+            semantic_condition_mask,
+            batch_size=batch_size,
+            n_view=n_view,
+            num_keyframes=int(getattr(self.transformer.config, "semantic_plan_num_keyframes", 4)),
+            do_classifier_free_guidance=self.do_classifier_free_guidance,
+            device=device,
+            dtype=prompt_embeds.dtype,
+        )
 
         if len(image.shape) == 4:  # in this case, a single image act as input
             image = image.unsqueeze(2)
@@ -897,6 +971,9 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
                         video_attention_mask=video_attention_mask,
                         history_action_state=history_action_state_in,
                         condition_mask=conditioning_mask,
+                        semantic_plan=semantic_plan,
+                        semantic_plan_times=semantic_plan_times,
+                        semantic_condition_mask=semantic_condition_mask,
                     )[0]
 
 

@@ -2,6 +2,7 @@ from typing import Dict, Optional, Union
 import json
 import os
 import sys
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -35,6 +36,38 @@ def load_index_file(index_filename):
         state_dict.update(load_file(checkpoint_file))
     return state_dict
 
+
+def resolve_checkpoint_files(pretrained_ckpt: Union[str, os.PathLike]) -> list[Path]:
+    """Resolve a checkpoint file, a single-file directory, or a sharded directory."""
+
+    checkpoint_path = Path(pretrained_ckpt)
+    if checkpoint_path.is_file():
+        return [checkpoint_path]
+    if not checkpoint_path.is_dir():
+        raise FileNotFoundError(f"checkpoint does not exist: {checkpoint_path}")
+
+    index_path = checkpoint_path / "diffusion_pytorch_model.safetensors.index.json"
+    if index_path.is_file():
+        with index_path.open() as handle:
+            index = json.load(handle)
+        weight_map = index.get("weight_map", index)
+        filenames = list(dict.fromkeys(weight_map.values()))
+        files = [checkpoint_path / filename for filename in filenames]
+    else:
+        canonical_file = checkpoint_path / "diffusion_pytorch_model.safetensors"
+        if canonical_file.is_file():
+            files = [canonical_file]
+        else:
+            files = sorted(checkpoint_path.glob("*.safetensors"))
+            if len(files) != 1:
+                raise FileNotFoundError(
+                    f"expected one safetensors file or a shard index in {checkpoint_path}, found {len(files)}"
+                )
+    missing = [path for path in files if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"checkpoint index references missing shards: {missing}")
+    return files
+
 def _find_mismatched_keys(
     state_dict,
     model_state_dict,
@@ -60,12 +93,9 @@ def load_checkpoints(model, pretrained_ckpt, strict=False, ignore_mismatched_siz
     Load safetensors model state dict file.
     """
 
-    # In this case we have many shards to load
-    if os.path.isdir(pretrained_ckpt):
-        state_dict = load_index_file(os.path.join(pretrained_ckpt, "diffusion_pytorch_model.safetensors.index.json"))
-    # in this case we need give the file path
-    else:
-        state_dict = load_file(pretrained_ckpt)
+    state_dict = {}
+    for checkpoint_file in resolve_checkpoint_files(pretrained_ckpt):
+        state_dict.update(load_file(str(checkpoint_file)))
 
     if strict:
         model.load_state_dict(state_dict, strict=True)

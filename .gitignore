@@ -44,6 +44,11 @@ slurm-*.err
 
 # Local datasets and generated media
 data/
+!ge_act/data/
+!ge_act/data/**
+# The data-code exception above must not re-include runtime caches.
+__pycache__/
+*.py[cod]
 datasets/
 visualizations/
 cosmos-predict2.5/assets/
