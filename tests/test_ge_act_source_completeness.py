@@ -46,6 +46,27 @@ def test_lerobot_dataset_keeps_two_camera_video_contract() -> None:
     assert hasattr(dataset_cls, "normalize_video")
 
 
+def test_lerobot_dataset_accepts_source_fps_metadata() -> None:
+    sys.path.insert(0, str(GE_ACT_ROOT))
+    try:
+        module = importlib.import_module("data.lerobot_like_dataset")
+    finally:
+        sys.path.pop(0)
+
+    dataset = module.CustomLeRobotDataset(
+        data_roots=[],
+        domains=[],
+        source_fps=20,
+        chunk=9,
+        action_chunk=36,
+        n_previous=4,
+        random_crop=False,
+    )
+
+    assert dataset.source_fps == 20
+    assert dataset.video_temporal_stride == 4
+
+
 def test_libero_plus_reuses_the_stable_libero_inference_class() -> None:
     source = (GE_ACT_ROOT / "experiments/eval_libero_plus.py").read_text()
     assert "from experiments.eval_libero import InferenceLibero" in source

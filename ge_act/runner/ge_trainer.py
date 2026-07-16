@@ -80,6 +80,23 @@ def compute_effective_video_fps(data_config: Dict[str, Any], default_source_fps:
     return source_fps / (action_chunk // chunk)
 
 
+def build_deepspeed_batch_config(
+    deepspeed_config: Dict[str, Any],
+    *,
+    per_device_batch_size: int,
+    world_size: int,
+    gradient_accumulation_steps: int,
+) -> Dict[str, Any]:
+    config = dict(deepspeed_config)
+    config["train_batch_size"] = (
+        per_device_batch_size * world_size * gradient_accumulation_steps
+    )
+    # Accelerate defaults this field to 1 when an explicit DeepSpeed config is
+    # supplied, even if DeepSpeedPlugin receives a different constructor value.
+    config["gradient_accumulation_steps"] = gradient_accumulation_steps
+    return config
+
+
 def compute_ltx_latent_frames(
     raw_future_frames: int,
     temporal_compression_ratio: int,
@@ -274,8 +291,12 @@ class Trainer:
             world_size = int(os.environ.get("WORLD_SIZE", 1))  # 或 self.args.world_size
             grad_accum = self.args.gradient_accumulation_steps
 
-            train_batch_size = per_device_bs * world_size * grad_accum
-            self.args.deepspeed["train_batch_size"] = train_batch_size
+            self.args.deepspeed = build_deepspeed_batch_config(
+                self.args.deepspeed,
+                per_device_batch_size=per_device_bs,
+                world_size=world_size,
+                gradient_accumulation_steps=grad_accum,
+            )
             ds_plugin = DeepSpeedPlugin(
                 hf_ds_config=self.args.deepspeed,
                 gradient_accumulation_steps=grad_accum

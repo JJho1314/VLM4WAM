@@ -54,6 +54,7 @@ class CustomLeRobotDataset(Dataset):
         step_recap_file = None,
         sample_size=(192, 256),
         sample_n_frames=64,
+        source_fps=30,
         preprocess = 'resize',
         valid_cam = ['observation.images.top_head', 'observation.images.hand_left', 'observation.images.hand_right'],
         chunk=1,
@@ -92,6 +93,7 @@ class CustomLeRobotDataset(Dataset):
                                  }
         sample_size:             video frame size
         sample_n_frames:         number of frames used to randomly or uniformly select memories
+        source_fps:              source video frame rate used to derive the effective model frame rate
         preprocess:              frame preprocessing strategy, resize or center_crop_resize
         valid_cam:               list of cam names
         chunk:                   number of video frames to predict
@@ -212,6 +214,7 @@ class CustomLeRobotDataset(Dataset):
         assert(self.chunk * self.video_temporal_stride == self.action_chunk)
 
         self.sample_n_frames = sample_n_frames
+        self.source_fps = source_fps
 
         self.sample_size = sample_size
 

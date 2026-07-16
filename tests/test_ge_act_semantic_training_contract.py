@@ -22,6 +22,7 @@ from runner.ge_trainer import (
 )
 from utils.model_utils import forward_pass, resolve_checkpoint_files
 from models.ltx_models.transformer_ltx_multiview import LTXVideoTransformer3DModel
+from runner import ge_trainer as ge_trainer_module
 
 
 class TinySemanticModel(nn.Module):
@@ -31,6 +32,18 @@ class TinySemanticModel(nn.Module):
         self.semantic_adapter = nn.Linear(2, 2)
         self.semantic_attn = nn.Linear(2, 2)
         self.action_proj = nn.Linear(2, 2)
+
+
+def test_deepspeed_config_preserves_requested_gradient_accumulation() -> None:
+    config = ge_trainer_module.build_deepspeed_batch_config(
+        {"zero_optimization": {"stage": 2}},
+        per_device_batch_size=2,
+        world_size=8,
+        gradient_accumulation_steps=8,
+    )
+
+    assert config["train_batch_size"] == 128
+    assert config["gradient_accumulation_steps"] == 8
 
 
 def test_optimizer_uses_separate_base_and_semantic_learning_rates() -> None:
