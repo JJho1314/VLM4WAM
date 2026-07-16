@@ -60,7 +60,7 @@ class LingbotDinoPlanHead(nn.Module):
         self.keyframe_embed = nn.Parameter(torch.zeros(self.num_keyframes, llm_hidden))
 
     def forward(self, image_hidden: torch.Tensor, latent_hidden: torch.Tensor) -> torch.Tensor:
-        # image_hidden: (B, N_img, H) — VLM image tokens (detach upstream);
+        # image_hidden: (B, N_img, H) — live for current heads, detached by future-head callers;
         # latent_hidden: (B, num_keyframes*num_latent_per_keyframe, H) — this-episode sem-plan latents
         batch = image_hidden.shape[0]
         hidden = image_hidden.shape[-1]
@@ -84,14 +84,19 @@ class LingbotDinoPlanHead(nn.Module):
         default) or ``future_depth_align_head`` (LingBot-Depth). Returns a report
         ``{"resampler_missing":..., "resampler_unexpected":..., "query_loaded":bool}``.
         """
-        # Dot-pinned matching: lingbot's current-depth head is plain "depth_align_head", a SUBSTRING
-        # of "future_depth_align_head" (keys look like "model.<head_name>.projector..."), so anchor
-        # both the projector marker and the embs suffix on the preceding ".".
-        marker = f".{head_name}.projector."
-        embs_suffix = "." + head_name.replace("_head", "_embs")  # .{future_video,depth,...}_align_embs
-        proj = {k.split(marker, 1)[1]: v for k, v in state.items() if marker in k}
+        marker = f"{head_name}.projector."
+        embs_suffix = head_name.replace("_head", "_embs")  # future_{video,depth}_align_embs
+        proj = {
+            k.split(marker, 1)[1]: v
+            for k, v in state.items()
+            if k.startswith(marker) or f".{marker}" in k
+        }
         res = self.resampler.load_state_dict(proj, strict=False)
-        query = [v for k, v in state.items() if k.endswith(embs_suffix)]
+        query = [
+            v
+            for k, v in state.items()
+            if k == embs_suffix or k.endswith(f".{embs_suffix}")
+        ]
         query_loaded = False
         if query and query[0].shape == self.query_embs.shape:
             self.query_embs.data.copy_(query[0].to(self.query_embs.dtype))
