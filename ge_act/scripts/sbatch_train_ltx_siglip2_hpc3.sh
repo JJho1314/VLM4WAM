@@ -11,7 +11,17 @@
 
 set -euo pipefail
 
-GE_ACT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -z "${GE_ACT_ROOT:-}" ]]; then
+    if [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "$SLURM_SUBMIT_DIR/main.py" ]]; then
+        GE_ACT_ROOT="$SLURM_SUBMIT_DIR"
+    else
+        GE_ACT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    fi
+fi
+if [[ ! -f "$GE_ACT_ROOT/main.py" ]]; then
+    echo "GE_ACT_ROOT does not contain main.py: $GE_ACT_ROOT" >&2
+    exit 2
+fi
 CONDA_ENV="${CONDA_ENV:-/data/user/jhe724/.conda/envs/genie_envisioner}"
 CONFIG="${CONFIG:-$GE_ACT_ROOT/configs/ltx_model/libero/video_model_libero_fastwam_siglip2.yaml}"
 

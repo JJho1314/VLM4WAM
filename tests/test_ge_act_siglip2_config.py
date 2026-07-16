@@ -69,6 +69,8 @@ def test_launchers_verify_cache_and_constrain_host_threads() -> None:
     assert "#SBATCH --gres=gpu:8" in sbatch_launcher
     assert "#SBATCH --cpus-per-task=96" in sbatch_launcher
     assert "#SBATCH --mem=512G" in sbatch_launcher
+    assert "SLURM_SUBMIT_DIR" in sbatch_launcher
+    assert '-f "$GE_ACT_ROOT/main.py"' in sbatch_launcher
     for variable in (
         "OMP_NUM_THREADS",
         "MKL_NUM_THREADS",
