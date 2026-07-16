@@ -47,10 +47,9 @@ enable_tiling: true
 add_state: false
 caption_dropout_p: 0.06
 
-# 2 samples/GPU * 8 GPUs * 8 accumulation = global batch 128.
-# Raise the per-GPU batch only after the preflight memory smoke test.
-batch_size: 2
-gradient_accumulation_steps: 8
+# 8 samples/GPU * 8 GPUs * 2 accumulation = global batch 128.
+batch_size: 8
+gradient_accumulation_steps: 2
 dataloader_num_workers: 8
 dataloader_prefetch_factor: 4
 pin_memory: true
@@ -126,6 +125,8 @@ data:
     sample_n_frames: 500
     preprocess: resize
     valid_cam: [observation.images.image, observation.images.wrist_image]
+    predecoded_video_root: /data/user/jhe724/junjie/datasets/LIBERO-fastwam-predecoded-rgb
+    require_predecoded: true
     source_fps: 20
     chunk: 9
     action_chunk: 36
@@ -145,6 +146,8 @@ data:
     sample_n_frames: 500
     preprocess: resize
     valid_cam: [observation.images.image, observation.images.wrist_image]
+    predecoded_video_root: /data/user/jhe724/junjie/datasets/LIBERO-fastwam-predecoded-rgb
+    require_predecoded: true
     source_fps: 20
     chunk: 9
     action_chunk: 36

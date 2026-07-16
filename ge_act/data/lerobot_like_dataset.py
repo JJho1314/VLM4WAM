@@ -10,6 +10,9 @@ import traceback
 import json
 import random
 import math
+from pathlib import Path
+from typing import Sequence
+
 import numpy as np
 import pandas as pd
 
@@ -34,6 +37,38 @@ from data.utils.statistics import StatisticInfo
 
 from utils import zero_rank_print
 from data.utils.utils import intrinsic_transform, gen_crop_config, intrin_crop_transform
+
+
+class PredecodedRGBFileNotFoundError(FileNotFoundError):
+    """Raised when strict predecoded RGB input is missing."""
+
+
+class InvalidPredecodedRGBError(ValueError):
+    """Raised when a predecoded RGB array violates the cache contract."""
+
+
+def load_predecoded_rgb(path: str | Path, slices: Sequence[int]) -> np.ndarray:
+    """Load indexed RGB frames from a validated episode-level NumPy cache."""
+    path = Path(path)
+    if not path.is_file():
+        raise PredecodedRGBFileNotFoundError(
+            f"predecoded RGB cache is missing: {path}"
+        )
+    try:
+        frames = np.load(path, mmap_mode="r", allow_pickle=False)
+    except (OSError, ValueError) as exc:
+        raise InvalidPredecodedRGBError(
+            f"invalid predecoded RGB cache: {path}: {exc}"
+        ) from exc
+    if (
+        frames.ndim != 4
+        or frames.shape[-1] != 3
+        or frames.dtype != np.uint8
+        or len(frames) == 0
+    ):
+        raise InvalidPredecodedRGBError(f"invalid predecoded RGB cache: {path}")
+    indexes = np.clip(np.asarray(slices, dtype=np.int64), 0, len(frames) - 1)
+    return np.asarray(frames[indexes])
 
 def load_jsonl(jsonl_path):
     """
@@ -63,6 +98,8 @@ class CustomLeRobotDataset(Dataset):
         previous_pick_mode='uniform',
         random_crop=True,
         dataset_info_cache_path = None,
+        predecoded_video_root = None,
+        require_predecoded = False,
         action_type = "absolute",
         action_space = "joint",
         ignore_seek = False,
@@ -136,6 +173,14 @@ class CustomLeRobotDataset(Dataset):
         if len(data_roots) == 1 and len(domains) > 1:
             data_roots = data_roots * len(domains)
         self.data_roots = data_roots
+        self.predecoded_video_root = (
+            Path(predecoded_video_root) if predecoded_video_root is not None else None
+        )
+        self.require_predecoded = bool(require_predecoded)
+        if self.require_predecoded and self.predecoded_video_root is None:
+            raise ValueError(
+                "require_predecoded=True requires predecoded_video_root"
+            )
         self.dataset = []
 
         if dataset_info_cache_path is not None and os.path.exists(dataset_info_cache_path):
@@ -322,11 +367,36 @@ class CustomLeRobotDataset(Dataset):
         return torch.tensor(self.StatisticInfo[domain_name+"_"+self.action_space]['mean']).unsqueeze(0), torch.tensor(self.StatisticInfo[domain_name+"_"+self.action_space]['std']).unsqueeze(0)+1e-6
 
 
+    def _predecoded_video_template(self, video_path):
+        if self.predecoded_video_root is None:
+            return None
+        source_path = Path(video_path)
+        for data_root in self.data_roots:
+            try:
+                relative_path = source_path.relative_to(Path(data_root))
+            except ValueError:
+                continue
+            return str((self.predecoded_video_root / relative_path).with_suffix(".npy"))
+        message = f"video path is outside configured data roots: {video_path}"
+        if self.require_predecoded:
+            raise InvalidPredecodedRGBError(message)
+        return None
+
     def seek_mp4(self, video_path, cam_name_list, slices):
         """
         seek video frames according to the input slices;
         output video shape: (c,v,t,h,w)
         """
+        cache_template = self._predecoded_video_template(video_path)
+        if cache_template is not None:
+            video_list = []
+            for cam_name in cam_name_list:
+                video = load_predecoded_rgb(cache_template.format(cam_name), slices)
+                video = torch.from_numpy(video).permute(3, 0, 1, 2).contiguous()
+                video = video.float() / 255.0
+                video_list.append(video)
+            return video_list
+
         ### PyAV sequential decode: no per-sample ffmpeg subprocess, no per-frame seek
         video_list = []
         want = sorted(set(int(s) for s in slices))
@@ -532,6 +602,11 @@ class CustomLeRobotDataset(Dataset):
                 try:
                     video, actions, caption, state = self.get_batch(idx)
                     break
+                except (PredecodedRGBFileNotFoundError, InvalidPredecodedRGBError):
+                    if self.require_predecoded:
+                        raise
+                    traceback.print_exc()
+                    idx = random.randint(0, self.length-1)
                 except:
                     ### print error information to debug
                     traceback.print_exc()

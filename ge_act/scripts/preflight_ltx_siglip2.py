@@ -36,6 +36,7 @@ def collect_preflight_errors(
     semantic = config.get("semantic_plan", {})
     model_config = config.get("diffusion_model", {}).get("config", {})
     train_data = config.get("data", {}).get("train", {})
+    val_data = config.get("data", {}).get("val", {})
     keyframes = semantic.get("keyframe_indices", [])
     if not semantic.get("enabled", False):
         errors.append("semantic_plan.enabled must be true")
@@ -51,6 +52,16 @@ def collect_preflight_errors(
         errors.append("FastWAM clip layout must use four memory and nine future frames")
     if train_data.get("source_fps") != 20:
         errors.append("LIBERO source_fps must be 20")
+    if not train_data.get("require_predecoded", False):
+        errors.append("training must require predecoded RGB caches")
+    if not val_data.get("require_predecoded", False):
+        errors.append("validation must require predecoded RGB caches")
+    train_cache_root = train_data.get("predecoded_video_root")
+    val_cache_root = val_data.get("predecoded_video_root")
+    if not train_cache_root:
+        errors.append("training predecoded RGB cache root is missing")
+    if train_cache_root != val_cache_root:
+        errors.append("train and validation must use the same predecoded RGB cache")
     if max(keyframes, default=-1) >= train_data.get("chunk", 0):
         errors.append("semantic keyframes exceed the future clip")
 
@@ -95,6 +106,8 @@ def collect_preflight_errors(
     for data_root in sorted(set(train_data.get("data_roots", []))):
         if not Path(data_root).is_dir():
             errors.append(f"missing training data root: {data_root}")
+    if train_cache_root and not Path(train_cache_root).is_dir():
+        errors.append(f"missing predecoded RGB cache root: {train_cache_root}")
 
     stat_file = Path(train_data.get("stat_file", ""))
     if not stat_file.is_absolute():

@@ -7,6 +7,7 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 
 cd "$GE_ACT_ROOT"
 python scripts/preflight_ltx_siglip2.py --config "$CONFIG" --world-size "$NPROC_PER_NODE"
+python scripts/predecode_lerobot_videos.py --config "$CONFIG" --verify-only
 
 torchrun \
   --standalone \
