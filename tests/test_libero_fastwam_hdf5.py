@@ -2,6 +2,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import multiprocessing as mp
 import os
 import pickle
 import random
@@ -2853,7 +2854,7 @@ def _make_real_benchmark_datasets(tmp_path, *, compression="none"):
         (0,),
         length=50,
     )
-    output = tmp_path / "hdf5"
+    output = tmp_path / f"hdf5-{compression}"
     converter.convert_dataset(
         make_convert_args(
             data_root=source,
@@ -3153,7 +3154,7 @@ def test_benchmark_cli_parity_failure_writes_report_and_exits_nonzero(tmp_path):
 
 def test_benchmark_cli_lzf_both_merges_none_report(tmp_path):
     none_old, none_hdf5, none_manifest = _write_benchmark_configs(
-        tmp_path / "none", compression="none"
+        tmp_path / "shared", compression="none"
     )
     none_report = tmp_path / "none.json"
     none_result = _run_benchmark_cli(
@@ -3168,7 +3169,7 @@ def test_benchmark_cli_lzf_both_merges_none_report(tmp_path):
     assert none_result.returncode == 0, none_result.stdout + none_result.stderr
 
     lzf_old, lzf_hdf5, lzf_manifest = _write_benchmark_configs(
-        tmp_path / "lzf", compression="lzf"
+        tmp_path / "shared", compression="lzf"
     )
     lzf_report = tmp_path / "lzf.json"
     lzf_result = _run_benchmark_cli(
@@ -3288,6 +3289,8 @@ def test_benchmark_counter_delta_reports_one_core_convention():
 
 def _compression_report(compression, speed, workers=2, run_label="warm"):
     return {
+        "host": "benchmark-host",
+        "git": {"sha": "a" * 40, "dirty": False},
         "compression": compression,
         "run_label": run_label,
         "arguments": {
@@ -3300,6 +3303,25 @@ def _compression_report(compression, speed, workers=2, run_label="warm"):
             "prefetch_factor": 4,
         },
         "parity": {"passed": True},
+        "mapping": {
+            "pairs": [
+                {
+                    "domain": "domain",
+                    "episode_index": 0,
+                    "old_index": 0,
+                    "hdf5_index": 0,
+                }
+            ]
+        },
+        "filesystem": {
+            "manifest": "nfs",
+            "old_data": {"/shared/source": "nfs"},
+            "old_predecoded_video_root": "nfs",
+            "hdf5_shards": {
+                f"/{compression}/shard_0.h5": "nfs",
+                f"/{compression}/shard_1.h5": "nfs",
+            },
+        },
         "throughput": [
             {
                 "workers": workers,
@@ -3309,10 +3331,26 @@ def _compression_report(compression, speed, workers=2, run_label="warm"):
     }
 
 
+def _add_compression_parity_pairs(report):
+    report["parity"]["pairs"] = [
+        {
+            "domain": "domain",
+            "episode_index": 0,
+            "old_index": 0,
+            "hdf5_index": 0,
+            "frame_indexes": [1, 2],
+            "action_indexes": [1, 2, 3],
+        }
+    ]
+    return report
+
+
 def test_benchmark_merge_compression_reports_selects_with_95_percent_rule():
+    current = _add_compression_parity_pairs(_compression_report("lzf", 96.0, workers=4))
+    other = _add_compression_parity_pairs(_compression_report("none", 100.0, workers=2))
     selection = benchmark.merge_compression_reports(
-        _compression_report("lzf", 96.0, workers=4),
-        _compression_report("none", 100.0, workers=2),
+        current,
+        other,
     )
     assert selection == {
         "by_compression": {
@@ -3327,8 +3365,8 @@ def test_benchmark_merge_compression_reports_selects_with_95_percent_rule():
 
 @pytest.mark.parametrize("problem", ["same", "parity", "label", "arguments"])
 def test_benchmark_merge_compression_reports_rejects_incomparable_runs(problem):
-    current = _compression_report("lzf", 96.0)
-    other = _compression_report("none", 100.0)
+    current = _add_compression_parity_pairs(_compression_report("lzf", 96.0))
+    other = _add_compression_parity_pairs(_compression_report("none", 100.0))
     if problem == "same":
         other["compression"] = "lzf"
     elif problem == "parity":
@@ -3339,6 +3377,82 @@ def test_benchmark_merge_compression_reports_rejects_incomparable_runs(problem):
         other["arguments"]["measure_batches"] = 99
     with pytest.raises(ValueError, match="compression|parity|run_label|arguments"):
         benchmark.merge_compression_reports(current, other)
+
+
+@pytest.mark.parametrize(
+    "problem", ["host", "sha", "dirty", "mapping", "parity_pair", "filesystem"]
+)
+def test_benchmark_merge_rejects_execution_context_mismatch(problem):
+    current = _add_compression_parity_pairs(_compression_report("lzf", 96.0))
+    other = _add_compression_parity_pairs(_compression_report("none", 100.0))
+    if problem == "host":
+        other["host"] = "other-host"
+    elif problem == "sha":
+        other["git"]["sha"] = "b" * 40
+    elif problem == "dirty":
+        other["git"]["dirty"] = True
+    elif problem == "mapping":
+        other["mapping"]["pairs"][0]["old_index"] = 1
+    elif problem == "parity_pair":
+        other["parity"]["pairs"][0]["frame_indexes"] = [2, 3]
+    else:
+        other["filesystem"]["manifest"] = "ext4"
+    with pytest.raises(ValueError, match="host|git|mapping|parity|filesystem"):
+        benchmark.merge_compression_reports(current, other)
+
+
+def test_benchmark_merge_rejects_missing_git_sha():
+    current = _add_compression_parity_pairs(_compression_report("lzf", 96.0))
+    other = _add_compression_parity_pairs(_compression_report("none", 100.0))
+    other["git"]["sha"] = None
+    with pytest.raises(ValueError, match="git.*sha"):
+        benchmark.merge_compression_reports(current, other)
+
+
+class _GateProbeDataset(torch.utils.data.Dataset):
+    def __init__(self, count, reads):
+        self.count = count
+        self.reads = reads
+
+    def __len__(self):
+        return self.count
+
+    def __getitem__(self, index):
+        with self.reads.get_lock():
+            self.reads.value += 1
+        return _benchmark_sample()
+
+
+def test_benchmark_resource_counters_gate_prefetch_and_cover_full_stream(monkeypatch):
+    context = mp.get_context()
+    reads = context.Value("i", 0)
+    calls = []
+
+    def counters(_pids):
+        calls.append(reads.value)
+        return {
+            "read_bytes": reads.value * 10,
+            "read_chars": reads.value * 20,
+            "cpu_seconds": float(reads.value),
+            "method": "fake",
+        }
+
+    monkeypatch.setattr(benchmark, "aggregate_process_counters", counters)
+    result = benchmark.measure_dataloader(
+        _GateProbeDataset(8, reads),
+        workers=2,
+        batch_size=2,
+        warmup_batches=1,
+        measure_batches=1,
+        prefetch_factor=2,
+    )
+    assert calls == [0, 8]
+    assert result["counter_window"] == "full_stream_including_warmup_measurement_drain"
+    assert result["resource_observed_batches"] == 4
+    assert result["resource_observed_samples"] == 8
+    assert result["drain_batches"] == 2
+    assert result["drain_samples"] == 4
+    assert result["resource_elapsed_seconds"] > 0
 
 
 @pytest.mark.parametrize("workers", [4, 8])

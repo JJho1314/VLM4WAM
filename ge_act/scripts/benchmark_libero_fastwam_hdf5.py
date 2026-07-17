@@ -10,7 +10,9 @@ import importlib
 import importlib.util
 import json
 import math
+import multiprocessing as multiprocessing
 import os
+import queue
 import re
 import socket
 import subprocess
@@ -188,6 +190,74 @@ def merge_compression_reports(
     if current.get("arguments") != other.get("arguments"):
         raise ValueError("compression report arguments must match")
 
+    host = current.get("host")
+    if type(host) is not str or not host or other.get("host") != host:
+        raise ValueError("compression report host values must be present and match")
+    for report in (current, other):
+        git = report.get("git")
+        if (
+            type(git) is not dict
+            or type(git.get("sha")) is not str
+            or not git["sha"]
+            or type(git.get("dirty")) is not bool
+        ):
+            raise ValueError("compression report git sha/dirty must be present")
+    if current["git"] != other["git"]:
+        raise ValueError("compression report git metadata must match")
+
+    def pair_projection(report: dict[str, Any], section: str, fields: tuple[str, ...]):
+        pairs = report.get(section, {}).get("pairs")
+        if type(pairs) is not list or not pairs:
+            raise ValueError(f"compression report {section} pairs must be present")
+        try:
+            return [{field: pair[field] for field in fields} for pair in pairs]
+        except (KeyError, TypeError) as error:
+            raise ValueError(
+                f"compression report {section} pairs are malformed"
+            ) from error
+
+    mapping_fields = ("domain", "episode_index", "old_index", "hdf5_index")
+    parity_fields = (*mapping_fields, "frame_indexes", "action_indexes")
+    if pair_projection(current, "mapping", mapping_fields) != pair_projection(
+        other, "mapping", mapping_fields
+    ):
+        raise ValueError("compression report mapping pairs must match")
+    if pair_projection(current, "parity", parity_fields) != pair_projection(
+        other, "parity", parity_fields
+    ):
+        raise ValueError("compression report parity pairs must match")
+
+    def filesystem_projection(report: dict[str, Any]) -> dict[str, Any]:
+        filesystem = report.get("filesystem")
+        if type(filesystem) is not dict:
+            raise ValueError("compression report filesystem context must be present")
+        old_data = filesystem.get("old_data")
+        shards = filesystem.get("hdf5_shards")
+        manifest = filesystem.get("manifest")
+        predecoded = filesystem.get("old_predecoded_video_root")
+        if (
+            type(manifest) is not str
+            or not manifest
+            or type(predecoded) is not str
+            or not predecoded
+            or type(old_data) is not dict
+            or not old_data
+            or type(shards) is not dict
+            or not shards
+            or any(type(value) is not str or not value for value in old_data.values())
+            or any(type(value) is not str or not value for value in shards.values())
+        ):
+            raise ValueError("compression report filesystem context is malformed")
+        return {
+            "manifest": manifest,
+            "old_data": sorted(old_data.items()),
+            "old_predecoded_video_root": predecoded,
+            "hdf5_shard_filesystems": sorted(shards.values()),
+        }
+
+    if filesystem_projection(current) != filesystem_projection(other):
+        raise ValueError("compression report filesystem contexts must match")
+
     reports = {report["compression"]: report for report in (current, other)}
     by_compression = {
         name: _best_hdf5_throughput(reports[name]) for name in ("none", "lzf")
@@ -340,11 +410,23 @@ class PeakWorkerRSSMonitor:
             "peak_rss_method": (
                 f"{self.interval_seconds * 1000:g}ms aggregate RSS poll + /proc VmHWM"
             ),
-            "peak_rss_window": "warmup+measurement",
+            "peak_rss_window": "full_stream_including_warmup_measurement_drain",
             "peak_rss_caveat": (
                 "sum of per-worker VmHWM is a conservative corroborating bound"
             ),
         }
+
+
+class _WorkerStartGate:
+    """Block each worker before its first dataset read until counters are sampled."""
+
+    def __init__(self, release_event: Any, ready_queue: Any):
+        self.release_event = release_event
+        self.ready_queue = ready_queue
+
+    def __call__(self, worker_id: int) -> None:
+        self.ready_queue.put(worker_id)
+        self.release_event.wait()
 
 
 def read_process_counters(pid: int) -> dict[str, Any]:
@@ -759,6 +841,12 @@ def measure_dataloader(
         if type(value) is not int or value < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}")
 
+    process_context = multiprocessing.get_context()
+    release_event = process_context.Event() if workers > 0 else None
+    ready_queue = process_context.Queue() if workers > 0 else None
+    worker_init_fn = (
+        _WorkerStartGate(release_event, ready_queue) if workers > 0 else None
+    )
     loader = DataLoader(
         dataset=dataset,
         batch_size=batch_size,
@@ -767,6 +855,7 @@ def measure_dataloader(
         pin_memory=True,
         persistent_workers=workers > 0,
         prefetch_factor=prefetch_factor if workers > 0 else None,
+        worker_init_fn=worker_init_fn,
     )
     iterator = None
     worker_processes = []
@@ -777,13 +866,29 @@ def measure_dataloader(
         iterator = iter(loader)
         worker_processes = list(getattr(iterator, "_workers", []) or [])
         worker_pids = [process.pid for process in worker_processes]
-        rss_monitor = PeakWorkerRSSMonitor(worker_pids)
-        rss_monitor.start()
-        for index in range(warmup_batches):
-            _next_batch(iterator, "warmup", index)
-
+        if workers > 0:
+            try:
+                ready_workers = {ready_queue.get(timeout=30.0) for _ in range(workers)}
+            except queue.Empty as error:
+                raise RuntimeError(
+                    "DataLoader workers did not reach start gate"
+                ) from error
+            if ready_workers != set(range(workers)):
+                raise RuntimeError(
+                    f"unexpected workers at start gate: {sorted(ready_workers)}"
+                )
         counter_pids = [os.getpid(), *worker_pids]
         counters_before = aggregate_process_counters(counter_pids)
+        rss_monitor = PeakWorkerRSSMonitor(worker_pids)
+        rss_monitor.start()
+        resource_start = time.perf_counter()
+        if release_event is not None:
+            release_event.set()
+
+        warmup_samples = 0
+        for index in range(warmup_batches):
+            warmup_samples += _batch_size(_next_batch(iterator, "warmup", index))
+
         measurement_start = time.perf_counter()
         durations = []
         observed_samples = 0
@@ -793,11 +898,24 @@ def measure_dataloader(
             durations.append(time.perf_counter() - start)
             observed_samples += _batch_size(batch)
         measurement_elapsed = time.perf_counter() - measurement_start
+        drain_batches = 0
+        drain_samples = 0
+        while True:
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                break
+            drain_batches += 1
+            drain_samples += _batch_size(batch)
+        resource_elapsed = time.perf_counter() - resource_start
         counters_after = aggregate_process_counters(counter_pids)
         counter_result = counter_delta(
             counters_before,
             counters_after,
-            elapsed_seconds=measurement_elapsed,
+            elapsed_seconds=resource_elapsed,
+        )
+        counter_result["counter_window"] = (
+            "full_stream_including_warmup_measurement_drain"
         )
         rss_result = rss_monitor.stop()
         total_seconds = sum(durations)
@@ -812,16 +930,29 @@ def measure_dataloader(
             "observed_samples": observed_samples,
             "batch_seconds": durations,
             "total_measure_seconds": total_seconds,
+            "measurement_elapsed_seconds": measurement_elapsed,
             "samples_per_second": observed_samples / total_seconds,
             "median_batch_seconds": percentile(durations, 50),
             "p95_batch_seconds": percentile(durations, 95),
             "worker_pids": worker_pids,
             "main_process_rss_bytes": read_process_rss_bytes(os.getpid()),
             "workers_shutdown": False,
+            "resource_elapsed_seconds": resource_elapsed,
+            "resource_observed_batches": (
+                warmup_batches + len(durations) + drain_batches
+            ),
+            "resource_observed_samples": (
+                warmup_samples + observed_samples + drain_samples
+            ),
+            "drain_batches": drain_batches,
+            "drain_samples": drain_samples,
+            "worker_start_gate_ready": workers,
             **rss_result,
             **counter_result,
         }
     finally:
+        if release_event is not None:
+            release_event.set()
         if rss_monitor is not None and rss_result is None:
             rss_result = rss_monitor.stop()
         if iterator is not None:
@@ -835,6 +966,9 @@ def measure_dataloader(
             result["workers_shutdown"] = all(
                 not process.is_alive() for process in worker_processes
             )
+        if ready_queue is not None:
+            ready_queue.close()
+            ready_queue.join_thread()
     if result is None:  # pragma: no cover - exceptions leave through the try block
         raise RuntimeError("DataLoader benchmark did not produce a result")
     return result
