@@ -2323,7 +2323,9 @@ def _write_command_stub(path: Path, command: str) -> None:
     path.chmod(0o755)
 
 
-def _run_hdf5_launcher(tmp_path: Path, *, args=(), env_overrides=None) -> list[str]:
+def _run_hdf5_launcher(
+    tmp_path: Path, *, args=(), env_overrides=None, cwd: Path | None = None
+) -> list[str]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     _write_command_stub(bin_dir / "python", "python")
@@ -2351,7 +2353,7 @@ def _run_hdf5_launcher(tmp_path: Path, *, args=(), env_overrides=None) -> list[s
     subprocess.run(
         ["bash", str(HDF5_LAUNCHER), *map(str, args)],
         check=True,
-        cwd=tmp_path,
+        cwd=tmp_path if cwd is None else cwd,
         env=environment,
         text=True,
         capture_output=True,
@@ -2405,3 +2407,157 @@ def test_hdf5_launcher_defaults_to_hdf5_config_and_eight_processes(tmp_path):
     assert "--world-size 8" in lines[0]
     assert lines[1].startswith("torchrun --standalone --nnodes=1 --nproc_per_node=8")
     assert f"main.py --config_file {HDF5_CONFIG!s}" in lines[1]
+
+
+@pytest.mark.parametrize("config_source", ["positional", "environment"])
+def test_hdf5_launcher_resolves_relative_config_from_callers_working_directory(
+    tmp_path, config_source
+):
+    caller = GE_ACT_ROOT.parent
+    if config_source == "positional":
+        relative_config = Path("ge_act/configs/ltx_model/libero") / HDF5_CONFIG.name
+        expected = HDF5_CONFIG
+        args = (relative_config,)
+        env_overrides = None
+    else:
+        fixture_config = tmp_path / "relative-fixture.yaml"
+        fixture_config.touch()
+        relative_config = Path(os.path.relpath(fixture_config, caller))
+        expected = fixture_config.resolve()
+        args = ()
+        env_overrides = {"CONFIG": str(relative_config)}
+
+    lines = _run_hdf5_launcher(
+        tmp_path,
+        args=args,
+        env_overrides=env_overrides,
+        cwd=caller,
+    )
+
+    assert f"--config {expected}" in lines[0]
+    assert f"main.py --config_file {expected}" in lines[1]
+
+
+def test_hdf5_launcher_multinode_requires_explicit_master_addr(tmp_path):
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        _run_hdf5_launcher(
+            tmp_path,
+            env_overrides={"NNODES": "2", "NUM_PROCESSES": "4"},
+        )
+    assert "MASTER_ADDR" in error.value.stderr
+    invocation_log = tmp_path / "invocations.log"
+    assert not invocation_log.exists() or not invocation_log.read_text(encoding="utf-8")
+
+
+def test_hdf5_launcher_dynamic_import_constructs_real_dataset(tmp_path):
+    manifest_path, stat_file = make_reader_fixture(tmp_path / "fixture")
+    config = yaml.safe_load(HDF5_CONFIG.read_text(encoding="utf-8"))
+    for split in ("train", "val"):
+        config["data"][split]["manifest_path"] = str(manifest_path)
+        config["data"][split]["stat_file"] = str(stat_file)
+    config_path = tmp_path / "integration.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_command_stub(bin_dir / "python", "python")
+    torchrun = bin_dir / "torchrun"
+    torchrun.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "config=''\n"
+        "while (($#)); do\n"
+        '  if [[ "$1" == \'--config_file\' ]]; then config="$2"; shift 2; else shift; fi\n'
+        "done\n"
+        '[[ -n "$config" ]]\n'
+        '"$REAL_PYTHON" -c \'import json, os, sys; '
+        "from pathlib import Path; import yaml; "
+        "from utils import import_custom_class; "
+        "config = yaml.safe_load(Path(sys.argv[1]).read_text()); "
+        'dataset_class = import_custom_class(config["train_data_class"], '
+        'config["train_data_class_path"]); '
+        'dataset = dataset_class(**config["data"]["train"]); '
+        'result = {"class": dataset.__class__.__name__, "length": len(dataset), '
+        '"cwd": os.getcwd(), "config": str(Path(sys.argv[1]).resolve()), '
+        '"pythonpath": os.environ.get("PYTHONPATH", "")}; '
+        'Path(os.environ["PROBE_RESULT"]).write_text(json.dumps(result)); '
+        'dataset.close()\' "$config"\n',
+        encoding="utf-8",
+    )
+    torchrun.chmod(0o755)
+    probe_result = tmp_path / "probe.json"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "CONFIG": str(config_path),
+            "PATH": f"{bin_dir}:{environment['PATH']}",
+            "INVOCATION_LOG": str(tmp_path / "invocations.log"),
+            "PROBE_RESULT": str(probe_result),
+            "PYTHONPATH": "/existing/sentinel",
+            "REAL_PYTHON": sys.executable,
+        }
+    )
+
+    subprocess.run(
+        ["bash", str(HDF5_LAUNCHER)],
+        check=True,
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+
+    result = json.loads(probe_result.read_text(encoding="utf-8"))
+    assert result["class"] == "LiberoFastWAMHDF5Dataset"
+    assert result["length"] == 1
+    assert Path(result["cwd"]) == GE_ACT_ROOT
+    assert Path(result["config"]) == config_path.resolve()
+    python_paths = result["pythonpath"].split(os.pathsep)
+    assert str(GE_ACT_ROOT.parent) in [
+        str(Path(path).resolve()) for path in python_paths
+    ]
+    assert "/existing/sentinel" in python_paths
+
+
+def test_hdf5_preflight_missing_h5py_is_clean_cli_error(tmp_path):
+    blocker = tmp_path / "blocker"
+    blocker.mkdir()
+    blocker.joinpath("sitecustomize.py").write_text(
+        "import builtins\n"
+        "import importlib.util\n"
+        "_real_import = builtins.__import__\n"
+        "_real_find_spec = importlib.util.find_spec\n"
+        "def _blocked_import(name, *args, **kwargs):\n"
+        "    if name == 'h5py' or name.startswith('h5py.'):\n"
+        "        raise ModuleNotFoundError(\"No module named 'h5py'\")\n"
+        "    return _real_import(name, *args, **kwargs)\n"
+        "def _blocked_find_spec(name, *args, **kwargs):\n"
+        "    if name == 'h5py':\n"
+        "        return None\n"
+        "    return _real_find_spec(name, *args, **kwargs)\n"
+        "builtins.__import__ = _blocked_import\n"
+        "importlib.util.find_spec = _blocked_find_spec\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join((str(blocker), str(GE_ACT_ROOT.parent)))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HDF5_PREFLIGHT),
+            "--config",
+            str(HDF5_CONFIG),
+            "--minimum-free-gb",
+            "0",
+        ],
+        cwd=GE_ACT_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "missing Python module: h5py" in combined
+    assert "Traceback" not in combined

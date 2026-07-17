@@ -2,11 +2,24 @@
 set -euo pipefail
 
 GE_ACT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CALLER_PWD="$PWD"
 CONFIG="${CONFIG:-${1:-$GE_ACT_ROOT/configs/ltx_model/libero/video_model_libero_fastwam_siglip2_hdf5.yaml}}"
+if [[ "$CONFIG" != /* ]]; then
+  CONFIG="$CALLER_PWD/$CONFIG"
+fi
+CONFIG="$(realpath -m -- "$CONFIG")"
+REPOSITORY_ROOT="$(cd "$GE_ACT_ROOT/.." && pwd)"
+export PYTHONPATH="$REPOSITORY_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
 NUM_PROCESSES="${NUM_PROCESSES:-${NPROC_PER_NODE:-8}}"
 NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
 WORLD_SIZE="$((NNODES * NUM_PROCESSES))"
+
+if ((NNODES > 1)) && [[ -z "${MASTER_ADDR:-}" ]]; then
+  echo "MASTER_ADDR must be set when NNODES > 1" >&2
+  exit 2
+fi
 
 TORCHRUN_ARGS=(
   "--nnodes=$NNODES"

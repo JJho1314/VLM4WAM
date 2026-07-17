@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import importlib.util
 import json
 import os
@@ -16,17 +17,6 @@ import yaml
 
 
 GE_ACT_ROOT = Path(__file__).resolve().parents[1]
-_REPOSITORY_ROOT = str(GE_ACT_ROOT.parent)
-_ADDED_REPOSITORY_ROOT = _REPOSITORY_ROOT not in sys.path
-if _ADDED_REPOSITORY_ROOT:
-    sys.path.insert(0, _REPOSITORY_ROOT)
-try:
-    from ge_act.data.libero_fastwam_hdf5_schema import load_manifest
-finally:
-    if _ADDED_REPOSITORY_ROOT:
-        sys.path.remove(_REPOSITORY_ROOT)
-
-
 REQUIRED_MODULES = (
     "torch",
     "diffusers",
@@ -70,6 +60,20 @@ def _nearest_existing_parent(path: Path) -> Path:
     while not path.exists() and path != path.parent:
         path = path.parent
     return path
+
+
+def load_manifest(path: Path):
+    """Lazily import H1 only after the h5py dependency check succeeds."""
+    repository_root = str(GE_ACT_ROOT.parent)
+    added_repository_root = repository_root not in sys.path
+    if added_repository_root:
+        sys.path.insert(0, repository_root)
+    try:
+        schema = importlib.import_module("ge_act.data.libero_fastwam_hdf5_schema")
+        return schema.load_manifest(path)
+    finally:
+        if added_repository_root:
+            sys.path.remove(repository_root)
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -287,20 +291,22 @@ def _collect_path_errors(
     minimum_free_gb: float,
 ) -> list[str]:
     errors: list[str] = []
+    missing_modules: set[str] = set()
     for module_name in REQUIRED_MODULES:
         if importlib.util.find_spec(module_name) is None:
+            missing_modules.add(module_name)
             errors.append(f"missing Python module: {module_name}")
 
     data = _mapping(config.get("data"))
     train_data = _mapping(data.get("train"))
     val_data = _mapping(data.get("val"))
     manifest_path = train_data.get("manifest_path")
-    if type(manifest_path) is str and manifest_path:
+    if "h5py" not in missing_modules and type(manifest_path) is str and manifest_path:
         try:
             load_manifest(Path(manifest_path))
         except json.JSONDecodeError as error:
             errors.append(f"manifest JSON error at {manifest_path}: {error.msg}")
-        except (OSError, ValueError) as error:
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
             errors.append(f"invalid HDF5 manifest {manifest_path}: {error}")
 
     checked_stats: set[Path] = set()
