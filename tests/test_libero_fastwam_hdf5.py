@@ -1,11 +1,23 @@
 import json
+from argparse import Namespace
 from pathlib import Path
 
+import av
 import h5py
 import numpy as np
+import pandas as pd
 import pytest
+import torch
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as tvf
 
 from ge_act.data import libero_fastwam_hdf5_schema as schema
+from ge_act.scripts import convert_libero_fastwam_hdf5 as converter
+
+
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:Passing a BlockManager to DataFrame is deprecated:DeprecationWarning"
+)
 
 
 DATASET_DECLARATIONS = {
@@ -467,3 +479,537 @@ def test_atomic_write_manifest_removes_temp_file_when_serialization_fails(tmp_pa
         schema.atomic_write_manifest(path, payload)
     assert path.read_text(encoding="utf-8") == "old"
     assert set(tmp_path.iterdir()) == {path, tmp_path / "shard_00000.h5"}
+
+
+CAMERAS = ("observation.images.image", "observation.images.wrist_image")
+
+
+def _write_jsonl(path: Path, records: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+
+def _synthetic_rgb(episode_index: int, length: int, camera_index: int) -> np.ndarray:
+    values = np.arange(length * 8 * 10 * 3, dtype=np.uint32).reshape(
+        length, 8, 10, 3
+    )
+    return ((values + episode_index * 17 + camera_index * 73) % 256).astype(
+        np.uint8
+    )
+
+
+def _write_mp4(path: Path, frames: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with av.open(str(path), mode="w") as container:
+        stream = container.add_stream("mpeg4", rate=20)
+        stream.width = frames.shape[2]
+        stream.height = frames.shape[1]
+        stream.pix_fmt = "yuv420p"
+        for array in frames:
+            frame = av.VideoFrame.from_ndarray(array, format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+
+
+def make_tiny_lerobot_domain(
+    data_root: Path,
+    domain: str,
+    *,
+    episode_indexes: tuple[int, ...] = (2, 0, 1),
+    length: int = 3,
+    write_mp4: bool = False,
+    task_lists: dict[int, list[int]] | None = None,
+) -> Path:
+    domain_root = data_root / domain
+    meta = domain_root / "meta"
+    _write_jsonl(
+        meta / "tasks.jsonl",
+        [
+            {"task_index": 0, "task": f"perform {domain} task zero"},
+            {"task_index": 1, "task": f"perform {domain} task one"},
+        ],
+    )
+    _write_jsonl(
+        meta / "episodes.jsonl",
+        [
+            {
+                "episode_index": episode_index,
+                "tasks": (task_lists or {}).get(episode_index, [episode_index % 2]),
+                "length": length,
+            }
+            for episode_index in episode_indexes
+        ],
+    )
+    meta.joinpath("info.json").write_text(
+        json.dumps({"chunks_size": 1000, "total_chunks": 1}),
+        encoding="utf-8",
+    )
+    for episode_index in episode_indexes:
+        parquet = (
+            domain_root
+            / "data/chunk-000"
+            / f"episode_{episode_index:06d}.parquet"
+        )
+        parquet.parent.mkdir(parents=True, exist_ok=True)
+        action = [
+            np.arange(7, dtype=np.float32) + episode_index + step / 10
+            for step in range(length)
+        ]
+        state = [
+            np.arange(8, dtype=np.float32) + episode_index + step / 5
+            for step in range(length)
+        ]
+        pd.DataFrame(
+            {"action": action, "observation.state": state}
+        ).to_parquet(parquet)
+        for camera_index, camera in enumerate(CAMERAS):
+            video = (
+                domain_root
+                / "videos/chunk-000"
+                / camera
+                / f"episode_{episode_index:06d}.mp4"
+            )
+            frames = _synthetic_rgb(episode_index, length, camera_index)
+            if write_mp4:
+                _write_mp4(video, frames)
+            else:
+                video.parent.mkdir(parents=True, exist_ok=True)
+                video.touch()
+    return data_root
+
+
+def make_tiny_predecoded_cache(
+    cache_root: Path,
+    data_root: Path,
+    domain: str,
+    episode_indexes: tuple[int, ...],
+    *,
+    length: int = 3,
+) -> Path:
+    for episode_index in episode_indexes:
+        for camera_index, camera in enumerate(CAMERAS):
+            destination = (
+                cache_root
+                / domain
+                / "videos/chunk-000"
+                / camera
+                / f"episode_{episode_index:06d}.npy"
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            np.save(
+                destination,
+                _synthetic_rgb(episode_index, length, camera_index),
+                allow_pickle=False,
+            )
+    return cache_root
+
+
+def make_convert_args(
+    *,
+    data_root: Path,
+    domains: list[str],
+    output_root: Path,
+    predecoded_root: Path | None,
+    max_episodes: int | None = None,
+    episodes_per_shard: int = 2,
+    compression: str = "none",
+    overwrite: bool = False,
+) -> Namespace:
+    return Namespace(
+        data_root=[str(data_root)],
+        domains=domains,
+        predecoded_root=(
+            None if predecoded_root is None else str(predecoded_root)
+        ),
+        output_root=str(output_root),
+        max_episodes=max_episodes,
+        episodes_per_shard=episodes_per_shard,
+        compression=compression,
+        resize_microbatch=2,
+        overwrite=overwrite,
+    )
+
+
+def test_resize_rgb_uint8_matches_float_resize_with_quantization_bound():
+    frames = _synthetic_rgb(0, 5, 0)
+    actual = converter.resize_rgb_uint8(frames, size=(256, 256), microbatch=2)
+    reference = tvf.resize(
+        torch.from_numpy(frames).permute(0, 3, 1, 2).float() / 255.0,
+        [256, 256],
+        interpolation=InterpolationMode.BILINEAR,
+        antialias=True,
+    )
+    restored = torch.from_numpy(actual).permute(0, 3, 1, 2).float() / 255.0
+    assert actual.shape == (5, 256, 256, 3)
+    assert actual.dtype == np.uint8
+    assert (restored - reference).abs().max() <= 0.5 / 255.0 + 1e-6
+
+
+@pytest.mark.parametrize(
+    "frames",
+    [
+        np.empty((0, 8, 10, 3), dtype=np.uint8),
+        np.empty((2, 8, 10), dtype=np.uint8),
+        np.empty((2, 8, 10, 4), dtype=np.uint8),
+        np.empty((2, 8, 10, 3), dtype=np.float32),
+    ],
+)
+def test_resize_rgb_uint8_rejects_invalid_source_arrays(frames):
+    with pytest.raises(ValueError, match="RGB"):
+        converter.resize_rgb_uint8(frames)
+
+
+@pytest.mark.parametrize("microbatch", [0, -1, True])
+def test_resize_rgb_uint8_rejects_invalid_microbatch(microbatch):
+    with pytest.raises(ValueError, match="microbatch"):
+        converter.resize_rgb_uint8(_synthetic_rgb(0, 2, 0), microbatch=microbatch)
+
+
+def test_discovery_is_deterministic_resolves_captions_and_deduplicates_pairs(
+    tmp_path,
+):
+    source = make_tiny_lerobot_domain(tmp_path / "source", "domain_b")
+    make_tiny_lerobot_domain(source, "domain_a", episode_indexes=(3, 1))
+    cache = make_tiny_predecoded_cache(
+        tmp_path / "cache", source, "domain_b", (2, 0, 1)
+    )
+    make_tiny_predecoded_cache(cache, source, "domain_a", (3, 1))
+
+    episodes = converter.discover_source_episodes(
+        [source, source, source],
+        ["domain_b", "domain_b", "domain_a"],
+        predecoded_root=cache,
+    )
+
+    assert [episode.key for episode in episodes] == [
+        "domain_b:000000",
+        "domain_b:000001",
+        "domain_b:000002",
+        "domain_a:000001",
+        "domain_a:000003",
+    ]
+    assert episodes[0].caption == "perform domain_b task zero"
+    assert episodes[1].caption == "perform domain_b task one"
+    assert episodes[0].main_cache_path == (
+        cache
+        / "domain_b/videos/chunk-000/observation.images.image/episode_000000.npy"
+    ).resolve()
+
+
+def test_discovery_applies_max_episodes_after_ordering(tmp_path):
+    source = make_tiny_lerobot_domain(tmp_path / "source", "domain_b")
+    make_tiny_lerobot_domain(source, "domain_a", episode_indexes=(3, 1))
+    cache = make_tiny_predecoded_cache(
+        tmp_path / "cache", source, "domain_b", (2, 0, 1)
+    )
+    make_tiny_predecoded_cache(cache, source, "domain_a", (3, 1))
+    episodes = converter.discover_source_episodes(
+        [source],
+        ["domain_b", "domain_a"],
+        predecoded_root=cache,
+        max_episodes=4,
+    )
+    assert [episode.key for episode in episodes] == [
+        "domain_b:000000",
+        "domain_b:000001",
+        "domain_b:000002",
+        "domain_a:000001",
+    ]
+
+
+def test_discovery_rejects_conflicting_roots_with_same_final_key(tmp_path):
+    first = make_tiny_lerobot_domain(
+        tmp_path / "first", "domain", episode_indexes=(0,)
+    )
+    second = make_tiny_lerobot_domain(
+        tmp_path / "second", "domain", episode_indexes=(0,)
+    )
+    first_cache = make_tiny_predecoded_cache(
+        tmp_path / "cache", first, "domain", (0,)
+    )
+    make_tiny_predecoded_cache(first_cache, second, "domain", (0,))
+    with pytest.raises(ValueError, match="duplicate final episode key"):
+        converter.discover_source_episodes(
+            [first, second], ["domain", "domain"], predecoded_root=first_cache
+        )
+
+
+@pytest.mark.parametrize("missing", ["parquet", "main", "wrist"])
+def test_discovery_rejects_missing_required_episode_inputs(tmp_path, missing):
+    source = make_tiny_lerobot_domain(
+        tmp_path / "source", "domain", episode_indexes=(0,)
+    )
+    cache = make_tiny_predecoded_cache(
+        tmp_path / "cache", source, "domain", (0,)
+    )
+    if missing == "parquet":
+        source.joinpath("domain/data/chunk-000/episode_000000.parquet").unlink()
+    else:
+        camera = CAMERAS[0 if missing == "main" else 1]
+        cache.joinpath(
+            f"domain/videos/chunk-000/{camera}/episode_000000.npy"
+        ).unlink()
+    with pytest.raises(FileNotFoundError, match=f"{missing}|parquet|camera"):
+        converter.discover_source_episodes(
+            [source], ["domain"], predecoded_root=cache
+        )
+
+
+def test_discovery_rejects_zero_or_multiple_tasks(tmp_path):
+    for tasks in ([], [0, 1]):
+        source = make_tiny_lerobot_domain(
+            tmp_path / f"source-{len(tasks)}",
+            "domain",
+            episode_indexes=(0,),
+            task_lists={0: tasks},
+        )
+        cache = make_tiny_predecoded_cache(
+            tmp_path / f"cache-{len(tasks)}", source, "domain", (0,)
+        )
+        with pytest.raises(ValueError, match="exactly one task"):
+            converter.discover_source_episodes(
+                [source], ["domain"], predecoded_root=cache
+            )
+
+
+@pytest.mark.parametrize(
+    ("column", "replacement", "message"),
+    [
+        ("action", [np.zeros(6, np.float32)] * 3, "action"),
+        ("observation.state", [np.zeros(9, np.float32)] * 3, "state"),
+        ("action", [np.zeros(7, np.float32)] * 2, "row count"),
+    ],
+)
+def test_converter_rejects_wrong_control_width_or_row_count(
+    tmp_path, column, replacement, message
+):
+    source = make_tiny_lerobot_domain(
+        tmp_path / "source", "domain", episode_indexes=(0,)
+    )
+    cache = make_tiny_predecoded_cache(
+        tmp_path / "cache", source, "domain", (0,)
+    )
+    parquet = source / "domain/data/chunk-000/episode_000000.parquet"
+    frame = pd.read_parquet(parquet)
+    if len(replacement) != len(frame):
+        frame = frame.iloc[: len(replacement)].copy()
+    frame[column] = replacement
+    frame.to_parquet(parquet)
+    with pytest.raises(ValueError, match=message):
+        converter.convert_dataset(
+            make_convert_args(
+                data_root=source,
+                domains=["domain"],
+                output_root=tmp_path / "out",
+                predecoded_root=cache,
+            )
+        )
+    assert not (tmp_path / "out/manifest.json").exists()
+
+
+@pytest.mark.parametrize("compression", ["none", "lzf"])
+def test_converter_writes_atomic_shards_and_exact_manifest(tmp_path, compression):
+    source = make_tiny_lerobot_domain(tmp_path / "source", "domain")
+    cache = make_tiny_predecoded_cache(
+        tmp_path / "cache", source, "domain", (2, 0, 1)
+    )
+    output = tmp_path / f"out-{compression}"
+    report = converter.convert_dataset(
+        make_convert_args(
+            data_root=source,
+            domains=["domain"],
+            output_root=output,
+            predecoded_root=cache,
+            max_episodes=3,
+            episodes_per_shard=2,
+            compression=compression,
+        )
+    )
+    assert report == {"episodes": 3, "shards": 2, "compression": compression}
+    payload, records = schema.load_manifest(output / "manifest.json")
+    assert payload["compression"] == compression
+    assert payload["source_roots"] == [str(source.resolve())]
+    assert [record.episode_index for record in records] == [0, 1, 2]
+    assert len({record.shard_path for record in records}) == 2
+    assert not list(output.glob("*.tmp*"))
+    for shard_path in {record.shard_path for record in records}:
+        with h5py.File(shard_path, "r") as shard:
+            assert shard.attrs["schema_version"] == schema.SCHEMA_VERSION
+            assert shard.attrs["compression"] == compression
+            assert shard.attrs["image_height"] == 256
+            assert shard.attrs["image_width"] == 256
+            assert list(shard.attrs["camera_names"].astype(str)) == [
+                "main",
+                "wrist",
+            ]
+            for record in records:
+                if record.shard_path != shard_path:
+                    continue
+                group = shard[record.group]
+                schema.validate_episode_group(group, record)
+                expected_compression = None if compression == "none" else "lzf"
+                assert group["rgb_main"].compression == expected_compression
+                assert group["rgb_main"].chunks == (1, 256, 256, 3)
+                assert group["rgb_wrist"].chunks == (1, 256, 256, 3)
+                assert group["action"].chunks[0] <= 64
+                assert group["state"].chunks[0] <= 64
+
+
+def test_converter_manifest_records_all_configured_source_roots(tmp_path):
+    first = make_tiny_lerobot_domain(
+        tmp_path / "first", "domain_a", episode_indexes=(0,)
+    )
+    second = make_tiny_lerobot_domain(
+        tmp_path / "second", "domain_b", episode_indexes=(0,)
+    )
+    cache = make_tiny_predecoded_cache(
+        tmp_path / "cache", first, "domain_a", (0,)
+    )
+    make_tiny_predecoded_cache(cache, second, "domain_b", (0,))
+    args = make_convert_args(
+        data_root=first,
+        domains=["domain_a", "domain_b"],
+        output_root=tmp_path / "out",
+        predecoded_root=cache,
+        max_episodes=1,
+    )
+    args.data_root = [str(first), str(second)]
+    converter.convert_dataset(args)
+    payload, _ = schema.load_manifest(tmp_path / "out/manifest.json")
+    assert payload["source_roots"] == [
+        str(first.resolve()),
+        str(second.resolve()),
+    ]
+
+
+def test_converter_strict_cache_requires_exact_frame_count(tmp_path):
+    source = make_tiny_lerobot_domain(
+        tmp_path / "source", "domain", episode_indexes=(0,)
+    )
+    cache = make_tiny_predecoded_cache(
+        tmp_path / "cache", source, "domain", (0,), length=2
+    )
+    with pytest.raises(ValueError, match="frame count"):
+        converter.convert_dataset(
+            make_convert_args(
+                data_root=source,
+                domains=["domain"],
+                output_root=tmp_path / "out",
+                predecoded_root=cache,
+            )
+        )
+
+
+def test_converter_decodes_mp4_when_cache_is_absent(tmp_path):
+    source = make_tiny_lerobot_domain(
+        tmp_path / "source",
+        "domain",
+        episode_indexes=(0,),
+        write_mp4=True,
+    )
+    output = tmp_path / "out"
+    converter.convert_dataset(
+        make_convert_args(
+            data_root=source,
+            domains=["domain"],
+            output_root=output,
+            predecoded_root=None,
+        )
+    )
+    _, records = schema.load_manifest(output / "manifest.json")
+    assert len(records) == 1
+    with h5py.File(records[0].shard_path, "r") as shard:
+        assert shard[records[0].group]["rgb_main"].shape == (3, 256, 256, 3)
+
+
+def test_converter_failure_removes_new_shards_temps_and_manifest(
+    tmp_path, monkeypatch
+):
+    source = make_tiny_lerobot_domain(tmp_path / "source", "domain")
+    cache = make_tiny_predecoded_cache(
+        tmp_path / "cache", source, "domain", (2, 0, 1)
+    )
+    output = tmp_path / "out"
+    real_validate = schema.validate_episode_group
+    calls = 0
+
+    def fail_in_second_shard(group, record):
+        nonlocal calls
+        calls += 1
+        if record.episode_index == 2:
+            raise ValueError("injected shard validation failure")
+        return real_validate(group, record)
+
+    monkeypatch.setattr(schema, "validate_episode_group", fail_in_second_shard)
+    with pytest.raises(ValueError, match="injected shard validation failure"):
+        converter.convert_dataset(
+            make_convert_args(
+                data_root=source,
+                domains=["domain"],
+                output_root=output,
+                predecoded_root=cache,
+                episodes_per_shard=2,
+            )
+        )
+    assert not (output / "manifest.json").exists()
+    assert not list(output.glob("*.h5"))
+    assert not list(output.glob("*.tmp*"))
+
+
+def test_converter_reuses_valid_matching_output_and_guards_fingerprint(
+    tmp_path,
+):
+    source = make_tiny_lerobot_domain(
+        tmp_path / "source", "domain", episode_indexes=(0,)
+    )
+    cache = make_tiny_predecoded_cache(
+        tmp_path / "cache", source, "domain", (0,)
+    )
+    output = tmp_path / "out"
+    args = make_convert_args(
+        data_root=source,
+        domains=["domain"],
+        output_root=output,
+        predecoded_root=cache,
+    )
+    converter.convert_dataset(args)
+    _, records = schema.load_manifest(output / "manifest.json")
+    shard = records[0].shard_path
+    before = shard.stat().st_mtime_ns
+    assert converter.convert_dataset(args) == {
+        "episodes": 1,
+        "shards": 1,
+        "compression": "none",
+    }
+    assert shard.stat().st_mtime_ns == before
+
+    lzf_args = make_convert_args(
+        data_root=source,
+        domains=["domain"],
+        output_root=output,
+        predecoded_root=cache,
+        compression="lzf",
+    )
+    with pytest.raises(ValueError, match="fingerprint"):
+        converter.convert_dataset(lzf_args)
+    lzf_args.overwrite = True
+    converter.convert_dataset(lzf_args)
+    payload, _ = schema.load_manifest(output / "manifest.json")
+    assert payload["compression"] == "lzf"
+
+
+def test_converter_rejects_more_than_32_episodes_per_shard(tmp_path):
+    args = make_convert_args(
+        data_root=tmp_path / "source",
+        domains=["domain"],
+        output_root=tmp_path / "out",
+        predecoded_root=tmp_path / "cache",
+        episodes_per_shard=33,
+    )
+    with pytest.raises(ValueError, match="episodes_per_shard"):
+        converter.convert_dataset(args)
