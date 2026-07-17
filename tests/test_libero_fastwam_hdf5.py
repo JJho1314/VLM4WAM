@@ -1,4 +1,7 @@
 import json
+import os
+import pickle
+import random
 from argparse import Namespace
 from pathlib import Path
 
@@ -12,6 +15,11 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as tvf
 
 from ge_act.data import libero_fastwam_hdf5_schema as schema
+from ge_act.data import libero_fastwam_hdf5_dataset as hdf5_dataset
+from ge_act.data.libero_fastwam_hdf5_dataset import (
+    LiberoFastWAMHDF5Dataset,
+    read_rows_preserving_order,
+)
 from ge_act.scripts import convert_libero_fastwam_hdf5 as converter
 
 
@@ -1438,3 +1446,345 @@ def test_converter_rejects_more_than_32_episodes_per_shard(tmp_path):
     )
     with pytest.raises(ValueError, match="episodes_per_shard"):
         converter.convert_dataset(args)
+
+
+def make_reader_fixture(
+    tmp_path: Path,
+    *,
+    episodes: int = 1,
+    one_shard_per_episode: bool = False,
+) -> tuple[Path, Path]:
+    root = tmp_path / "reader"
+    root.mkdir(parents=True, exist_ok=True)
+    records = []
+    shard_count = episodes if one_shard_per_episode else 1
+    for shard_index in range(shard_count):
+        shard_path = root / f"shard_{shard_index:05d}.h5"
+        with h5py.File(shard_path, "w") as shard:
+            episode_indexes = (
+                [shard_index] if one_shard_per_episode else range(episodes)
+            )
+            for episode_index in episode_indexes:
+                key = f"domain:{episode_index:06d}"
+                group = shard.create_group(f"episodes/{key}")
+                string_dtype = h5py.string_dtype(encoding="utf-8")
+                group.create_dataset(
+                    "caption", data=f"caption {episode_index}", dtype=string_dtype
+                )
+                group.create_dataset("domain", data="domain", dtype=string_dtype)
+                group.create_dataset(
+                    "episode_index", data=episode_index, dtype=np.int64
+                )
+                group.create_dataset("length", data=50, dtype=np.int64)
+                group.create_dataset(
+                    "rgb_main",
+                    shape=(50, 256, 256, 3),
+                    dtype=np.uint8,
+                    chunks=(1, 256, 256, 3),
+                    fillvalue=10 + episode_index,
+                )
+                group.create_dataset(
+                    "rgb_wrist",
+                    shape=(50, 256, 256, 3),
+                    dtype=np.uint8,
+                    chunks=(1, 256, 256, 3),
+                    fillvalue=110 + episode_index,
+                )
+                group.create_dataset(
+                    "action",
+                    data=np.arange(50 * 7, dtype=np.float32).reshape(50, 7),
+                )
+                group.create_dataset(
+                    "state",
+                    data=np.arange(50 * 8, dtype=np.float32).reshape(50, 8),
+                )
+                records.append(
+                    {
+                        "key": key,
+                        "shard": shard_path.name,
+                        "group": f"episodes/{key}",
+                        "caption": f"caption {episode_index}",
+                        "domain": "domain",
+                        "episode_index": episode_index,
+                        "length": 50,
+                    }
+                )
+
+    payload = {
+        "schema_version": 1,
+        "camera_names": ["main", "wrist"],
+        "image_size": [256, 256],
+        "source_fps": 20,
+        "n_previous": 4,
+        "chunk": 9,
+        "action_chunk": 36,
+        "action_type": "absolute",
+        "action_space": "eef",
+        "compression": "none",
+        "source_roots": [str(tmp_path / "source")],
+        "datasets": DATASET_DECLARATIONS,
+        "converter_fingerprint": "b" * 64,
+        "episodes": records,
+    }
+    manifest_path = root / "manifest.json"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    stats_path = root / "stats.json"
+    stats_path.write_text(
+        json.dumps(
+            {
+                "domain_eef": {"mean": [1.0] * 7, "std": [2.0] * 7},
+                "domain_state_eef": {"mean": [3.0] * 8, "std": [4.0] * 8},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest_path, stats_path
+
+
+def make_reader(tmp_path: Path, **kwargs) -> LiberoFastWAMHDF5Dataset:
+    manifest_path, stats_path = make_reader_fixture(
+        tmp_path, **kwargs.pop("fixture", {})
+    )
+    return LiberoFastWAMHDF5Dataset(
+        manifest_path=manifest_path,
+        stat_file=stats_path,
+        **kwargs,
+    )
+
+
+def test_hdf5_dataset_constructor_opens_no_shards(tmp_path, monkeypatch):
+    manifest_path, stats_path = make_reader_fixture(tmp_path)
+
+    def fail_open(*args, **kwargs):
+        raise AssertionError("constructor opened an HDF5 shard")
+
+    monkeypatch.setattr(hdf5_dataset.h5py, "File", fail_open)
+    dataset = LiberoFastWAMHDF5Dataset(
+        manifest_path=manifest_path,
+        stat_file=stats_path,
+    )
+    assert len(dataset) == 1
+    assert dataset._handles == {}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source_fps", 30),
+        ("valid_cam", ["observation.images.wrist_image", "observation.images.image"]),
+        ("chunk", 8),
+        ("action_chunk", 32),
+        ("n_previous", 3),
+        ("action_type", "relative"),
+        ("action_space", "joint"),
+        ("ignore_seek", True),
+    ],
+)
+def test_hdf5_dataset_rejects_non_fixed_arguments(tmp_path, field, value):
+    manifest_path, stats_path = make_reader_fixture(tmp_path)
+    with pytest.raises(ValueError, match=field):
+        LiberoFastWAMHDF5Dataset(
+            manifest_path=manifest_path,
+            stat_file=stats_path,
+            **{field: value},
+        )
+
+
+@pytest.mark.parametrize(
+    ("key", "field", "value", "message"),
+    [
+        ("domain_eef", "mean", [0.0] * 6, "domain_eef.*mean.*7"),
+        ("domain_eef", "std", [1.0] * 8, "domain_eef.*std.*7"),
+        ("domain_state_eef", "mean", [0.0] * 7, "domain_state_eef.*mean.*8"),
+        ("domain_state_eef", "std", [1.0] * 9, "domain_state_eef.*std.*8"),
+    ],
+)
+def test_hdf5_dataset_rejects_wrong_statistics_width(
+    tmp_path, key, field, value, message
+):
+    manifest_path, stats_path = make_reader_fixture(tmp_path)
+    stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    stats[key][field] = value
+    stats_path.write_text(json.dumps(stats), encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        LiberoFastWAMHDF5Dataset(
+            manifest_path=manifest_path,
+            stat_file=stats_path,
+        )
+
+
+def test_hdf5_dataset_returns_fixed_normalized_sample_in_camera_order(tmp_path):
+    dataset = make_reader(
+        tmp_path,
+        fix_epiidx=0,
+        fix_sidx=12,
+        fix_mem_idx=[1, 4, 8, 11],
+    )
+    sample = dataset[0]
+    assert sample["video"].shape == (3, 2, 13, 256, 256)
+    assert sample["video"].dtype == torch.float32
+    assert sample["actions"].shape == (40, 7)
+    assert sample["actions"].dtype == torch.float32
+    assert sample["state"].shape == (1, 8)
+    assert sample["state"].dtype == torch.float32
+    assert sample["caption"] == "caption 0"
+    torch.testing.assert_close(
+        sample["video"][:, 0],
+        torch.full((3, 13, 256, 256), 10 / 255.0 * 2.0 - 1.0),
+    )
+    torch.testing.assert_close(
+        sample["video"][:, 1],
+        torch.full((3, 13, 256, 256), 110 / 255.0 * 2.0 - 1.0),
+    )
+    expected_action_indexes = [1, 4, 8, 11, *range(12, 48)]
+    raw_actions = torch.arange(50 * 7, dtype=torch.float32).reshape(50, 7)
+    expected_actions = (raw_actions[expected_action_indexes] - 1.0) / (2.0 + 1e-6)
+    torch.testing.assert_close(sample["actions"], expected_actions)
+    raw_state = torch.arange(50 * 8, dtype=torch.float32).reshape(50, 8)
+    torch.testing.assert_close(sample["state"], (raw_state[[11]] - 3.0) / (4.0 + 1e-6))
+    assert dataset.get_frame_indexes(50) == (
+        [1, 4, 8, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47],
+        expected_action_indexes,
+    )
+
+
+class TrackingRows:
+    def __init__(self):
+        self.shape = (6, 2)
+        self.calls = []
+        self.array = np.arange(12, dtype=np.float32).reshape(6, 2)
+
+    def __getitem__(self, indexes):
+        self.calls.append(np.asarray(indexes).copy())
+        return self.array[indexes]
+
+
+def test_read_rows_preserves_order_repeats_and_clips_without_full_read():
+    rows = TrackingRows()
+    actual = read_rows_preserving_order(rows, [4, 1, 4, -2, 9], length=6)
+    np.testing.assert_array_equal(actual, rows.array[[4, 1, 4, 0, 5]])
+    assert len(rows.calls) == 1
+    np.testing.assert_array_equal(rows.calls[0], [0, 1, 4, 5])
+
+
+@pytest.mark.parametrize("indexes", [[], [[1, 2]], [1.5], [True]])
+def test_read_rows_rejects_invalid_indexes(indexes):
+    with pytest.raises((TypeError, ValueError), match="indexes"):
+        read_rows_preserving_order(TrackingRows(), indexes, length=6)
+
+
+@pytest.mark.parametrize("mode", ["uniform", "random"])
+def test_hdf5_dataset_training_sampling_invariants(tmp_path, mode):
+    dataset = make_reader(tmp_path, previous_pick_mode=mode)
+    random.seed(7)
+    np.random.seed(7)
+    frame_indexes, action_indexes = dataset.get_frame_indexes(50)
+    assert len(frame_indexes) == 13
+    assert len(action_indexes) == 40
+    assert all(0 <= index < 50 for index in frame_indexes + action_indexes)
+    assert frame_indexes[:4] == action_indexes[:4]
+    assert frame_indexes[4:] == action_indexes[4:][3::4]
+
+
+@pytest.mark.parametrize(
+    ("fix_sidx", "fix_mem_idx", "message"),
+    [
+        (1, None, "together"),
+        (None, [1, 2, 3, 4], "together"),
+        (1, [1, 2, 3], "length 4"),
+    ],
+)
+def test_hdf5_dataset_rejects_invalid_fixed_indexes(
+    tmp_path, fix_sidx, fix_mem_idx, message
+):
+    with pytest.raises(ValueError, match=message):
+        make_reader(tmp_path, fix_sidx=fix_sidx, fix_mem_idx=fix_mem_idx)
+
+
+def test_hdf5_dataset_supports_normal_negative_dataset_indexes(tmp_path):
+    dataset = make_reader(tmp_path, fixture={"episodes": 2})
+    assert dataset[-1]["caption"] == "caption 1"
+    with pytest.raises(IndexError):
+        _ = dataset[-3]
+
+
+def test_hdf5_dataset_lru_reuses_and_evicts_closed_handle(tmp_path):
+    dataset = make_reader(
+        tmp_path,
+        max_open_shards=2,
+        fixture={"episodes": 3, "one_shard_per_episode": True},
+    )
+    dataset[0]
+    first_path = next(iter(dataset._handles))
+    first = dataset._handles[first_path]
+    dataset[0]
+    assert dataset._handles[first_path] is first
+    dataset[1]
+    dataset[2]
+    assert len(dataset._handles) == 2
+    assert first.id.valid == 0
+
+
+def test_hdf5_dataset_close_is_idempotent_and_reopens_invalid_handle(tmp_path):
+    dataset = make_reader(tmp_path)
+    dataset[0]
+    path, first = next(iter(dataset._handles.items()))
+    first.close()
+    dataset[0]
+    assert dataset._handles[path] is not first
+    assert dataset._handles[path].id.valid == 1
+    dataset.close()
+    dataset.close()
+    assert dataset._handles == {}
+
+
+def test_hdf5_dataset_pickle_drops_live_handles(tmp_path):
+    dataset = make_reader(tmp_path)
+    dataset[0]
+    handle = next(iter(dataset._handles.values()))
+    restored = pickle.loads(pickle.dumps(dataset))
+    assert len(dataset._handles) == 1
+    assert handle.id.valid == 1
+    assert restored._handles == {}
+
+
+def test_hdf5_dataset_pid_change_closes_inherited_handles(tmp_path, monkeypatch):
+    dataset = make_reader(tmp_path)
+    dataset[0]
+    inherited = next(iter(dataset._handles.values()))
+    parent_pid = os.getpid()
+    monkeypatch.setattr(hdf5_dataset.os, "getpid", lambda: parent_pid + 1000)
+    dataset[0]
+    replacement = next(iter(dataset._handles.values()))
+    assert inherited.id.valid == 0
+    assert replacement is not inherited
+    assert replacement.id.valid == 1
+
+
+@pytest.mark.parametrize("failure", ["open", "missing_group", "corrupt"])
+def test_hdf5_dataset_failures_include_full_read_context(tmp_path, failure):
+    dataset = make_reader(
+        tmp_path,
+        fixture={"episodes": 2},
+        fix_sidx=12,
+        fix_mem_idx=[1, 4, 8, 11],
+    )
+    record = dataset.records[0]
+    if failure == "open":
+        record.shard_path.unlink()
+    else:
+        with h5py.File(record.shard_path, "a") as shard:
+            if failure == "missing_group":
+                del shard[record.group]
+            else:
+                del shard[f"{record.group}/state"]
+
+    with pytest.raises(Exception) as error:
+        dataset[0]
+    message = str(error.value)
+    assert "worker=main" in message
+    assert str(record.shard_path) in message
+    assert record.key in message
+    assert "frame_indexes=" in message
+    assert "action_indexes=" in message
+    assert "caption 1" not in message
