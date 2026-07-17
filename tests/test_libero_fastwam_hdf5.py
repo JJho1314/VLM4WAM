@@ -14,6 +14,22 @@ DATASET_DECLARATIONS = {
     "action": {"width": 7, "dtype": "float32"},
     "state": {"width": 8, "dtype": "float32"},
 }
+EXPECTED_MANIFEST_FIELDS = {
+    "schema_version",
+    "camera_names",
+    "image_size",
+    "source_fps",
+    "n_previous",
+    "chunk",
+    "action_chunk",
+    "action_type",
+    "action_space",
+    "compression",
+    "source_roots",
+    "datasets",
+    "converter_fingerprint",
+    "episodes",
+}
 
 
 def make_manifest(tmp_path: Path, **overrides):
@@ -23,7 +39,14 @@ def make_manifest(tmp_path: Path, **overrides):
     key = "libero_goal:000010"
     payload = {
         "schema_version": 1,
-        "fixed_contract": dict(schema.FIXED_CONTRACT),
+        "camera_names": ["main", "wrist"],
+        "image_size": [256, 256],
+        "source_fps": 20,
+        "n_previous": 4,
+        "chunk": 9,
+        "action_chunk": 36,
+        "action_type": "absolute",
+        "action_space": "eef",
         "compression": "lzf",
         "source_roots": [str(tmp_path / "source")],
         "datasets": DATASET_DECLARATIONS,
@@ -78,6 +101,10 @@ def test_manifest_accepts_canonical_libero_contract(tmp_path):
     ]
 
 
+def test_manifest_fields_are_exact_canonical_top_level_contract():
+    assert schema.MANIFEST_FIELDS == EXPECTED_MANIFEST_FIELDS
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -92,10 +119,10 @@ def test_manifest_accepts_canonical_libero_contract(tmp_path):
         ("action_space", "joint"),
     ],
 )
-def test_manifest_rejects_wrong_fixed_contract(tmp_path, field, value):
+def test_manifest_rejects_wrong_top_level_contract_field(tmp_path, field, value):
     payload = make_manifest(tmp_path)
-    payload["fixed_contract"] = dict(payload["fixed_contract"], **{field: value})
-    with pytest.raises(ValueError, match="fixed_contract"):
+    payload[field] = value
+    with pytest.raises(ValueError, match=field):
         schema.validate_manifest(payload, tmp_path)
 
 
@@ -108,20 +135,19 @@ def test_manifest_rejects_unsupported_schema_version(tmp_path, version):
 
 @pytest.mark.parametrize(
     "field",
-    [
-        "schema_version",
-        "fixed_contract",
-        "compression",
-        "source_roots",
-        "datasets",
-        "converter_fingerprint",
-        "episodes",
-    ],
+    sorted(EXPECTED_MANIFEST_FIELDS),
 )
 def test_manifest_rejects_missing_required_section(tmp_path, field):
     payload = make_manifest(tmp_path)
     del payload[field]
     with pytest.raises(ValueError, match=field):
+        schema.validate_manifest(payload, tmp_path)
+
+
+def test_manifest_rejects_unexpected_top_level_field(tmp_path):
+    payload = make_manifest(tmp_path)
+    payload["unexpected"] = "value"
+    with pytest.raises(ValueError, match="unexpected.*unexpected"):
         schema.validate_manifest(payload, tmp_path)
 
 
@@ -272,8 +298,10 @@ def test_manifest_rejects_symlink_shard_escape(tmp_path):
 
 def test_load_manifest_reads_json_and_validates_relative_to_parent(tmp_path):
     manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(json.dumps(make_manifest(tmp_path)), encoding="utf-8")
-    records = schema.load_manifest(manifest_path)
+    payload = make_manifest(tmp_path)
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    loaded_payload, records = schema.load_manifest(manifest_path)
+    assert loaded_payload == payload
     assert records[0].shard_path == (tmp_path / "shard_00000.h5").resolve()
     assert records[0].caption == "pick up the red mug"
 

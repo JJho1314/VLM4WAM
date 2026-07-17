@@ -31,6 +31,14 @@ DATASET_DECLARATIONS = {
     "action": {"width": 7, "dtype": "float32"},
     "state": {"width": 8, "dtype": "float32"},
 }
+MANIFEST_FIELDS = {
+    "schema_version",
+    "compression",
+    "source_roots",
+    "datasets",
+    "converter_fingerprint",
+    "episodes",
+} | set(FIXED_CONTRACT)
 EPISODE_FIELDS = {
     "key",
     "shard",
@@ -53,12 +61,13 @@ class EpisodeRecord:
     length: int
 
 
-def load_manifest(path: Path) -> list[EpisodeRecord]:
+def load_manifest(path: Path) -> tuple[dict[str, Any], list[EpisodeRecord]]:
     """Load and validate a manifest relative to its containing directory."""
     path = Path(path)
     with path.open(encoding="utf-8") as stream:
         payload = json.load(stream)
-    return validate_manifest(payload, path.parent)
+    records = validate_manifest(payload, path.parent)
+    return payload, records
 
 
 def _matches_exact_structure(actual: Any, expected: Any) -> bool:
@@ -82,15 +91,25 @@ def validate_manifest(payload: Any, root: Path) -> list[EpisodeRecord]:
     if type(payload) is not dict:
         raise ValueError("manifest payload must be a dict")
 
+    actual_fields = set(payload)
+    if actual_fields != MANIFEST_FIELDS:
+        missing = sorted(MANIFEST_FIELDS - actual_fields)
+        unexpected = sorted(actual_fields - MANIFEST_FIELDS)
+        details = []
+        if missing:
+            details.append(f"missing fields {missing!r}")
+        if unexpected:
+            details.append(f"unexpected fields {unexpected!r}")
+        raise ValueError(f"manifest has {', '.join(details)}")
+
     schema_version = payload.get("schema_version")
     if type(schema_version) is not int or schema_version != SCHEMA_VERSION:
         raise ValueError(f"schema_version must be {SCHEMA_VERSION}")
 
-    fixed_contract = payload.get("fixed_contract")
-    if not _matches_exact_structure(fixed_contract, FIXED_CONTRACT):
-        raise ValueError(
-            f"fixed_contract must be {FIXED_CONTRACT!r}, got {fixed_contract!r}"
-        )
+    for field, expected in FIXED_CONTRACT.items():
+        actual = payload[field]
+        if not _matches_exact_structure(actual, expected):
+            raise ValueError(f"{field} must be {expected!r}, got {actual!r}")
 
     compression = payload.get("compression")
     if type(compression) is not str or compression not in ("none", "lzf"):
