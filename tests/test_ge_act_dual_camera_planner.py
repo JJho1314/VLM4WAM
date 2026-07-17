@@ -87,6 +87,14 @@ def test_ge_act_adapter_selects_current_and_future_endpoint_without_concat() -> 
 
     assert item["current_camera_images"].shape == (2, 2, 2, 3)
     assert item["future_camera_images"].shape == (2, 2, 2, 3)
+    torch.testing.assert_close(
+        item["future_camera_images"][0],
+        torch.full((2, 2, 3), 0.5),
+    )
+    torch.testing.assert_close(
+        item["future_camera_images"][1],
+        torch.full((2, 2, 3), 1.0),
+    )
     assert item["images"][0].getpixel((0, 0))[0] == 64
     assert item["images"][1].getpixel((0, 0))[0] == 128
     assert item["prompt"] == "pick the cup"
