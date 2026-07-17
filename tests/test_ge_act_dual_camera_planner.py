@@ -117,6 +117,26 @@ class CheckpointHead(nn.Module):
         self.dim_out = int(dim_out)
 
 
+class CameraValueTeacher:
+    def __init__(self, *, tokens: int, feature_dim: int) -> None:
+        self.tokens = tokens
+        self.feature_dim = feature_dim
+        self.inputs: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def encode_current_and_future(
+        self,
+        current: torch.Tensor,
+        future: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self.inputs = (current.clone(), future.clone())
+
+        def encode(frames: torch.Tensor) -> torch.Tensor:
+            values = frames.mean(dim=(1, 2, 3)).reshape(-1, 1, 1)
+            return values.expand(-1, self.tokens, self.feature_dim).clone()
+
+        return encode(current), encode(future)
+
+
 def valid_initialization_metadata() -> dict[str, Any]:
     return {
         "use_current_alignment": True,
@@ -570,7 +590,7 @@ def test_ge_act_dataset_selection_loads_configured_train_dataset(
     dataset_module.write_text(
         "from pathlib import Path\n"
         "class FakeGEActDataset:\n"
-        "    def __init__(self, marker):\n"
+        "    def __init__(self, marker, **kwargs):\n"
         "        self.marker = marker\n"
         "        self.constructor_cwd = Path.cwd()\n"
         "    def __len__(self):\n"
@@ -583,9 +603,18 @@ def test_ge_act_dataset_selection_loads_configured_train_dataset(
         "train_data_class: FakeGEActDataset\n"
         "data:\n"
         "  train:\n"
-        "    marker: configured-train-split\n",
+        "    marker: configured-train-split\n"
+        "    valid_cam: [observation.images.image, observation.images.wrist_image]\n"
+        "    source_fps: 20\n"
+        "    chunk: 9\n"
+        "    action_chunk: 36\n"
+        "    n_previous: 4\n"
+        "    ignore_seek: false\n",
         encoding="utf-8",
     )
+
+    original_cwd = Path.cwd()
+    original_sys_path = list(sys.path)
 
     dataset = planner.load_ge_act_dual_camera_planner_dataset(config_path)
 
@@ -594,6 +623,86 @@ def test_ge_act_dataset_selection_loads_configured_train_dataset(
     assert dataset.dataset.constructor_cwd == PLANNER_ROOT.parent / "ge_act"
     assert dataset.n_previous == 4
     assert dataset.future_offset == 8
+    assert Path.cwd() == original_cwd
+    assert sys.path == original_sys_path
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        (
+            "valid_cam: [observation.images.wrist_image, observation.images.image]",
+            "valid_cam",
+        ),
+        ("source_fps: 10", "source_fps"),
+        ("chunk: 13", "chunk"),
+        ("action_chunk: 54", "action_chunk"),
+        ("n_previous: 3", "n_previous"),
+        ("ignore_seek: true", "ignore_seek"),
+    ],
+)
+def test_ge_act_dataset_rejects_incompatible_camera_or_temporal_contract(
+    tmp_path: Path,
+    override: str,
+    message: str,
+) -> None:
+    field = override.split(":", 1)[0]
+    contract = {
+        "valid_cam": (
+            "valid_cam: [observation.images.image, observation.images.wrist_image]"
+        ),
+        "source_fps": "source_fps: 20",
+        "chunk": "chunk: 9",
+        "action_chunk": "action_chunk: 36",
+        "n_previous": "n_previous: 4",
+        "ignore_seek": "ignore_seek: false",
+    }
+    contract[field] = override
+    config_path = tmp_path / "invalid.yaml"
+    config_path.write_text(
+        "train_data_class_path: unused.py\n"
+        "train_data_class: Unused\n"
+        "data:\n"
+        "  train:\n"
+        + "".join(f"    {line}\n" for line in contract.values()),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        planner.load_ge_act_dual_camera_planner_dataset(config_path)
+
+
+def test_ge_act_dataset_restores_process_state_when_constructor_fails(
+    tmp_path: Path,
+) -> None:
+    dataset_module = tmp_path / "broken_ge_act_dataset.py"
+    dataset_module.write_text(
+        "class BrokenGEActDataset:\n"
+        "    def __init__(self, **kwargs):\n"
+        "        raise RuntimeError('constructor failed')\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "broken.yaml"
+    config_path.write_text(
+        f"train_data_class_path: {dataset_module}\n"
+        "train_data_class: BrokenGEActDataset\n"
+        "data:\n"
+        "  train:\n"
+        "    valid_cam: [observation.images.image, observation.images.wrist_image]\n"
+        "    source_fps: 20\n"
+        "    chunk: 9\n"
+        "    action_chunk: 36\n"
+        "    n_previous: 4\n",
+        encoding="utf-8",
+    )
+    original_cwd = Path.cwd()
+    original_sys_path = list(sys.path)
+
+    with pytest.raises(RuntimeError, match="constructor failed"):
+        planner.load_ge_act_dual_camera_planner_dataset(config_path)
+
+    assert Path.cwd() == original_cwd
+    assert sys.path == original_sys_path
 
 
 def test_flatten_two_camera_frames_for_online_teachers_preserves_order() -> None:
@@ -621,6 +730,79 @@ def test_teacher_features_restore_batch_view_layout() -> None:
 
     assert restored.shape == (2, 2, 256, 1024)
     torch.testing.assert_close(restored[0, 1], encoded[1])
+
+
+def test_encode_dual_camera_teachers_preserves_current_future_and_view_order() -> None:
+    current = torch.empty(2, 2, 4, 4, 3)
+    future = torch.empty_like(current)
+    current[0, 0].fill_(-1.0)
+    current[0, 1].fill_(-0.5)
+    current[1, 0].fill_(0.0)
+    current[1, 1].fill_(0.5)
+    future[0, 0].fill_(-0.75)
+    future[0, 1].fill_(-0.25)
+    future[1, 0].fill_(0.25)
+    future[1, 1].fill_(1.0)
+    appearance = CameraValueTeacher(tokens=256, feature_dim=1024)
+    depth = CameraValueTeacher(tokens=256, feature_dim=2048)
+
+    labels = planner.encode_dual_camera_teacher_targets(
+        current,
+        future,
+        appearance_encoder=appearance,
+        depth_encoder=depth,
+    )
+
+    assert labels["current_dino_labels"].shape == (2, 2, 256, 1024)
+    assert labels["semantic_plan_labels"].shape == (2, 2, 256, 1024)
+    assert labels["current_depth_labels"].shape == (2, 2, 256, 2048)
+    assert labels["depth_plan_labels"].shape == (2, 2, 256, 2048)
+    assert labels["current_dino_labels"][:, :, 0, 0].tolist() == [
+        [0.0, 0.25],
+        [0.5, 0.75],
+    ]
+    assert labels["semantic_plan_labels"][:, :, 0, 0].tolist() == [
+        [0.125, 0.375],
+        [0.625, 1.0],
+    ]
+    assert appearance.inputs is not None
+    assert appearance.inputs[0].shape == (4, 3, 4, 4)
+
+
+@pytest.mark.parametrize(
+    ("current_shape", "future_shape"),
+    [
+        ((2, 1, 4, 4, 3), (2, 1, 4, 4, 3)),
+        ((2, 2, 4, 4, 3), (2, 2, 5, 4, 3)),
+    ],
+)
+def test_encode_dual_camera_teachers_rejects_bad_camera_batches(
+    current_shape: tuple[int, ...],
+    future_shape: tuple[int, ...],
+) -> None:
+    appearance = CameraValueTeacher(tokens=256, feature_dim=1024)
+    depth = CameraValueTeacher(tokens=256, feature_dim=2048)
+
+    with pytest.raises(ValueError, match=r"\[B,2,H,W,3\]|same shape"):
+        planner.encode_dual_camera_teacher_targets(
+            torch.zeros(current_shape),
+            torch.zeros(future_shape),
+            appearance_encoder=appearance,
+            depth_encoder=depth,
+        )
+
+
+def test_encode_dual_camera_teachers_rejects_wrong_teacher_shape() -> None:
+    appearance = CameraValueTeacher(tokens=81, feature_dim=1024)
+    depth = CameraValueTeacher(tokens=256, feature_dim=2048)
+
+    with pytest.raises(ValueError, match="appearance current.*256, 1024"):
+        planner.encode_dual_camera_teacher_targets(
+            torch.zeros(1, 2, 4, 4, 3),
+            torch.zeros(1, 2, 4, 4, 3),
+            appearance_encoder=appearance,
+            depth_encoder=depth,
+        )
 
 
 def test_ge_act_launchers_record_dual_camera_training_contract() -> None:

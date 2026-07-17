@@ -399,6 +399,30 @@ def validate_dataset_source_selection(
     return selected[0]
 
 
+GE_ACT_DUAL_CAMERA_TRAIN_CONTRACT = {
+    "valid_cam": [
+        "observation.images.image",
+        "observation.images.wrist_image",
+    ],
+    "source_fps": 20,
+    "chunk": 9,
+    "action_chunk": 36,
+    "n_previous": 4,
+    "ignore_seek": False,
+}
+
+
+def validate_ge_act_dual_camera_train_config(train_config: dict[str, Any]) -> None:
+    """Reject GE-Act configs whose view order or temporal endpoints differ."""
+    for field, expected in GE_ACT_DUAL_CAMERA_TRAIN_CONTRACT.items():
+        actual = train_config.get(field, False if field == "ignore_seek" else None)
+        if type(actual) is not type(expected) or actual != expected:
+            raise ValueError(
+                "GE-Act dual-camera planner requires "
+                f"data.train.{field}={expected!r}, got {actual!r}"
+            )
+
+
 def load_ge_act_dual_camera_planner_dataset(
     config_path: str | Path,
 ) -> GEActDualCameraPlannerDataset:
@@ -418,25 +442,28 @@ def load_ge_act_dual_camera_planner_dataset(
             "GE-Act config must define train_data_class, train_data_class_path, "
             "and mapping data.train"
         ) from error
+    validate_ge_act_dual_camera_train_config(train_config)
 
     ge_act_root = Path(__file__).resolve().parents[1] / "ge_act"
     source_path = Path(class_source)
     if source_path.suffix == ".py" and not source_path.is_absolute():
         class_source = str(ge_act_root / source_path)
     ge_act_root_string = str(ge_act_root)
-    if ge_act_root_string not in sys.path:
-        sys.path.insert(0, ge_act_root_string)
-    from ge_act.utils import import_custom_class
-
-    dataset_class = import_custom_class(class_name, class_source)
-    # GE-Act runners construct datasets from the ge_act directory, and their
-    # YAML train split may contain paths such as configs/ltx_model/....
+    previous_sys_path = list(sys.path)
     previous_working_directory = Path.cwd()
-    os.chdir(ge_act_root)
     try:
+        if ge_act_root_string not in sys.path:
+            sys.path.insert(0, ge_act_root_string)
+        from ge_act.utils import import_custom_class
+
+        dataset_class = import_custom_class(class_name, class_source)
+        # GE-Act runners construct datasets from the ge_act directory, and their
+        # YAML train split may contain paths such as configs/ltx_model/....
+        os.chdir(ge_act_root)
         dataset = dataset_class(**train_config)
     finally:
         os.chdir(previous_working_directory)
+        sys.path[:] = previous_sys_path
     return GEActDualCameraPlannerDataset(
         dataset,
         n_previous=4,
@@ -471,6 +498,86 @@ def restore_camera_teacher_features(
             f"B*V={expected}, got {tuple(encoded.shape)}"
         )
     return encoded.reshape(int(batch_size), int(num_views), *encoded.shape[1:])
+
+
+def encode_dual_camera_teacher_targets(
+    current_camera_images: torch.Tensor,
+    future_camera_images: torch.Tensor,
+    *,
+    appearance_encoder: Any,
+    depth_encoder: Any,
+) -> dict[str, torch.Tensor]:
+    """Encode normalized main/wrist frames without losing the view dimension."""
+    for name, frames in (
+        ("current", current_camera_images),
+        ("future", future_camera_images),
+    ):
+        if frames.ndim != 5 or frames.shape[1] != 2 or frames.shape[-1] != 3:
+            raise ValueError(
+                f"{name} camera teacher frames must be [B,2,H,W,3], "
+                f"got {tuple(frames.shape)}"
+            )
+        if not torch.isfinite(frames).all():
+            raise ValueError(f"{name} camera teacher frames must be finite")
+        if frames.min() < -1.0001 or frames.max() > 1.0001:
+            raise ValueError(
+                f"{name} camera teacher frames must be normalized to [-1,1]"
+            )
+    if current_camera_images.shape != future_camera_images.shape:
+        raise ValueError(
+            "current and future camera teacher frames must have the same shape, got "
+            f"{tuple(current_camera_images.shape)} and "
+            f"{tuple(future_camera_images.shape)}"
+        )
+
+    batch_size, num_views = current_camera_images.shape[:2]
+    current_bv = (
+        flatten_camera_teacher_frames(current_camera_images).float() + 1.0
+    ).mul_(0.5).clamp_(0.0, 1.0)
+    future_bv = (
+        flatten_camera_teacher_frames(future_camera_images).float() + 1.0
+    ).mul_(0.5).clamp_(0.0, 1.0)
+    with torch.no_grad():
+        current_appearance, future_appearance = (
+            appearance_encoder.encode_current_and_future(current_bv, future_bv)
+        )
+        current_depth, future_depth = depth_encoder.encode_current_and_future(
+            current_bv,
+            future_bv,
+        )
+
+    expected_shapes = {
+        "appearance current": (batch_size * num_views, 256, 1024),
+        "appearance future": (batch_size * num_views, 256, 1024),
+        "depth current": (batch_size * num_views, 256, 2048),
+        "depth future": (batch_size * num_views, 256, 2048),
+    }
+    features = {
+        "appearance current": current_appearance,
+        "appearance future": future_appearance,
+        "depth current": current_depth,
+        "depth future": future_depth,
+    }
+    for name, encoded in features.items():
+        expected = expected_shapes[name]
+        if tuple(encoded.shape) != expected:
+            raise ValueError(
+                f"{name} teacher features must be {expected}, got {tuple(encoded.shape)}"
+            )
+
+    def restore(encoded: torch.Tensor) -> torch.Tensor:
+        return restore_camera_teacher_features(
+            encoded,
+            batch_size=batch_size,
+            num_views=num_views,
+        ).float()
+
+    return {
+        "current_dino_labels": restore(current_appearance),
+        "semantic_plan_labels": restore(future_appearance),
+        "current_depth_labels": restore(current_depth),
+        "depth_plan_labels": restore(future_depth),
+    }
 
 
 def configure_gradient_checkpointing(model: nn.Module, *, enabled: bool) -> None:
@@ -3537,44 +3644,14 @@ def main() -> None:
                     raise RuntimeError(
                         "GE-Act dual-camera training requires both appearance and depth teachers"
                     )
-                batch_size, num_views = current_camera_images.shape[:2]
-                # GE-Act emits normalized RGB in [-1, 1]; the actual SigLIP2/DA3
-                # encoder APIs consume [0, 1] or [0, 255] BCHW tensors.
-                current_bv = (
-                    flatten_camera_teacher_frames(current_camera_images).float() + 1.0
-                ).mul_(0.5).clamp_(0.0, 1.0)
-                future_bv = (
-                    flatten_camera_teacher_frames(future_camera_images).float() + 1.0
-                ).mul_(0.5).clamp_(0.0, 1.0)
-                with torch.no_grad():
-                    current_dino, future_dino = dino_encoder.encode_current_and_future(
-                        current_bv,
-                        future_bv,
+                batch.update(
+                    encode_dual_camera_teacher_targets(
+                        current_camera_images,
+                        future_camera_images,
+                        appearance_encoder=dino_encoder,
+                        depth_encoder=depth_encoder,
                     )
-                    current_depth, future_depth = depth_encoder.encode_current_and_future(
-                        current_bv,
-                        future_bv,
-                    )
-                batch["current_dino_labels"] = restore_camera_teacher_features(
-                    current_dino,
-                    batch_size=batch_size,
-                    num_views=num_views,
-                ).float()
-                batch["semantic_plan_labels"] = restore_camera_teacher_features(
-                    future_dino,
-                    batch_size=batch_size,
-                    num_views=num_views,
-                ).float()
-                batch["current_depth_labels"] = restore_camera_teacher_features(
-                    current_depth,
-                    batch_size=batch_size,
-                    num_views=num_views,
-                ).float()
-                batch["depth_plan_labels"] = restore_camera_teacher_features(
-                    future_depth,
-                    batch_size=batch_size,
-                    num_views=num_views,
-                ).float()
+                )
             elif keyframes is not None:
                 with torch.no_grad():
                     if dino_encoder is not None:
