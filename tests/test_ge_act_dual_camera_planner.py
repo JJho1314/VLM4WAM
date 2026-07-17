@@ -504,6 +504,147 @@ def test_wrapper_rejects_unsupported_camera_view_count() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("dataset_root", "fastwam_config", "ge_act_config"),
+    [
+        (None, None, None),
+        (Path("legacy"), Path("fastwam.yaml"), None),
+        (Path("legacy"), None, Path("ge_act.yaml")),
+        (None, Path("fastwam.yaml"), Path("ge_act.yaml")),
+    ],
+)
+def test_dataset_selection_requires_exactly_one_source(
+    dataset_root: Path | None,
+    fastwam_config: Path | None,
+    ge_act_config: Path | None,
+) -> None:
+    with pytest.raises(ValueError, match="exactly one"):
+        planner.validate_dataset_source_selection(
+            dataset_root=dataset_root,
+            fastwam_data_config=fastwam_config,
+            ge_act_data_config=ge_act_config,
+        )
+
+
+def test_dataset_selection_accepts_ge_act_config_without_loading_models() -> None:
+    assert (
+        planner.validate_dataset_source_selection(
+            dataset_root=None,
+            fastwam_data_config=None,
+            ge_act_data_config=Path("ge_act.yaml"),
+        )
+        == "ge_act"
+    )
+
+
+def test_dataset_selection_cli_accepts_ge_act_config_without_loading_models(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "ge_act.yaml"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "planner",
+            "--model-path",
+            str(tmp_path / "model"),
+            "--ge-act-data-config",
+            str(config_path),
+            "--output-dir",
+            str(tmp_path / "output"),
+        ],
+    )
+
+    args = planner.parse_args()
+
+    assert args.ge_act_data_config == config_path
+    assert args.dataset_root is None
+    assert args.fastwam_data_config is None
+
+
+def test_ge_act_dataset_selection_loads_configured_train_dataset(
+    tmp_path: Path,
+) -> None:
+    dataset_module = tmp_path / "fake_ge_act_dataset.py"
+    dataset_module.write_text(
+        "from pathlib import Path\n"
+        "class FakeGEActDataset:\n"
+        "    def __init__(self, marker):\n"
+        "        self.marker = marker\n"
+        "        self.constructor_cwd = Path.cwd()\n"
+        "    def __len__(self):\n"
+        "        return 1\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "ge_act.yaml"
+    config_path.write_text(
+        f"train_data_class_path: {dataset_module}\n"
+        "train_data_class: FakeGEActDataset\n"
+        "data:\n"
+        "  train:\n"
+        "    marker: configured-train-split\n",
+        encoding="utf-8",
+    )
+
+    dataset = planner.load_ge_act_dual_camera_planner_dataset(config_path)
+
+    assert isinstance(dataset, GEActDualCameraPlannerDataset)
+    assert dataset.dataset.marker == "configured-train-split"
+    assert dataset.dataset.constructor_cwd == PLANNER_ROOT.parent / "ge_act"
+    assert dataset.n_previous == 4
+    assert dataset.future_offset == 8
+
+
+def test_flatten_two_camera_frames_for_online_teachers_preserves_order() -> None:
+    frames = torch.zeros(2, 2, 4, 4, 3, dtype=torch.uint8)
+    frames[:, 0].fill_(10)
+    frames[:, 1].fill_(20)
+
+    flat = planner.flatten_camera_teacher_frames(frames)
+
+    assert flat.shape == (4, 3, 4, 4)
+    assert flat[0].float().mean() == 10
+    assert flat[1].float().mean() == 20
+    assert flat[2].float().mean() == 10
+    assert flat[3].float().mean() == 20
+
+
+def test_teacher_features_restore_batch_view_layout() -> None:
+    encoded = torch.arange(4 * 256 * 1024).reshape(4, 256, 1024)
+
+    restored = planner.restore_camera_teacher_features(
+        encoded,
+        batch_size=2,
+        num_views=2,
+    )
+
+    assert restored.shape == (2, 2, 256, 1024)
+    torch.testing.assert_close(restored[0, 1], encoded[1])
+
+
+def test_ge_act_launchers_record_dual_camera_training_contract() -> None:
+    legacy_launcher = (
+        PLANNER_ROOT / "lingbot_dino_4b" / "train_lingbot_dino_4b.sh"
+    ).read_text(encoding="utf-8")
+    ge_act_launcher = (
+        PLANNER_ROOT
+        / "dinov3_da3_2b"
+        / "train_ge_act_dual_camera_siglip2da3.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "GE_ACT_DATA_CONFIG" in legacy_launcher
+    assert "--ge-act-data-config" in legacy_launcher
+    assert "INIT_PLANNER_CHECKPOINT" in legacy_launcher
+    assert "--init-planner-checkpoint" in legacy_launcher
+    assert "NUM_TASK_TOKENS=${NUM_TASK_TOKENS:-64}" in legacy_launcher
+    assert "MAX_STEPS=${MAX_STEPS:-30000}" in ge_act_launcher
+    assert "SIGLIP2_INPUT_SIZE=${SIGLIP2_INPUT_SIZE:-256}" in ge_act_launcher
+    assert "DA3_ALIGN_STRATEGY=${DA3_ALIGN_STRATEGY:-last_layer}" in ge_act_launcher
+    assert "FULL_FINETUNE=${FULL_FINETUNE:-1}" in ge_act_launcher
+    assert "FUTURE_KEYFRAME_OFFSET=${FUTURE_KEYFRAME_OFFSET:-8}" in ge_act_launcher
+
+
 def test_legacy_checkpoint_initializes_four_shared_heads_without_expansion(
     tmp_path: Path,
 ) -> None:

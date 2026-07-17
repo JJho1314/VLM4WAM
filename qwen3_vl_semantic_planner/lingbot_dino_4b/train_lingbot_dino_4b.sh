@@ -3,13 +3,13 @@
 # Runs through Accelerate + DeepSpeed ZeRO-2 by default in the validated box env.
 # All paths default to the downloaded/extracted weights on this box.
 #
-# Required: exactly one of DATASET_ROOT (legacy DROID data) or FASTWAM_DATA_CONFIG.
+# Required: exactly one of DATASET_ROOT, FASTWAM_DATA_CONFIG, or GE_ACT_DATA_CONFIG.
 # Smoke:     USE_DEEPSPEED=0 NUM_GPUS=1 BATCH_SIZE=1 GRAD_ACCUM=1 EXPECTED_GLOBAL_BATCH=1 MAX_STEPS=2 SAVE_STEPS=2 FULL_FINETUNE=0 bash train_lingbot_dino_4b.sh
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLANNER_DIR="$(dirname "$HERE")"                       # qwen3_vl_semantic_planner
-REPO_ROOT="$(cd "$PLANNER_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$PLANNER_DIR/.." && pwd)"
 cd "$REPO_ROOT" || exit 2
 
 # covt/planner training env: transformers 4.57 (Qwen3-VL) + torch 2.6 flex_attention + mistral_common 1.9
@@ -20,6 +20,7 @@ USE_DEEPSPEED=${USE_DEEPSPEED:-1}
 
 WEIGHTS=${WEIGHTS:-/data/LFT-W02_data/junjie/weights}
 MODEL_PATH=${MODEL_PATH:-$WEIGHTS/Qwen3-VL-4B-lingbot-vlm}          # extracted 4B VLM (see extract_qwenvl_from_lingbot.py)
+INIT_PLANNER_CHECKPOINT=${INIT_PLANNER_CHECKPOINT:-}
 LINGBOT_6B=${LINGBOT_6B:-$WEIGHTS/lingbot-vla-v2-6b}
 DINO_TEACHER_CKPT=${DINO_TEACHER_CKPT:-$LINGBOT_6B/dino_video/teacher_step_10000.pth}
 DINO_TEACHER_CONFIG=${DINO_TEACHER_CONFIG:-$LINGBOT_6B/dino_video/config.yaml}
@@ -59,15 +60,16 @@ UTILS3D_MOGE_PATH=${UTILS3D_MOGE_PATH:-/data/LFT-W02_data/junjie/weights/py_deps
 
 DATASET_ROOT=${DATASET_ROOT:-}
 FASTWAM_DATA_CONFIG=${FASTWAM_DATA_CONFIG:-}
+GE_ACT_DATA_CONFIG=${GE_ACT_DATA_CONFIG:-}
 FASTWAM_DATASET_DIRS=${FASTWAM_DATASET_DIRS:-}
 FASTWAM_TEXT_EMBEDDING_CACHE_DIR=${FASTWAM_TEXT_EMBEDDING_CACHE_DIR:-}
 FASTWAM_PRETRAINED_NORM_STATS=${FASTWAM_PRETRAINED_NORM_STATS:-}
-if [[ -n "$DATASET_ROOT" && -n "$FASTWAM_DATA_CONFIG" ]]; then
-  echo "[launch] set only one of DATASET_ROOT or FASTWAM_DATA_CONFIG" >&2
-  exit 2
-fi
-if [[ -z "$DATASET_ROOT" && -z "$FASTWAM_DATA_CONFIG" ]]; then
-  echo "[launch] set DATASET_ROOT or FASTWAM_DATA_CONFIG" >&2
+DATA_SOURCE_COUNT=0
+[[ -n "$DATASET_ROOT" ]] && DATA_SOURCE_COUNT=$((DATA_SOURCE_COUNT + 1))
+[[ -n "$FASTWAM_DATA_CONFIG" ]] && DATA_SOURCE_COUNT=$((DATA_SOURCE_COUNT + 1))
+[[ -n "$GE_ACT_DATA_CONFIG" ]] && DATA_SOURCE_COUNT=$((DATA_SOURCE_COUNT + 1))
+if [[ "$DATA_SOURCE_COUNT" -ne 1 ]]; then
+  echo "[launch] set exactly one of DATASET_ROOT, FASTWAM_DATA_CONFIG, or GE_ACT_DATA_CONFIG" >&2
   exit 2
 fi
 OUTPUT_DIR=${OUTPUT_DIR:-$REPO_ROOT/outputs/qwen3vl_semantic_planner/qwen3vl4b_lingbot_dino_uniform_k5}
@@ -107,11 +109,10 @@ DTYPE=${DTYPE:-bf16}
 FULL_FINETUNE=${FULL_FINETUNE:-1}   # 1: tune LM+head; 0: head + plan-token embeddings only (fits small GPUs)
 
 mkdir -p "$OUTPUT_DIR" logs
-DATA_SOURCE=${FASTWAM_DATA_CONFIG:-$DATASET_ROOT}
+DATA_SOURCE=${GE_ACT_DATA_CONFIG:-${FASTWAM_DATA_CONFIG:-$DATASET_ROOT}}
 echo "[launch] gpus=$NUM_GPUS model=$MODEL_PATH dataset=$DATA_SOURCE out=$OUTPUT_DIR full_ft=$FULL_FINETUNE"
 
 TRAIN_ARGS=(
-  --model-path "$MODEL_PATH"
   --output-dir "$OUTPUT_DIR"
   --max-steps "$MAX_STEPS"
   --batch-size "$BATCH_SIZE"
@@ -148,7 +149,14 @@ TRAIN_ARGS=(
   --dino-input-size "$DINO_INPUT_SIZE"
   --video-target-type "$VIDEO_TARGET_TYPE"
 )
-if [[ -n "$FASTWAM_DATA_CONFIG" ]]; then
+if [[ -n "$INIT_PLANNER_CHECKPOINT" ]]; then
+  TRAIN_ARGS+=(--init-planner-checkpoint "$INIT_PLANNER_CHECKPOINT")
+else
+  TRAIN_ARGS+=(--model-path "$MODEL_PATH")
+fi
+if [[ -n "$GE_ACT_DATA_CONFIG" ]]; then
+  TRAIN_ARGS+=(--ge-act-data-config "$GE_ACT_DATA_CONFIG")
+elif [[ -n "$FASTWAM_DATA_CONFIG" ]]; then
   export PYTHONPATH="$REPO_ROOT/third_party/FastWAM/src${PYTHONPATH:+:$PYTHONPATH}"
   TRAIN_ARGS+=(--fastwam-data-config "$FASTWAM_DATA_CONFIG")
   if [[ -n "$FASTWAM_DATASET_DIRS" ]]; then
@@ -177,7 +185,7 @@ if [[ "$PRIVATE_LATENT_PER_KEYFRAME" =~ ^[1-9][0-9]*$ ]]; then
   TRAIN_ARGS+=(--private-latent-per-keyframe "$PRIVATE_LATENT_PER_KEYFRAME")
 fi
 # warm-start only if the 6b model shards are actually present (skip gracefully, e.g. smoke on HPC3).
-if [[ -n "$HEAD_WARMSTART_CKPT" && -f "$HEAD_WARMSTART_CKPT/model.safetensors.index.json" ]]; then
+if [[ -z "$INIT_PLANNER_CHECKPOINT" && -n "$HEAD_WARMSTART_CKPT" && -f "$HEAD_WARMSTART_CKPT/model.safetensors.index.json" ]]; then
   TRAIN_ARGS+=(--head-warmstart-ckpt "$HEAD_WARMSTART_CKPT")
 else
   echo "[launch] skip head warm-start (no model.safetensors.index.json under '$HEAD_WARMSTART_CKPT')"

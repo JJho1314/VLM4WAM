@@ -54,6 +54,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "din
 from lingbot_dino_head import LingbotDinoPlanHead  # noqa: E402
 from dino_video_target import DinoVideoTargetEncoder  # noqa: E402
 from depth_target import DepthTargetEncoder  # noqa: E402
+try:  # package import in tests/libraries; flat fallback when launched as a script
+    from .ge_act_dual_camera import (  # type: ignore[import-not-found]
+        DualCameraPlannerCollator,
+        GEActDualCameraPlannerDataset,
+    )
+except ImportError:  # pragma: no cover - exercised by the production script entry point
+    from ge_act_dual_camera import (  # noqa: E402
+        DualCameraPlannerCollator,
+        GEActDualCameraPlannerDataset,
+    )
 from distributed_runtime import (  # noqa: E402
     accumulation_context,
     build_accelerator,
@@ -369,6 +379,100 @@ def _nonnegative_int(value: str) -> int:
     return parsed
 
 
+def validate_dataset_source_selection(
+    *,
+    dataset_root: Path | None,
+    fastwam_data_config: Path | None,
+    ge_act_data_config: Path | None,
+) -> str:
+    sources = {
+        "legacy": dataset_root,
+        "fastwam": fastwam_data_config,
+        "ge_act": ge_act_data_config,
+    }
+    selected = [name for name, value in sources.items() if value is not None]
+    if len(selected) != 1:
+        raise ValueError(
+            "exactly one of --dataset-root, --fastwam-data-config, or "
+            "--ge-act-data-config is required"
+        )
+    return selected[0]
+
+
+def load_ge_act_dual_camera_planner_dataset(
+    config_path: str | Path,
+) -> GEActDualCameraPlannerDataset:
+    import yaml
+
+    config_path = Path(config_path)
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = yaml.load(handle, Loader=yaml.Loader)
+    if not isinstance(config, dict):
+        raise ValueError(f"GE-Act config must be a mapping: {config_path}")
+    try:
+        class_name = str(config["train_data_class"])
+        class_source = str(config["train_data_class_path"])
+        train_config = dict(config["data"]["train"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            "GE-Act config must define train_data_class, train_data_class_path, "
+            "and mapping data.train"
+        ) from error
+
+    ge_act_root = Path(__file__).resolve().parents[1] / "ge_act"
+    source_path = Path(class_source)
+    if source_path.suffix == ".py" and not source_path.is_absolute():
+        class_source = str(ge_act_root / source_path)
+    ge_act_root_string = str(ge_act_root)
+    if ge_act_root_string not in sys.path:
+        sys.path.insert(0, ge_act_root_string)
+    from ge_act.utils import import_custom_class
+
+    dataset_class = import_custom_class(class_name, class_source)
+    # GE-Act runners construct datasets from the ge_act directory, and their
+    # YAML train split may contain paths such as configs/ltx_model/....
+    previous_working_directory = Path.cwd()
+    os.chdir(ge_act_root)
+    try:
+        dataset = dataset_class(**train_config)
+    finally:
+        os.chdir(previous_working_directory)
+    return GEActDualCameraPlannerDataset(
+        dataset,
+        n_previous=4,
+        future_offset=8,
+    )
+
+
+def flatten_camera_teacher_frames(frames: torch.Tensor) -> torch.Tensor:
+    if frames.ndim != 5 or frames.shape[-1] != 3:
+        raise ValueError(
+            f"camera teacher frames must be [B,V,H,W,3], got {tuple(frames.shape)}"
+        )
+    batch_size, num_views, height, width, _channels = frames.shape
+    return frames.permute(0, 1, 4, 2, 3).reshape(
+        batch_size * num_views,
+        3,
+        height,
+        width,
+    ).contiguous()
+
+
+def restore_camera_teacher_features(
+    encoded: torch.Tensor,
+    *,
+    batch_size: int,
+    num_views: int,
+) -> torch.Tensor:
+    expected = int(batch_size) * int(num_views)
+    if encoded.ndim < 2 or encoded.shape[0] != expected:
+        raise ValueError(
+            "encoded camera teacher features must have leading dimension "
+            f"B*V={expected}, got {tuple(encoded.shape)}"
+        )
+    return encoded.reshape(int(batch_size), int(num_views), *encoded.shape[1:])
+
+
 def configure_gradient_checkpointing(model: nn.Module, *, enabled: bool) -> None:
     if not enabled:
         if hasattr(model, "gradient_checkpointing_disable"):
@@ -399,6 +503,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset-root", type=Path, default=None)
     parser.add_argument("--fastwam-data-config", type=Path, default=None)
+    parser.add_argument("--ge-act-data-config", type=Path, default=None)
     parser.add_argument("--fastwam-dataset-dir", action="append", default=[])
     parser.add_argument(
         "--fastwam-text-embedding-cache-dir",
@@ -570,9 +675,15 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--init-planner-checkpoint is mutually exclusive with --head-warmstart-ckpt"
         )
-    if (args.dataset_root is None) == (args.fastwam_data_config is None):
+    try:
+        validate_dataset_source_selection(
+            dataset_root=args.dataset_root,
+            fastwam_data_config=args.fastwam_data_config,
+            ge_act_data_config=args.ge_act_data_config,
+        )
+    except ValueError as error:
         parser.error(
-            "exactly one of --dataset-root or --fastwam-data-config is required"
+            str(error)
         )
     if args.fastwam_dataset_dir and args.fastwam_data_config is None:
         parser.error("--fastwam-dataset-dir requires --fastwam-data-config")
@@ -3072,7 +3183,11 @@ def main() -> None:
     if args.plan_head_type == "lingbot_dino":
         if not args.online_plan_labels:
             raise ValueError("lingbot_dino requires --online-plan-labels (online DINO-video targets)")
-        if args.frame_ranges_json is None and args.fastwam_data_config is None:
+        if (
+            args.frame_ranges_json is None
+            and args.fastwam_data_config is None
+            and args.ge_act_data_config is None
+        ):
             args.frame_ranges_json = args.dataset_root / "frame_ranges.json"
         if args.video_target_type == "dinov3":
             from dinov3_target import Dinov3TargetEncoder  # noqa: E402
@@ -3152,7 +3267,11 @@ def main() -> None:
 
         if args.siglip2_encoder_path is None:
             raise ValueError("--online-plan-labels requires --siglip2-encoder-path")
-        if args.frame_ranges_json is None and args.fastwam_data_config is None:
+        if (
+            args.frame_ranges_json is None
+            and args.fastwam_data_config is None
+            and args.ge_act_data_config is None
+        ):
             args.frame_ranges_json = args.dataset_root / "frame_ranges.json"
         sig_model, sig_processor = load_siglip2(args.siglip2_encoder_path, device, "bf16")
         sig_model.requires_grad_(False)
@@ -3218,6 +3337,7 @@ def main() -> None:
         da3_align_strategy=getattr(args, "da3_align_strategy", "last_layer"),
         da3_num_layers=int(getattr(args, "da3_num_layers", 1)),
         da3_layer_weights=getattr(args, "da3_layer_weights_resolved", None),
+        num_camera_views=2 if args.ge_act_data_config is not None else 1,
     )
     if args.init_planner_checkpoint is not None:
         initialization_report = load_planner_initialization(
@@ -3274,7 +3394,27 @@ def main() -> None:
             flush=True,
         )
 
-    if args.online_plan_labels:
+    if args.ge_act_data_config is not None:
+        dataset = load_ge_act_dual_camera_planner_dataset(args.ge_act_data_config)
+        collator = DualCameraPlannerCollator(
+            processor=processor,
+            plan_sequence=plan_sequence,
+        )
+        if accelerator.is_main_process:
+            print(
+                json.dumps(
+                    {
+                        "online_plan_labels": True,
+                        "dataset_source": "ge_act",
+                        "stems": len(dataset),
+                        "keyframe_offsets": [8],
+                        "num_camera_views": 2,
+                        "feature_type": args.sample_feature_type,
+                    }
+                ),
+                flush=True,
+            )
+    elif args.online_plan_labels:
         if args.fastwam_data_config is not None:
             dataset = FastWAMOnlinePlannerDataset.from_config(
                 args.fastwam_data_config,
@@ -3302,6 +3442,10 @@ def main() -> None:
                 max_samples=args.max_samples,
                 seed=args.seed,
             )
+        collator = Collator(
+            processor=processor,
+            plan_sequence=plan_sequence,
+        )
         if accelerator.is_main_process:
             print(
                 json.dumps(
@@ -3325,15 +3469,16 @@ def main() -> None:
             max_samples=args.max_samples,
             sample_one_window_per_stem=args.sample_one_window_per_stem,
         )
+        collator = Collator(
+            processor=processor,
+            plan_sequence=plan_sequence,
+        )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=Collator(
-            processor=processor,
-            plan_sequence=plan_sequence,
-        ),
+        collate_fn=collator,
         pin_memory=True,
     )
 
@@ -3373,6 +3518,13 @@ def main() -> None:
             batch.pop("stems", None)
             keyframes = batch.pop("keyframe_images", None)
             current = batch.pop("current_image", None)
+            current_camera_images = batch.pop("current_camera_images", None)
+            future_camera_images = batch.pop("future_camera_images", None)
+            if (current_camera_images is None) != (future_camera_images is None):
+                raise RuntimeError(
+                    "dual-camera batches must contain both current_camera_images "
+                    "and future_camera_images"
+                )
             future_video_effective_fps = batch.pop(
                 "future_video_effective_fps",
                 None,
@@ -3380,7 +3532,50 @@ def main() -> None:
             module = accelerator.unwrap_model(wrapper)
             model_dtype = next(module.model.parameters()).dtype
             batch = move_qwen_inputs_to_device(batch, device, model_dtype=model_dtype)
-            if keyframes is not None:
+            if current_camera_images is not None:
+                if dino_encoder is None or depth_encoder is None:
+                    raise RuntimeError(
+                        "GE-Act dual-camera training requires both appearance and depth teachers"
+                    )
+                batch_size, num_views = current_camera_images.shape[:2]
+                # GE-Act emits normalized RGB in [-1, 1]; the actual SigLIP2/DA3
+                # encoder APIs consume [0, 1] or [0, 255] BCHW tensors.
+                current_bv = (
+                    flatten_camera_teacher_frames(current_camera_images).float() + 1.0
+                ).mul_(0.5).clamp_(0.0, 1.0)
+                future_bv = (
+                    flatten_camera_teacher_frames(future_camera_images).float() + 1.0
+                ).mul_(0.5).clamp_(0.0, 1.0)
+                with torch.no_grad():
+                    current_dino, future_dino = dino_encoder.encode_current_and_future(
+                        current_bv,
+                        future_bv,
+                    )
+                    current_depth, future_depth = depth_encoder.encode_current_and_future(
+                        current_bv,
+                        future_bv,
+                    )
+                batch["current_dino_labels"] = restore_camera_teacher_features(
+                    current_dino,
+                    batch_size=batch_size,
+                    num_views=num_views,
+                ).float()
+                batch["semantic_plan_labels"] = restore_camera_teacher_features(
+                    future_dino,
+                    batch_size=batch_size,
+                    num_views=num_views,
+                ).float()
+                batch["current_depth_labels"] = restore_camera_teacher_features(
+                    current_depth,
+                    batch_size=batch_size,
+                    num_views=num_views,
+                ).float()
+                batch["depth_plan_labels"] = restore_camera_teacher_features(
+                    future_depth,
+                    batch_size=batch_size,
+                    num_views=num_views,
+                ).float()
+            elif keyframes is not None:
                 with torch.no_grad():
                     if dino_encoder is not None:
                         # Online DINO-video targets: teacher over [current, current, keyframe_k] clips
