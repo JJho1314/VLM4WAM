@@ -62,6 +62,7 @@ from models.ltx_models.semantic_conditioning import (
     build_semantic_plan_times,
     select_future_keyframes,
 )
+from models.ltx_models.vlm_semantic_planner import FrozenDualCameraVLMPlanner
 
 LOG_LEVEL = "INFO"
 # LOG_LEVEL = "DEBUG"
@@ -124,6 +125,39 @@ def sample_semantic_condition_mask(
         raise ValueError("semantic dropout probability must be in [0, 1]")
     keep = torch.rand(batch_size, device=device, generator=generator) >= dropout_probability
     return keep.to(dtype=dtype).repeat_interleave(n_view)
+
+
+def build_vlm_semantic_condition(
+    provider,
+    video: torch.Tensor,
+    instructions,
+    *,
+    n_previous: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Predict from the last current observation without exposing future RGB."""
+
+    if video.ndim != 6 or video.shape[1] != 3 or video.shape[2] != 2:
+        raise ValueError(f"video must be [B,3,2,T,H,W], got {tuple(video.shape)}")
+    current_index = int(n_previous) - 1
+    if current_index < 0 or current_index >= video.shape[3]:
+        raise ValueError(
+            f"n_previous={n_previous} selects invalid current index {current_index}"
+        )
+    current_images = video[:, :, :, current_index].permute(0, 2, 1, 3, 4)
+    plan = provider.predict(current_images.contiguous(), instructions)
+    expected_tokens = (video.shape[0], 2, 1, 256, 1024)
+    expected_times = (video.shape[0] * 2, 1)
+    if tuple(plan.semantic_tokens.shape) != expected_tokens:
+        raise RuntimeError(
+            "VLM semantic tokens must have shape "
+            f"{expected_tokens}, got {tuple(plan.semantic_tokens.shape)}"
+        )
+    if tuple(plan.times.shape) != expected_times:
+        raise RuntimeError(
+            f"VLM semantic times must have shape {expected_times}, "
+            f"got {tuple(plan.times.shape)}"
+        )
+    return plan.semantic_tokens, plan.times
 
 
 def freeze_conditioning_modules(*components) -> None:
@@ -233,6 +267,7 @@ class Trainer:
         self.vae = None
         self.scheduler = None
         self.semantic_encoder = None
+        self.semantic_planner = None
         self.video_frame_rate = compute_effective_video_fps(self.args.data["train"])
 
         self._init_distributed()
@@ -473,14 +508,24 @@ class Trainer:
 
         semantic_config = getattr(self.args, "semantic_plan", {})
         if semantic_config.get("enabled", False):
-            self.semantic_encoder = OnlineSiglip2SemanticEncoder(
-                semantic_config["model_name_or_path"],
-                device=device,
-                dtype=dtype,
-                frame_microbatch_size=int(semantic_config.get("frame_microbatch_size", 32)),
-                expected_tokens=int(semantic_config.get("tokens_per_frame", 256)),
-                expected_feature_dim=int(semantic_config.get("feature_dim", 1024)),
-            )
+            semantic_source = semantic_config.get("source", "gt_siglip2")
+            if semantic_source == "gt_siglip2":
+                self.semantic_encoder = OnlineSiglip2SemanticEncoder(
+                    semantic_config["model_name_or_path"],
+                    device=device,
+                    dtype=dtype,
+                    frame_microbatch_size=int(semantic_config.get("frame_microbatch_size", 32)),
+                    expected_tokens=int(semantic_config.get("tokens_per_frame", 256)),
+                    expected_feature_dim=int(semantic_config.get("feature_dim", 1024)),
+                )
+            elif semantic_source == "vlm_planner":
+                self.semantic_planner = FrozenDualCameraVLMPlanner.from_checkpoint(
+                    semantic_config["planner_checkpoint"],
+                    device=device,
+                    dtype=dtype,
+                )
+            else:
+                raise ValueError(f"unknown semantic_plan.source: {semantic_source}")
 
 
         ### Load Diffuser Scheduler
@@ -501,7 +546,12 @@ class Trainer:
     def prepare_trainable_parameters(self):
         logger.info("Initializing trainable parameters")
         
-        freeze_conditioning_modules(self.text_encoder, self.vae, self.semantic_encoder)
+        freeze_conditioning_modules(
+            self.text_encoder,
+            self.vae,
+            self.semantic_encoder,
+            getattr(self.semantic_planner, "wrapper", None),
+        )
 
         if torch.backends.mps.is_available() and self.state.weight_dtype == torch.bfloat16:
             # due to pytorch#99272, MPS does not yet support bfloat16.
@@ -659,6 +709,8 @@ class Trainer:
                     batch_size, c, n_view, _, h, w = video.shape
                     mem_size = self.args.data['train']['n_previous']
                     semantic_keyframes = None
+                    planner_semantic_plan = None
+                    planner_semantic_times = None
                     if self.semantic_encoder is not None:
                         semantic_config = self.args.semantic_plan
                         semantic_future = rearrange(
@@ -669,6 +721,15 @@ class Trainer:
                             semantic_future,
                             indices=tuple(semantic_config.get("keyframe_indices", (0, 3, 5, 8))),
                         ).contiguous()
+                    elif self.semantic_planner is not None:
+                        planner_semantic_plan, planner_semantic_times = (
+                            build_vlm_semantic_condition(
+                                self.semantic_planner,
+                                video,
+                                batch['caption'],
+                                n_previous=mem_size,
+                            )
+                        )
                     video = rearrange(video, 'b c v t h w -> (b v) c t h w')
 
                     # here we use color jitter to the video, with different views or different batches different jitter
@@ -706,6 +767,16 @@ class Trainer:
                             indices=tuple(self.args.semantic_plan.get("keyframe_indices", (0, 3, 5, 8))),
                             device=accelerator.device,
                         )
+                    elif self.semantic_planner is not None:
+                        semantic_plan = planner_semantic_plan.to(
+                            device=accelerator.device,
+                            dtype=weight_dtype,
+                        )
+                        semantic_plan_times = planner_semantic_times.to(
+                            device=accelerator.device,
+                            dtype=torch.float32,
+                        )
+                    if semantic_plan is not None:
                         semantic_condition_mask = sample_semantic_condition_mask(
                             batch_size=batch_size,
                             n_view=n_view,
@@ -997,9 +1068,13 @@ class Trainer:
 
         image = image[:batch_size]
 
-        if self.semantic_encoder is not None:
+        if self.semantic_encoder is not None or self.semantic_planner is not None:
             semantic_mode = semantic_mode or self.args.semantic_plan.get("validation_mode", "gt")
             if semantic_mode == "gt":
+                if self.semantic_encoder is None:
+                    raise ValueError(
+                        "GT semantic validation requires semantic_plan.source=gt_siglip2"
+                    )
                 mem_size = self.args.data['train']['n_previous']
                 raw_future_frames = self.args.data['train']['chunk']
                 semantic_future = rearrange(
@@ -1025,6 +1100,30 @@ class Trainer:
                     num_latent_frames=latent_num_frames,
                     indices=tuple(self.args.semantic_plan.get("keyframe_indices", (0, 3, 5, 8))),
                     device=accelerator.device,
+                )
+                semantic_condition_mask = torch.ones(
+                    batch_size * v,
+                    device=accelerator.device,
+                    dtype=self.state.weight_dtype,
+                )
+            elif semantic_mode == "planner":
+                if self.semantic_planner is None:
+                    raise ValueError(
+                        "planner semantic validation requires semantic_plan.source=vlm_planner"
+                    )
+                semantic_plan, semantic_plan_times = build_vlm_semantic_condition(
+                    self.semantic_planner,
+                    gt_video[:batch_size],
+                    prompt[:batch_size],
+                    n_previous=self.args.data['train']['n_previous'],
+                )
+                semantic_plan = semantic_plan.to(
+                    device=accelerator.device,
+                    dtype=self.state.weight_dtype,
+                )
+                semantic_plan_times = semantic_plan_times.to(
+                    device=accelerator.device,
+                    dtype=torch.float32,
                 )
                 semantic_condition_mask = torch.ones(
                     batch_size * v,

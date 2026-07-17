@@ -38,30 +38,59 @@ def collect_preflight_errors(
     train_data = config.get("data", {}).get("train", {})
     val_data = config.get("data", {}).get("val", {})
     keyframes = semantic.get("keyframe_indices", [])
+    semantic_source = semantic.get("source", "gt_siglip2")
+    hdf5_backend = config.get("train_data_class") == "LiberoFastWAMHDF5Dataset"
     if not semantic.get("enabled", False):
         errors.append("semantic_plan.enabled must be true")
-    if keyframes != [0, 3, 5, 8]:
-        errors.append("semantic keyframes must be [0, 3, 5, 8]")
+    if semantic_source == "gt_siglip2":
+        if keyframes != [0, 3, 5, 8]:
+            errors.append("semantic keyframes must be [0, 3, 5, 8]")
+        if semantic.get("validation_mode", "gt") != "gt":
+            errors.append("GT SigLIP2 validation_mode must be gt")
+        if not semantic.get("model_name_or_path"):
+            errors.append("semantic_plan.model_name_or_path is required")
+    elif semantic_source == "vlm_planner":
+        if keyframes != [8]:
+            errors.append("VLM planner semantic keyframes must be [8]")
+        if semantic.get("validation_mode") != "planner":
+            errors.append("VLM planner validation_mode must be planner")
+        if not semantic.get("planner_checkpoint"):
+            errors.append("semantic_plan.planner_checkpoint is required")
+    else:
+        errors.append(f"unknown semantic_plan.source: {semantic_source}")
     if semantic.get("tokens_per_frame") != 256:
         errors.append("SigLIP2 must provide 256 tokens per frame")
     if semantic.get("feature_dim") != 1024 or model_config.get("semantic_plan_in_dim") != 1024:
         errors.append("SigLIP2 feature width must be 1024")
     if model_config.get("semantic_plan_cross_attention_blocks") != list(range(28)):
         errors.append("semantic cross-attention must be enabled in all 28 LTX blocks")
+    if model_config.get("semantic_plan_num_keyframes") != len(keyframes):
+        errors.append("LTX semantic keyframe count must match semantic_plan.keyframe_indices")
+    if model_config.get("semantic_plan_num_views") != 2:
+        errors.append("LTX semantic plan must preserve two camera views")
     if train_data.get("chunk") != 9 or train_data.get("n_previous") != 4:
         errors.append("FastWAM clip layout must use four memory and nine future frames")
     if train_data.get("source_fps") != 20:
         errors.append("LIBERO source_fps must be 20")
-    if not train_data.get("require_predecoded", False):
-        errors.append("training must require predecoded RGB caches")
-    if not val_data.get("require_predecoded", False):
-        errors.append("validation must require predecoded RGB caches")
-    train_cache_root = train_data.get("predecoded_video_root")
-    val_cache_root = val_data.get("predecoded_video_root")
-    if not train_cache_root:
-        errors.append("training predecoded RGB cache root is missing")
-    if train_cache_root != val_cache_root:
-        errors.append("train and validation must use the same predecoded RGB cache")
+    train_cache_root = None
+    if hdf5_backend:
+        train_manifest = train_data.get("manifest_path")
+        val_manifest = val_data.get("manifest_path")
+        if not train_manifest:
+            errors.append("training HDF5 manifest is missing")
+        if train_manifest != val_manifest:
+            errors.append("train and validation must use the same HDF5 manifest")
+    else:
+        if not train_data.get("require_predecoded", False):
+            errors.append("training must require predecoded RGB caches")
+        if not val_data.get("require_predecoded", False):
+            errors.append("validation must require predecoded RGB caches")
+        train_cache_root = train_data.get("predecoded_video_root")
+        val_cache_root = val_data.get("predecoded_video_root")
+        if not train_cache_root:
+            errors.append("training predecoded RGB cache root is missing")
+        if train_cache_root != val_cache_root:
+            errors.append("train and validation must use the same predecoded RGB cache")
     if max(keyframes, default=-1) >= train_data.get("chunk", 0):
         errors.append("semantic keyframes exceed the future clip")
 
@@ -87,17 +116,21 @@ def collect_preflight_errors(
     required_paths = {
         "LTX pretrained components": config.get("pretrained_model_name_or_path"),
         "base diffusion checkpoint": config.get("diffusion_model", {}).get("model_path"),
-        "SigLIP2 checkpoint": semantic.get("model_name_or_path"),
     }
+    if semantic_source == "gt_siglip2":
+        required_paths["SigLIP2 checkpoint"] = semantic.get("model_name_or_path")
+    elif semantic_source == "vlm_planner":
+        required_paths["dual-camera VLM planner"] = semantic.get("planner_checkpoint")
     for label, raw_path in required_paths.items():
         if not raw_path or not Path(raw_path).exists():
             errors.append(f"missing {label}: {raw_path}")
-    siglip_path = Path(semantic.get("model_name_or_path", ""))
-    if siglip_path.is_dir() and not (
-        list(siglip_path.glob("*.safetensors"))
-        or (siglip_path / "pytorch_model.bin").is_file()
-    ):
-        errors.append(f"SigLIP2 directory has no model weights: {siglip_path}")
+    if semantic_source == "gt_siglip2":
+        siglip_path = Path(semantic.get("model_name_or_path", ""))
+        if siglip_path.is_dir() and not (
+            list(siglip_path.glob("*.safetensors"))
+            or (siglip_path / "pytorch_model.bin").is_file()
+        ):
+            errors.append(f"SigLIP2 directory has no model weights: {siglip_path}")
     ltx_path = Path(config.get("pretrained_model_name_or_path", ""))
     if ltx_path.is_dir():
         for component in ("tokenizer", "text_encoder", "vae"):
@@ -106,7 +139,11 @@ def collect_preflight_errors(
     for data_root in sorted(set(train_data.get("data_roots", []))):
         if not Path(data_root).is_dir():
             errors.append(f"missing training data root: {data_root}")
-    if train_cache_root and not Path(train_cache_root).is_dir():
+    if hdf5_backend:
+        manifest_path = train_data.get("manifest_path")
+        if manifest_path and not Path(manifest_path).is_file():
+            errors.append(f"missing HDF5 manifest: {manifest_path}")
+    elif train_cache_root and not Path(train_cache_root).is_dir():
         errors.append(f"missing predecoded RGB cache root: {train_cache_root}")
 
     stat_file = Path(train_data.get("stat_file", ""))

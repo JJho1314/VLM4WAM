@@ -44,7 +44,16 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from qwen3vl_wrapper import load_qwen3vl_model_and_processor, move_qwen_inputs_to_device
+try:  # package import for GE-Act provider; flat fallback for script entry point
+    from .qwen3vl_wrapper import (
+        load_qwen3vl_model_and_processor,
+        move_qwen_inputs_to_device,
+    )
+except ImportError:  # pragma: no cover - exercised by the production script entry point
+    from qwen3vl_wrapper import (
+        load_qwen3vl_model_and_processor,
+        move_qwen_inputs_to_device,
+    )
 
 # 4B-specific modules live in the lingbot_dino_4b/ subpackage; add it to the path (flat import,
 # matching how lingbot_dino_head imports lingbot_resampler).
@@ -64,15 +73,26 @@ except ImportError:  # pragma: no cover - exercised by the production script ent
         DualCameraPlannerCollator,
         GEActDualCameraPlannerDataset,
     )
-from distributed_runtime import (  # noqa: E402
-    accumulation_context,
-    build_accelerator,
-    checkpoint_module,
-    is_deepspeed,
-    is_optimizer_update,
-    should_save_periodic_checkpoint,
-    validate_runtime_contract,
-)
+try:  # package import for GE-Act provider; flat fallback for script entry point
+    from .distributed_runtime import (  # type: ignore[import-not-found]
+        accumulation_context,
+        build_accelerator,
+        checkpoint_module,
+        is_deepspeed,
+        is_optimizer_update,
+        should_save_periodic_checkpoint,
+        validate_runtime_contract,
+    )
+except ImportError:  # pragma: no cover - exercised by the production script entry point
+    from distributed_runtime import (  # noqa: E402
+        accumulation_context,
+        build_accelerator,
+        checkpoint_module,
+        is_deepspeed,
+        is_optimizer_update,
+        should_save_periodic_checkpoint,
+        validate_runtime_contract,
+    )
 
 import contextlib  # noqa: E402
 

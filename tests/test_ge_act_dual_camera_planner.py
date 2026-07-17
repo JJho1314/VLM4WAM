@@ -1086,8 +1086,9 @@ def test_qwen_loader_can_read_processor_from_separate_directory(
             )
 
         @classmethod
-        def from_pretrained(cls, path: str, **_kwargs: Any) -> "FakeQwenModel":
+        def from_pretrained(cls, path: str, **kwargs: Any) -> "FakeQwenModel":
             calls["model"] = Path(path)
+            calls["model_kwargs"] = kwargs
             return cls()
 
     monkeypatch.setitem(
@@ -1107,7 +1108,10 @@ def test_qwen_loader_can_read_processor_from_separate_directory(
         dtype="fp32",
     )
 
-    assert calls == {"model": model_dir, "processor": processor_dir}
+    assert calls["model"] == model_dir
+    assert calls["processor"] == processor_dir
+    assert calls["model_kwargs"]["torch_dtype"] is torch.float32
+    assert "dtype" not in calls["model_kwargs"]
     assert processor.tokenizer.padding_side == "left"
 
 

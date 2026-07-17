@@ -73,7 +73,7 @@ def load_qwen3vl_model_and_processor(
     )
 
     model_kwargs: dict[str, Any] = {
-        "dtype": torch_dtype,
+        "torch_dtype": torch_dtype,
         "local_files_only": local_files_only,
         "attn_implementation": attn_implementation,
     }
