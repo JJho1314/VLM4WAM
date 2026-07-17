@@ -16,6 +16,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -147,6 +148,64 @@ def choose_compression(results: dict[str, float]) -> str:
     return "lzf" if values["lzf"] >= 0.95 * values["none"] else "none"
 
 
+def _best_hdf5_throughput(report: dict[str, Any]) -> dict[str, float | int]:
+    throughput = report.get("throughput")
+    if type(throughput) is not list or not throughput:
+        raise ValueError("compression report throughput must be a non-empty list")
+    candidates = []
+    for entry in throughput:
+        try:
+            workers = entry["workers"]
+            speed = entry["backends"]["hdf5"]["samples_per_second"]
+        except (KeyError, TypeError) as error:
+            raise ValueError("compression report throughput is malformed") from error
+        if type(workers) is not int or workers < 0 or isinstance(speed, bool):
+            raise ValueError("compression report throughput is malformed")
+        speed = float(speed)
+        if not math.isfinite(speed) or speed <= 0:
+            raise ValueError(
+                "compression report throughput must be finite and positive"
+            )
+        candidates.append((speed, workers))
+    speed, workers = max(candidates)
+    return {"best_samples_per_second": speed, "workers": workers}
+
+
+def merge_compression_reports(
+    current: dict[str, Any], other: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate comparable none/LZF runs and select the production candidate."""
+    if type(current) is not dict or type(other) is not dict:
+        raise ValueError("compression reports must be dicts")
+    compressions = {current.get("compression"), other.get("compression")}
+    if compressions != {"none", "lzf"}:
+        raise ValueError("compression reports must contain exactly none and lzf")
+    for report in (current, other):
+        if report.get("parity", {}).get("passed") is not True:
+            raise ValueError("compression report parity must pass")
+    if current.get("run_label") != other.get("run_label"):
+        raise ValueError("compression report run_label values must match")
+    if current.get("arguments") != other.get("arguments"):
+        raise ValueError("compression report arguments must match")
+
+    reports = {report["compression"]: report for report in (current, other)}
+    by_compression = {
+        name: _best_hdf5_throughput(reports[name]) for name in ("none", "lzf")
+    }
+    selected = choose_compression(
+        {
+            name: details["best_samples_per_second"]
+            for name, details in by_compression.items()
+        }
+    )
+    return {
+        "by_compression": by_compression,
+        "selected_format": selected,
+        "selected_workers": by_compression[selected]["workers"],
+        "threshold": 0.95,
+    }
+
+
 def atomic_write_json(path: str | Path, payload: Any) -> None:
     """Write one JSON report atomically and remove temporary files on failure."""
     path = Path(path)
@@ -189,6 +248,28 @@ def _proc_status_path(pid: int) -> Path:
     return Path("/proc") / str(pid) / "status"
 
 
+def _proc_io_path(pid: int) -> Path:
+    return Path("/proc") / str(pid) / "io"
+
+
+def _proc_stat_path(pid: int) -> Path:
+    return Path("/proc") / str(pid) / "stat"
+
+
+def _read_status_kib(pid: int, field: str) -> int:
+    try:
+        status = _proc_status_path(pid).read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return 0
+    prefix = f"{field}:"
+    for line in status.splitlines():
+        if line.startswith(prefix):
+            fields = line.split()
+            if len(fields) >= 2:
+                return int(fields[1]) * 1024
+    return 0
+
+
 def read_process_rss_bytes(pid: int) -> int:
     """Read RSS through psutil, falling back to /proc; vanished PIDs return zero."""
     if type(pid) is not int or pid <= 0:
@@ -200,20 +281,162 @@ def read_process_rss_bytes(pid: int) -> int:
             return 0
         except (_psutil.AccessDenied, PermissionError):
             pass
-    try:
-        status = _proc_status_path(pid).read_text(encoding="utf-8")
-    except (FileNotFoundError, ProcessLookupError):
-        return 0
-    for line in status.splitlines():
-        if line.startswith("VmRSS:"):
-            fields = line.split()
-            if len(fields) >= 2:
-                return int(fields[1]) * 1024
-    return 0
+    return _read_status_kib(pid, "VmRSS")
+
+
+def read_process_peak_rss_bytes(pid: int) -> int:
+    """Read Linux high-water RSS; vanished or unsupported processes return zero."""
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("pid must be a positive integer")
+    return _read_status_kib(pid, "VmHWM")
 
 
 def aggregate_worker_rss_bytes(pids: Sequence[int]) -> int:
     return sum(read_process_rss_bytes(int(pid)) for pid in pids)
+
+
+def aggregate_worker_peak_rss_bytes(pids: Sequence[int]) -> int:
+    return sum(read_process_peak_rss_bytes(int(pid)) for pid in pids)
+
+
+class PeakWorkerRSSMonitor:
+    """Poll aggregate worker RSS while retaining kernel VmHWM as corroboration."""
+
+    def __init__(self, pids: Sequence[int], interval_seconds: float = 0.01):
+        self.pids = list(pids)
+        self.interval_seconds = float(interval_seconds)
+        if not math.isfinite(self.interval_seconds) or self.interval_seconds <= 0:
+            raise ValueError("RSS polling interval must be finite and positive")
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._samples: list[int] = []
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._samples.append(aggregate_worker_rss_bytes(self.pids))
+            self._stop.wait(self.interval_seconds)
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError("RSS monitor already started")
+        self._thread = threading.Thread(
+            target=self._run, name="libero-rss-monitor", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> dict[str, Any]:
+        if self._thread is None:
+            raise RuntimeError("RSS monitor was not started")
+        self._stop.set()
+        self._thread.join()
+        self._samples.append(aggregate_worker_rss_bytes(self.pids))
+        hwm = aggregate_worker_peak_rss_bytes(self.pids)
+        polled_peak = max(self._samples, default=0)
+        return {
+            "peak_aggregate_worker_rss_bytes": max(polled_peak, hwm),
+            "aggregate_worker_rss_bytes": self._samples[-1],
+            "worker_peak_rss_hwm_bytes": hwm,
+            "rss_sample_count": len(self._samples),
+            "peak_rss_method": (
+                f"{self.interval_seconds * 1000:g}ms aggregate RSS poll + /proc VmHWM"
+            ),
+            "peak_rss_window": "warmup+measurement",
+            "peak_rss_caveat": (
+                "sum of per-worker VmHWM is a conservative corroborating bound"
+            ),
+        }
+
+
+def read_process_counters(pid: int) -> dict[str, Any]:
+    """Read process I/O and CPU counters with a Linux /proc fallback."""
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("pid must be a positive integer")
+    if _psutil is not None:
+        try:
+            process = _psutil.Process(pid)
+            io_counters = process.io_counters()
+            cpu = process.cpu_times()
+            return {
+                "read_bytes": int(getattr(io_counters, "read_bytes", 0)),
+                "read_chars": int(getattr(io_counters, "read_chars", 0)),
+                "cpu_seconds": float(cpu.user + cpu.system),
+                "method": "psutil",
+            }
+        except (_psutil.NoSuchProcess, _psutil.ZombieProcess, ProcessLookupError):
+            return {
+                "read_bytes": 0,
+                "read_chars": 0,
+                "cpu_seconds": 0.0,
+                "method": "vanished",
+            }
+        except (_psutil.AccessDenied, PermissionError, AttributeError):
+            pass
+    try:
+        io_text = _proc_io_path(pid).read_text(encoding="utf-8")
+        stat_text = _proc_stat_path(pid).read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return {
+            "read_bytes": 0,
+            "read_chars": 0,
+            "cpu_seconds": 0.0,
+            "method": "vanished",
+        }
+    io_values = {}
+    for line in io_text.splitlines():
+        if ":" in line:
+            name, value = line.split(":", 1)
+            io_values[name] = int(value.strip())
+    closing = stat_text.rfind(")")
+    stat_fields = stat_text[closing + 2 :].split()
+    if closing < 0 or len(stat_fields) <= 12:
+        raise ValueError(f"malformed /proc stat for pid {pid}")
+    ticks = float(os.sysconf("SC_CLK_TCK"))
+    cpu_seconds = (int(stat_fields[11]) + int(stat_fields[12])) / ticks
+    return {
+        "read_bytes": int(io_values.get("read_bytes", 0)),
+        "read_chars": int(io_values.get("rchar", 0)),
+        "cpu_seconds": cpu_seconds,
+        "method": "proc",
+    }
+
+
+def aggregate_process_counters(pids: Sequence[int]) -> dict[str, Any]:
+    counters = [read_process_counters(int(pid)) for pid in pids]
+    methods = sorted({counter["method"] for counter in counters})
+    return {
+        "read_bytes": sum(counter["read_bytes"] for counter in counters),
+        "read_chars": sum(counter["read_chars"] for counter in counters),
+        "cpu_seconds": sum(counter["cpu_seconds"] for counter in counters),
+        "method": "+".join(methods),
+    }
+
+
+def counter_delta(
+    before: dict[str, Any], after: dict[str, Any], *, elapsed_seconds: float
+) -> dict[str, Any]:
+    if not math.isfinite(elapsed_seconds) or elapsed_seconds <= 0:
+        raise ValueError("counter elapsed_seconds must be finite and positive")
+    read_bytes = max(0, int(after["read_bytes"]) - int(before["read_bytes"]))
+    read_chars = max(0, int(after["read_chars"]) - int(before["read_chars"]))
+    cpu_seconds = max(0.0, float(after["cpu_seconds"]) - float(before["cpu_seconds"]))
+    core_equivalents = cpu_seconds / elapsed_seconds
+    return {
+        "read_bytes": read_bytes,
+        "read_chars": read_chars,
+        "cpu_seconds": cpu_seconds,
+        "cpu_core_equivalents": core_equivalents,
+        "cpu_utilization_percent": core_equivalents * 100.0,
+        "counter_method": after["method"],
+        "counter_window": "measurement",
+        "io_counter_caveat": (
+            "read_bytes is kernel-accounted storage I/O and may exclude cached/NFS "
+            "traffic; read_chars is the logical read syscall byte count"
+        ),
+        "cpu_utilization_caveat": (
+            "one-core convention: 100% equals one fully utilized CPU core; "
+            "values may exceed 100%"
+        ),
+    }
 
 
 @dataclass(frozen=True)
@@ -319,8 +542,11 @@ def map_episode_pairs(
         )
         if len(pairs) == episode_limit:
             break
-    if not pairs:
-        raise ValueError("missing mapped episode pairs")
+    if len(pairs) != episode_limit:
+        raise ValueError(
+            "insufficient mapped episode pairs: "
+            f"requested={episode_limit} available={len(pairs)}"
+        )
     return pairs
 
 
@@ -544,14 +770,21 @@ def measure_dataloader(
     )
     iterator = None
     worker_processes = []
+    rss_monitor: PeakWorkerRSSMonitor | None = None
+    rss_result: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
     try:
         iterator = iter(loader)
         worker_processes = list(getattr(iterator, "_workers", []) or [])
         worker_pids = [process.pid for process in worker_processes]
+        rss_monitor = PeakWorkerRSSMonitor(worker_pids)
+        rss_monitor.start()
         for index in range(warmup_batches):
             _next_batch(iterator, "warmup", index)
 
+        counter_pids = [os.getpid(), *worker_pids]
+        counters_before = aggregate_process_counters(counter_pids)
+        measurement_start = time.perf_counter()
         durations = []
         observed_samples = 0
         for index in range(measure_batches):
@@ -559,6 +792,14 @@ def measure_dataloader(
             batch = _next_batch(iterator, "measurement", index)
             durations.append(time.perf_counter() - start)
             observed_samples += _batch_size(batch)
+        measurement_elapsed = time.perf_counter() - measurement_start
+        counters_after = aggregate_process_counters(counter_pids)
+        counter_result = counter_delta(
+            counters_before,
+            counters_after,
+            elapsed_seconds=measurement_elapsed,
+        )
+        rss_result = rss_monitor.stop()
         total_seconds = sum(durations)
         if total_seconds <= 0:
             raise RuntimeError("measured DataLoader duration must be positive")
@@ -575,11 +816,14 @@ def measure_dataloader(
             "median_batch_seconds": percentile(durations, 50),
             "p95_batch_seconds": percentile(durations, 95),
             "worker_pids": worker_pids,
-            "aggregate_worker_rss_bytes": aggregate_worker_rss_bytes(worker_pids),
             "main_process_rss_bytes": read_process_rss_bytes(os.getpid()),
             "workers_shutdown": False,
+            **rss_result,
+            **counter_result,
         }
     finally:
+        if rss_monitor is not None and rss_result is None:
+            rss_result = rss_monitor.stop()
         if iterator is not None:
             shutdown = getattr(iterator, "_shutdown_workers", None)
             if callable(shutdown):
@@ -818,6 +1062,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefetch-factor", type=_positive_int, default=4)
     parser.add_argument("--run-label", choices=("cold", "warm"), required=True)
     parser.add_argument("--compression", choices=("none", "lzf"), required=True)
+    parser.add_argument("--compare-report", type=Path)
     return parser
 
 
@@ -834,6 +1079,11 @@ def _base_report(args: argparse.Namespace) -> dict[str, Any]:
             "hdf5_config": str(hdf5_config),
             "hdf5_manifest": str(manifest),
             "output_json": str(args.output_json.expanduser().resolve()),
+            "compare_report": (
+                None
+                if args.compare_report is None
+                else str(args.compare_report.expanduser().resolve())
+            ),
         },
         "mode": args.mode,
         "compression": args.compression,
@@ -925,6 +1175,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 warmup_batches=args.warmup_batches,
                 measure_batches=args.measure_batches,
                 prefetch_factor=args.prefetch_factor,
+            )
+        if args.compare_report is not None:
+            with (
+                args.compare_report.expanduser()
+                .resolve()
+                .open(encoding="utf-8") as stream
+            ):
+                compare_report = json.load(stream)
+            report["compression_selection"] = merge_compression_reports(
+                report, compare_report
             )
     except Exception as error:
         report["fatal_error"] = f"{type(error).__name__}: {error}"

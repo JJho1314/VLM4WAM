@@ -7,6 +7,7 @@ import pickle
 import random
 import subprocess
 import sys
+import time
 from argparse import Namespace
 from pathlib import Path
 
@@ -2838,7 +2839,7 @@ def test_benchmark_atomic_json_success_and_failure_cleanup(tmp_path, monkeypatch
     assert list(tmp_path.iterdir()) == [output]
 
 
-def _make_real_benchmark_datasets(tmp_path):
+def _make_real_benchmark_datasets(tmp_path, *, compression="none"):
     source = make_tiny_lerobot_domain(
         tmp_path / "source",
         "domain",
@@ -2859,6 +2860,7 @@ def _make_real_benchmark_datasets(tmp_path):
             domains=["domain"],
             output_root=output,
             predecoded_root=cache,
+            compression=compression,
         )
     )
     stats = tmp_path / "stats.json"
@@ -2936,6 +2938,16 @@ def test_benchmark_real_dataloaders_exact_accounting_and_cleanup(tmp_path):
             assert result["p95_batch_seconds"] >= result["median_batch_seconds"]
             assert len(result["worker_pids"]) == worker_result["workers"]
             assert result["workers_shutdown"] is True
+            assert (
+                result["peak_aggregate_worker_rss_bytes"]
+                >= result["aggregate_worker_rss_bytes"]
+            )
+            assert result["rss_sample_count"] >= 2
+            assert result["read_bytes"] >= 0
+            assert result["read_chars"] >= 0
+            assert result["cpu_seconds"] >= 0
+            assert result["cpu_utilization_percent"] >= 0
+            assert result["counter_method"]
     assert new._handles == {}
 
 
@@ -2960,9 +2972,9 @@ def test_benchmark_insufficient_stream_fails_and_closes_dataset():
     assert new.closed is True
 
 
-def _write_benchmark_configs(tmp_path):
+def _write_benchmark_configs(tmp_path, *, compression="none"):
     old, new, manifest, stats, source, cache = _make_real_benchmark_datasets(
-        tmp_path / "fixture"
+        tmp_path / "fixture", compression=compression
     )
     old.close() if hasattr(old, "close") else None
     new.close()
@@ -3018,43 +3030,57 @@ def _write_benchmark_configs(tmp_path):
     return old_path, new_path, manifest
 
 
-def _run_benchmark_cli(tmp_path, old_config, hdf5_config, manifest, output):
+def _run_benchmark_cli(
+    tmp_path,
+    old_config,
+    hdf5_config,
+    manifest,
+    output,
+    *,
+    episodes=1,
+    mode="parity",
+    compression="none",
+    compare_report=None,
+):
     environment = os.environ.copy()
     environment["PYTHONPATH"] = os.pathsep.join(
         (str(GE_ACT_ROOT.parent), environment.get("PYTHONPATH", ""))
     )
+    command = [
+        sys.executable,
+        "-m",
+        "ge_act.scripts.benchmark_libero_fastwam_hdf5",
+        "--old-config",
+        str(old_config),
+        "--hdf5-config",
+        str(hdf5_config),
+        "--hdf5-manifest",
+        str(manifest),
+        "--output-json",
+        str(output),
+        "--mode",
+        mode,
+        "--episodes",
+        str(episodes),
+        "--samples",
+        "1",
+        "--workers",
+        "0",
+        "--batch-size",
+        "1",
+        "--warmup-batches",
+        "0",
+        "--measure-batches",
+        "1",
+        "--run-label",
+        "warm",
+        "--compression",
+        compression,
+    ]
+    if compare_report is not None:
+        command.extend(("--compare-report", str(compare_report)))
     return subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "ge_act.scripts.benchmark_libero_fastwam_hdf5",
-            "--old-config",
-            str(old_config),
-            "--hdf5-config",
-            str(hdf5_config),
-            "--hdf5-manifest",
-            str(manifest),
-            "--output-json",
-            str(output),
-            "--mode",
-            "parity",
-            "--episodes",
-            "1",
-            "--samples",
-            "1",
-            "--workers",
-            "0",
-            "--batch-size",
-            "1",
-            "--warmup-batches",
-            "0",
-            "--measure-batches",
-            "1",
-            "--run-label",
-            "warm",
-            "--compression",
-            "none",
-        ],
+        command,
         cwd=tmp_path,
         env=environment,
         text=True,
@@ -3123,3 +3149,215 @@ def test_benchmark_cli_parity_failure_writes_report_and_exits_nonzero(tmp_path):
     assert report["parity"]["passed"] is False
     assert len(report["parity"]["failures"]) == 1
     assert report["parity"]["pairs"][0]["domain"] == "domain"
+
+
+def test_benchmark_cli_lzf_both_merges_none_report(tmp_path):
+    none_old, none_hdf5, none_manifest = _write_benchmark_configs(
+        tmp_path / "none", compression="none"
+    )
+    none_report = tmp_path / "none.json"
+    none_result = _run_benchmark_cli(
+        tmp_path,
+        none_old,
+        none_hdf5,
+        none_manifest,
+        none_report,
+        mode="both",
+        compression="none",
+    )
+    assert none_result.returncode == 0, none_result.stdout + none_result.stderr
+
+    lzf_old, lzf_hdf5, lzf_manifest = _write_benchmark_configs(
+        tmp_path / "lzf", compression="lzf"
+    )
+    lzf_report = tmp_path / "lzf.json"
+    lzf_result = _run_benchmark_cli(
+        tmp_path,
+        lzf_old,
+        lzf_hdf5,
+        lzf_manifest,
+        lzf_report,
+        mode="both",
+        compression="lzf",
+        compare_report=none_report,
+    )
+    assert lzf_result.returncode == 0, lzf_result.stdout + lzf_result.stderr
+    report = json.loads(lzf_report.read_text(encoding="utf-8"))
+    assert report["parity"]["passed"] is True
+    assert report["throughput"][0]["backends"]["hdf5"]["observed_batches"] == 1
+    selection = report["compression_selection"]
+    assert set(selection["by_compression"]) == {"none", "lzf"}
+    assert selection["selected_format"] in {"none", "lzf"}
+    assert selection["threshold"] == 0.95
+
+
+def test_benchmark_mapping_requires_exact_requested_episode_count():
+    old = Namespace(dataset=[_old_episode_record("domain", 0)])
+    new = Namespace(records=[_hdf5_episode_record("domain", 0)])
+    with pytest.raises(ValueError, match="requested=2.*available=1"):
+        benchmark.map_episode_pairs(old, new, episode_limit=2)
+
+
+def test_benchmark_cli_rejects_partial_episode_selection(tmp_path):
+    old_config, hdf5_config, manifest = _write_benchmark_configs(tmp_path)
+    output = tmp_path / "partial.json"
+    result = _run_benchmark_cli(
+        tmp_path, old_config, hdf5_config, manifest, output, episodes=2
+    )
+    assert result.returncode != 0
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert "requested=2" in report["fatal_error"]
+    assert "available=1" in report["fatal_error"]
+
+
+def test_benchmark_peak_rss_monitor_captures_transient_and_hwm(monkeypatch):
+    samples = iter([100, 900, 200, 200])
+    monkeypatch.setattr(
+        benchmark,
+        "aggregate_worker_rss_bytes",
+        lambda _pids: next(samples, 200),
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "aggregate_worker_peak_rss_bytes",
+        lambda _pids: 700,
+    )
+    monitor = benchmark.PeakWorkerRSSMonitor([1, 2], interval_seconds=0.001)
+    monitor.start()
+    time.sleep(0.01)
+    result = monitor.stop()
+    assert result["peak_aggregate_worker_rss_bytes"] == 900
+    assert result["worker_peak_rss_hwm_bytes"] == 700
+    assert result["rss_sample_count"] >= 3
+    assert "poll" in result["peak_rss_method"]
+
+
+def test_benchmark_proc_peak_rss_and_counters_fallback(tmp_path, monkeypatch):
+    status = tmp_path / "status"
+    io_path = tmp_path / "io"
+    stat_path = tmp_path / "stat"
+    status.write_text("VmRSS:\t12 kB\nVmHWM:\t34 kB\n", encoding="utf-8")
+    io_path.write_text("rchar: 1234\nread_bytes: 5678\n", encoding="utf-8")
+    fields = ["R"] + ["0"] * 10 + ["200", "100"] + ["0"] * 20
+    stat_path.write_text(f"99 (worker name) {' '.join(fields)}\n", encoding="utf-8")
+    monkeypatch.setattr(benchmark, "_psutil", None)
+    monkeypatch.setattr(benchmark, "_proc_status_path", lambda _pid: status)
+    monkeypatch.setattr(benchmark, "_proc_io_path", lambda _pid: io_path)
+    monkeypatch.setattr(benchmark, "_proc_stat_path", lambda _pid: stat_path)
+    monkeypatch.setattr(benchmark.os, "sysconf", lambda _name: 100)
+
+    assert benchmark.read_process_peak_rss_bytes(99) == 34 * 1024
+    counters = benchmark.read_process_counters(99)
+    assert counters == {
+        "read_bytes": 5678,
+        "read_chars": 1234,
+        "cpu_seconds": 3.0,
+        "method": "proc",
+    }
+    status.unlink()
+    io_path.unlink()
+    stat_path.unlink()
+    assert benchmark.read_process_peak_rss_bytes(99) == 0
+    assert benchmark.read_process_counters(99)["method"] == "vanished"
+
+
+def test_benchmark_counter_delta_reports_one_core_convention():
+    result = benchmark.counter_delta(
+        {
+            "read_bytes": 100,
+            "read_chars": 1000,
+            "cpu_seconds": 4.0,
+            "method": "proc",
+        },
+        {
+            "read_bytes": 500,
+            "read_chars": 1800,
+            "cpu_seconds": 6.5,
+            "method": "proc",
+        },
+        elapsed_seconds=1.0,
+    )
+    assert result["read_bytes"] == 400
+    assert result["read_chars"] == 800
+    assert result["cpu_seconds"] == 2.5
+    assert result["cpu_core_equivalents"] == 2.5
+    assert result["cpu_utilization_percent"] == 250.0
+    assert result["counter_method"] == "proc"
+    assert "100%" in result["cpu_utilization_caveat"]
+
+
+def _compression_report(compression, speed, workers=2, run_label="warm"):
+    return {
+        "compression": compression,
+        "run_label": run_label,
+        "arguments": {
+            "episodes": 64,
+            "samples": 1024,
+            "workers": [0, 2, 4, 8],
+            "batch_size": 8,
+            "warmup_batches": 20,
+            "measure_batches": 100,
+            "prefetch_factor": 4,
+        },
+        "parity": {"passed": True},
+        "throughput": [
+            {
+                "workers": workers,
+                "backends": {"hdf5": {"samples_per_second": speed}},
+            }
+        ],
+    }
+
+
+def test_benchmark_merge_compression_reports_selects_with_95_percent_rule():
+    selection = benchmark.merge_compression_reports(
+        _compression_report("lzf", 96.0, workers=4),
+        _compression_report("none", 100.0, workers=2),
+    )
+    assert selection == {
+        "by_compression": {
+            "none": {"best_samples_per_second": 100.0, "workers": 2},
+            "lzf": {"best_samples_per_second": 96.0, "workers": 4},
+        },
+        "selected_format": "lzf",
+        "selected_workers": 4,
+        "threshold": 0.95,
+    }
+
+
+@pytest.mark.parametrize("problem", ["same", "parity", "label", "arguments"])
+def test_benchmark_merge_compression_reports_rejects_incomparable_runs(problem):
+    current = _compression_report("lzf", 96.0)
+    other = _compression_report("none", 100.0)
+    if problem == "same":
+        other["compression"] = "lzf"
+    elif problem == "parity":
+        other["parity"]["passed"] = False
+    elif problem == "label":
+        other["run_label"] = "cold"
+    else:
+        other["arguments"]["measure_batches"] = 99
+    with pytest.raises(ValueError, match="compression|parity|run_label|arguments"):
+        benchmark.merge_compression_reports(current, other)
+
+
+@pytest.mark.parametrize("workers", [4, 8])
+def test_benchmark_lightweight_high_worker_shutdown(workers):
+    old = _BenchmarkFakeOldDataset()
+    new = _BenchmarkFakeHDF5Dataset()
+    plans = benchmark.build_sample_plans(
+        old, new, benchmark.map_episode_pairs(old, new, episode_limit=1)
+    )
+    result = benchmark.measure_dataloader(
+        benchmark.DeterministicHDF5View(new, plans, sample_count=workers),
+        workers=workers,
+        batch_size=workers,
+        warmup_batches=0,
+        measure_batches=1,
+        prefetch_factor=1,
+    )
+    assert result["workers_shutdown"] is True
+    assert len(result["worker_pids"]) == workers
+    assert "peak_aggregate_worker_rss_bytes" in result
+    assert "read_bytes" in result
+    assert "cpu_utilization_percent" in result
