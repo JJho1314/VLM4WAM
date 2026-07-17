@@ -88,3 +88,6 @@ maskfree_instructsam_cosmos_pipeline_*.png
 # Scratch / smoke-run outputs (regenerable; keep out of git)
 scratch/
 scratch_*/
+
+# Isolated implementation worktrees
+.worktrees/
