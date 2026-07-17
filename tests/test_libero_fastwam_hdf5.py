@@ -28,6 +28,7 @@ from ge_act.data.libero_fastwam_hdf5_dataset import (
 )
 from ge_act.data.lerobot_like_dataset import CustomLeRobotDataset
 from ge_act.scripts import convert_libero_fastwam_hdf5 as converter
+from ge_act.scripts import benchmark_libero_fastwam_hdf5 as benchmark
 
 
 pytestmark = pytest.mark.filterwarnings(
@@ -2561,3 +2562,564 @@ def test_hdf5_preflight_missing_h5py_is_clean_cli_error(tmp_path):
     assert result.returncode != 0
     assert "missing Python module: h5py" in combined
     assert "Traceback" not in combined
+
+
+def _benchmark_sample(*, main=0.0, wrist=0.5):
+    video = torch.empty((3, 2, 2, 2, 2), dtype=torch.float32)
+    video[:, 0].fill_(main)
+    video[:, 1].fill_(wrist)
+    return {
+        "video": video,
+        "actions": torch.arange(14, dtype=torch.float32).reshape(2, 7),
+        "caption": "benchmark caption",
+        "state": torch.arange(8, dtype=torch.float32).reshape(1, 8),
+    }
+
+
+def test_benchmark_parity_accepts_uint8_rounding_bound_per_camera():
+    old = _benchmark_sample()
+    new = copy.deepcopy(old)
+    new["video"][:, 0].add_(1.0 / 255.0)
+    new["video"][:, 1].sub_(1.0 / 255.0)
+
+    report = benchmark.compare_samples(old, new)
+
+    assert report["exact_fields"] == [
+        "actions",
+        "state",
+        "caption",
+        "shape",
+        "dtype",
+    ]
+    assert report["normalized_rgb_error"]["main"] <= 1 / 255 + 1e-6
+    assert report["normalized_rgb_error"]["wrist"] <= 1 / 255 + 1e-6
+    assert report["max_normalized_rgb_error"] <= 1 / 255 + 1e-6
+
+
+def test_benchmark_parity_rejects_apparent_camera_swap():
+    old = _benchmark_sample(main=-0.75, wrist=0.75)
+    new = copy.deepcopy(old)
+    new["video"] = old["video"].flip(1)
+    with pytest.raises(AssertionError, match="camera.*order|camera.*swap"):
+        benchmark.compare_samples(old, new)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda sample: sample.pop("state"), "keys"),
+        (lambda sample: sample.update(extra=1), "keys"),
+        (
+            lambda sample: sample.update(video=sample["video"][:, :, :1]),
+            "shape",
+        ),
+        (
+            lambda sample: sample.update(video=sample["video"].to(torch.float64)),
+            "dtype",
+        ),
+        (lambda sample: sample.update(caption="wrong"), "caption"),
+        (lambda sample: sample["actions"].add_(1), "actions"),
+        (lambda sample: sample["state"].add_(1), "state"),
+        (
+            lambda sample: sample["video"][:, 0].add_(1 / 255 + 2e-6),
+            "main.*RGB|RGB.*main",
+        ),
+    ],
+)
+def test_benchmark_parity_rejects_contract_mismatch(mutation, message):
+    old = _benchmark_sample()
+    new = copy.deepcopy(old)
+    mutation(new)
+    with pytest.raises(AssertionError, match=message):
+        benchmark.compare_samples(old, new)
+
+
+def test_benchmark_compression_winner_prefers_lzf_within_five_percent():
+    assert benchmark.choose_compression({"none": 100.0, "lzf": 97.0}) == "lzf"
+    assert benchmark.choose_compression({"none": 100.0, "lzf": 95.0}) == "lzf"
+    assert benchmark.choose_compression({"none": 100.0, "lzf": 94.9}) == "none"
+    assert benchmark.choose_compression({"none": 100.0, "lzf": 140.0}) == "lzf"
+
+
+@pytest.mark.parametrize(
+    "results",
+    [
+        {},
+        {"none": 1.0},
+        {"none": 1.0, "lzf": 0.0},
+        {"none": -1.0, "lzf": 1.0},
+        {"none": float("nan"), "lzf": 1.0},
+        {"none": 1.0, "lzf": float("inf")},
+        {"none": True, "lzf": 1.0},
+    ],
+)
+def test_benchmark_compression_winner_rejects_invalid_metrics(results):
+    with pytest.raises(ValueError, match="none|lzf|finite|positive"):
+        benchmark.choose_compression(results)
+
+
+def _old_episode_record(domain, episode_index, caption="caption", length=50):
+    stem = f"episode_{episode_index:06d}"
+    return [
+        f"/source/{domain}/videos/chunk-000/{{}}/{stem}.mp4",
+        None,
+        f"/source/{domain}/data/chunk-000/{stem}.parquet",
+        domain,
+        "",
+        None,
+        caption,
+        length,
+    ]
+
+
+def _hdf5_episode_record(domain, episode_index, caption="caption", length=50):
+    key = f"{domain}:{episode_index:06d}"
+    return schema.EpisodeRecord(
+        key=key,
+        shard_path=Path("/manifest/shard.h5"),
+        group=f"episodes/{key}",
+        caption=caption,
+        domain=domain,
+        episode_index=episode_index,
+        length=length,
+    )
+
+
+def test_benchmark_maps_pairs_in_manifest_order_and_limits_episodes():
+    old = Namespace(
+        dataset=[
+            _old_episode_record("domain", 1, "one"),
+            _old_episode_record("domain", 0, "zero"),
+        ]
+    )
+    new = Namespace(
+        records=[
+            _hdf5_episode_record("domain", 0, "zero"),
+            _hdf5_episode_record("domain", 1, "one"),
+        ]
+    )
+
+    pairs = benchmark.map_episode_pairs(old, new, episode_limit=1)
+
+    assert [(pair.domain, pair.episode_index) for pair in pairs] == [("domain", 0)]
+    assert pairs[0].old_index == 1
+    assert pairs[0].hdf5_index == 0
+
+
+@pytest.mark.parametrize("problem", ["duplicate", "missing", "caption", "length"])
+def test_benchmark_mapping_rejects_bad_identity_or_metadata(problem):
+    old_records = [_old_episode_record("domain", 0)]
+    new_records = [_hdf5_episode_record("domain", 0)]
+    if problem == "duplicate":
+        old_records.append(_old_episode_record("domain", 0))
+    elif problem == "missing":
+        new_records = [_hdf5_episode_record("domain", 1)]
+    elif problem == "caption":
+        new_records[0] = _hdf5_episode_record("domain", 0, caption="wrong")
+    else:
+        new_records[0] = _hdf5_episode_record("domain", 0, length=49)
+
+    with pytest.raises(ValueError, match=problem):
+        benchmark.map_episode_pairs(
+            Namespace(dataset=old_records),
+            Namespace(records=new_records),
+            episode_limit=8,
+        )
+
+
+class _BenchmarkFakeOldDataset:
+    def __init__(self):
+        self.dataset = [_old_episode_record("domain", 0)]
+        self.fix_sidx = None
+        self.fix_mem_idx = None
+        self.action_chunk = 36
+        self.video_temporal_stride = 4
+        self.item_calls = 0
+        self.batch_calls = 0
+
+    def get_frame_indexes(self, length):
+        return CustomLeRobotDataset.get_frame_indexes(self, length)
+
+    def get_batch(self, index):
+        self.batch_calls += 1
+        frame_indexes, action_indexes = self.get_frame_indexes(50)
+        sample = _benchmark_sample()
+        sample["actions"] = torch.tensor(action_indexes, dtype=torch.float32)[:, None]
+        sample["state"] = torch.tensor(frame_indexes[:1], dtype=torch.float32)[:, None]
+        return tuple(sample[key] for key in ("video", "actions", "caption", "state"))
+
+    def __getitem__(self, index):
+        self.item_calls += 1
+        raise AssertionError("old __getitem__ fallback must not be used")
+
+
+class _BenchmarkFakeHDF5Dataset:
+    def __init__(self):
+        self.records = [_hdf5_episode_record("domain", 0)]
+        self.fix_sidx = None
+        self.fix_mem_idx = None
+        self.action_chunk = 36
+        self.video_temporal_stride = 4
+        self.read_calls = []
+        self.closed = False
+
+    def get_frame_indexes(self, length):
+        return LiberoFastWAMHDF5Dataset.get_frame_indexes(self, length)
+
+    def read_by_indexes(self, index, frame_indexes, action_indexes):
+        self.read_calls.append((index, list(frame_indexes), list(action_indexes)))
+        sample = _benchmark_sample()
+        sample["actions"] = torch.tensor(action_indexes, dtype=torch.float32)[:, None]
+        sample["state"] = torch.tensor(frame_indexes[:1], dtype=torch.float32)[:, None]
+        return sample
+
+    def close(self):
+        self.closed = True
+
+
+def test_benchmark_fixed_wrappers_share_indexes_and_bypass_old_fallback():
+    old = _BenchmarkFakeOldDataset()
+    new = _BenchmarkFakeHDF5Dataset()
+    pairs = benchmark.map_episode_pairs(old, new, episode_limit=1)
+    plans = benchmark.build_sample_plans(old, new, pairs)
+    old_view = benchmark.DeterministicOldView(old, plans, sample_count=2)
+    new_view = benchmark.DeterministicHDF5View(new, plans, sample_count=2)
+
+    old_sample = old_view[1]
+    new_sample = new_view[1]
+
+    assert old.item_calls == 0
+    assert old.batch_calls == 1
+    assert new.read_calls[0][1:] == (
+        plans[0].frame_indexes,
+        plans[0].action_indexes,
+    )
+    benchmark.compare_samples(old_sample, new_sample)
+
+
+def test_benchmark_percentile_and_rss_helpers(tmp_path, monkeypatch):
+    assert benchmark.percentile([4.0, 1.0, 3.0, 2.0], 50) == 2.5
+    assert benchmark.percentile([1.0, 2.0, 3.0, 4.0], 95) == pytest.approx(3.85)
+
+    status = tmp_path / "status"
+    missing = tmp_path / "missing-status"
+    status.write_text("Name:\ttest\nVmRSS:\t123 kB\n", encoding="utf-8")
+    monkeypatch.setattr(benchmark, "_psutil", None)
+    monkeypatch.setattr(
+        benchmark,
+        "_proc_status_path",
+        lambda pid: status if pid == 123 else missing,
+    )
+    assert benchmark.read_process_rss_bytes(123) == 123 * 1024
+    assert benchmark.aggregate_worker_rss_bytes([123, 999]) == 123 * 1024
+    status.unlink()
+    assert benchmark.read_process_rss_bytes(123) == 0
+
+
+def test_benchmark_atomic_json_success_and_failure_cleanup(tmp_path, monkeypatch):
+    output = tmp_path / "report.json"
+    benchmark.atomic_write_json(output, {"value": 1})
+    assert json.loads(output.read_text(encoding="utf-8")) == {"value": 1}
+    assert list(tmp_path.iterdir()) == [output]
+
+    with pytest.raises(TypeError):
+        benchmark.atomic_write_json(output, {"bad": {1}})
+    assert json.loads(output.read_text(encoding="utf-8")) == {"value": 1}
+    assert list(tmp_path.iterdir()) == [output]
+
+    monkeypatch.setattr(
+        benchmark.os,
+        "replace",
+        lambda *_args: (_ for _ in ()).throw(OSError("replace failed")),
+    )
+    with pytest.raises(OSError, match="replace failed"):
+        benchmark.atomic_write_json(output, {"value": 2})
+    assert json.loads(output.read_text(encoding="utf-8")) == {"value": 1}
+    assert list(tmp_path.iterdir()) == [output]
+
+
+def _make_real_benchmark_datasets(tmp_path):
+    source = make_tiny_lerobot_domain(
+        tmp_path / "source",
+        "domain",
+        episode_indexes=(0,),
+        length=50,
+    )
+    cache = make_tiny_predecoded_cache(
+        tmp_path / "cache",
+        source,
+        "domain",
+        (0,),
+        length=50,
+    )
+    output = tmp_path / "hdf5"
+    converter.convert_dataset(
+        make_convert_args(
+            data_root=source,
+            domains=["domain"],
+            output_root=output,
+            predecoded_root=cache,
+        )
+    )
+    stats = tmp_path / "stats.json"
+    stats.write_text(
+        json.dumps(
+            {
+                "domain_eef": {"mean": [1.0] * 7, "std": [2.0] * 7},
+                "domain_state_eef": {"mean": [3.0] * 8, "std": [4.0] * 8},
+            }
+        ),
+        encoding="utf-8",
+    )
+    old = CustomLeRobotDataset(
+        data_roots=[str(source)],
+        domains=["domain"],
+        sample_size=[256, 256],
+        sample_n_frames=500,
+        source_fps=20,
+        preprocess="resize",
+        valid_cam=list(CAMERAS),
+        chunk=9,
+        action_chunk=36,
+        n_previous=4,
+        previous_pick_mode="random",
+        random_crop=False,
+        predecoded_video_root=str(cache),
+        require_predecoded=True,
+        action_type="absolute",
+        action_space="eef",
+        ignore_seek=False,
+        train_dataset=True,
+        action_key="action",
+        state_key="observation.state",
+        stat_file=str(stats),
+    )
+    new = LiberoFastWAMHDF5Dataset(
+        manifest_path=output / "manifest.json",
+        stat_file=stats,
+    )
+    return old, new, output / "manifest.json", stats, source, cache
+
+
+def test_benchmark_real_dataloaders_exact_accounting_and_cleanup(tmp_path):
+    old, new, *_ = _make_real_benchmark_datasets(tmp_path)
+    pairs = benchmark.map_episode_pairs(old, new, episode_limit=1)
+    plans = benchmark.build_sample_plans(old, new, pairs)
+    benchmark.compare_samples(
+        benchmark.DeterministicOldView(old, plans, sample_count=1)[0],
+        benchmark.DeterministicHDF5View(new, plans, sample_count=1)[0],
+    )
+    results = benchmark.run_throughput_benchmarks(
+        old,
+        new,
+        plans,
+        workers=[0, 2],
+        sample_count=3,
+        batch_size=1,
+        warmup_batches=1,
+        measure_batches=2,
+        prefetch_factor=2,
+    )
+
+    assert [result["execution_order"] for result in results] == [
+        ["old", "hdf5"],
+        ["hdf5", "old"],
+    ]
+    for worker_result in results:
+        assert set(worker_result["backends"]) == {"old", "hdf5"}
+        for result in worker_result["backends"].values():
+            assert result["observed_batches"] == 2
+            assert result["observed_samples"] == 2
+            assert len(result["batch_seconds"]) == 2
+            assert result["samples_per_second"] > 0
+            assert result["median_batch_seconds"] > 0
+            assert result["p95_batch_seconds"] >= result["median_batch_seconds"]
+            assert len(result["worker_pids"]) == worker_result["workers"]
+            assert result["workers_shutdown"] is True
+    assert new._handles == {}
+
+
+def test_benchmark_insufficient_stream_fails_and_closes_dataset():
+    old = _BenchmarkFakeOldDataset()
+    new = _BenchmarkFakeHDF5Dataset()
+    plans = benchmark.build_sample_plans(
+        old,
+        new,
+        benchmark.map_episode_pairs(old, new, episode_limit=1),
+    )
+    view = benchmark.DeterministicHDF5View(new, plans, sample_count=1)
+    with pytest.raises(RuntimeError, match="insufficient.*measurement"):
+        benchmark.measure_dataloader(
+            view,
+            workers=0,
+            batch_size=1,
+            warmup_batches=1,
+            measure_batches=1,
+            prefetch_factor=2,
+        )
+    assert new.closed is True
+
+
+def _write_benchmark_configs(tmp_path):
+    old, new, manifest, stats, source, cache = _make_real_benchmark_datasets(
+        tmp_path / "fixture"
+    )
+    old.close() if hasattr(old, "close") else None
+    new.close()
+    relative_stats = os.path.relpath(stats, GE_ACT_ROOT)
+    common = {
+        "source_fps": 20,
+        "sample_n_frames": 500,
+        "valid_cam": list(CAMERAS),
+        "chunk": 9,
+        "action_chunk": 36,
+        "n_previous": 4,
+        "previous_pick_mode": "random",
+        "action_type": "absolute",
+        "action_space": "eef",
+    }
+    old_config = {
+        "train_data_class_path": "data/lerobot_like_dataset.py",
+        "train_data_class": "CustomLeRobotDataset",
+        "data": {
+            "train": {
+                **common,
+                "data_roots": [str(source)],
+                "domains": ["domain"],
+                "sample_size": [256, 256],
+                "preprocess": "resize",
+                "predecoded_video_root": str(cache),
+                "require_predecoded": True,
+                "random_crop": False,
+                "ignore_seek": False,
+                "train_dataset": True,
+                "action_key": "action",
+                "state_key": "observation.state",
+                "stat_file": relative_stats,
+            }
+        },
+    }
+    new_config = {
+        "train_data_class_path": "data/libero_fastwam_hdf5_dataset.py",
+        "train_data_class": "LiberoFastWAMHDF5Dataset",
+        "data": {
+            "train": {
+                **common,
+                "manifest_path": "/must/be/overridden/manifest.json",
+                "stat_file": relative_stats,
+                "train_dataset": True,
+            }
+        },
+    }
+    old_path = tmp_path / "old.yaml"
+    new_path = tmp_path / "hdf5.yaml"
+    old_path.write_text(yaml.safe_dump(old_config), encoding="utf-8")
+    new_path.write_text(yaml.safe_dump(new_config), encoding="utf-8")
+    return old_path, new_path, manifest
+
+
+def _run_benchmark_cli(tmp_path, old_config, hdf5_config, manifest, output):
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (str(GE_ACT_ROOT.parent), environment.get("PYTHONPATH", ""))
+    )
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "ge_act.scripts.benchmark_libero_fastwam_hdf5",
+            "--old-config",
+            str(old_config),
+            "--hdf5-config",
+            str(hdf5_config),
+            "--hdf5-manifest",
+            str(manifest),
+            "--output-json",
+            str(output),
+            "--mode",
+            "parity",
+            "--episodes",
+            "1",
+            "--samples",
+            "1",
+            "--workers",
+            "0",
+            "--batch-size",
+            "1",
+            "--warmup-batches",
+            "0",
+            "--measure-batches",
+            "1",
+            "--run-label",
+            "warm",
+            "--compression",
+            "none",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+
+
+def test_benchmark_cli_help_and_config_resolution_from_different_cwd(tmp_path):
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(GE_ACT_ROOT.parent)
+    help_result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "ge_act.scripts.benchmark_libero_fastwam_hdf5",
+            "--help",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+    assert help_result.returncode == 0
+    assert "--hdf5-manifest" in help_result.stdout
+
+    old_config, hdf5_config, manifest = _write_benchmark_configs(tmp_path)
+    output = tmp_path / "success.json"
+    before = list(sys.path)
+    result = _run_benchmark_cli(tmp_path, old_config, hdf5_config, manifest, output)
+    assert list(sys.path) == before
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["parity"]["passed"] is True
+    assert report["mapping"]["selected_pairs"] == 1
+    assert report["run_label"] == "warm"
+    assert report["filesystem"]["manifest"]
+    assert report["filesystem"]["old_predecoded_video_root"]
+
+
+def test_benchmark_dataset_construction_restores_sys_path(tmp_path, monkeypatch):
+    old_config, hdf5_config, manifest = _write_benchmark_configs(tmp_path)
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    monkeypatch.chdir(caller)
+    before = list(sys.path)
+
+    old, _ = benchmark.construct_train_dataset(old_config)
+    new, _ = benchmark.construct_train_dataset(hdf5_config, manifest_override=manifest)
+
+    assert list(sys.path) == before
+    assert len(old) == len(new) == 1
+    new.close()
+
+
+def test_benchmark_cli_parity_failure_writes_report_and_exits_nonzero(tmp_path):
+    old_config, hdf5_config, manifest = _write_benchmark_configs(tmp_path)
+    _, records = schema.load_manifest(manifest)
+    with h5py.File(records[0].shard_path, "r+") as shard:
+        shard[records[0].group]["rgb_main"][:] = 255
+    output = tmp_path / "failure.json"
+
+    result = _run_benchmark_cli(tmp_path, old_config, hdf5_config, manifest, output)
+
+    assert result.returncode != 0
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["parity"]["passed"] is False
+    assert len(report["parity"]["failures"]) == 1
+    assert report["parity"]["pairs"][0]["domain"] == "domain"
