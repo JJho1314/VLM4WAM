@@ -102,9 +102,19 @@ class ViewAwareHead(nn.Module):
 
 
 class CheckpointHead(nn.Module):
-    def __init__(self, *, rows: int = 64 * 256, hidden_size: int = 2) -> None:
+    def __init__(
+        self,
+        *,
+        rows: int = 256,
+        hidden_size: int = 2,
+        dim_out: int = 1024,
+    ) -> None:
         super().__init__()
         self.query_embs = nn.Parameter(torch.randn(rows, hidden_size))
+        self.num_keyframes = 1
+        self.num_latent_per_keyframe = 64
+        self.num_backbone_tokens = 256
+        self.dim_out = int(dim_out)
 
 
 def valid_initialization_metadata() -> dict[str, Any]:
@@ -112,6 +122,21 @@ def valid_initialization_metadata() -> dict[str, Any]:
         "use_current_alignment": True,
         "independent_modality_task_tokens": True,
         "num_task_tokens": 64,
+        "num_latent_per_keyframe": 64,
+        "branch_latent_per_keyframe": 64,
+        "num_keyframes": 1,
+        "grid_size": 16,
+        "semantic_dim": 1024,
+        "target_len": 256,
+        "target_tokens": 256,
+        "video_target_type": "siglip2",
+        "has_depth_head": True,
+        "depth_grid_size": 16,
+        "depth_feature_dim": 2048,
+        "depth_target_type": "da3",
+        "plan_head_type": "lingbot_dino",
+        "sequence_length": 9,
+        "keyframe_offsets": [8],
         "latent_len": 4 * 64,
         "total_unique_latent_per_keyframe": 4 * 64,
         "query_layout": (
@@ -146,12 +171,19 @@ def make_fake_dual_camera_checkpoint_wrapper() -> PlannerWrapper:
     wrapper.use_current_alignment = True
     wrapper.independent_modality_task_tokens = True
     wrapper.num_task_tokens = 64
+    wrapper.num_latent_per_keyframe = 64
+    wrapper.branch_latent_per_keyframe = 64
+    wrapper.num_keyframes = 1
+    wrapper.target_len = 256
     wrapper.latent_len = 4 * 64
     wrapper.num_camera_views = 2
+    wrapper.use_depth = True
+    wrapper.plan_head_type = "lingbot_dino"
+    wrapper.plan_token_ids = list(range(4 * 64))
     wrapper.plan_head = CheckpointHead()
-    wrapper.depth_head = CheckpointHead()
+    wrapper.depth_head = CheckpointHead(dim_out=2048)
     wrapper.current_plan_head = CheckpointHead()
-    wrapper.current_depth_head = CheckpointHead()
+    wrapper.current_depth_head = CheckpointHead(dim_out=2048)
     return wrapper
 
 
@@ -230,7 +262,7 @@ def make_checkpoint_args(tmp_path: Path) -> SimpleNamespace:
         freeze_lm_head=True,
         video_target_type="siglip2",
         depth_target_type="da3",
-        depth_dim=1024,
+        depth_dim=2048,
         depth_grid_size=16,
     )
 
@@ -487,7 +519,7 @@ def test_legacy_checkpoint_initializes_four_shared_heads_without_expansion(
         "current_depth_head",
     ]
     assert wrapper.plan_head.query_embs.shape == (
-        64 * 256,
+        256,
         wrapper.plan_head.query_embs.shape[1],
     )
     assert wrapper.latent_len == 256
@@ -519,12 +551,83 @@ def test_legacy_checkpoint_rejects_non_independent_64_token_metadata(
         )
 
 
+def test_legacy_checkpoint_rejects_reordered_plan_token_ids(tmp_path: Path) -> None:
+    source = make_four_head_checkpoint(tmp_path)
+    metadata = valid_initialization_metadata()
+    metadata["plan_token_ids"] = metadata["plan_token_ids"][1:] + [0]
+    (source / "planner_meta.json").write_text(
+        json.dumps(metadata), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="plan_token_ids"):
+        planner.load_planner_initialization(
+            make_fake_dual_camera_checkpoint_wrapper(), source
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "corrupted"),
+    [
+        ("num_keyframes", 2),
+        ("grid_size", 8),
+        ("semantic_dim", 512),
+        ("target_len", 128),
+        ("target_tokens", 128),
+        ("video_target_type", "dinov3"),
+        ("has_depth_head", False),
+        ("depth_grid_size", 8),
+        ("depth_feature_dim", 1024),
+        ("depth_target_type", "morgbd"),
+        ("sequence_length", 8),
+        ("keyframe_offsets", [7]),
+    ],
+)
+def test_legacy_checkpoint_rejects_corrupted_output_geometry_metadata(
+    tmp_path: Path,
+    field: str,
+    corrupted: Any,
+) -> None:
+    source = make_four_head_checkpoint(tmp_path)
+    metadata = valid_initialization_metadata()
+    metadata[field] = corrupted
+    (source / "planner_meta.json").write_text(
+        json.dumps(metadata), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match=field):
+        planner.load_planner_initialization(
+            make_fake_dual_camera_checkpoint_wrapper(), source
+        )
+
+
+def test_legacy_checkpoint_rejects_incompatible_wrapper_target_geometry(
+    tmp_path: Path,
+) -> None:
+    source = make_four_head_checkpoint(tmp_path)
+    wrapper = make_fake_dual_camera_checkpoint_wrapper()
+    wrapper.target_len = 128
+
+    with pytest.raises(ValueError, match="target_len"):
+        planner.load_planner_initialization(wrapper, source)
+
+
+def test_legacy_checkpoint_rejects_incompatible_head_output_geometry(
+    tmp_path: Path,
+) -> None:
+    source = make_four_head_checkpoint(tmp_path)
+    wrapper = make_fake_dual_camera_checkpoint_wrapper()
+    wrapper.current_depth_head.dim_out = 1024
+
+    with pytest.raises(ValueError, match="current_depth_head.dim_out"):
+        planner.load_planner_initialization(wrapper, source)
+
+
 def test_legacy_checkpoint_strictly_rejects_head_shape_mismatch(
     tmp_path: Path,
 ) -> None:
     source = make_four_head_checkpoint(tmp_path)
     torch.save(
-        CheckpointHead(rows=64 * 256 + 1).state_dict(),
+        CheckpointHead(rows=257).state_dict(),
         source / "plan_head.pt",
     )
 

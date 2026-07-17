@@ -88,6 +88,21 @@ _INITIALIZATION_METADATA = {
     "use_current_alignment": True,
     "independent_modality_task_tokens": True,
     "num_task_tokens": 64,
+    "num_latent_per_keyframe": 64,
+    "branch_latent_per_keyframe": 64,
+    "num_keyframes": 1,
+    "grid_size": 16,
+    "semantic_dim": 1024,
+    "target_len": 256,
+    "target_tokens": 256,
+    "video_target_type": "siglip2",
+    "has_depth_head": True,
+    "depth_grid_size": 16,
+    "depth_feature_dim": 2048,
+    "depth_target_type": "da3",
+    "plan_head_type": "lingbot_dino",
+    "sequence_length": 9,
+    "keyframe_offsets": [8],
     "latent_len": 4 * 64,
     "total_unique_latent_per_keyframe": 4 * 64,
     "query_layout": (
@@ -193,7 +208,13 @@ def load_planner_initialization(
     wrapper_fields = {
         "use_current_alignment": True,
         "independent_modality_task_tokens": True,
+        "use_depth": True,
+        "plan_head_type": "lingbot_dino",
         "num_task_tokens": 64,
+        "num_latent_per_keyframe": 64,
+        "branch_latent_per_keyframe": 64,
+        "num_keyframes": 1,
+        "target_len": 256,
         "latent_len": 4 * 64,
     }
     for field, expected in wrapper_fields.items():
@@ -204,11 +225,54 @@ def load_planner_initialization(
                 f"expected {expected!r}, got {actual!r}"
             )
 
-    loaded = []
-    for attribute, filename in HEAD_FILES.items():
+    wrapper_plan_token_ids = getattr(wrapper, "plan_token_ids", None)
+    if (
+        not isinstance(wrapper_plan_token_ids, list)
+        or metadata["plan_token_ids"] != wrapper_plan_token_ids
+    ):
+        raise ValueError(
+            "incompatible planner initialization metadata field plan_token_ids: "
+            "checkpoint token IDs must exactly match the wrapper in order and value"
+        )
+
+    head_geometry = {
+        "plan_head": 1024,
+        "depth_head": 2048,
+        "current_plan_head": 1024,
+        "current_depth_head": 2048,
+    }
+    for attribute, expected_dim_out in head_geometry.items():
         head = getattr(wrapper, attribute, None)
         if head is None:
             raise ValueError(f"planner wrapper is missing required head {attribute}")
+        expected_fields = {
+            "num_keyframes": 1,
+            "num_latent_per_keyframe": 64,
+            "num_backbone_tokens": 256,
+            "dim_out": expected_dim_out,
+        }
+        for field, expected in expected_fields.items():
+            actual = getattr(head, field, None)
+            if not _metadata_value_matches(actual, expected):
+                raise ValueError(
+                    f"incompatible planner wrapper field {attribute}.{field}: "
+                    f"expected {expected!r}, got {actual!r}"
+                )
+        query_embs = getattr(head, "query_embs", None)
+        if (
+            not torch.is_tensor(query_embs)
+            or query_embs.ndim != 2
+            or query_embs.shape[0] != 256
+        ):
+            shape = tuple(query_embs.shape) if torch.is_tensor(query_embs) else None
+            raise ValueError(
+                f"incompatible planner wrapper field {attribute}.query_embs: "
+                f"expected [256, hidden], got {shape}"
+            )
+
+    loaded = []
+    for attribute, filename in HEAD_FILES.items():
+        head = getattr(wrapper, attribute, None)
         state = torch.load(
             checkpoint_dir / filename,
             map_location="cpu",
