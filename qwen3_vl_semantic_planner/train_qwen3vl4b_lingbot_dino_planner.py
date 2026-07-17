@@ -1213,8 +1213,12 @@ class PlannerWrapper(nn.Module):
         da3_align_strategy: str = "last_layer",
         da3_num_layers: int = 1,
         da3_layer_weights: Sequence[float] | None = None,
+        num_camera_views: int = 1,
     ) -> None:
         super().__init__()
+        self.num_camera_views = int(num_camera_views)
+        if self.num_camera_views not in (1, 2):
+            raise ValueError("num_camera_views must be 1 or 2")
         if sem_mlp_hidden_size < 0:
             sem_mlp_hidden_size = hidden_size
         self.mse_loss_weight = float(mse_loss_weight)
@@ -1725,6 +1729,40 @@ class PlannerWrapper(nn.Module):
         batch, _, hidden_dim = hidden.shape
         return hidden[mask].reshape(batch, n_img, hidden_dim)
 
+    def collect_image_hidden_by_view(
+        self,
+        hidden: torch.Tensor,
+        input_ids: torch.Tensor,
+        *,
+        num_views: int,
+    ) -> torch.Tensor:
+        if self.image_token_id is None:
+            raise RuntimeError("lingbot_dino head needs model.config.image_token_id, which is unset")
+        rows = []
+        for batch_index in range(input_ids.shape[0]):
+            positions = torch.nonzero(
+                input_ids[batch_index] == int(self.image_token_id),
+                as_tuple=False,
+            ).flatten()
+            split_points = torch.nonzero(
+                positions[1:] != positions[:-1] + 1,
+                as_tuple=False,
+            ).flatten() + 1
+            spans = torch.tensor_split(positions, split_points.cpu().tolist())
+            if len(spans) != num_views or any(span.numel() == 0 for span in spans):
+                raise RuntimeError(
+                    f"expected {num_views} image-token spans, got {len(spans)}"
+                )
+            if len({int(span.numel()) for span in spans}) != 1:
+                raise RuntimeError("dual-camera image-token spans must have equal length")
+            rows.append(
+                torch.stack(
+                    [hidden[batch_index, span] for span in spans],
+                    dim=0,
+                )
+            )
+        return torch.stack(rows, dim=0)
+
     def _forward_hiddens(self, **inputs: Any) -> tuple[torch.Tensor | None, torch.Tensor]:
         """One VLM forward -> live ``(image_hidden|None, plan_hidden)`` tensors.
 
@@ -1739,7 +1777,15 @@ class PlannerWrapper(nn.Module):
         plan_hidden = self.collect_plan_hidden(hidden, input_ids, self.latent_len)
         image_hidden = None
         if self.plan_head_type == "lingbot_dino":
-            image_hidden = self.collect_image_hidden(hidden, input_ids)
+            num_views = getattr(self, "num_camera_views", 1)
+            if num_views == 1:
+                image_hidden = self.collect_image_hidden(hidden, input_ids)
+            else:
+                image_hidden = self.collect_image_hidden_by_view(
+                    hidden,
+                    input_ids,
+                    num_views=num_views,
+                )
         return image_hidden, plan_hidden
 
     @staticmethod
@@ -1973,19 +2019,37 @@ class PlannerWrapper(nn.Module):
             "future_depth": (self.depth_head, hidden_by_branch["future_depth"]),
         }
         plans = {}
+        num_views = getattr(self, "num_camera_views", 1)
         for name, (head, hidden) in heads_and_hiddens.items():
             head_dtype = next(head.parameters()).dtype
-            branch_image_hidden = self.image_hidden_for_alignment_branch(
-                image_hidden,
-                name,
+            head_hidden = hidden.to(dtype=head_dtype)
+            if num_views == 1:
+                image_hiddens = (image_hidden,)
+            else:
+                if image_hidden.ndim != 4 or image_hidden.shape[1] != num_views:
+                    raise RuntimeError(
+                        f"expected image hidden [B,{num_views},N,H], got "
+                        f"{tuple(image_hidden.shape)}"
+                    )
+                image_hiddens = image_hidden.unbind(dim=1)
+            view_plans = []
+            for view_image_hidden in image_hiddens:
+                branch_image_hidden = self.image_hidden_for_alignment_branch(
+                    view_image_hidden,
+                    name,
+                )
+                plan = head(
+                    branch_image_hidden.to(dtype=head_dtype),
+                    head_hidden,
+                ).float()
+                if name in ("current_depth", "future_depth"):
+                    plan = self._reshape_depth_plan(plan)  # [B,tok,L*D] -> [B,tok,L,D] for wsa_multilayer
+                view_plans.append(plan)
+            plans[name] = (
+                view_plans[0]
+                if num_views == 1
+                else torch.stack(view_plans, dim=1)
             )
-            plan = head(
-                branch_image_hidden.to(dtype=head_dtype),
-                hidden.to(dtype=head_dtype),
-            ).float()
-            if name in ("current_depth", "future_depth"):
-                plan = self._reshape_depth_plan(plan)  # [B,tok,L*D] -> [B,tok,L,D] for wsa_multilayer
-            plans[name] = plan
         return plans
 
     def predict_semantic_plan(self, **inputs: Any) -> torch.Tensor:
@@ -2068,7 +2132,8 @@ class PlannerWrapper(nn.Module):
         current_depth_labels: torch.Tensor | None = None,
         **inputs: Any,
     ) -> dict[str, torch.Tensor]:
-        batch, target_len, _ = semantic_plan_labels.shape
+        batch = semantic_plan_labels.shape[0]
+        target_len = semantic_plan_labels.shape[-2]
         if target_len != self.target_len:
             raise RuntimeError(f"Batch has {target_len} target tokens, wrapper expects {self.target_len}")
         if self.plan_head_type == "lingbot_dino":
