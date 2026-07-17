@@ -67,6 +67,160 @@ from distributed_runtime import (  # noqa: E402
 import contextlib  # noqa: E402
 
 
+HEAD_FILES = {
+    "plan_head": "plan_head.pt",
+    "depth_head": "depth_head.pt",
+    "current_plan_head": "current_plan_head.pt",
+    "current_depth_head": "current_depth_head.pt",
+}
+
+DUAL_CAMERA_EXPORT_METADATA = {
+    "planner_input_layout": "separate_camera_images",
+    "camera_names": ["main", "wrist"],
+    "num_camera_views": 2,
+    "camera_head_sharing": "shared_head_per_view_image_context",
+    "semantic_output_layout": "batch_view_token_feature",
+    "semantic_teacher": "siglip2-large-patch16-256",
+    "future_keyframe_offsets": [8],
+}
+
+_INITIALIZATION_METADATA = {
+    "use_current_alignment": True,
+    "independent_modality_task_tokens": True,
+    "num_task_tokens": 64,
+    "latent_len": 4 * 64,
+    "total_unique_latent_per_keyframe": 4 * 64,
+    "query_layout": (
+        "current_dino_64_then_current_depth_64_then_"
+        "future_dino_64_then_future_depth_64"
+    ),
+}
+
+
+def _metadata_value_matches(actual: Any, expected: Any) -> bool:
+    if isinstance(expected, bool):
+        return type(actual) is bool and actual == expected
+    if isinstance(expected, int):
+        return type(actual) is int and actual == expected
+    if isinstance(expected, list):
+        return (
+            isinstance(actual, list)
+            and len(actual) == len(expected)
+            and all(
+                _metadata_value_matches(item, expected_item)
+                for item, expected_item in zip(actual, expected, strict=True)
+            )
+        )
+    return actual == expected
+
+
+def validate_dual_camera_export_metadata(
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Reject exports that cannot preserve separate main/wrist view context."""
+    if not isinstance(metadata, dict):
+        raise ValueError("dual-camera planner metadata must be a dictionary")
+    for field, expected in DUAL_CAMERA_EXPORT_METADATA.items():
+        actual = metadata.get(field)
+        if not _metadata_value_matches(actual, expected):
+            raise ValueError(
+                f"incompatible dual-camera metadata field {field}: "
+                f"expected {expected!r}, got {actual!r}"
+            )
+    legacy_input_frame = metadata.get("planner_input_frame")
+    if legacy_input_frame not in (None, "separate_camera_images"):
+        raise ValueError(
+            "incompatible dual-camera metadata field planner_input_frame: "
+            "expected 'separate_camera_images', "
+            f"got {legacy_input_frame!r}"
+        )
+    return metadata
+
+
+def _validate_planner_initialization_metadata(metadata: dict[str, Any]) -> None:
+    for field, expected in _INITIALIZATION_METADATA.items():
+        actual = metadata.get(field)
+        if not _metadata_value_matches(actual, expected):
+            raise ValueError(
+                f"incompatible planner initialization metadata field {field}: "
+                f"expected {expected!r}, got {actual!r}"
+            )
+
+    plan_token_ids = metadata.get("plan_token_ids")
+    if (
+        not isinstance(plan_token_ids, list)
+        or len(plan_token_ids) != 4 * 64
+        or any(type(token_id) is not int or token_id < 0 for token_id in plan_token_ids)
+        or len(set(plan_token_ids)) != 4 * 64
+    ):
+        raise ValueError(
+            "incompatible planner initialization metadata field plan_token_ids: "
+            "expected 256 unique non-negative integers"
+        )
+    expected_token_strings = [f"<|sem_plan_{index}|>" for index in range(4 * 64)]
+    if metadata.get("plan_token_strings") != expected_token_strings:
+        raise ValueError(
+            "incompatible planner initialization metadata field plan_token_strings: "
+            "expected four independent groups of 64 ordered plan tokens"
+        )
+
+
+def load_planner_initialization(
+    wrapper: nn.Module,
+    checkpoint_dir: str | Path,
+) -> dict[str, Any]:
+    """Strict-load the four legacy alignment heads into an existing wrapper."""
+    checkpoint_dir = Path(checkpoint_dir)
+    required_files = ["planner_meta.json", *HEAD_FILES.values()]
+    missing = [name for name in required_files if not (checkpoint_dir / name).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"incomplete planner initialization {checkpoint_dir}: missing {missing}"
+        )
+
+    try:
+        metadata = json.loads(
+            (checkpoint_dir / "planner_meta.json").read_text(encoding="utf-8")
+        )
+    except (json.JSONDecodeError, OSError) as error:
+        raise ValueError(
+            f"invalid planner initialization metadata in {checkpoint_dir}"
+        ) from error
+    if not isinstance(metadata, dict):
+        raise ValueError("planner initialization metadata must be a dictionary")
+    _validate_planner_initialization_metadata(metadata)
+
+    wrapper_fields = {
+        "use_current_alignment": True,
+        "independent_modality_task_tokens": True,
+        "num_task_tokens": 64,
+        "latent_len": 4 * 64,
+    }
+    for field, expected in wrapper_fields.items():
+        actual = getattr(wrapper, field, None)
+        if not _metadata_value_matches(actual, expected):
+            raise ValueError(
+                f"incompatible planner wrapper field {field}: "
+                f"expected {expected!r}, got {actual!r}"
+            )
+
+    loaded = []
+    for attribute, filename in HEAD_FILES.items():
+        head = getattr(wrapper, attribute, None)
+        if head is None:
+            raise ValueError(f"planner wrapper is missing required head {attribute}")
+        state = torch.load(
+            checkpoint_dir / filename,
+            map_location="cpu",
+            weights_only=True,
+        )
+        if not isinstance(state, dict):
+            raise ValueError(f"planner head file {filename} must contain a state dictionary")
+        head.load_state_dict(state, strict=True)
+        loaded.append(attribute)
+    return {"loaded_heads": loaded, "source": str(checkpoint_dir)}
+
+
 def _bidirectional_prefix_mask(config, input_embeds, attention_mask, cache_position,
                                past_key_values, position_ids=None,
                                or_mask_function=None, and_mask_function=None):
@@ -169,7 +323,16 @@ def configure_gradient_checkpointing(model: nn.Module, *, enabled: bool) -> None
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=Path, required=True)
+    parser.add_argument("--model-path", type=Path, default=None)
+    parser.add_argument(
+        "--init-planner-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "initialize the Qwen model, processor, token embeddings, and exactly four "
+            "alignment heads from an exported planner checkpoint"
+        ),
+    )
     parser.add_argument("--dataset-root", type=Path, default=None)
     parser.add_argument("--fastwam-data-config", type=Path, default=None)
     parser.add_argument("--fastwam-dataset-dir", action="append", default=[])
@@ -334,6 +497,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260622)
     parser.add_argument("--log-steps", type=int, default=10)
     args = parser.parse_args()
+    if args.model_path is None and args.init_planner_checkpoint is None:
+        parser.error("one of --model-path or --init-planner-checkpoint is required")
+    if (
+        args.init_planner_checkpoint is not None
+        and args.head_warmstart_ckpt is not None
+    ):
+        parser.error(
+            "--init-planner-checkpoint is mutually exclusive with --head-warmstart-ckpt"
+        )
     if (args.dataset_root is None) == (args.fastwam_data_config is None):
         parser.error(
             "exactly one of --dataset-root or --fastwam-data-config is required"
@@ -1539,6 +1711,14 @@ class PlannerWrapper(nn.Module):
     ) -> "PlannerWrapper":
         """Rebuild and freeze a planner from the files written by ``save_checkpoint``."""
         checkpoint_dir = Path(checkpoint_dir)
+        num_camera_views = metadata.get("num_camera_views", 1)
+        if type(num_camera_views) is not int or num_camera_views not in (1, 2):
+            raise ValueError(
+                "incompatible planner metadata field num_camera_views: "
+                f"expected 1 or 2, got {num_camera_views!r}"
+            )
+        if num_camera_views == 2:
+            validate_dual_camera_export_metadata(metadata)
         text_config = getattr(model.config, "text_config", model.config)
         hidden_size = int(text_config.hidden_size)
         query_embedding_source = metadata.get("query_embedding_source")
@@ -1604,6 +1784,7 @@ class PlannerWrapper(nn.Module):
             da3_align_strategy=str(metadata.get("da3_align_strategy", "last_layer")),
             da3_num_layers=int(metadata.get("da3_num_layers", 1)),
             da3_layer_weights=metadata.get("da3_layer_weights", None),
+            num_camera_views=num_camera_views,
         )
         wrapper.plan_head.load_state_dict(
             torch.load(
@@ -2492,6 +2673,7 @@ def save_checkpoint(
     if not is_main(rank):
         return
     module = wrapper
+    num_camera_views = int(getattr(module, "num_camera_views", 1))
     fastwam_data_config = getattr(args, "fastwam_data_config", None)
     fastwam_offsets = None
     if fastwam_data_config is not None:
@@ -2677,12 +2859,19 @@ def save_checkpoint(
             ],
             "token_order": "keyframe_major_row_major",
             "planner_input_frame": (
-                "fastwam_current_multicamera_composite"
-                if fastwam_data_config is not None
-                else "legacy_single_current_frame"
+                "separate_camera_images"
+                if num_camera_views == 2
+                else (
+                    "fastwam_current_multicamera_composite"
+                    if fastwam_data_config is not None
+                    else "legacy_single_current_frame"
+                )
             ),
         }
     )
+    if num_camera_views == 2:
+        meta.update(DUAL_CAMERA_EXPORT_METADATA)
+        validate_dual_camera_export_metadata(meta)
     (ckpt / "planner_meta.json").write_text(
         json.dumps(meta, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -2740,8 +2929,28 @@ def main() -> None:
     random.seed(args.seed + rank)
     torch.manual_seed(args.seed + rank)
 
+    model_path = args.model_path
+    processor_path = None
+    if args.init_planner_checkpoint is not None:
+        initialization_dir = Path(args.init_planner_checkpoint)
+        model_path = initialization_dir / "qwen3vl_lora_or_model"
+        processor_path = initialization_dir / "processor"
+        missing = [
+            str(path.name)
+            for path in (model_path, processor_path)
+            if not path.is_dir()
+        ]
+        if missing:
+            raise FileNotFoundError(
+                f"incomplete planner initialization {initialization_dir}: "
+                f"missing directories {missing}"
+            )
+        # Save metadata must identify the model actually used for this fresh run.
+        args.model_path = model_path
+
     model, processor = load_qwen3vl_model_and_processor(
-        args.model_path,
+        model_path,
+        processor_path=processor_path,
         device=None,
         dtype=args.dtype,
         attn_implementation="sdpa",
@@ -2946,7 +3155,17 @@ def main() -> None:
         da3_num_layers=int(getattr(args, "da3_num_layers", 1)),
         da3_layer_weights=getattr(args, "da3_layer_weights_resolved", None),
     )
-    if args.plan_head_type == "lingbot_dino" and args.head_warmstart_ckpt is not None:
+    if args.init_planner_checkpoint is not None:
+        initialization_report = load_planner_initialization(
+            wrapper,
+            args.init_planner_checkpoint,
+        )
+        if accelerator.is_main_process:
+            print(
+                json.dumps({"planner_initialization": initialization_report}),
+                flush=True,
+            )
+    elif args.plan_head_type == "lingbot_dino" and args.head_warmstart_ckpt is not None:
         head_state = _load_lingbot_head_state(args.head_warmstart_ckpt)
         report = wrapper.plan_head.load_lingbot_warmstart(head_state, head_name="future_video_align_head")
         if wrapper.depth_head is not None:
