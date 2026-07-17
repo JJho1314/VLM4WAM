@@ -3042,6 +3042,7 @@ def _run_benchmark_cli(
     mode="parity",
     compression="none",
     compare_report=None,
+    workers=(0,),
 ):
     environment = os.environ.copy()
     environment["PYTHONPATH"] = os.pathsep.join(
@@ -3066,7 +3067,7 @@ def _run_benchmark_cli(
         "--samples",
         "1",
         "--workers",
-        "0",
+        *(str(worker) for worker in workers),
         "--batch-size",
         "1",
         "--warmup-batches",
@@ -3165,6 +3166,7 @@ def test_benchmark_cli_lzf_both_merges_none_report(tmp_path):
         none_report,
         mode="both",
         compression="none",
+        workers=(0, 2, 4, 8),
     )
     assert none_result.returncode == 0, none_result.stdout + none_result.stderr
 
@@ -3181,11 +3183,16 @@ def test_benchmark_cli_lzf_both_merges_none_report(tmp_path):
         mode="both",
         compression="lzf",
         compare_report=none_report,
+        workers=(0, 2, 4, 8),
     )
     assert lzf_result.returncode == 0, lzf_result.stdout + lzf_result.stderr
     report = json.loads(lzf_report.read_text(encoding="utf-8"))
     assert report["parity"]["passed"] is True
-    assert report["throughput"][0]["backends"]["hdf5"]["observed_batches"] == 1
+    assert [entry["workers"] for entry in report["throughput"]] == [0, 2, 4, 8]
+    assert all(
+        entry["backends"]["hdf5"]["observed_batches"] == 1
+        for entry in report["throughput"]
+    )
     selection = report["compression_selection"]
     assert set(selection["by_compression"]) == {"none", "lzf"}
     assert selection["selected_format"] in {"none", "lzf"}
@@ -3290,7 +3297,7 @@ def test_benchmark_counter_delta_reports_one_core_convention():
 def _compression_report(compression, speed, workers=2, run_label="warm"):
     return {
         "host": "benchmark-host",
-        "git": {"sha": "a" * 40, "dirty": False},
+        "git": {"sha": "a" * 40, "dirty": False, "fingerprint": None},
         "compression": compression,
         "run_label": run_label,
         "arguments": {
@@ -3310,6 +3317,8 @@ def _compression_report(compression, speed, workers=2, run_label="warm"):
                     "episode_index": 0,
                     "old_index": 0,
                     "hdf5_index": 0,
+                    "caption": "pick up the bowl",
+                    "length": 50,
                 }
             ]
         },
@@ -3409,6 +3418,184 @@ def test_benchmark_merge_rejects_missing_git_sha():
         benchmark.merge_compression_reports(current, other)
 
 
+def test_benchmark_merge_rejects_missing_git_fingerprint_field():
+    current = _add_compression_parity_pairs(_compression_report("lzf", 96.0))
+    other = _add_compression_parity_pairs(_compression_report("none", 100.0))
+    other["git"].pop("fingerprint")
+    with pytest.raises(ValueError, match="git.*fingerprint"):
+        benchmark.merge_compression_reports(current, other)
+
+
+def test_benchmark_merge_accepts_matching_dirty_tree_fingerprint():
+    current = _add_compression_parity_pairs(_compression_report("lzf", 96.0))
+    other = _add_compression_parity_pairs(_compression_report("none", 100.0))
+    for report in (current, other):
+        report["git"] = {
+            "sha": "a" * 40,
+            "dirty": True,
+            "fingerprint": "b" * 64,
+        }
+
+    selection = benchmark.merge_compression_reports(current, other)
+
+    assert selection["selected_format"] == "lzf"
+
+
+@pytest.mark.parametrize(
+    ("dirty", "fingerprint"),
+    [
+        (False, "b" * 64),
+        (True, None),
+        (True, "not-a-sha256"),
+    ],
+)
+def test_benchmark_merge_rejects_invalid_dirty_tree_fingerprint(dirty, fingerprint):
+    current = _add_compression_parity_pairs(_compression_report("lzf", 96.0))
+    other = _add_compression_parity_pairs(_compression_report("none", 100.0))
+    for report in (current, other):
+        report["git"] = {
+            "sha": "a" * 40,
+            "dirty": dirty,
+            "fingerprint": fingerprint,
+        }
+
+    with pytest.raises(ValueError, match="git.*fingerprint"):
+        benchmark.merge_compression_reports(current, other)
+
+
+def test_benchmark_merge_rejects_different_dirty_tree_fingerprint():
+    current = _add_compression_parity_pairs(_compression_report("lzf", 96.0))
+    other = _add_compression_parity_pairs(_compression_report("none", 100.0))
+    current["git"] = {
+        "sha": "a" * 40,
+        "dirty": True,
+        "fingerprint": "b" * 64,
+    }
+    other["git"] = {
+        "sha": "a" * 40,
+        "dirty": True,
+        "fingerprint": "c" * 64,
+    }
+
+    with pytest.raises(ValueError, match="git.*match"):
+        benchmark.merge_compression_reports(current, other)
+
+
+@pytest.mark.parametrize(
+    ("field", "change"),
+    [
+        ("caption", "place the bowl"),
+        ("length", 49),
+        pytest.param("caption", None, id="missing-caption"),
+        pytest.param("length", None, id="missing-length"),
+    ],
+)
+def test_benchmark_merge_rejects_mapping_metadata_mismatch(field, change):
+    current = _add_compression_parity_pairs(_compression_report("lzf", 96.0))
+    other = _add_compression_parity_pairs(_compression_report("none", 100.0))
+    pair = other["mapping"]["pairs"][0]
+    if change is None:
+        pair.pop(field)
+    else:
+        pair[field] = change
+
+    with pytest.raises(ValueError, match="mapping"):
+        benchmark.merge_compression_reports(current, other)
+
+
+def _run_git(repo, *arguments):
+    return subprocess.run(
+        ["git", *arguments],
+        cwd=repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+
+
+def _make_benchmark_git_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run_git(repo, "init")
+    _run_git(repo, "config", "user.email", "benchmark@example.com")
+    _run_git(repo, "config", "user.name", "Benchmark Test")
+    (repo / ".gitignore").write_text("ignored.bin\n", encoding="utf-8")
+    (repo / "tracked.bin").write_bytes(b"tracked\x00base")
+    _run_git(repo, "add", ".gitignore", "tracked.bin")
+    _run_git(repo, "commit", "-m", "initial")
+    return repo
+
+
+def _assert_dirty_fingerprint(metadata):
+    assert metadata["dirty"] is True
+    assert len(metadata["fingerprint"]) == 64
+    assert set(metadata["fingerprint"]) <= set("0123456789abcdef")
+
+
+def test_benchmark_git_metadata_fingerprints_staged_and_unstaged_binary_diff(
+    tmp_path, monkeypatch
+):
+    repo = _make_benchmark_git_repo(tmp_path)
+    monkeypatch.setattr(benchmark, "REPOSITORY_ROOT", repo)
+    clean = benchmark._git_metadata()
+    assert clean == {
+        "sha": _run_git(repo, "rev-parse", "HEAD"),
+        "dirty": False,
+        "fingerprint": None,
+    }
+
+    tracked = repo / "tracked.bin"
+    tracked.write_bytes(b"staged\x00binary")
+    _run_git(repo, "add", "tracked.bin")
+    staged = benchmark._git_metadata()
+    _assert_dirty_fingerprint(staged)
+    assert benchmark._git_metadata() == staged
+
+    tracked.write_bytes(b"staged\x00binary\x00plus-unstaged")
+    staged_and_unstaged = benchmark._git_metadata()
+    _assert_dirty_fingerprint(staged_and_unstaged)
+    assert staged_and_unstaged["fingerprint"] != staged["fingerprint"]
+
+
+def test_benchmark_git_metadata_streams_untracked_identity_mode_and_content(
+    tmp_path, monkeypatch
+):
+    repo = _make_benchmark_git_repo(tmp_path)
+    monkeypatch.setattr(benchmark, "REPOSITORY_ROOT", repo)
+    ignored = repo / "ignored.bin"
+    ignored.write_bytes(b"not part of the dirty tree")
+    assert benchmark._git_metadata()["dirty"] is False
+
+    payload = repo / "payload.bin"
+    payload.write_bytes(b"a" * (2 * 1024 * 1024 + 17))
+    payload.chmod(0o600)
+    first = benchmark._git_metadata()
+    _assert_dirty_fingerprint(first)
+    assert benchmark._git_metadata() == first
+
+    payload.write_bytes(b"a" * (2 * 1024 * 1024 + 16) + b"b")
+    content_changed = benchmark._git_metadata()
+    assert content_changed["fingerprint"] != first["fingerprint"]
+
+    payload.chmod(0o700)
+    mode_changed = benchmark._git_metadata()
+    assert mode_changed["fingerprint"] != content_changed["fingerprint"]
+
+    renamed = repo / "renamed.bin"
+    payload.rename(renamed)
+    path_changed = benchmark._git_metadata()
+    assert path_changed["fingerprint"] != mode_changed["fingerprint"]
+
+    renamed.unlink()
+    renamed.symlink_to("target-a")
+    symlink_a = benchmark._git_metadata()
+    assert symlink_a["fingerprint"] != path_changed["fingerprint"]
+    renamed.unlink()
+    renamed.symlink_to("target-b")
+    symlink_b = benchmark._git_metadata()
+    assert symlink_b["fingerprint"] != symlink_a["fingerprint"]
+
+
 class _GateProbeDataset(torch.utils.data.Dataset):
     def __init__(self, count, reads):
         self.count = count
@@ -3421,6 +3608,68 @@ class _GateProbeDataset(torch.utils.data.Dataset):
         with self.reads.get_lock():
             self.reads.value += 1
         return _benchmark_sample()
+
+
+class _ExplodingGateDataset(torch.utils.data.Dataset):
+    def __init__(self):
+        self.closed = False
+
+    def __len__(self):
+        return 4
+
+    def __getitem__(self, _index):
+        raise RuntimeError("worker getitem exploded")
+
+    def close(self):
+        self.closed = True
+
+
+class _TrackingReadyQueue:
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+        self.closed = False
+        self.joined = False
+
+    def put(self, value):
+        return self.wrapped.put(value)
+
+    def get(self, *args, **kwargs):
+        return self.wrapped.get(*args, **kwargs)
+
+    def close(self):
+        self.closed = True
+        return self.wrapped.close()
+
+    def join_thread(self):
+        self.joined = True
+        return self.wrapped.join_thread()
+
+
+class _TrackingProcessContext:
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+        self.queues = []
+
+    def Event(self):
+        return self.wrapped.Event()
+
+    def Queue(self):
+        queue = _TrackingReadyQueue(self.wrapped.Queue())
+        self.queues.append(queue)
+        return queue
+
+
+class _TrackingRSSMonitor(benchmark.PeakWorkerRSSMonitor):
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stop_calls = 0
+        self.__class__.instances.append(self)
+
+    def stop(self):
+        self.stop_calls += 1
+        return super().stop()
 
 
 def test_benchmark_resource_counters_gate_prefetch_and_cover_full_stream(monkeypatch):
@@ -3453,6 +3702,43 @@ def test_benchmark_resource_counters_gate_prefetch_and_cover_full_stream(monkeyp
     assert result["drain_batches"] == 2
     assert result["drain_samples"] == 4
     assert result["resource_elapsed_seconds"] > 0
+
+
+def test_benchmark_worker_getitem_error_cleans_up_without_deadlock(monkeypatch):
+    actual_context = mp.get_context()
+    tracking_context = _TrackingProcessContext(actual_context)
+    monkeypatch.setattr(
+        benchmark,
+        "multiprocessing",
+        Namespace(get_context=lambda: tracking_context),
+    )
+    _TrackingRSSMonitor.instances = []
+    monkeypatch.setattr(benchmark, "PeakWorkerRSSMonitor", _TrackingRSSMonitor)
+    dataset = _ExplodingGateDataset()
+    child_pids_before = {process.pid for process in mp.active_children()}
+
+    start = time.perf_counter()
+    with pytest.raises(RuntimeError, match="worker getitem exploded"):
+        benchmark.measure_dataloader(
+            dataset,
+            workers=2,
+            batch_size=1,
+            warmup_batches=1,
+            measure_batches=1,
+            prefetch_factor=2,
+        )
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 10.0
+    assert dataset.closed is True
+    assert len(tracking_context.queues) == 1
+    assert tracking_context.queues[0].closed is True
+    assert tracking_context.queues[0].joined is True
+    assert len(_TrackingRSSMonitor.instances) == 1
+    monitor = _TrackingRSSMonitor.instances[0]
+    assert monitor.stop_calls == 1
+    assert monitor._thread is not None and not monitor._thread.is_alive()
+    assert {process.pid for process in mp.active_children()} <= child_pids_before
 
 
 @pytest.mark.parametrize("workers", [4, 8])

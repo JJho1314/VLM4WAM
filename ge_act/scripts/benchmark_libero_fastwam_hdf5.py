@@ -15,6 +15,7 @@ import os
 import queue
 import re
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -202,6 +203,19 @@ def merge_compression_reports(
             or type(git.get("dirty")) is not bool
         ):
             raise ValueError("compression report git sha/dirty must be present")
+        if "fingerprint" not in git:
+            raise ValueError("compression report git fingerprint must be present")
+        fingerprint = git["fingerprint"]
+        if git["dirty"]:
+            if (
+                type(fingerprint) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+            ):
+                raise ValueError(
+                    "compression report dirty git fingerprint must be sha256"
+                )
+        elif fingerprint is not None:
+            raise ValueError("compression report clean git fingerprint must be null")
     if current["git"] != other["git"]:
         raise ValueError("compression report git metadata must match")
 
@@ -216,8 +230,16 @@ def merge_compression_reports(
                 f"compression report {section} pairs are malformed"
             ) from error
 
-    mapping_fields = ("domain", "episode_index", "old_index", "hdf5_index")
-    parity_fields = (*mapping_fields, "frame_indexes", "action_indexes")
+    mapping_fields = (
+        "domain",
+        "episode_index",
+        "old_index",
+        "hdf5_index",
+        "caption",
+        "length",
+    )
+    identity_fields = ("domain", "episode_index", "old_index", "hdf5_index")
+    parity_fields = (*identity_fields, "frame_indexes", "action_indexes")
     if pair_projection(current, "mapping", mapping_fields) != pair_projection(
         other, "mapping", mapping_fields
     ):
@@ -1142,24 +1164,130 @@ def _filesystem_type(path: str | Path) -> str:
     return max(candidates)[1] if candidates else "unknown"
 
 
+def _hash_component(hasher: Any, label: bytes, payload: bytes) -> None:
+    """Hash one length-framed binary component without ambiguous concatenation."""
+    hasher.update(len(label).to_bytes(4, "big"))
+    hasher.update(label)
+    hasher.update(len(payload).to_bytes(8, "big"))
+    hasher.update(payload)
+
+
+def _git_diff_digest() -> tuple[int, bytes]:
+    """Stream the complete HEAD-to-worktree binary diff into a nested digest."""
+    process = subprocess.Popen(
+        [
+            "git",
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "HEAD",
+            "--",
+        ],
+        cwd=REPOSITORY_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None and process.stderr is not None
+    digest = hashlib.sha256()
+    byte_count = 0
+    while True:
+        chunk = process.stdout.read(1024 * 1024)
+        if not chunk:
+            break
+        byte_count += len(chunk)
+        digest.update(chunk)
+    stderr = process.stderr.read()
+    return_code = process.wait()
+    if return_code:
+        raise subprocess.CalledProcessError(
+            return_code,
+            process.args,
+            stderr=stderr,
+        )
+    return byte_count, digest.digest()
+
+
+def _untracked_paths() -> list[bytes]:
+    result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z", "--"],
+        cwd=REPOSITORY_ROOT,
+        check=True,
+        capture_output=True,
+    )
+    return sorted(path for path in result.stdout.split(b"\0") if path)
+
+
+def _stream_file_digest(path: bytes) -> bytes:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.digest()
+
+
+def _dirty_tree_fingerprint() -> tuple[bool, str | None]:
+    """Fingerprint tracked changes and complete non-ignored untracked objects."""
+    diff_size, diff_digest = _git_diff_digest()
+    untracked_paths = _untracked_paths()
+    if diff_size == 0 and not untracked_paths:
+        return False, None
+
+    hasher = hashlib.sha256()
+    _hash_component(hasher, b"format", b"libero-benchmark-dirty-tree-v1")
+    _hash_component(hasher, b"git-diff-size", str(diff_size).encode("ascii"))
+    _hash_component(hasher, b"git-diff-sha256", diff_digest)
+    repository_bytes = os.fsencode(REPOSITORY_ROOT)
+    for relative_path in untracked_paths:
+        full_path = os.path.join(repository_bytes, relative_path)
+        metadata = os.lstat(full_path)
+        file_type = stat.S_IFMT(metadata.st_mode)
+        permissions = stat.S_IMODE(metadata.st_mode)
+        _hash_component(hasher, b"untracked-path", relative_path)
+        _hash_component(hasher, b"untracked-type", str(file_type).encode("ascii"))
+        _hash_component(
+            hasher, b"untracked-permissions", format(permissions, "04o").encode("ascii")
+        )
+        if stat.S_ISREG(metadata.st_mode):
+            _hash_component(
+                hasher, b"untracked-size", str(metadata.st_size).encode("ascii")
+            )
+            _hash_component(
+                hasher, b"untracked-content-sha256", _stream_file_digest(full_path)
+            )
+        elif stat.S_ISLNK(metadata.st_mode):
+            _hash_component(hasher, b"untracked-symlink-target", os.readlink(full_path))
+        else:
+            _hash_component(
+                hasher, b"untracked-size", str(metadata.st_size).encode("ascii")
+            )
+            _hash_component(
+                hasher, b"untracked-device", str(metadata.st_rdev).encode("ascii")
+            )
+    return True, hasher.hexdigest()
+
+
 def _git_metadata() -> dict[str, Any]:
-    def command(*arguments: str) -> str:
+    try:
         result = subprocess.run(
-            ["git", *arguments],
+            ["git", "rev-parse", "HEAD"],
             cwd=REPOSITORY_ROOT,
             check=True,
             text=True,
             capture_output=True,
         )
-        return result.stdout.strip()
-
-    try:
+        dirty, fingerprint = _dirty_tree_fingerprint()
         return {
-            "sha": command("rev-parse", "HEAD"),
-            "dirty": bool(command("status", "--porcelain")),
+            "sha": result.stdout.strip(),
+            "dirty": dirty,
+            "fingerprint": fingerprint,
         }
     except (OSError, subprocess.CalledProcessError):
-        return {"sha": None, "dirty": None}
+        return {"sha": None, "dirty": None, "fingerprint": None}
 
 
 def _positive_int(value: str) -> int:
