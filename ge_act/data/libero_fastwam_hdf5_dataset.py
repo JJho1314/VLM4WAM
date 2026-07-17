@@ -27,6 +27,30 @@ FIXED_CAMERAS = [
 ]
 
 
+def _clip_integer_indexes(
+    indexes: Sequence[int] | np.ndarray,
+    *,
+    length: int,
+    name: str,
+) -> np.ndarray:
+    requested = np.asarray(indexes)
+    if requested.ndim != 1 or requested.size == 0:
+        raise ValueError(f"{name} must be a non-empty 1-D integer sequence")
+    if requested.dtype.kind not in "iu" or requested.dtype.kind == "b":
+        raise TypeError(f"{name} must be a non-empty 1-D integer sequence")
+    if type(length) is not int or length <= 0 or length > np.iinfo(np.int64).max:
+        raise ValueError(
+            f"length must be an integer in [1, {np.iinfo(np.int64).max}], "
+            f"got {length!r}"
+        )
+
+    if requested.dtype.kind == "u":
+        clipped = np.minimum(requested, length - 1)
+        return clipped.astype(np.int64, copy=False)
+    signed = requested.astype(np.int64, copy=False)
+    return np.clip(signed, 0, length - 1)
+
+
 def read_rows_preserving_order(
     dataset: Any,
     indexes: Sequence[int] | np.ndarray,
@@ -34,12 +58,6 @@ def read_rows_preserving_order(
     length: int | None = None,
 ) -> np.ndarray:
     """Read sorted unique rows once, then restore clipped order and repeats."""
-    requested = np.asarray(indexes)
-    if requested.ndim != 1 or requested.size == 0:
-        raise ValueError("indexes must be a non-empty 1-D integer sequence")
-    if requested.dtype.kind not in "iu" or requested.dtype.kind == "b":
-        raise TypeError("indexes must be a non-empty 1-D integer sequence")
-
     dataset_length = int(dataset.shape[0])
     if length is None:
         length = dataset_length
@@ -48,7 +66,7 @@ def read_rows_preserving_order(
             f"length must be an integer in [1, {dataset_length}], got {length!r}"
         )
 
-    clipped = np.clip(requested.astype(np.int64, copy=False), 0, length - 1)
+    clipped = _clip_integer_indexes(indexes, length=length, name="indexes")
     unique_rows = np.unique(clipped)
     values = np.asarray(dataset[unique_rows])
     gather = np.searchsorted(unique_rows, clipped)
@@ -244,9 +262,7 @@ class LiberoFastWAMHDF5Dataset(Dataset):
             action_future = list(
                 range(self.fix_sidx, self.fix_sidx + self.action_chunk)
             )
-            frame_future = action_future[
-                self.video_temporal_stride - 1 :: self.video_temporal_stride
-            ]
+            frame_future = action_future[:: self.video_temporal_stride]
             action_future = np.clip(action_future, 0, total_frames - 1).tolist()
             frame_future = np.clip(frame_future, 0, total_frames - 1).tolist()
             memories = np.clip(self.fix_mem_idx, 0, total_frames - 1).tolist()
@@ -300,8 +316,12 @@ class LiberoFastWAMHDF5Dataset(Dataset):
         """Read one manifest record by explicit, clipped row indexes."""
         selected = self._resolve_index(index)
         record = self.records[selected]
-        frame_list = self._validated_index_list(frame_indexes, "frame_indexes")
-        action_list = self._validated_index_list(action_indexes, "action_indexes")
+        frame_list = self._validated_index_list(
+            frame_indexes, "frame_indexes", record.length
+        )
+        action_list = self._validated_index_list(
+            action_indexes, "action_indexes", record.length
+        )
         if len(action_list) < self.n_previous:
             raise ValueError(
                 f"action_indexes must contain at least {self.n_previous} rows"
@@ -352,13 +372,10 @@ class LiberoFastWAMHDF5Dataset(Dataset):
         }
 
     @staticmethod
-    def _validated_index_list(indexes: Sequence[int], name: str) -> list[int]:
-        array = np.asarray(indexes)
-        if array.ndim != 1 or array.size == 0 or array.dtype.kind not in "iu":
-            raise ValueError(f"{name} must be a non-empty 1-D integer sequence")
-        if array.dtype.kind == "b":
-            raise ValueError(f"{name} must be a non-empty 1-D integer sequence")
-        return array.astype(np.int64, copy=False).tolist()
+    def _validated_index_list(
+        indexes: Sequence[int], name: str, length: int
+    ) -> list[int]:
+        return _clip_integer_indexes(indexes, length=length, name=name).tolist()
 
     def _get_handle(self, path: Path) -> h5py.File:
         current_pid = os.getpid()

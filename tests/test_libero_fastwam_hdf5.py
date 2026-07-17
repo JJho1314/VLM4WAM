@@ -20,6 +20,7 @@ from ge_act.data.libero_fastwam_hdf5_dataset import (
     LiberoFastWAMHDF5Dataset,
     read_rows_preserving_order,
 )
+from ge_act.data.lerobot_like_dataset import CustomLeRobotDataset
 from ge_act.scripts import convert_libero_fastwam_hdf5 as converter
 
 
@@ -1498,6 +1499,8 @@ def make_reader_fixture(
                     "state",
                     data=np.arange(50 * 8, dtype=np.float32).reshape(50, 8),
                 )
+                group["rgb_main"][-1] = 49
+                group["rgb_wrist"][-1] = 149
                 records.append(
                     {
                         "key": key,
@@ -1643,9 +1646,23 @@ def test_hdf5_dataset_returns_fixed_normalized_sample_in_camera_order(tmp_path):
     raw_state = torch.arange(50 * 8, dtype=torch.float32).reshape(50, 8)
     torch.testing.assert_close(sample["state"], (raw_state[[11]] - 3.0) / (4.0 + 1e-6))
     assert dataset.get_frame_indexes(50) == (
-        [1, 4, 8, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47],
+        [1, 4, 8, 11, 12, 16, 20, 24, 28, 32, 36, 40, 44],
         expected_action_indexes,
     )
+
+
+def test_hdf5_fixed_sampling_matches_original_loader(tmp_path):
+    dataset = make_reader(
+        tmp_path,
+        fix_sidx=12,
+        fix_mem_idx=[1, 4, 8, 11],
+    )
+    original = object.__new__(CustomLeRobotDataset)
+    original.fix_sidx = 12
+    original.fix_mem_idx = [1, 4, 8, 11]
+    original.action_chunk = 36
+    original.video_temporal_stride = 4
+    assert dataset.get_frame_indexes(50) == original.get_frame_indexes(50)
 
 
 class TrackingRows:
@@ -1665,6 +1682,34 @@ def test_read_rows_preserves_order_repeats_and_clips_without_full_read():
     np.testing.assert_array_equal(actual, rows.array[[4, 1, 4, 0, 5]])
     assert len(rows.calls) == 1
     np.testing.assert_array_equal(rows.calls[0], [0, 1, 4, 5])
+
+
+def test_read_rows_clips_uint64_above_int64_before_casting():
+    rows = TrackingRows()
+    indexes = np.asarray([np.uint64(2**63)], dtype=np.uint64)
+    actual = read_rows_preserving_order(rows, indexes, length=6)
+    np.testing.assert_array_equal(actual, rows.array[[5]])
+    np.testing.assert_array_equal(rows.calls[0], [5])
+
+
+def test_read_by_indexes_clips_uint64_above_int64_before_casting(tmp_path):
+    dataset = make_reader(tmp_path)
+    huge = np.uint64(2**63)
+    sample = dataset.read_by_indexes(
+        0,
+        np.asarray([huge], dtype=np.uint64),
+        np.asarray([0, 1, 2, huge], dtype=np.uint64),
+    )
+    torch.testing.assert_close(
+        sample["video"][:, 0, 0],
+        torch.full((3, 256, 256), 49 / 255.0 * 2.0 - 1.0),
+    )
+    raw_actions = torch.arange(50 * 7, dtype=torch.float32).reshape(50, 7)
+    torch.testing.assert_close(
+        sample["actions"][-1], (raw_actions[-1] - 1.0) / (2.0 + 1e-6)
+    )
+    raw_state = torch.arange(50 * 8, dtype=torch.float32).reshape(50, 8)
+    torch.testing.assert_close(sample["state"], (raw_state[[-1]] - 3.0) / (4.0 + 1e-6))
 
 
 @pytest.mark.parametrize("indexes", [[], [[1, 2]], [1.5], [True]])
