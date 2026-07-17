@@ -74,9 +74,13 @@ The public dual-camera prediction API returns:
 ```text
 current_siglip: [B, 2, 256, 1024]
 future_siglip:  [B, 2, 256, 1024]
-current_depth:  [B, 2, 256, 1024]
-future_depth:   [B, 2, 256, 1024]
+current_depth:  [B, 2, 256, 2048]
+future_depth:   [B, 2, 256, 2048]
 ```
+
+The depth width follows the existing `step_030000` DA3-Large last-layer head.
+It is auxiliary planner supervision only; GE-Act consumes the 1024-D
+`future_siglip` branch.
 
 The depth width is restored from the current DA3 checkpoint contract and is
 fixed to `1024` for this run. The historical internal `dino` name may remain

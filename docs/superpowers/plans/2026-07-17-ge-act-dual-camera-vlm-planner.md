@@ -14,7 +14,8 @@
 - VLM input uses two independent image slots and never constructs a horizontal composite.
 - The planner keeps four independent 64-token query groups, 256 total query tokens.
 - Current/future SigLIP2 and current/future depth supervision remain enabled for both views.
-- Per-view SigLIP2 and depth outputs are `[B,2,256,1024]`.
+- Per-view SigLIP2 outputs are `[B,2,256,1024]`; DA3-Large last-layer depth
+  outputs are `[B,2,256,2048]`. GE-Act consumes only future SigLIP2.
 - The only exported future keyframe is offset `8` in a nine-frame future window, normalized to time `1.0`.
 - `/data/users/junjie/code/VLM4WAM_k1_zero2_bidir/outputs/qwen3vl2b_siglip2_da3_libero_cur_k1/step_030000` is initialization only; legacy composite metadata is rejected by dual-camera inference.
 - GE-Act freezes the planner and trains only LTX plus the semantic adapter during the initial integration.
@@ -334,7 +335,8 @@ git commit -m "feat(planner): initialize and export dual-camera checkpoints"
 
 **Interfaces:**
 - New CLI: `--ge-act-data-config PATH`, mutually exclusive with legacy dataset sources.
-- Training targets: four tensors shaped `[B,2,256,1024]`.
+- Training targets: current/future SigLIP2 are `[B,2,256,1024]` and
+  current/future DA3 depth are `[B,2,256,2048]`.
 
 - [ ] **Step 1: Add failing tests for GE-Act dataset selection and teacher reshape**
 
@@ -380,8 +382,8 @@ current_siglip, future_siglip = dino_encoder.encode_current_and_future(current_b
 current_depth, future_depth = depth_encoder.encode_current_and_future(current_bv, future_bv)
 batch["current_dino_labels"] = current_siglip.reshape(b, views, 256, 1024)
 batch["semantic_plan_labels"] = future_siglip.reshape(b, views, 256, 1024)
-batch["current_depth_labels"] = current_depth.reshape(b, views, 256, 1024)
-batch["depth_plan_labels"] = future_depth.reshape(b, views, 256, 1024)
+batch["current_depth_labels"] = current_depth.reshape(b, views, 256, 2048)
+batch["depth_plan_labels"] = future_depth.reshape(b, views, 256, 2048)
 ```
 
 Update the shell launcher to accept `GE_ACT_DATA_CONFIG` and `INIT_PLANNER_CHECKPOINT`, set `NUM_TASK_TOKENS=64`, and pass the two new CLI arguments. The dedicated launcher records SigLIP2-large-patch16-256, DA3 last-layer, offset 8, full fine-tuning, and 30,000 steps.
