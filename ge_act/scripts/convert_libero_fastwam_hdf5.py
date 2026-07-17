@@ -116,9 +116,7 @@ def discover_source_episodes(
     max_episodes: int | None = None,
 ) -> list[SourceEpisode]:
     """Discover unique episodes in caller domain order and numeric episode order."""
-    if max_episodes is not None and (
-        type(max_episodes) is not int or max_episodes < 1
-    ):
+    if max_episodes is not None and (type(max_episodes) is not int or max_episodes < 1):
         raise ValueError("max_episodes must be a positive integer or None")
     cache_root = (
         None
@@ -140,21 +138,18 @@ def discover_source_episodes(
                 f"chunks_size must be a positive integer: {meta_root / 'info.json'}"
             )
 
-        task_by_index: dict[int, str] = {}
+        task_texts: set[str] = set()
         for item in _load_jsonl(meta_root / "tasks.jsonl"):
             if type(item) is not dict:
                 raise ValueError(f"task record must be a dict: domain={domain}")
-            task_index = item.get("task_index")
             task = item.get("task")
-            if type(task_index) is not int or type(task) is not str or not task:
+            if type(task) is not str or not task:
                 raise ValueError(
                     f"invalid task metadata: domain={domain}, record={item!r}"
                 )
-            if task_index in task_by_index:
-                raise ValueError(
-                    f"duplicate task index: domain={domain}, task_index={task_index}"
-                )
-            task_by_index[task_index] = task
+            if task in task_texts:
+                raise ValueError(f"duplicate task text: domain={domain}, task={task!r}")
+            task_texts.add(task)
 
         raw_episodes = _load_jsonl(meta_root / "episodes.jsonl")
         try:
@@ -184,11 +179,16 @@ def discover_source_episodes(
                     f"episode must have exactly one task: domain={domain}, "
                     f"episode={episode_index}, tasks={tasks!r}"
                 )
-            task_index = tasks[0]
-            if type(task_index) is not int or task_index not in task_by_index:
+            task_text = tasks[0]
+            if type(task_text) is not str or not task_text:
                 raise ValueError(
-                    f"unknown task index: domain={domain}, episode={episode_index}, "
-                    f"task_index={task_index!r}"
+                    f"episode task must be non-empty task text: domain={domain}, "
+                    f"episode={episode_index}, task={task_text!r}"
+                )
+            if task_text not in task_texts:
+                raise ValueError(
+                    f"unknown task text: domain={domain}, episode={episode_index}, "
+                    f"task={task_text!r}"
                 )
 
             key = f"{domain}:{episode_index:06d}"
@@ -234,7 +234,9 @@ def discover_source_episodes(
                     caches[camera_role] = cache_path
                     required_path = cache_path
                 if not required_path.is_file():
-                    source_kind = "camera cache" if cache_root is not None else "camera video"
+                    source_kind = (
+                        "camera cache" if cache_root is not None else "camera video"
+                    )
                     raise FileNotFoundError(
                         f"missing {camera_role} {source_kind}: domain={domain}, "
                         f"episode={episode_index}, camera={camera_name}, "
@@ -248,7 +250,7 @@ def discover_source_episodes(
                     domain=domain,
                     episode_index=episode_index,
                     length=length,
-                    caption=task_by_index[task_index],
+                    caption=task_text,
                     parquet_path=parquet_path,
                     main_video_path=videos["main"],
                     wrist_video_path=videos["wrist"],
@@ -342,9 +344,7 @@ def decode_rgb_video(video_path: str | Path) -> np.ndarray:
     return result
 
 
-def _load_rgb_source(
-    episode: SourceEpisode, camera_role: str
-) -> np.ndarray:
+def _load_rgb_source(episode: SourceEpisode, camera_role: str) -> np.ndarray:
     cache_path = getattr(episode, f"{camera_role}_cache_path")
     video_path = getattr(episode, f"{camera_role}_video_path")
     if cache_path is None:
@@ -443,9 +443,7 @@ def _converter_inputs(args: Any) -> SimpleNamespace:
     if type(microbatch) is not int or microbatch < 1:
         raise ValueError("resize_microbatch must be a positive integer")
     max_episodes = getattr(args, "max_episodes", None)
-    if max_episodes is not None and (
-        type(max_episodes) is not int or max_episodes < 1
-    ):
+    if max_episodes is not None and (type(max_episodes) is not int or max_episodes < 1):
         raise ValueError("max_episodes must be a positive integer or None")
     predecoded_value = getattr(args, "predecoded_root", None)
     return SimpleNamespace(
@@ -475,23 +473,17 @@ def _unique_source_roots(data_roots: Iterable[Path]) -> list[str]:
     return roots
 
 
-def _fingerprint(
-    config: SimpleNamespace, episodes: Sequence[SourceEpisode]
-) -> str:
+def _fingerprint(config: SimpleNamespace, episodes: Sequence[SourceEpisode]) -> str:
     canonical = {
         "schema_version": schema.SCHEMA_VERSION,
         "contract": schema.FIXED_CONTRACT,
         "datasets": schema.DATASET_DECLARATIONS,
         "source_specs": [
             [str(root), domain]
-            for root, domain in _aligned_source_specs(
-                config.data_roots, config.domains
-            )
+            for root, domain in _aligned_source_specs(config.data_roots, config.domains)
         ],
         "predecoded_root": (
-            None
-            if config.predecoded_root is None
-            else str(config.predecoded_root)
+            None if config.predecoded_root is None else str(config.predecoded_root)
         ),
         "compression": config.compression,
         "episodes_per_shard": config.episodes_per_shard,
@@ -504,9 +496,7 @@ def _fingerprint(
                 "length": episode.length,
                 "caption": episode.caption,
                 "parquet_path": str(episode.parquet_path),
-                "main_source": str(
-                    episode.main_cache_path or episode.main_video_path
-                ),
+                "main_source": str(episode.main_cache_path or episode.main_video_path),
                 "wrist_source": str(
                     episode.wrist_cache_path or episode.wrist_video_path
                 ),
@@ -520,9 +510,7 @@ def _fingerprint(
     return hashlib.sha256(serialized).hexdigest()
 
 
-def _record_for(
-    episode: SourceEpisode, shard_path: Path
-) -> schema.EpisodeRecord:
+def _record_for(episode: SourceEpisode, shard_path: Path) -> schema.EpisodeRecord:
     return schema.EpisodeRecord(
         key=episode.key,
         shard_path=shard_path.resolve(),
@@ -535,9 +523,7 @@ def _record_for(
 
 
 def _camera_names_attr() -> np.ndarray:
-    return np.asarray(
-        ["main", "wrist"], dtype=h5py.string_dtype(encoding="utf-8")
-    )
+    return np.asarray(["main", "wrist"], dtype=h5py.string_dtype(encoding="utf-8"))
 
 
 def _read_camera_names_attribute(file: h5py.File) -> list[str]:
@@ -588,7 +574,47 @@ def _validate_shard(
                 f"{sorted(expected_groups)!r}, got {sorted(actual_groups)!r}"
             )
         for record in records:
-            schema.validate_episode_group(file[record.group], record)
+            group = file[record.group]
+            try:
+                schema.validate_episode_group(group, record)
+            except Exception as error:
+                raise ValueError(
+                    f"shard {shard_path} group {record.group} is invalid: {error}"
+                ) from error
+
+            expected_rgb_compression = None if compression == "none" else "lzf"
+            storage_contract = {
+                "rgb_main": ((1, 256, 256, 3), expected_rgb_compression),
+                "rgb_wrist": ((1, 256, 256, 3), expected_rgb_compression),
+                "action": ((min(64, record.length), 7), None),
+                "state": ((min(64, record.length), 8), None),
+            }
+            for dataset_name, (
+                expected_chunks,
+                expected_compression,
+            ) in storage_contract.items():
+                dataset = group[dataset_name]
+                if dataset.chunks != expected_chunks:
+                    raise ValueError(
+                        f"shard {shard_path} group {record.group} dataset "
+                        f"{dataset_name} chunks must be {expected_chunks!r}, "
+                        f"got {dataset.chunks!r}"
+                    )
+                if dataset.compression != expected_compression:
+                    raise ValueError(
+                        f"shard {shard_path} group {record.group} dataset "
+                        f"{dataset_name} compression must be "
+                        f"{expected_compression!r}, got {dataset.compression!r}"
+                    )
+            for dataset_name in ("caption", "domain", "episode_index", "length"):
+                dataset = group[dataset_name]
+                if dataset.chunks is not None or dataset.compression is not None:
+                    raise ValueError(
+                        f"shard {shard_path} group {record.group} scalar "
+                        f"{dataset_name} must be contiguous and uncompressed, got "
+                        f"chunks={dataset.chunks!r}, compression="
+                        f"{dataset.compression!r}"
+                    )
 
 
 def _write_episode_group(
@@ -612,12 +638,8 @@ def _write_episode_group(
         "chunks": (1, IMAGE_SIZE[0], IMAGE_SIZE[1], 3),
         "compression": hdf5_compression,
     }
-    group.create_dataset(
-        "rgb_main", data=main, dtype=np.uint8, **rgb_options
-    )
-    group.create_dataset(
-        "rgb_wrist", data=wrist, dtype=np.uint8, **rgb_options
-    )
+    group.create_dataset("rgb_main", data=main, dtype=np.uint8, **rgb_options)
+    group.create_dataset("rgb_wrist", data=wrist, dtype=np.uint8, **rgb_options)
     group.create_dataset(
         "action",
         data=action,
@@ -633,9 +655,7 @@ def _write_episode_group(
     string_dtype = h5py.string_dtype(encoding="utf-8")
     group.create_dataset("caption", data=episode.caption, dtype=string_dtype)
     group.create_dataset("domain", data=episode.domain, dtype=string_dtype)
-    group.create_dataset(
-        "episode_index", data=episode.episode_index, dtype=np.int64
-    )
+    group.create_dataset("episode_index", data=episode.episode_index, dtype=np.int64)
     group.create_dataset("length", data=episode.length, dtype=np.int64)
 
 
@@ -685,6 +705,8 @@ def _write_shard_atomic(
             fingerprint=fingerprint,
         )
         os.replace(temporary, shard_path)
+    except Exception as error:
+        raise ValueError(f"failed to build shard {shard_path}: {error}") from error
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -745,6 +767,35 @@ def _validate_published_output(
     return payload, records
 
 
+def _make_shard_plan(
+    output_root: Path,
+    generation: str,
+    episodes: Sequence[SourceEpisode],
+    episodes_per_shard: int,
+) -> tuple[
+    list[Path],
+    list[list[SourceEpisode]],
+    list[list[schema.EpisodeRecord]],
+    list[schema.EpisodeRecord],
+]:
+    shard_count = (len(episodes) + episodes_per_shard - 1) // episodes_per_shard
+    shard_paths = [
+        output_root / f"shard_{index:05d}_{generation}.h5"
+        for index in range(shard_count)
+    ]
+    episode_batches: list[list[SourceEpisode]] = []
+    record_batches: list[list[schema.EpisodeRecord]] = []
+    all_records: list[schema.EpisodeRecord] = []
+    for shard_index, shard_path in enumerate(shard_paths):
+        start = shard_index * episodes_per_shard
+        batch = list(episodes[start : start + episodes_per_shard])
+        records = [_record_for(episode, shard_path) for episode in batch]
+        episode_batches.append(batch)
+        record_batches.append(records)
+        all_records.extend(records)
+    return shard_paths, episode_batches, record_batches, all_records
+
+
 def convert_dataset(args: Any) -> dict[str, int | str]:
     """Convert source episodes and atomically publish a validated manifest."""
     config = _converter_inputs(args)
@@ -781,44 +832,58 @@ def convert_dataset(args: Any) -> dict[str, int | str]:
             else:
                 return {
                     "episodes": len(existing_records),
-                    "shards": len(
-                        {record.shard_path for record in existing_records}
-                    ),
+                    "shards": len({record.shard_path for record in existing_records}),
                     "compression": existing_payload["compression"],
                 }
 
-    shard_count = (
-        len(episodes) + config.episodes_per_shard - 1
-    ) // config.episodes_per_shard
     generation = fingerprint[:12]
     if fresh_generation_required:
         generation = f"{generation}_{uuid.uuid4().hex[:8]}"
-    shard_paths = [
-        output_root / f"shard_{index:05d}_{generation}.h5"
-        for index in range(shard_count)
-    ]
-    if not manifest_path.exists() and any(path.exists() for path in shard_paths):
-        if not config.overwrite:
-            raise FileExistsError(
-                "matching shard files exist without a manifest; pass --overwrite "
-                "to create a fresh immutable generation"
-            )
-        generation = f"{generation}_{uuid.uuid4().hex[:8]}"
-        shard_paths = [
-            output_root / f"shard_{index:05d}_{generation}.h5"
-            for index in range(shard_count)
-        ]
+    shard_paths, episode_batches, record_batches, all_records = _make_shard_plan(
+        output_root,
+        generation,
+        episodes,
+        config.episodes_per_shard,
+    )
 
-    all_records: list[schema.EpisodeRecord] = []
-    episode_batches: list[list[SourceEpisode]] = []
-    record_batches: list[list[schema.EpisodeRecord]] = []
-    for shard_index, shard_path in enumerate(shard_paths):
-        start = shard_index * config.episodes_per_shard
-        batch = episodes[start : start + config.episodes_per_shard]
-        records = [_record_for(episode, shard_path) for episode in batch]
-        episode_batches.append(batch)
-        record_batches.append(records)
-        all_records.extend(records)
+    reused_shards: set[Path] = set()
+    if not manifest_path.exists() and not fresh_generation_required:
+        invalid_orphan: tuple[Path, Exception] | None = None
+        for shard_path, record_batch in zip(shard_paths, record_batches):
+            if not shard_path.exists():
+                continue
+            try:
+                _validate_shard(
+                    shard_path,
+                    record_batch,
+                    compression=config.compression,
+                    fingerprint=fingerprint,
+                )
+            except Exception as error:
+                invalid_orphan = (shard_path, error)
+                break
+            reused_shards.add(shard_path)
+
+        if invalid_orphan is not None:
+            invalid_path, validation_error = invalid_orphan
+            if not config.overwrite:
+                raise ValueError(
+                    f"invalid orphan shard {invalid_path}: {validation_error}; "
+                    "pass --overwrite to create a fresh immutable generation"
+                ) from validation_error
+            generation = f"{fingerprint[:12]}_{uuid.uuid4().hex[:8]}"
+            (
+                shard_paths,
+                episode_batches,
+                record_batches,
+                all_records,
+            ) = _make_shard_plan(
+                output_root,
+                generation,
+                episodes,
+                config.episodes_per_shard,
+            )
+            reused_shards.clear()
 
     payload = _manifest_payload(config, episodes, all_records, fingerprint)
     created_shards: list[Path] = []
@@ -826,6 +891,8 @@ def convert_dataset(args: Any) -> dict[str, int | str]:
         for shard_path, episode_batch, record_batch in zip(
             shard_paths, episode_batches, record_batches
         ):
+            if shard_path in reused_shards:
+                continue
             _write_shard_atomic(
                 shard_path,
                 episode_batch,
@@ -855,7 +922,7 @@ def convert_dataset(args: Any) -> dict[str, int | str]:
 
     return {
         "episodes": len(episodes),
-        "shards": shard_count,
+        "shards": len(shard_paths),
         "compression": config.compression,
     }
 
