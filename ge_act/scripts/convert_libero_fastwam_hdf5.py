@@ -406,7 +406,14 @@ def _load_controls(episode: SourceEpisode) -> tuple[np.ndarray, np.ndarray]:
                 f"episode={episode.episode_index}, path={episode.parquet_path}, "
                 f"expected={expected_shape}, got={array.shape}"
             )
-        arrays[output_name] = np.ascontiguousarray(array, dtype=np.float32)
+        try:
+            arrays[output_name] = np.ascontiguousarray(array, dtype=np.float32)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                f"invalid {output_name} values: domain={episode.domain}, "
+                f"episode={episode.episode_index}, path={episode.parquet_path}: "
+                f"cannot convert to float32: {error}"
+            ) from error
     return arrays["action"], arrays["state"]
 
 
@@ -741,19 +748,83 @@ def _manifest_payload(
     return payload
 
 
+def _expected_manifest_semantics(
+    config: SimpleNamespace,
+    episodes: Sequence[SourceEpisode],
+    fingerprint: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": schema.SCHEMA_VERSION,
+        **schema.FIXED_CONTRACT,
+        "compression": config.compression,
+        "source_roots": _unique_source_roots(config.data_roots),
+        "datasets": schema.DATASET_DECLARATIONS,
+        "converter_fingerprint": fingerprint,
+        "episodes": [
+            {
+                "key": episode.key,
+                "group": f"episodes/{episode.key}",
+                "caption": episode.caption,
+                "domain": episode.domain,
+                "episode_index": episode.episode_index,
+                "length": episode.length,
+            }
+            for episode in episodes
+        ],
+    }
+
+
+def _validate_manifest_semantics(
+    payload: dict[str, Any], expected: dict[str, Any]
+) -> None:
+    fields = ["converter_fingerprint"] + [
+        field
+        for field in expected
+        if field not in ("converter_fingerprint", "episodes")
+    ]
+    for field in fields:
+        expected_value = expected[field]
+        actual_value = payload[field]
+        if actual_value != expected_value:
+            raise ValueError(
+                f"published manifest semantic mismatch for {field}: "
+                f"existing={actual_value!r}, requested={expected_value!r}"
+            )
+
+    actual_episodes = payload["episodes"]
+    expected_episodes = expected["episodes"]
+    if len(actual_episodes) != len(expected_episodes):
+        raise ValueError(
+            "published manifest semantic mismatch for episodes: "
+            f"existing count={len(actual_episodes)}, "
+            f"requested count={len(expected_episodes)}"
+        )
+    for index, (actual, requested) in enumerate(
+        zip(actual_episodes, expected_episodes)
+    ):
+        for field, expected_value in requested.items():
+            actual_value = actual[field]
+            if actual_value != expected_value:
+                raise ValueError(
+                    "published manifest semantic mismatch for "
+                    f"episodes[{index}].{field}: existing={actual_value!r}, "
+                    f"requested={expected_value!r}"
+                )
+
+
 def _validate_published_output(
-    manifest_path: Path, *, expected_fingerprint: str | None = None
+    manifest_path: Path,
+    *,
+    expected_semantics: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[schema.EpisodeRecord]]:
     payload, records = schema.load_manifest(manifest_path)
-    if (
-        expected_fingerprint is not None
-        and payload["converter_fingerprint"] != expected_fingerprint
-    ):
-        raise ValueError(
-            "converter fingerprint mismatch: "
-            f"existing={payload['converter_fingerprint']}, "
-            f"requested={expected_fingerprint}"
-        )
+    if expected_semantics is not None:
+        _validate_manifest_semantics(payload, expected_semantics)
+        expected_compression = expected_semantics["compression"]
+        expected_fingerprint = expected_semantics["converter_fingerprint"]
+    else:
+        expected_compression = payload["compression"]
+        expected_fingerprint = payload["converter_fingerprint"]
     records_by_shard: dict[Path, list[schema.EpisodeRecord]] = {}
     for record in records:
         records_by_shard.setdefault(record.shard_path, []).append(record)
@@ -761,8 +832,8 @@ def _validate_published_output(
         _validate_shard(
             shard_path,
             shard_records,
-            compression=payload["compression"],
-            fingerprint=payload["converter_fingerprint"],
+            compression=expected_compression,
+            fingerprint=expected_fingerprint,
         )
     return payload, records
 
@@ -806,38 +877,23 @@ def convert_dataset(args: Any) -> dict[str, int | str]:
         max_episodes=config.max_episodes,
     )
     fingerprint = _fingerprint(config, episodes)
+    expected_semantics = _expected_manifest_semantics(config, episodes, fingerprint)
     output_root = config.output_root
     output_root.mkdir(parents=True, exist_ok=True)
     manifest_path = output_root / "manifest.json"
 
-    fresh_generation_required = False
-    if manifest_path.exists():
-        try:
-            existing_payload, existing_records = _validate_published_output(
-                manifest_path
-            )
-        except Exception:
-            if not config.overwrite:
-                raise
-            fresh_generation_required = True
-        else:
-            if existing_payload["converter_fingerprint"] != fingerprint:
-                if not config.overwrite:
-                    raise ValueError(
-                        "converter fingerprint mismatch: "
-                        f"existing={existing_payload['converter_fingerprint']}, "
-                        f"requested={fingerprint}; pass --overwrite to replace"
-                    )
-                fresh_generation_required = True
-            else:
-                return {
-                    "episodes": len(existing_records),
-                    "shards": len({record.shard_path for record in existing_records}),
-                    "compression": existing_payload["compression"],
-                }
+    if manifest_path.exists() and not config.overwrite:
+        _, existing_records = _validate_published_output(
+            manifest_path, expected_semantics=expected_semantics
+        )
+        return {
+            "episodes": len(existing_records),
+            "shards": len({record.shard_path for record in existing_records}),
+            "compression": config.compression,
+        }
 
     generation = fingerprint[:12]
-    if fresh_generation_required:
+    if config.overwrite:
         generation = f"{generation}_{uuid.uuid4().hex[:8]}"
     shard_paths, episode_batches, record_batches, all_records = _make_shard_plan(
         output_root,
@@ -847,7 +903,7 @@ def convert_dataset(args: Any) -> dict[str, int | str]:
     )
 
     reused_shards: set[Path] = set()
-    if not manifest_path.exists() and not fresh_generation_required:
+    if not manifest_path.exists() and not config.overwrite:
         invalid_orphan: tuple[Path, Exception] | None = None
         for shard_path, record_batch in zip(shard_paths, record_batches):
             if not shard_path.exists():
@@ -866,24 +922,10 @@ def convert_dataset(args: Any) -> dict[str, int | str]:
 
         if invalid_orphan is not None:
             invalid_path, validation_error = invalid_orphan
-            if not config.overwrite:
-                raise ValueError(
-                    f"invalid orphan shard {invalid_path}: {validation_error}; "
-                    "pass --overwrite to create a fresh immutable generation"
-                ) from validation_error
-            generation = f"{fingerprint[:12]}_{uuid.uuid4().hex[:8]}"
-            (
-                shard_paths,
-                episode_batches,
-                record_batches,
-                all_records,
-            ) = _make_shard_plan(
-                output_root,
-                generation,
-                episodes,
-                config.episodes_per_shard,
-            )
-            reused_shards.clear()
+            raise ValueError(
+                f"invalid orphan shard {invalid_path}: {validation_error}; "
+                "pass --overwrite to create a fresh immutable generation"
+            ) from validation_error
 
     payload = _manifest_payload(config, episodes, all_records, fingerprint)
     created_shards: list[Path] = []
