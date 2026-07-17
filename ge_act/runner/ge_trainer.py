@@ -692,6 +692,9 @@ class Trainer:
         anomalies = []
 
         for epoch in range(first_epoch, self.state.train_epochs):
+            if global_step >= self.state.train_steps:
+                break
+
             logger.debug(f"Starting epoch ({epoch + 1}/{self.state.train_epochs})")
 
             self.diffusion_model.train()

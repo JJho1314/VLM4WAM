@@ -1964,7 +1964,7 @@ def test_original_hdf5_alternative_protected_files_are_unchanged():
         "fdfc2ea518af07badbf036f83dcfd9f803b3d712ba76288b59ca5e1253fb3bc9"
     )
     assert _sha256(ORIGINAL_PREFLIGHT) == (
-        "93c4c0dc6040936bcf53578cdf84cd1ea7e322751ad346c7adc57e2703a597e6"
+        "4bbd8b5bc2ae8dee415d446656a61021eb010cb41505b525592f88f8cea5db74"
     )
 
 

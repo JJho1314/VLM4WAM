@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import io
 import sys
 from pathlib import Path
 
@@ -22,6 +24,7 @@ from runner.ge_trainer import (
     should_save_checkpoint,
 )
 from utils.model_utils import forward_pass, resolve_checkpoint_files
+from utils import Tee
 from models.ltx_models.transformer_ltx_multiview import LTXVideoTransformer3DModel
 from runner import ge_trainer as ge_trainer_module
 
@@ -144,6 +147,50 @@ def test_main_exposes_a_positive_bounded_smoke_step_override() -> None:
 
     assert "--max_train_steps" in source
     assert "runner.args.train_steps = args.max_train_steps" in source
+
+
+def test_training_loop_checks_step_limit_before_entering_each_epoch() -> None:
+    tree = ast.parse((GE_ACT_ROOT / "runner" / "ge_trainer.py").read_text())
+    trainer = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Trainer"
+    )
+    train_method = next(
+        node
+        for node in trainer.body
+        if isinstance(node, ast.FunctionDef) and node.name == "train"
+    )
+    epoch_loop = next(
+        node
+        for node in train_method.body
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "epoch"
+    )
+
+    epoch_guard = epoch_loop.body[0]
+    assert isinstance(epoch_guard, ast.If)
+    assert ast.unparse(epoch_guard.test) == "global_step >= self.state.train_steps"
+    assert any(isinstance(statement, ast.Break) for statement in epoch_guard.body)
+
+
+def test_tee_flush_skips_streams_that_are_already_closed(tmp_path: Path) -> None:
+    live_stream = io.StringIO()
+    closed_stream = (tmp_path / "closed.log").open("w")
+    closed_stream.close()
+
+    Tee(live_stream, closed_stream).flush()
+
+
+def test_tee_write_skips_streams_that_are_already_closed(tmp_path: Path) -> None:
+    live_stream = io.StringIO()
+    closed_stream = (tmp_path / "closed.log").open("w")
+    closed_stream.close()
+
+    Tee(live_stream, closed_stream).write("still logged")
+
+    assert live_stream.getvalue() == "still logged"
 
 
 def test_forward_pass_uses_real_frame_rate_and_forwards_semantics() -> None:

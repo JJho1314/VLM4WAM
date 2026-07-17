@@ -15,12 +15,18 @@ import torch.distributed as dist
 class Tee:
     def __init__(self, *files):
         self.files = files
+
     def write(self, obj):
         for f in self.files:
+            if getattr(f, "closed", False):
+                continue
             f.write(obj)
             f.flush()
+
     def flush(self):
         for f in self.files:
+            if getattr(f, "closed", False):
+                continue
             f.flush()
 
 def init_logging(log_dir, rank):
