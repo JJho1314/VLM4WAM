@@ -124,12 +124,14 @@ The converter records deterministic source episode identities. Tests and the
 pilot compare both loaders using identical episode IDs and explicit frame/action
 indexes, bypassing random selection. Required equality:
 
-- main and wrist frames after the existing deterministic 256x256 resize;
+- main and wrist frames preserve identity/order and, after normalization, have
+  maximum absolute error at most `1/255 + 1e-6` relative to the current float
+  resize path (the exact bound introduced by rounding resized RGB to uint8);
 - repeated, clamped, and out-of-range frame behavior;
 - selected action and state values;
 - caption and domain;
 - final video/action/state shapes and dtypes;
-- normalized video tensors within the existing tolerance.
+- normalized video tensor shapes and dtypes exactly match the existing loader.
 
 Any mismatch fails the pilot and prevents full conversion.
 
