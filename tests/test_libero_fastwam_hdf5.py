@@ -1,7 +1,12 @@
+import copy
+import hashlib
+import importlib.util
 import json
 import os
 import pickle
 import random
+import subprocess
+import sys
 from argparse import Namespace
 from pathlib import Path
 
@@ -11,6 +16,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
+import yaml
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as tvf
 
@@ -51,6 +57,52 @@ EXPECTED_MANIFEST_FIELDS = {
     "converter_fingerprint",
     "episodes",
 }
+
+GE_ACT_ROOT = Path(__file__).resolve().parents[1] / "ge_act"
+ORIGINAL_CONFIG = (
+    GE_ACT_ROOT / "configs/ltx_model/libero/video_model_libero_fastwam_siglip2.yaml"
+)
+HDF5_CONFIG = (
+    GE_ACT_ROOT
+    / "configs/ltx_model/libero/video_model_libero_fastwam_siglip2_hdf5.yaml"
+)
+ORIGINAL_LOADER = GE_ACT_ROOT / "data/lerobot_like_dataset.py"
+ORIGINAL_PREFLIGHT = GE_ACT_ROOT / "scripts/preflight_ltx_siglip2.py"
+ORIGINAL_LAUNCHER = GE_ACT_ROOT / "scripts/train_ltx_siglip2.sh"
+HDF5_PREFLIGHT = GE_ACT_ROOT / "scripts/preflight_libero_fastwam_hdf5.py"
+HDF5_LAUNCHER = GE_ACT_ROOT / "scripts/train_ltx_siglip2_hdf5.sh"
+
+HDF5_DATA_BLOCK = {
+    "manifest_path": (
+        "/data/user/jhe724/junjie/datasets/LIBERO-fastwam-hdf5/manifest.json"
+    ),
+    "stat_file": "configs/ltx_model/libero/libero_fastwam_mix.json",
+    "source_fps": 20,
+    "sample_n_frames": 500,
+    "valid_cam": [
+        "observation.images.image",
+        "observation.images.wrist_image",
+    ],
+    "chunk": 9,
+    "action_chunk": 36,
+    "n_previous": 4,
+    "previous_pick_mode": "random",
+    "action_type": "absolute",
+    "action_space": "eef",
+}
+
+
+def _load_python_module(path: Path, name: str):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_hdf5_preflight():
+    return _load_python_module(HDF5_PREFLIGHT, "hdf5_preflight_under_test")
 
 
 def make_manifest(tmp_path: Path, **overrides):
@@ -1833,3 +1885,523 @@ def test_hdf5_dataset_failures_include_full_read_context(tmp_path, failure):
     assert "frame_indexes=" in message
     assert "action_indexes=" in message
     assert "caption 1" not in message
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_hdf5_preflight_fixture(tmp_path: Path) -> dict:
+    dataset_root = tmp_path / "dataset"
+    manifest_path = dataset_root / "manifest.json"
+    payload = make_manifest(dataset_root)
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    stat_file = tmp_path / "stats.json"
+    stat_file.write_text("{}", encoding="utf-8")
+    ltx_root = tmp_path / "ltx"
+    for component in ("tokenizer", "text_encoder", "vae"):
+        (ltx_root / component).mkdir(parents=True, exist_ok=True)
+    diffusion_checkpoint = tmp_path / "base.safetensors"
+    diffusion_checkpoint.touch()
+    siglip_root = tmp_path / "siglip"
+    siglip_root.mkdir()
+    (siglip_root / "model.safetensors").touch()
+    output_parent = tmp_path / "outputs"
+    output_parent.mkdir()
+
+    config = yaml.safe_load(HDF5_CONFIG.read_text(encoding="utf-8"))
+    for split in ("train", "val"):
+        config["data"][split]["manifest_path"] = str(manifest_path)
+        config["data"][split]["stat_file"] = str(stat_file)
+    config["pretrained_model_name_or_path"] = str(ltx_root)
+    config["diffusion_model"]["model_path"] = str(diffusion_checkpoint)
+    config["semantic_plan"]["model_name_or_path"] = str(siglip_root)
+    config["output_dir"] = str(output_parent / "run")
+    return config
+
+
+def test_hdf5_training_entrypoints_exist():
+    assert HDF5_CONFIG.is_file()
+    assert HDF5_PREFLIGHT.is_file()
+    assert HDF5_LAUNCHER.is_file()
+
+
+def test_hdf5_yaml_only_changes_allowed_active_config_sections():
+    original = yaml.safe_load(ORIGINAL_CONFIG.read_text(encoding="utf-8"))
+    actual = yaml.safe_load(HDF5_CONFIG.read_text(encoding="utf-8"))
+    expected = copy.deepcopy(original)
+    expected.update(
+        {
+            "tracker_name": "ltx_siglip2_hdf5_trainer",
+            "output_dir": (
+                "/data/user/jhe724/junjie/outputs/libero_fastwam_ltx_siglip2_hdf5"
+            ),
+            "train_data_class_path": "data/libero_fastwam_hdf5_dataset.py",
+            "train_data_class": "LiberoFastWAMHDF5Dataset",
+            "val_data_class_path": "data/libero_fastwam_hdf5_dataset.py",
+            "val_data_class": "LiberoFastWAMHDF5Dataset",
+            "data": {
+                "train": dict(HDF5_DATA_BLOCK, train_dataset=True),
+                "val": dict(HDF5_DATA_BLOCK, train_dataset=False),
+            },
+        }
+    )
+    assert actual == expected
+
+
+def test_original_hdf5_alternative_protected_files_are_unchanged():
+    assert _sha256(ORIGINAL_CONFIG) == (
+        "14fd689abc9813cd962886776c5a89c06c036a3920247cb078cca9b84003daad"
+    )
+    assert _sha256(ORIGINAL_LOADER) == (
+        "35dbcaa7746344f789d1be26a5b67b323296c4d48702aa260abde51c409261a4"
+    )
+    assert _sha256(ORIGINAL_LAUNCHER) == (
+        "fdfc2ea518af07badbf036f83dcfd9f803b3d712ba76288b59ca5e1253fb3bc9"
+    )
+    assert _sha256(ORIGINAL_PREFLIGHT) == (
+        "93c4c0dc6040936bcf53578cdf84cd1ea7e322751ad346c7adc57e2703a597e6"
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("source_fps", 30, "source_fps"),
+        ("sample_n_frames", 499, "sample_n_frames"),
+        ("chunk", 8, "chunk"),
+        ("action_chunk", 32, "action_chunk"),
+        ("n_previous", 3, "n_previous"),
+        ("previous_pick_mode", "uniform", "previous_pick_mode"),
+        ("action_type", "relative", "action_type"),
+        ("action_space", "joint", "action_space"),
+        ("train_dataset", False, "train_dataset"),
+    ],
+)
+def test_hdf5_preflight_rejects_non_fixed_train_contract(
+    tmp_path, field, value, message
+):
+    preflight = _load_hdf5_preflight()
+    config = _write_hdf5_preflight_fixture(tmp_path)
+    config["data"]["train"][field] = value
+    errors = preflight.collect_hdf5_preflight_errors(
+        config, world_size=8, check_paths=False
+    )
+    assert any(message in error and "train" in error for error in errors)
+
+
+def test_hdf5_preflight_rejects_wrong_camera_order_in_both_splits(tmp_path):
+    preflight = _load_hdf5_preflight()
+    config = _write_hdf5_preflight_fixture(tmp_path)
+    wrong_order = [
+        "observation.images.wrist_image",
+        "observation.images.image",
+    ]
+    config["data"]["train"]["valid_cam"] = wrong_order
+    config["data"]["val"]["valid_cam"] = wrong_order
+    errors = preflight.collect_hdf5_preflight_errors(
+        config, world_size=8, check_paths=False
+    )
+    assert any("train valid_cam" in error for error in errors)
+    assert any("val valid_cam" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("split", "key"),
+    [
+        ("train", "data_roots"),
+        ("train", "predecoded_video_root"),
+        ("train", "require_predecoded"),
+        ("train", "sample_size"),
+        ("train", "state_key"),
+        ("train", "ignore_seek"),
+        ("val", "domains"),
+        ("val", "preprocess"),
+        ("val", "random_crop"),
+        ("val", "action_key"),
+    ],
+)
+def test_hdf5_preflight_rejects_old_loader_keys(tmp_path, split, key):
+    preflight = _load_hdf5_preflight()
+    config = _write_hdf5_preflight_fixture(tmp_path)
+    config["data"][split][key] = "forbidden"
+    errors = preflight.collect_hdf5_preflight_errors(
+        config, world_size=8, check_paths=False
+    )
+    assert any(split in error and key in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda config: config.update(train_data_class="WrongDataset"),
+            "train_data_class",
+        ),
+        (
+            lambda config: config.update(
+                val_data_class_path="data/lerobot_like_dataset.py"
+            ),
+            "val_data_class_path",
+        ),
+        (
+            lambda config: config["data"]["val"].update(train_dataset=True),
+            "val train_dataset",
+        ),
+        (
+            lambda config: config["semantic_plan"].update(enabled=False),
+            "semantic_plan.enabled",
+        ),
+        (
+            lambda config: config["semantic_plan"].update(
+                keyframe_indices=[0, 2, 5, 8]
+            ),
+            "keyframes",
+        ),
+        (
+            lambda config: config["semantic_plan"].update(
+                keyframe_indices=[0, 3, 5, 8.0]
+            ),
+            "keyframes",
+        ),
+        (
+            lambda config: config["semantic_plan"].update(keyframe_indices="bad"),
+            "keyframes",
+        ),
+        (
+            lambda config: config["semantic_plan"].update(
+                keyframe_indices=[0, 3, "five", 8]
+            ),
+            "keyframes",
+        ),
+        (
+            lambda config: config["semantic_plan"].update(tokens_per_frame=81),
+            "256 tokens",
+        ),
+        (
+            lambda config: config["diffusion_model"]["config"].update(
+                semantic_plan_in_dim=768
+            ),
+            "feature width",
+        ),
+        (
+            lambda config: config["diffusion_model"]["config"].update(
+                semantic_plan_cross_attention_blocks=list(range(27))
+            ),
+            "all 28",
+        ),
+        (lambda config: config.update(batch_size=7), "global batch"),
+        (lambda config: config.update(train_steps=20_000), "train_steps"),
+        (lambda config: config.update(save_steps=[30_000]), "save_steps"),
+        (
+            lambda config: config.update(gradient_checkpointing=False),
+            "gradient checkpointing",
+        ),
+        (
+            lambda config: config.update(train_mode="action_only"),
+            "train_mode",
+        ),
+        (
+            lambda config: config["deepspeed"]["zero_optimization"].update(stage=3),
+            "DeepSpeed ZeRO stage",
+        ),
+    ],
+)
+def test_hdf5_preflight_rejects_training_semantic_and_model_mismatch(
+    tmp_path, mutation, message
+):
+    preflight = _load_hdf5_preflight()
+    config = _write_hdf5_preflight_fixture(tmp_path)
+    mutation(config)
+    errors = preflight.collect_hdf5_preflight_errors(
+        config, world_size=8, check_paths=False
+    )
+    assert any(message in error for error in errors)
+
+
+def test_hdf5_preflight_rejects_train_val_manifest_mismatch(tmp_path):
+    preflight = _load_hdf5_preflight()
+    config = _write_hdf5_preflight_fixture(tmp_path)
+    config["data"]["val"]["manifest_path"] = str(tmp_path / "other.json")
+    errors = preflight.collect_hdf5_preflight_errors(
+        config, world_size=8, check_paths=False
+    )
+    assert any("same manifest" in error for error in errors)
+
+
+def test_hdf5_preflight_check_paths_false_does_no_discovery_or_io(
+    tmp_path, monkeypatch
+):
+    preflight = _load_hdf5_preflight()
+    config = _write_hdf5_preflight_fixture(tmp_path)
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("check_paths=False performed filesystem discovery")
+
+    monkeypatch.setattr(preflight.importlib.util, "find_spec", unexpected)
+    monkeypatch.setattr(preflight, "load_manifest", unexpected)
+    monkeypatch.setattr(preflight.shutil, "disk_usage", unexpected)
+    monkeypatch.setattr(preflight.os, "access", unexpected)
+    assert (
+        preflight.collect_hdf5_preflight_errors(config, world_size=8, check_paths=False)
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("camera_names", ["wrist", "main"], "camera_names"),
+        ("compression", "gzip", "compression"),
+        (
+            "datasets",
+            dict(DATASET_DECLARATIONS, action={"width": 8, "dtype": "float32"}),
+            "datasets",
+        ),
+    ],
+)
+def test_hdf5_preflight_reports_manifest_contract_errors(
+    tmp_path, monkeypatch, field, value, message
+):
+    config = _write_hdf5_preflight_fixture(tmp_path)
+    manifest_path = Path(config["data"]["train"]["manifest_path"])
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload[field] = value
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    preflight = _load_hdf5_preflight()
+    monkeypatch.setattr(preflight.importlib.util, "find_spec", lambda _name: object())
+    errors = preflight.collect_hdf5_preflight_errors(
+        config,
+        world_size=8,
+        check_paths=True,
+        minimum_free_gb=0.0,
+    )
+    assert any("manifest" in error and message in error for error in errors)
+
+
+def test_hdf5_preflight_reports_missing_and_unsafe_manifest_shards(
+    tmp_path, monkeypatch
+):
+    config = _write_hdf5_preflight_fixture(tmp_path)
+    manifest_path = Path(config["data"]["train"]["manifest_path"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_path.with_name(manifest["episodes"][0]["shard"]).unlink()
+    preflight = _load_hdf5_preflight()
+    monkeypatch.setattr(preflight.importlib.util, "find_spec", lambda _name: object())
+    errors = preflight.collect_hdf5_preflight_errors(
+        config,
+        world_size=8,
+        check_paths=True,
+        minimum_free_gb=0.0,
+    )
+    assert any("missing HDF5 shard" in error for error in errors)
+
+    outside = tmp_path / "outside.h5"
+    outside.touch()
+    manifest["episodes"][0]["shard"] = "../outside.h5"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    preflight = _load_hdf5_preflight()
+    monkeypatch.setattr(preflight.importlib.util, "find_spec", lambda _name: object())
+    errors = preflight.collect_hdf5_preflight_errors(
+        config,
+        world_size=8,
+        check_paths=True,
+        minimum_free_gb=0.0,
+    )
+    assert any("outside manifest root" in error for error in errors)
+
+
+def test_hdf5_preflight_reports_invalid_manifest_json_without_raising(
+    tmp_path, monkeypatch
+):
+    config = _write_hdf5_preflight_fixture(tmp_path)
+    Path(config["data"]["train"]["manifest_path"]).write_text(
+        "{broken", encoding="utf-8"
+    )
+    preflight = _load_hdf5_preflight()
+    monkeypatch.setattr(preflight.importlib.util, "find_spec", lambda _name: object())
+    errors = preflight.collect_hdf5_preflight_errors(
+        config,
+        world_size=8,
+        check_paths=True,
+        minimum_free_gb=0.0,
+    )
+    assert any("manifest" in error and "JSON" in error for error in errors)
+
+
+def test_hdf5_preflight_loads_shared_manifest_once(tmp_path, monkeypatch):
+    preflight = _load_hdf5_preflight()
+    config = _write_hdf5_preflight_fixture(tmp_path)
+    real_load = preflight.load_manifest
+    calls = []
+
+    def tracking_load(path):
+        calls.append(Path(path))
+        return real_load(path)
+
+    monkeypatch.setattr(preflight, "load_manifest", tracking_load)
+    monkeypatch.setattr(preflight.importlib.util, "find_spec", lambda _name: object())
+    errors = preflight.collect_hdf5_preflight_errors(
+        config,
+        world_size=8,
+        check_paths=True,
+        minimum_free_gb=0.0,
+    )
+    assert errors == []
+    assert calls == [Path(config["data"]["train"]["manifest_path"])]
+
+
+@pytest.mark.parametrize(
+    ("remove", "message"),
+    [
+        ("stat", "normalization statistics"),
+        ("ltx_component", "LTX component"),
+        ("diffusion", "base diffusion checkpoint"),
+        ("siglip", "SigLIP2 checkpoint"),
+    ],
+)
+def test_hdf5_preflight_reports_missing_required_paths(
+    tmp_path, monkeypatch, remove, message
+):
+    preflight = _load_hdf5_preflight()
+    config = _write_hdf5_preflight_fixture(tmp_path)
+    if remove == "stat":
+        Path(config["data"]["train"]["stat_file"]).unlink()
+    elif remove == "ltx_component":
+        Path(config["pretrained_model_name_or_path"], "vae").rmdir()
+    elif remove == "diffusion":
+        Path(config["diffusion_model"]["model_path"]).unlink()
+    else:
+        Path(
+            config["semantic_plan"]["model_name_or_path"], "model.safetensors"
+        ).unlink()
+    monkeypatch.setattr(preflight.importlib.util, "find_spec", lambda _name: object())
+    errors = preflight.collect_hdf5_preflight_errors(
+        config,
+        world_size=8,
+        check_paths=True,
+        minimum_free_gb=0.0,
+    )
+    assert any(message in error for error in errors)
+
+
+def test_hdf5_preflight_requires_h5py_and_reports_low_output_disk(
+    tmp_path, monkeypatch
+):
+    preflight = _load_hdf5_preflight()
+    config = _write_hdf5_preflight_fixture(tmp_path)
+    monkeypatch.setattr(
+        preflight.importlib.util,
+        "find_spec",
+        lambda name: None if name == "h5py" else object(),
+    )
+    monkeypatch.setattr(
+        preflight.shutil,
+        "disk_usage",
+        lambda _path: Namespace(total=1024**3, used=1024**3, free=0),
+    )
+    errors = preflight.collect_hdf5_preflight_errors(
+        config,
+        world_size=8,
+        check_paths=True,
+        minimum_free_gb=100.0,
+    )
+    assert any("missing Python module: h5py" in error for error in errors)
+    assert any("100.0 GiB" in error for error in errors)
+
+
+def _write_command_stub(path: Path, command: str) -> None:
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f"printf '{command}' >> \"$INVOCATION_LOG\"\n"
+        'printf \' %q\' "$@" >> "$INVOCATION_LOG"\n'
+        "printf '\\n' >> \"$INVOCATION_LOG\"\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def _run_hdf5_launcher(tmp_path: Path, *, args=(), env_overrides=None) -> list[str]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_command_stub(bin_dir / "python", "python")
+    _write_command_stub(bin_dir / "torchrun", "torchrun")
+    invocation_log = tmp_path / "invocations.log"
+    environment = os.environ.copy()
+    for name in (
+        "CONFIG",
+        "NUM_PROCESSES",
+        "NPROC_PER_NODE",
+        "NNODES",
+        "NODE_RANK",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+    ):
+        environment.pop(name, None)
+    environment.update(
+        {
+            "PATH": f"{bin_dir}:{environment['PATH']}",
+            "INVOCATION_LOG": str(invocation_log),
+        }
+    )
+    if env_overrides:
+        environment.update(env_overrides)
+    subprocess.run(
+        ["bash", str(HDF5_LAUNCHER), *map(str, args)],
+        check=True,
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+    return invocation_log.read_text(encoding="utf-8").splitlines()
+
+
+def test_hdf5_launcher_executes_only_new_preflight_then_torchrun(tmp_path):
+    config = tmp_path / "explicit.yaml"
+    lines = _run_hdf5_launcher(
+        tmp_path,
+        args=(tmp_path / "ignored-positional.yaml",),
+        env_overrides={"CONFIG": str(config), "NUM_PROCESSES": "4"},
+    )
+    assert len(lines) == 2
+    assert lines[0].startswith("python scripts/preflight_libero_fastwam_hdf5.py")
+    assert f"--config {config!s}" in lines[0]
+    assert "--world-size 4" in lines[0]
+    assert lines[1].startswith("torchrun --standalone --nnodes=1 --nproc_per_node=4")
+    assert f"main.py --config_file {config!s}" in lines[1]
+    assert all("predecode" not in line for line in lines)
+    assert all("preflight_ltx_siglip2.py" not in line for line in lines)
+
+
+def test_hdf5_launcher_supports_nproc_fallback_and_multinode_overrides(tmp_path):
+    positional = tmp_path / "positional.yaml"
+    lines = _run_hdf5_launcher(
+        tmp_path,
+        args=(positional,),
+        env_overrides={
+            "NPROC_PER_NODE": "4",
+            "NNODES": "2",
+            "NODE_RANK": "1",
+            "MASTER_ADDR": "10.0.0.8",
+            "MASTER_PORT": "29600",
+        },
+    )
+    assert f"--config {positional!s}" in lines[0]
+    assert "--world-size 8" in lines[0]
+    assert "--standalone" not in lines[1]
+    assert "--nnodes=2" in lines[1]
+    assert "--nproc_per_node=4" in lines[1]
+    assert "--node_rank=1" in lines[1]
+    assert "--master_addr=10.0.0.8" in lines[1]
+    assert "--master_port=29600" in lines[1]
+
+
+def test_hdf5_launcher_defaults_to_hdf5_config_and_eight_processes(tmp_path):
+    lines = _run_hdf5_launcher(tmp_path)
+    assert f"--config {HDF5_CONFIG!s}" in lines[0]
+    assert "--world-size 8" in lines[0]
+    assert lines[1].startswith("torchrun --standalone --nnodes=1 --nproc_per_node=8")
+    assert f"main.py --config_file {HDF5_CONFIG!s}" in lines[1]
