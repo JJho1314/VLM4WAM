@@ -12,28 +12,48 @@ from PIL import Image
 from torch import nn
 
 
-_DUAL_CAMERA_METADATA = {
+_DUAL_CAMERA_COMMON_METADATA = {
     "planner_input_layout": "separate_camera_images",
     "camera_names": ["main", "wrist"],
     "num_camera_views": 2,
     "camera_head_sharing": "shared_head_per_view_image_context",
-    "semantic_output_layout": "batch_view_token_feature",
     "semantic_teacher": "siglip2-large-patch16-256",
+}
+
+_K1_METADATA = {
     "future_keyframe_offsets": [8],
     "num_keyframes": 1,
+    "semantic_output_layout": "batch_view_token_feature",
     "grid_size": 16,
     "semantic_dim": 1024,
     "target_tokens": 256,
     "video_target_type": "siglip2",
 }
 
+_K4_METADATA = {
+    "future_keyframe_offsets": [2, 4, 6, 8],
+    "num_keyframes": 4,
+    "semantic_output_layout": "batch_view_keyframe_token_feature",
+    "sequence_length": 9,
+    "grid_size": 16,
+    "semantic_dim": 1024,
+    "target_tokens": 4 * 256,
+    "target_tokens_per_keyframe": 256,
+    "planner_token_count": 384,
+    "video_target_type": "siglip2",
+    "use_current_alignment": False,
+}
+
 _CHECKPOINT_FILES = (
     "planner_meta.json",
     "plan_head.pt",
     "depth_head.pt",
+    "plan_token_embedding.pt",
+)
+
+_CURRENT_ALIGNMENT_FILES = (
     "current_plan_head.pt",
     "current_depth_head.pt",
-    "plan_token_embedding.pt",
 )
 
 
@@ -60,7 +80,26 @@ def validate_dual_camera_planner_metadata(
     """Validate the exact independently trained main/wrist export geometry."""
     if not isinstance(metadata, dict):
         raise ValueError("dual-camera planner metadata must be a dictionary")
-    for field, expected in _DUAL_CAMERA_METADATA.items():
+    for field, expected in _DUAL_CAMERA_COMMON_METADATA.items():
+        actual = metadata.get(field)
+        if not _metadata_matches(actual, expected):
+            raise ValueError(
+                f"incompatible dual-camera planner metadata field {field}: "
+                f"expected {expected!r}, got {actual!r}"
+            )
+    num_keyframes = metadata.get("num_keyframes")
+    if num_keyframes == 1:
+        geometry = _K1_METADATA
+        planner_token_count = 256
+    elif num_keyframes == 4:
+        geometry = _K4_METADATA
+        planner_token_count = 384
+    else:
+        raise ValueError(
+            "incompatible dual-camera planner metadata field num_keyframes: "
+            f"expected 1 or 4, got {num_keyframes!r}"
+        )
+    for field, expected in geometry.items():
         actual = metadata.get(field)
         if not _metadata_matches(actual, expected):
             raise ValueError(
@@ -73,11 +112,13 @@ def validate_dual_camera_planner_metadata(
             "incompatible dual-camera planner metadata field planner_input_frame: "
             f"expected 'separate_camera_images', got {input_frame!r}"
         )
-    expected_tokens = [f"<|sem_plan_{index}|>" for index in range(256)]
+    expected_tokens = [
+        f"<|sem_plan_{index}|>" for index in range(planner_token_count)
+    ]
     if metadata.get("plan_token_strings") != expected_tokens:
         raise ValueError(
             "incompatible dual-camera planner metadata field plan_token_strings: "
-            "expected 256 ordered independent planner tokens"
+            f"expected {planner_token_count} ordered planner tokens"
         )
     return metadata
 
@@ -126,6 +167,10 @@ class FrozenDualCameraVLMPlanner:
         input_mover: Callable[[dict[str, Any]], dict[str, Any]],
         plan_tokens: Sequence[str],
         device: torch.device | str,
+        num_keyframes: int,
+        future_keyframe_offsets: Sequence[int],
+        sequence_length: int,
+        target_tokens_per_keyframe: int,
     ) -> None:
         self.wrapper = wrapper
         self.processor = processor
@@ -133,6 +178,12 @@ class FrozenDualCameraVLMPlanner:
         self.input_mover = input_mover
         self.plan_tokens = list(plan_tokens)
         self.device = torch.device(device)
+        self.num_keyframes = int(num_keyframes)
+        self.future_keyframe_offsets = tuple(
+            int(offset) for offset in future_keyframe_offsets
+        )
+        self.sequence_length = int(sequence_length)
+        self.target_tokens_per_keyframe = int(target_tokens_per_keyframe)
 
     @classmethod
     def from_components(
@@ -144,13 +195,41 @@ class FrozenDualCameraVLMPlanner:
         input_mover: Callable[[dict[str, Any]], dict[str, Any]],
         device: torch.device | str,
         plan_tokens: Sequence[str] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> "FrozenDualCameraVLMPlanner":
+        if metadata is not None:
+            validate_dual_camera_planner_metadata(metadata)
+            num_keyframes = int(metadata["num_keyframes"])
+            offsets = tuple(int(value) for value in metadata["future_keyframe_offsets"])
+            sequence_length = int(metadata.get("sequence_length", 9))
+            tokens_per_keyframe = int(
+                metadata.get(
+                    "target_tokens_per_keyframe",
+                    int(metadata["target_tokens"]) // num_keyframes,
+                )
+            )
+            expected_plan_tokens = int(
+                metadata.get("planner_token_count", 256)
+            )
+        else:
+            num_keyframes = int(getattr(wrapper, "num_keyframes", 1))
+            offsets = (8,) if num_keyframes == 1 else (2, 4, 6, 8)
+            sequence_length = 9
+            target_len = int(getattr(wrapper, "target_len", num_keyframes * 256))
+            if target_len % num_keyframes != 0:
+                raise ValueError(
+                    f"target_len {target_len} does not divide K={num_keyframes}"
+                )
+            tokens_per_keyframe = target_len // num_keyframes
+            expected_plan_tokens = int(getattr(wrapper, "latent_len", 256))
         if plan_tokens is None:
-            token_count = int(getattr(wrapper, "latent_len", 256))
-            plan_tokens = [f"<|sem_plan_{index}|>" for index in range(token_count)]
-        if len(plan_tokens) != 256:
+            plan_tokens = [
+                f"<|sem_plan_{index}|>" for index in range(expected_plan_tokens)
+            ]
+        if len(plan_tokens) != expected_plan_tokens:
             raise ValueError(
-                f"dual-camera planner requires 256 plan tokens, got {len(plan_tokens)}"
+                "dual-camera planner requires "
+                f"{expected_plan_tokens} plan tokens, got {len(plan_tokens)}"
             )
         wrapper.eval()
         for parameter in wrapper.parameters():
@@ -162,6 +241,10 @@ class FrozenDualCameraVLMPlanner:
             input_mover=input_mover,
             plan_tokens=plan_tokens,
             device=device,
+            num_keyframes=num_keyframes,
+            future_keyframe_offsets=offsets,
+            sequence_length=sequence_length,
+            target_tokens_per_keyframe=tokens_per_keyframe,
         )
 
     @staticmethod
@@ -235,9 +318,12 @@ class FrozenDualCameraVLMPlanner:
             raise ValueError(f"invalid planner metadata: {metadata_path}") from error
         validate_dual_camera_planner_metadata(metadata)
 
+        required_files = list(_CHECKPOINT_FILES)
+        if bool(metadata.get("use_current_alignment", metadata["num_keyframes"] == 1)):
+            required_files.extend(_CURRENT_ALIGNMENT_FILES)
         missing = [
             name
-            for name in _CHECKPOINT_FILES
+            for name in required_files
             if not (checkpoint_dir / name).is_file()
         ]
         for directory in ("qwen3vl_lora_or_model", "processor"):
@@ -264,6 +350,7 @@ class FrozenDualCameraVLMPlanner:
             input_builder=input_builder,
             input_mover=input_mover,
             plan_tokens=metadata["plan_token_strings"],
+            metadata=metadata,
             device=resolved_device,
         )
 
@@ -291,9 +378,15 @@ class FrozenDualCameraVLMPlanner:
                 self.plan_tokens,
             )
         )
-        plans = self.wrapper.predict_current_future_plans(**model_inputs)
-        future = plans.get("future_dino")
-        expected = (current_images.shape[0], 2, 256, 1024)
+        if bool(getattr(self.wrapper, "use_current_alignment", self.num_keyframes == 1)):
+            plans = self.wrapper.predict_current_future_plans(**model_inputs)
+            future = plans.get("future_dino")
+        elif hasattr(self.wrapper, "predict_dino_depth_plan"):
+            future, _depth = self.wrapper.predict_dino_depth_plan(**model_inputs)
+        else:
+            future = self.wrapper.predict_semantic_plan(**model_inputs)
+        flat_tokens = self.num_keyframes * self.target_tokens_per_keyframe
+        expected = (current_images.shape[0], 2, flat_tokens, 1024)
         if (
             not torch.is_tensor(future)
             or tuple(future.shape) != expected
@@ -304,11 +397,22 @@ class FrozenDualCameraVLMPlanner:
                 f"future_siglip must be finite with shape {expected}, got {shape}"
             )
         return DualCameraSemanticPlan(
-            semantic_tokens=future.detach().unsqueeze(2),
-            times=torch.ones(
-                current_images.shape[0] * 2,
-                1,
-                device=future.device,
-                dtype=torch.float32,
+            semantic_tokens=future.detach().reshape(
+                current_images.shape[0],
+                2,
+                self.num_keyframes,
+                self.target_tokens_per_keyframe,
+                1024,
             ),
+            times=(
+                torch.tensor(
+                    self.future_keyframe_offsets,
+                    device=future.device,
+                    dtype=torch.float32,
+                )
+                / float(self.sequence_length - 1)
+            )
+            .reshape(1, self.num_keyframes)
+            .expand(current_images.shape[0] * 2, -1)
+            .clone(),
         )
