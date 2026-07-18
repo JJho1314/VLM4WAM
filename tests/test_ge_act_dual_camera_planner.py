@@ -1113,6 +1113,9 @@ def test_ola_k4_config_and_launcher_are_fresh_and_fail_closed() -> None:
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     train = config["data"]["train"]
     launcher = launcher_path.read_text(encoding="utf-8")
+    trainer_source = (
+        PLANNER_ROOT / "train_qwen3vl4b_lingbot_dino_planner.py"
+    ).read_text(encoding="utf-8")
 
     assert config["train_data_class"] == "CustomLeRobotDataset"
     assert train["valid_cam"] == [
@@ -1123,7 +1126,10 @@ def test_ola_k4_config_and_launcher_are_fresh_and_fail_closed() -> None:
     assert train["chunk"] == 9
     assert train["n_previous"] == 4
     assert train["sample_size"] == [256, 256]
-    assert train["require_predecoded"] is False
+    assert train["predecoded_video_root"] == (
+        "/data/shared/datasets/libero_fastwam-predecoded-rgb"
+    )
+    assert train["require_predecoded"] is True
     assert len(train["domains"]) == 4
     assert all(
         root == "/data/shared/datasets/libero_fastwam"
@@ -1147,6 +1153,9 @@ def test_ola_k4_config_and_launcher_are_fresh_and_fail_closed() -> None:
         'export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"',
     ):
         assert required in launcher
+    assert "predecode_lerobot_videos.py" in launcher
+    assert "--verify-only" in launcher
+    assert "persistent_workers=args.num_workers > 0" in trainer_source
     assert "step_020000" not in launcher
 
 

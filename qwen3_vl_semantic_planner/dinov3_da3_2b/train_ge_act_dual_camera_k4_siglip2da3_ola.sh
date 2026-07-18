@@ -84,6 +84,10 @@ if [[ "$USE_CURRENT_ALIGNMENT" != "0" ]]; then
   exit 2
 fi
 
+"$PY" "$REPO_ROOT/ge_act/scripts/predecode_lerobot_videos.py" \
+  --config "$GE_ACT_DATA_CONFIG" \
+  --verify-only
+
 "$PY" "$HERE/preflight_dual_camera_k4.py" \
   --config "$GE_ACT_DATA_CONFIG" \
   --model-path "$MODEL_PATH" \

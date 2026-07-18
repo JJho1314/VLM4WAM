@@ -3905,6 +3905,7 @@ def main() -> None:
         num_workers=args.num_workers,
         collate_fn=collator,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
     )
 
     optim = build_optimizer(wrapper, args)

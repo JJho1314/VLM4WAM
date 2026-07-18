@@ -19,8 +19,8 @@ data:
     valid_cam:
       - observation.images.image
       - observation.images.wrist_image
-    predecoded_video_root: null
-    require_predecoded: false
+    predecoded_video_root: /data/shared/datasets/libero_fastwam-predecoded-rgb
+    require_predecoded: true
     source_fps: 20
     chunk: 9
     action_chunk: 36
