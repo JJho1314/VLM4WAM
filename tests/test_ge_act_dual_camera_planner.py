@@ -137,6 +137,59 @@ class CameraValueTeacher:
         return encode(current), encode(future)
 
 
+class FutureAppearanceTeacher:
+    def __init__(self, *, tokens: int = 256, feature_dim: int = 1024) -> None:
+        self.tokens = tokens
+        self.feature_dim = feature_dim
+        self.current: torch.Tensor | None = None
+        self.keyframes: list[torch.Tensor] = []
+
+    def encode_future_keyframes(
+        self,
+        current: torch.Tensor,
+        keyframes: list[torch.Tensor],
+        effective_fps: Any = None,
+    ) -> torch.Tensor:
+        assert effective_fps is None
+        self.current = current.clone()
+        self.keyframes = [frame.clone() for frame in keyframes]
+        encoded = []
+        for frame in keyframes:
+            values = frame.mean(dim=(1, 2, 3)).reshape(-1, 1, 1)
+            encoded.append(
+                values.expand(-1, self.tokens, self.feature_dim).clone()
+            )
+        return torch.cat(encoded, dim=1)
+
+
+class FutureDepthTeacher:
+    align_strategy = "wsa_multilayer"
+    num_layers = 4
+
+    def __init__(self, *, tokens: int = 256, feature_dim: int = 8) -> None:
+        self.tokens = tokens
+        self.feature_dim = feature_dim
+        self.keyframes: list[torch.Tensor] = []
+
+    def encode_future_keyframes(
+        self,
+        keyframes: list[torch.Tensor],
+    ) -> torch.Tensor:
+        self.keyframes = [frame.clone() for frame in keyframes]
+        per_keyframe = []
+        for frame in keyframes:
+            values = frame.mean(dim=(1, 2, 3)).reshape(-1, 1, 1, 1)
+            per_keyframe.append(
+                values.expand(
+                    -1,
+                    self.num_layers,
+                    self.tokens,
+                    self.feature_dim,
+                ).clone()
+            )
+        return torch.cat(per_keyframe, dim=2)
+
+
 def valid_initialization_metadata() -> dict[str, Any]:
     return {
         "use_current_alignment": True,
@@ -382,6 +435,46 @@ def test_ge_act_adapter_selects_current_and_future_endpoint_without_concat() -> 
     assert item["images"][0].getpixel((0, 0))[0] == 64
     assert item["images"][1].getpixel((0, 0))[0] == 128
     assert item["prompt"] == "pick the cup"
+
+
+def test_dual_camera_k4_dataset_preserves_view_then_keyframe_order() -> None:
+    video = torch.empty(3, 2, 13, 2, 2)
+    for view in range(2):
+        for frame in range(13):
+            video[:, view, frame].fill_(-0.9 + view * 0.4 + frame * 0.05)
+    wrapped = GEActDualCameraPlannerDataset(
+        FakeDataset({"video": video, "caption": "pick the cup"}),
+        n_previous=4,
+        future_offsets=(2, 4, 6, 8),
+    )
+
+    item = wrapped[0]
+
+    assert item["future_camera_images"].shape == (2, 4, 2, 2, 3)
+    torch.testing.assert_close(
+        item["future_camera_images"][:, :, 0, 0, 0],
+        torch.tensor(
+            [
+                [-0.6, -0.5, -0.4, -0.3],
+                [-0.2, -0.1, 0.0, 0.1],
+            ]
+        ),
+    )
+    assert wrapped.future_offsets == (2, 4, 6, 8)
+
+
+@pytest.mark.parametrize(
+    "offsets",
+    [(), (0, 2, 4, 8), (-1, 2, 4, 8), (2, 2, 4, 8), (4, 2, 6, 8)],
+)
+def test_dual_camera_k4_dataset_rejects_invalid_future_offsets(
+    offsets: tuple[int, ...],
+) -> None:
+    with pytest.raises(ValueError, match="strictly increasing positive"):
+        GEActDualCameraPlannerDataset(
+            FakeDataset({"video": torch.zeros(3, 2, 13, 2, 2)}),
+            future_offsets=offsets,
+        )
 
 
 def test_dual_camera_input_builder_flattens_images_main_then_wrist() -> None:
@@ -767,6 +860,43 @@ def test_encode_dual_camera_teachers_preserves_current_future_and_view_order() -
     ]
     assert appearance.inputs is not None
     assert appearance.inputs[0].shape == (4, 3, 4, 4)
+
+
+def test_encode_dual_camera_k4_future_targets_preserves_view_and_time() -> None:
+    current = torch.zeros(2, 2, 4, 4, 3)
+    future = torch.empty(2, 2, 4, 4, 4, 3)
+    for batch in range(2):
+        for view in range(2):
+            for keyframe in range(4):
+                future[batch, view, keyframe].fill_(
+                    -1.0 + 0.1 * (8 * batch + 4 * view + keyframe)
+                )
+    appearance = FutureAppearanceTeacher()
+    depth = FutureDepthTeacher()
+
+    labels = planner.encode_dual_camera_future_targets(
+        current,
+        future,
+        appearance_encoder=appearance,
+        depth_encoder=depth,
+    )
+
+    assert labels["semantic_plan_labels"].shape == (2, 2, 4 * 256, 1024)
+    assert labels["depth_plan_labels"].shape == (2, 2, 4, 4 * 256, 8)
+    torch.testing.assert_close(
+        labels["semantic_plan_labels"][0, :, ::256, 0],
+        torch.tensor(
+            [
+                [0.0, 0.05, 0.1, 0.15],
+                [0.2, 0.25, 0.3, 0.35],
+            ]
+        ),
+    )
+    assert appearance.current is not None
+    assert appearance.current.shape == (4, 3, 4, 4)
+    assert len(appearance.keyframes) == 4
+    assert all(frame.shape == (4, 3, 4, 4) for frame in appearance.keyframes)
+    assert len(depth.keyframes) == 4
 
 
 @pytest.mark.parametrize(

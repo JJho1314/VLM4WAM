@@ -527,7 +527,7 @@ def encode_dual_camera_teacher_targets(
     appearance_encoder: Any,
     depth_encoder: Any,
 ) -> dict[str, torch.Tensor]:
-    """Encode normalized main/wrist frames without losing the view dimension."""
+    """Encode one current/future frame pair without losing the view dimension."""
     for name, frames in (
         ("current", current_camera_images),
         ("future", future_camera_images),
@@ -545,7 +545,7 @@ def encode_dual_camera_teacher_targets(
             )
     if current_camera_images.shape != future_camera_images.shape:
         raise ValueError(
-            "current and future camera teacher frames must have the same shape, got "
+            "current and future camera teacher frames must have the same shape per frame, got "
             f"{tuple(current_camera_images.shape)} and "
             f"{tuple(future_camera_images.shape)}"
         )
@@ -597,6 +597,129 @@ def encode_dual_camera_teacher_targets(
         "semantic_plan_labels": restore(future_appearance),
         "current_depth_labels": restore(current_depth),
         "depth_plan_labels": restore(future_depth),
+    }
+
+
+def encode_dual_camera_future_targets(
+    current_camera_images: torch.Tensor,
+    future_camera_images: torch.Tensor,
+    *,
+    appearance_encoder: Any,
+    depth_encoder: Any,
+) -> dict[str, torch.Tensor]:
+    """Encode K future keyframes while preserving sample, view, and time order.
+
+    Inputs use ``[B,V,K,H,W,3]`` and teacher tokens are concatenated along the
+    token axis within each view. WSA depth keeps its explicit backbone-layer axis.
+    """
+    if (
+        current_camera_images.ndim != 5
+        or current_camera_images.shape[1] != 2
+        or current_camera_images.shape[-1] != 3
+    ):
+        raise ValueError(
+            "current camera teacher frames must be [B,2,H,W,3], got "
+            f"{tuple(current_camera_images.shape)}"
+        )
+    if (
+        future_camera_images.ndim != 6
+        or future_camera_images.shape[1] != 2
+        or future_camera_images.shape[2] < 1
+        or future_camera_images.shape[-1] != 3
+    ):
+        raise ValueError(
+            "future camera teacher frames must be [B,2,K,H,W,3] with K>=1, got "
+            f"{tuple(future_camera_images.shape)}"
+        )
+    expected_current_shape = (
+        future_camera_images.shape[0],
+        future_camera_images.shape[1],
+        future_camera_images.shape[3],
+        future_camera_images.shape[4],
+        future_camera_images.shape[5],
+    )
+    if tuple(current_camera_images.shape) != tuple(expected_current_shape):
+        raise ValueError(
+            "current and future camera teacher frames must have the same shape "
+            "per frame, got "
+            f"{tuple(current_camera_images.shape)} and "
+            f"{tuple(future_camera_images.shape)}"
+        )
+    for name, frames in (
+        ("current", current_camera_images),
+        ("future", future_camera_images),
+    ):
+        if not torch.isfinite(frames).all():
+            raise ValueError(f"{name} camera teacher frames must be finite")
+        if frames.min() < -1.0001 or frames.max() > 1.0001:
+            raise ValueError(
+                f"{name} camera teacher frames must be normalized to [-1,1]"
+            )
+
+    batch_size, num_views, num_keyframes = future_camera_images.shape[:3]
+
+    def normalize(frames: torch.Tensor) -> torch.Tensor:
+        return (frames.float() + 1.0).mul_(0.5).clamp_(0.0, 1.0)
+
+    current_bv = normalize(flatten_camera_teacher_frames(current_camera_images))
+    keyframes_bv = [
+        normalize(flatten_camera_teacher_frames(future_camera_images[:, :, index]))
+        for index in range(num_keyframes)
+    ]
+    with torch.no_grad():
+        semantic = appearance_encoder.encode_future_keyframes(
+            current_bv,
+            keyframes_bv,
+            effective_fps=None,
+        )
+        depth = depth_encoder.encode_future_keyframes(keyframes_bv)
+
+    expected_rows = batch_size * num_views
+    expected_tokens = num_keyframes * 256
+    if (
+        semantic.ndim != 3
+        or semantic.shape[0] != expected_rows
+        or semantic.shape[1] != expected_tokens
+    ):
+        raise ValueError(
+            "future appearance teacher features must be "
+            f"[B*V,{expected_tokens},D], got {tuple(semantic.shape)}"
+        )
+    if depth.ndim not in (3, 4) or depth.shape[0] != expected_rows:
+        raise ValueError(
+            "future depth teacher features must be [B*V,K*256,D] or "
+            f"[B*V,L,K*256,D], got {tuple(depth.shape)}"
+        )
+    if depth.shape[-2] != expected_tokens:
+        raise ValueError(
+            f"future depth teacher token count must be {expected_tokens}, "
+            f"got {depth.shape[-2]}"
+        )
+
+    semantic = semantic.reshape(
+        batch_size,
+        num_views,
+        expected_tokens,
+        semantic.shape[-1],
+    ).float()
+    if depth.ndim == 4:
+        depth = depth.reshape(
+            batch_size,
+            num_views,
+            depth.shape[1],
+            expected_tokens,
+            depth.shape[-1],
+        ).float()
+    else:
+        depth = depth.reshape(
+            batch_size,
+            num_views,
+            expected_tokens,
+            depth.shape[-1],
+        ).float()
+    return {
+        "semantic_plan_labels": semantic,
+        "depth_plan_labels": depth,
     }
 
 

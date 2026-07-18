@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,10 +30,33 @@ def normalized_hwc_camera_frames_to_pil(
 
 
 class GEActDualCameraPlannerDataset(Dataset):
-    def __init__(self, dataset: Dataset, *, n_previous: int = 4, future_offset: int = 8):
+    def __init__(
+        self,
+        dataset: Dataset,
+        *,
+        n_previous: int = 4,
+        future_offset: int = 8,
+        future_offsets: Sequence[int] | None = None,
+    ):
+        """Select one legacy future frame or K ordered future keyframes per camera."""
         self.dataset = dataset
         self.n_previous = int(n_previous)
-        self.future_offset = int(future_offset)
+        offsets = (
+            (int(future_offset),)
+            if future_offsets is None
+            else tuple(int(offset) for offset in future_offsets)
+        )
+        if (
+            not offsets
+            or any(offset <= 0 for offset in offsets)
+            or any(left >= right for left, right in zip(offsets, offsets[1:]))
+        ):
+            raise ValueError(
+                "future_offsets must be strictly increasing positive integers, "
+                f"got {offsets}"
+            )
+        self.future_offsets = offsets
+        self.future_offset = offsets[-1]
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -43,15 +67,18 @@ class GEActDualCameraPlannerDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         sample = self.dataset[index]
         video = sample["video"]
-        expected_future_index = self.n_previous + self.future_offset
+        future_indices = [self.n_previous + off for off in self.future_offsets]
         if video.ndim != 5 or video.shape[0] != 3 or video.shape[1] != 2:
             raise ValueError(
                 f"GE-Act planner video must be [3,2,T,H,W], got {tuple(video.shape)}"
             )
-        if expected_future_index >= video.shape[2]:
-            raise ValueError(f"future index {expected_future_index} exceeds T={video.shape[2]}")
+        if future_indices[-1] >= video.shape[2]:
+            raise ValueError(f"future index {future_indices[-1]} exceeds T={video.shape[2]}")
         current = video[:, :, self.n_previous - 1].permute(1, 2, 3, 0).contiguous()
-        future = video[:, :, expected_future_index].permute(1, 2, 3, 0).contiguous()
+        # Preserve the legacy [V,H,W,3] result for K=1. K>1 is view-major
+        # [V,K,H,W,3], matching planner outputs [B,V,K*tokens,D].
+        futures = [video[:, :, i].permute(1, 2, 3, 0).contiguous() for i in future_indices]
+        future = futures[0] if len(futures) == 1 else torch.stack(futures, dim=1)
         return {
             "stem": f"geact_{index:09d}",
             "images": normalized_hwc_camera_frames_to_pil(current),
