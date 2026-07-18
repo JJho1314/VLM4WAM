@@ -540,6 +540,8 @@ def validate_ge_act_dual_camera_train_config(train_config: dict[str, Any]) -> No
 
 def load_ge_act_dual_camera_planner_dataset(
     config_path: str | Path,
+    *,
+    future_offsets: Sequence[int] = (8,),
 ) -> GEActDualCameraPlannerDataset:
     import yaml
 
@@ -582,7 +584,7 @@ def load_ge_act_dual_camera_planner_dataset(
     return GEActDualCameraPlannerDataset(
         dataset,
         n_previous=4,
-        future_offset=8,
+        future_offsets=future_offsets,
     )
 
 
@@ -3809,7 +3811,16 @@ def main() -> None:
         )
 
     if args.ge_act_data_config is not None:
-        dataset = load_ge_act_dual_camera_planner_dataset(args.ge_act_data_config)
+        ge_act_offsets = keyframe_offsets(
+            args.sequence_length,
+            args.num_keyframes,
+            args.keyframe_scheme,
+            args.keyframe_gamma,
+        )
+        dataset = load_ge_act_dual_camera_planner_dataset(
+            args.ge_act_data_config,
+            future_offsets=ge_act_offsets,
+        )
         collator = DualCameraPlannerCollator(
             processor=processor,
             plan_sequence=plan_sequence,
@@ -3821,7 +3832,7 @@ def main() -> None:
                         "online_plan_labels": True,
                         "dataset_source": "ge_act",
                         "stems": len(dataset),
-                        "keyframe_offsets": [8],
+                        "keyframe_offsets": list(ge_act_offsets),
                         "num_camera_views": 2,
                         "feature_type": args.sample_feature_type,
                     }
@@ -3951,14 +3962,24 @@ def main() -> None:
                     raise RuntimeError(
                         "GE-Act dual-camera training requires both appearance and depth teachers"
                     )
-                batch.update(
-                    encode_dual_camera_teacher_targets(
-                        current_camera_images,
-                        future_camera_images,
-                        appearance_encoder=dino_encoder,
-                        depth_encoder=depth_encoder,
+                if future_camera_images.ndim == 6:
+                    batch.update(
+                        encode_dual_camera_future_targets(
+                            current_camera_images,
+                            future_camera_images,
+                            appearance_encoder=dino_encoder,
+                            depth_encoder=depth_encoder,
+                        )
                     )
-                )
+                else:
+                    batch.update(
+                        encode_dual_camera_teacher_targets(
+                            current_camera_images,
+                            future_camera_images,
+                            appearance_encoder=dino_encoder,
+                            depth_encoder=depth_encoder,
+                        )
+                    )
             elif keyframes is not None:
                 with torch.no_grad():
                     if dino_encoder is not None:

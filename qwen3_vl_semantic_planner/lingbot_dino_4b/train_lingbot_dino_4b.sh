@@ -20,11 +20,11 @@ USE_DEEPSPEED=${USE_DEEPSPEED:-1}
 
 WEIGHTS=${WEIGHTS:-/data/LFT-W02_data/junjie/weights}
 MODEL_PATH=${MODEL_PATH:-$WEIGHTS/Qwen3-VL-4B-lingbot-vlm}          # extracted 4B VLM (see extract_qwenvl_from_lingbot.py)
-INIT_PLANNER_CHECKPOINT=${INIT_PLANNER_CHECKPOINT:-}
+INIT_PLANNER_CHECKPOINT=${INIT_PLANNER_CHECKPOINT-}
 LINGBOT_6B=${LINGBOT_6B:-$WEIGHTS/lingbot-vla-v2-6b}
 DINO_TEACHER_CKPT=${DINO_TEACHER_CKPT:-$LINGBOT_6B/dino_video/teacher_step_10000.pth}
 DINO_TEACHER_CONFIG=${DINO_TEACHER_CONFIG:-$LINGBOT_6B/dino_video/config.yaml}
-HEAD_WARMSTART_CKPT=${HEAD_WARMSTART_CKPT:-$LINGBOT_6B}             # warm-start head from future_video_align_head.*
+HEAD_WARMSTART_CKPT=${HEAD_WARMSTART_CKPT-$LINGBOT_6B}             # warm-start head from future_video_align_head.*
 
 # --- auxiliary future-DEPTH alignment (lingbot-style: MoGe-2 -> MoRGBD, smooth_L1) ---
 USE_DEPTH=${USE_DEPTH:-1}

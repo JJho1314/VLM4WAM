@@ -1094,6 +1094,92 @@ def test_ge_act_launchers_record_dual_camera_training_contract() -> None:
     assert "FUTURE_KEYFRAME_OFFSET=${FUTURE_KEYFRAME_OFFSET:-8}" in ge_act_launcher
 
 
+def test_ola_k4_config_and_launcher_are_fresh_and_fail_closed() -> None:
+    import yaml
+
+    config_path = (
+        PLANNER_ROOT.parent
+        / "ge_act"
+        / "configs"
+        / "ltx_model"
+        / "libero"
+        / "planner_data_libero_fastwam_ola.yaml"
+    )
+    launcher_path = (
+        PLANNER_ROOT
+        / "dinov3_da3_2b"
+        / "train_ge_act_dual_camera_k4_siglip2da3_ola.sh"
+    )
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    train = config["data"]["train"]
+    launcher = launcher_path.read_text(encoding="utf-8")
+
+    assert config["train_data_class"] == "CustomLeRobotDataset"
+    assert train["valid_cam"] == [
+        "observation.images.image",
+        "observation.images.wrist_image",
+    ]
+    assert train["source_fps"] == 20
+    assert train["chunk"] == 9
+    assert train["n_previous"] == 4
+    assert train["sample_size"] == [256, 256]
+    assert train["require_predecoded"] is False
+    assert len(train["domains"]) == 4
+    assert all(
+        root == "/data/shared/datasets/libero_fastwam"
+        for root in train["data_roots"]
+    )
+    for required in (
+        "NUM_KEYFRAMES=${NUM_KEYFRAMES:-4}",
+        "USE_CURRENT_ALIGNMENT=${USE_CURRENT_ALIGNMENT:-0}",
+        "BATCH_SIZE=${BATCH_SIZE:-8}",
+        "GRAD_ACCUM=${GRAD_ACCUM:-2}",
+        "EXPECTED_GLOBAL_BATCH=${EXPECTED_GLOBAL_BATCH:-128}",
+        "MAX_STEPS=${MAX_STEPS:-30000}",
+        "SAVE_STEPS=${SAVE_STEPS:-5000}",
+        "SAVE_START_STEP=${SAVE_START_STEP:-20000}",
+        "LR=${LR:-3e-5}",
+        "HEAD_LR=${HEAD_LR:-3e-4}",
+        "WARMUP_STEPS=${WARMUP_STEPS:-2500}",
+        "DA3_ALIGN_STRATEGY=${DA3_ALIGN_STRATEGY:-wsa_multilayer}",
+        "INIT_PLANNER_CHECKPOINT=",
+        "HEAD_WARMSTART_CKPT=",
+    ):
+        assert required in launcher
+    assert "step_020000" not in launcher
+
+
+def test_ge_act_k4_loader_uses_all_four_future_offsets(tmp_path: Path) -> None:
+    dataset_module = tmp_path / "fake_ge_act_k4_dataset.py"
+    dataset_module.write_text(
+        "class FakeGEActDataset:\n"
+        "    def __init__(self, **kwargs): pass\n"
+        "    def __len__(self): return 1\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "ge_act_k4.yaml"
+    config_path.write_text(
+        f"train_data_class_path: {dataset_module}\n"
+        "train_data_class: FakeGEActDataset\n"
+        "data:\n"
+        "  train:\n"
+        "    valid_cam: [observation.images.image, observation.images.wrist_image]\n"
+        "    source_fps: 20\n"
+        "    chunk: 9\n"
+        "    action_chunk: 36\n"
+        "    n_previous: 4\n"
+        "    ignore_seek: false\n",
+        encoding="utf-8",
+    )
+
+    dataset = planner.load_ge_act_dual_camera_planner_dataset(
+        config_path,
+        future_offsets=(2, 4, 6, 8),
+    )
+
+    assert dataset.future_offsets == (2, 4, 6, 8)
+
+
 def test_legacy_checkpoint_initializes_four_shared_heads_without_expansion(
     tmp_path: Path,
 ) -> None:

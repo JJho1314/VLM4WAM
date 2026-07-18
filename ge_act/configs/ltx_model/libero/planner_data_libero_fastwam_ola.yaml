@@ -1,0 +1,35 @@
+train_data_class_path: data/lerobot_like_dataset.py
+train_data_class: CustomLeRobotDataset
+
+data:
+  train:
+    data_roots:
+      - /data/shared/datasets/libero_fastwam
+      - /data/shared/datasets/libero_fastwam
+      - /data/shared/datasets/libero_fastwam
+      - /data/shared/datasets/libero_fastwam
+    domains:
+      - libero_10_no_noops_lerobot
+      - libero_goal_no_noops_lerobot
+      - libero_object_no_noops_lerobot
+      - libero_spatial_no_noops_lerobot
+    sample_size: [256, 256]
+    sample_n_frames: 500
+    preprocess: resize
+    valid_cam:
+      - observation.images.image
+      - observation.images.wrist_image
+    predecoded_video_root: null
+    require_predecoded: false
+    source_fps: 20
+    chunk: 9
+    action_chunk: 36
+    n_previous: 4
+    previous_pick_mode: random
+    random_crop: false
+    ignore_seek: false
+    action_type: absolute
+    action_space: eef
+    stat_file: configs/ltx_model/libero/libero_fastwam_mix.json
+    state_key: observation.state
+    action_key: action
