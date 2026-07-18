@@ -28,13 +28,13 @@
 - Consumes: the existing `train_ge_act_dual_camera_k4_siglip2da3_ola.sh` environment-variable interface.
 - Produces: 60 optimizer steps with progress, losses, and GPU telemetry.
 
-- [ ] **Step 1: Confirm all eight GPUs are free**
+- [x] **Step 1: Confirm all eight GPUs are free**
 
 Run: `nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader`
 
 Expected: every GPU has less than 500 MiB allocated.
 
-- [ ] **Step 2: Launch the 60-step candidate**
+- [x] **Step 2: Launch the 60-step candidate**
 
 ```bash
 RUN_KIND=formal \
@@ -46,7 +46,7 @@ bash qwen3_vl_semantic_planner/dinov3_da3_2b/train_ge_act_dual_camera_k4_siglip2
 
 Expected: runtime contract reports batch 16, accumulation 1, global batch 128, and gradient checkpointing false.
 
-- [ ] **Step 3: Record peak memory and completion**
+- [x] **Step 3: Record peak memory and completion**
 
 Run `nvidia-smi` during active forward/backward and inspect the benchmark log after exit.
 
@@ -62,15 +62,14 @@ Expected: all 60 steps complete, all logged losses are finite, and every GPU rem
 - Consumes: baseline 1.09 seconds/step and the Task 1 benchmark results.
 - Produces: one fresh 30k training process using the winning configuration.
 
-- [ ] **Step 1: Compute candidate steady-state speed**
+- [x] **Step 1: Compute candidate steady-state speed**
 
 Use progress elapsed time after initialization and report seconds per optimizer step, peak memory, and delta versus baseline.
 
-- [ ] **Step 2: Apply the decision rule**
+- [x] **Step 2: Apply the decision rule**
 
 Select B16 only if it is finite, below 75 GiB/GPU, and at least 10% faster; otherwise select B8.
 
-- [ ] **Step 3: Launch and verify the selected 30k run**
+- [x] **Step 3: Launch and verify the selected 30k run**
 
 Run the existing launcher with the selected `BATCH_SIZE` and `GRAD_ACCUM`, then verify the runtime contract, actual checkpointing state, first finite loss, process identity, output directory, and log path.
-

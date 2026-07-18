@@ -29,3 +29,11 @@ accumulation 2 run.
 The formal launcher must continue to require all 3,424 predecoded RGB caches,
 and its runtime log must report `model_gradient_checkpointing: false`.
 
+## Result
+
+The B16 candidate completed 60 steps with finite loss (`4.3851` at step 60)
+and peaked at 61.1 GiB/GPU. Its compute-only segments were about 14% faster,
+but its data-iterator boundary cost increased from 4--5 seconds to 6 seconds.
+Across the aligned step 1--59 interval, end-to-end time improved by only 1.47%,
+which fails the 10% selection threshold. The selected formal configuration is
+therefore batch 8/GPU with accumulation 2 and global batch 128.
