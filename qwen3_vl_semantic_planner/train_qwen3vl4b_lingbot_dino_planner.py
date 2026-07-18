@@ -836,6 +836,18 @@ def configure_gradient_checkpointing(model: nn.Module, *, enabled: bool) -> None
         model.enable_input_require_grads()
 
 
+def require_gradient_checkpointing_state(
+    model: nn.Module, *, expected: bool
+) -> bool:
+    actual = bool(getattr(model, "is_gradient_checkpointing", False))
+    if actual != bool(expected):
+        raise RuntimeError(
+            "gradient checkpointing state mismatch: "
+            f"requested={bool(expected)} actual={actual}"
+        )
+    return actual
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=Path, default=None)
@@ -3585,6 +3597,20 @@ def main() -> None:
     plan_token_ids = [processor.tokenizer.convert_tokens_to_ids(t) for t in plan_token_strs]
     model.config.use_cache = False
     configure_gradient_checkpointing(model, enabled=args.gradient_checkpointing)
+    actual_gradient_checkpointing = require_gradient_checkpointing_state(
+        model,
+        expected=args.gradient_checkpointing,
+    )
+    if accelerator.is_main_process:
+        print(
+            json.dumps(
+                {
+                    "model_gradient_checkpointing": actual_gradient_checkpointing,
+                    "model_use_cache": bool(model.config.use_cache),
+                }
+            ),
+            flush=True,
+        )
     set_trainable(
         model,
         freeze_vision=args.freeze_vision,

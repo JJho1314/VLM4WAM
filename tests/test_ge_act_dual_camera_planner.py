@@ -31,6 +31,13 @@ from qwen3_vl_semantic_planner.dinov3_da3_2b.depth_anything3_target import (
 PlannerWrapper = planner.PlannerWrapper
 
 
+def test_gradient_checkpointing_runtime_state_must_match_requested_mode() -> None:
+    model = SimpleNamespace(is_gradient_checkpointing=True)
+
+    with pytest.raises(RuntimeError, match="gradient checkpointing state mismatch"):
+        planner.require_gradient_checkpointing_state(model, expected=False)
+
+
 class FakeDataset(Dataset):
     def __init__(self, sample: dict[str, Any]):
         self.sample = sample
