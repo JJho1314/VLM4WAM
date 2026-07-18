@@ -6,6 +6,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLANNER_DIR="$(dirname "$HERE")"
 REPO_ROOT="$(cd "$PLANNER_DIR/.." && pwd)"
 cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 RUN_KIND=${RUN_KIND:-formal}
 PY=${PY:-/data/users/junjie/envs/vlm4wam/bin/python}

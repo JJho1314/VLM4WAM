@@ -1144,6 +1144,7 @@ def test_ola_k4_config_and_launcher_are_fresh_and_fail_closed() -> None:
         "DA3_ALIGN_STRATEGY=${DA3_ALIGN_STRATEGY:-wsa_multilayer}",
         "INIT_PLANNER_CHECKPOINT=",
         "HEAD_WARMSTART_CKPT=",
+        'export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"',
     ):
         assert required in launcher
     assert "step_020000" not in launcher
