@@ -190,21 +190,27 @@ class DepthAnything3TargetEncoder(nn.Module):
 
     @torch.no_grad()
     def encode_future_keyframes(self, keyframes_b3hw: Sequence[torch.Tensor]) -> torch.Tensor:
-        """keyframes: list of K x (B,3,H,W) future frames. Returns (B, K*tok, D) bf16 (detached).
+        """Encode K monocular future frames while retaining WSA's layer axis.
 
-        Monocular per-frame (no warmup clip), mirroring the lingbot depth teacher."""
-        if self.align_strategy == "wsa_multilayer":
-            # wsa_multilayer is only wired through the current-alignment path (encode_current_and_future);
-            # this multi-keyframe helper would need a 5-d [B,K,L,tok,D] contract the callers don't expect.
-            raise NotImplementedError(
-                "wsa_multilayer DA3 alignment is only supported with use_current_alignment "
-                "(via encode_current_and_future), not encode_future_keyframes"
-            )
+        ``last_layer`` returns ``[B,K*tok,D]``. ``wsa_multilayer`` returns
+        ``[B,L,K*tok,D]`` so each layer contains keyframes in temporal order.
+        """
+        if not keyframes_b3hw:
+            raise ValueError("keyframes_b3hw must not be empty")
         prepped = [self._prep(kf) for kf in keyframes_b3hw]  # each (B,3,R,R)
         b = prepped[0].shape[0]
         k = len(prepped)
         batch = torch.cat(prepped, dim=0)  # (K*B, 3, R, R)
-        feats = self._patch_tokens(batch)  # (K*B, tok, D)
+        feats = self._patch_tokens(batch)
+        if self.align_strategy == "wsa_multilayer":
+            # [K*B,L,tok,D] -> [B,L,K*tok,D]
+            layers, tok, dim = feats.shape[1:]
+            feats = (
+                feats.reshape(k, b, layers, tok, dim)
+                .permute(1, 2, 0, 3, 4)
+                .reshape(b, layers, k * tok, dim)
+            )
+            return feats.detach().to(torch.bfloat16)
         tok, dim = feats.shape[1], feats.shape[2]
         feats = feats.view(k, b, tok, dim).permute(1, 0, 2, 3).reshape(b, k * tok, dim)
         return feats.detach().to(torch.bfloat16)

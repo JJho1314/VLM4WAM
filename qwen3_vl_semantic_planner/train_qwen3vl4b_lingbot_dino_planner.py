@@ -114,6 +114,54 @@ DUAL_CAMERA_EXPORT_METADATA = {
     "future_keyframe_offsets": [8],
 }
 
+
+def build_dual_camera_export_metadata(
+    *,
+    future_keyframe_offsets: Sequence[int],
+    num_keyframes: int,
+    target_tokens_per_keyframe: int,
+    planner_token_count: int,
+) -> dict[str, Any]:
+    """Build the camera/export contract from the trained planner geometry."""
+    offsets = [int(offset) for offset in future_keyframe_offsets]
+    keyframes = int(num_keyframes)
+    tokens_per_keyframe = int(target_tokens_per_keyframe)
+    plan_tokens = int(planner_token_count)
+    if (
+        keyframes < 1
+        or len(offsets) != keyframes
+        or any(offset <= 0 for offset in offsets)
+        or any(left >= right for left, right in zip(offsets, offsets[1:]))
+    ):
+        raise ValueError(
+            "future_keyframe_offsets must contain one strictly increasing positive "
+            f"offset per keyframe, got {offsets} for K={keyframes}"
+        )
+    if tokens_per_keyframe <= 0 or plan_tokens <= 0:
+        raise ValueError("target and planner token counts must be positive")
+    metadata = {
+        "planner_input_layout": "separate_camera_images",
+        "camera_names": ["main", "wrist"],
+        "num_camera_views": 2,
+        "camera_head_sharing": "shared_head_per_view_image_context",
+        "semantic_output_layout": (
+            "batch_view_token_feature"
+            if keyframes == 1
+            else "batch_view_keyframe_token_feature"
+        ),
+        "semantic_teacher": "siglip2-large-patch16-256",
+        "future_keyframe_offsets": offsets,
+    }
+    if keyframes > 1:
+        metadata.update(
+            {
+                "num_keyframes": keyframes,
+                "target_tokens_per_keyframe": tokens_per_keyframe,
+                "planner_token_count": plan_tokens,
+            }
+        )
+    return metadata
+
 _INITIALIZATION_METADATA = {
     "use_current_alignment": True,
     "independent_modality_task_tokens": True,
@@ -165,7 +213,54 @@ def validate_dual_camera_export_metadata(
     """Reject exports that cannot preserve separate main/wrist view context."""
     if not isinstance(metadata, dict):
         raise ValueError("dual-camera planner metadata must be a dictionary")
-    for field, expected in DUAL_CAMERA_EXPORT_METADATA.items():
+    common = {
+        key: value
+        for key, value in DUAL_CAMERA_EXPORT_METADATA.items()
+        if key not in ("semantic_output_layout", "future_keyframe_offsets")
+    }
+    for field, expected in common.items():
+        actual = metadata.get(field)
+        if not _metadata_value_matches(actual, expected):
+            raise ValueError(
+                f"incompatible dual-camera metadata field {field}: "
+                f"expected {expected!r}, got {actual!r}"
+            )
+    offsets = metadata.get("future_keyframe_offsets")
+    if not isinstance(offsets, list) or not offsets:
+        raise ValueError(
+            "incompatible dual-camera metadata field future_keyframe_offsets: "
+            f"got {offsets!r}"
+        )
+    keyframes = len(offsets)
+    if keyframes == 1:
+        expected_fields = {
+            "semantic_output_layout": "batch_view_token_feature",
+            "future_keyframe_offsets": [8],
+        }
+        if metadata.get("num_keyframes", 1) != 1:
+            raise ValueError(
+                "incompatible dual-camera metadata field num_keyframes: expected 1, "
+                f"got {metadata.get('num_keyframes')!r}"
+            )
+    elif keyframes == 4:
+        expected_fields = {
+            "semantic_output_layout": "batch_view_keyframe_token_feature",
+            "future_keyframe_offsets": [2, 4, 6, 8],
+            "num_keyframes": 4,
+            "target_tokens_per_keyframe": 256,
+            "planner_token_count": 384,
+        }
+        if metadata.get("sequence_length", 9) != 9:
+            raise ValueError(
+                "incompatible dual-camera metadata field sequence_length: expected 9, "
+                f"got {metadata.get('sequence_length')!r}"
+            )
+    else:
+        raise ValueError(
+            "incompatible dual-camera metadata field future_keyframe_offsets: "
+            f"expected explicit K1 or K4 geometry, got {offsets!r}"
+        )
+    for field, expected in expected_fields.items():
         actual = metadata.get(field)
         if not _metadata_value_matches(actual, expected):
             raise ValueError(
@@ -1850,8 +1945,8 @@ class PlannerWrapper(nn.Module):
         self.use_depth = bool(use_depth) and plan_head_type == "lingbot_dino"
         # DA3 depth alignment strategy. last_layer: single-layer smooth-L1 on the last encoder layer
         # (unchanged legacy path). wsa_multilayer: predict L stacked layers per token and score each
-        # with cos + MSE(LayerNorm), per-layer weighted (WSA-style). Only supported with current
-        # alignment (the 2B DINOv3+DA3 line); the depth heads widen to dim_out = depth_dim * L.
+        # with cos + MSE(LayerNorm), per-layer weighted (WSA-style). The depth heads widen to
+        # dim_out = depth_dim * L for both current-alignment and future-only planners.
         self.da3_align_strategy = str(da3_align_strategy)
         if self.da3_align_strategy not in ("last_layer", "wsa_multilayer"):
             raise ValueError(f"unknown da3_align_strategy: {self.da3_align_strategy!r}")
@@ -1861,10 +1956,12 @@ class PlannerWrapper(nn.Module):
             self.da3_num_layers if self.da3_align_strategy == "wsa_multilayer" else 1
         )
         if self.da3_align_strategy == "wsa_multilayer":
-            if not (self.use_depth and use_current_alignment):
+            if not self.use_depth:
                 raise ValueError(
-                    "da3_align_strategy=wsa_multilayer requires lingbot_dino depth + current alignment"
+                    "da3_align_strategy=wsa_multilayer requires lingbot_dino depth"
                 )
+            if self.da3_num_layers < 1:
+                raise ValueError("da3_num_layers must be positive")
             _lw = list(da3_layer_weights) if da3_layer_weights else [1.0] * self.da3_num_layers
             if len(_lw) != self.da3_num_layers:
                 raise ValueError(
@@ -2476,26 +2573,40 @@ class PlannerWrapper(nn.Module):
         }
 
     def _reshape_depth_plan(self, x: torch.Tensor) -> torch.Tensor:
-        """Depth-head output [B, tok, L*D] -> [B, tok, L, D] for wsa_multilayer; unchanged otherwise."""
+        """Depth-head output ``[...,tok,L*D]`` -> ``[...,tok,L,D]`` for WSA."""
         if self.da3_align_strategy != "wsa_multilayer":
             return x
-        b, tok, ld = x.shape
-        return x.reshape(b, tok, self.da3_num_layers, self.depth_per_layer_dim)
+        expected = self.da3_num_layers * self.depth_per_layer_dim
+        if x.shape[-1] != expected:
+            raise RuntimeError(
+                f"WSA depth head width must be {expected}, got {x.shape[-1]}"
+            )
+        return x.reshape(
+            *x.shape[:-1],
+            self.da3_num_layers,
+            self.depth_per_layer_dim,
+        )
 
     def _reshape_depth_target(self, t: torch.Tensor) -> torch.Tensor:
-        """Depth teacher target [B, L, tok, D] -> [B, tok, L, D] for wsa_multilayer; unchanged otherwise."""
+        """Depth target ``[...,L,tok,D]`` -> ``[...,tok,L,D]`` for WSA."""
         if self.da3_align_strategy != "wsa_multilayer":
             return t
-        return t.permute(0, 2, 1, 3).contiguous()
+        if t.ndim < 4 or t.shape[-3] != self.da3_num_layers:
+            raise RuntimeError(
+                "WSA depth target must end in [L,tok,D] with "
+                f"L={self.da3_num_layers}, got {tuple(t.shape)}"
+            )
+        return t.transpose(-3, -2).contiguous()
 
     def _wsa_layer_loss(
         self, pred: torch.Tensor, target: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """WSA per-layer depth alignment. pred/target: [B, tok, L, D].
+        """WSA per-layer depth alignment. pred/target: ``[...,tok,L,D]``.
 
         Per layer: cos_loss = (1 - <norm(pred), norm(target)>).mean over tokens; mse_loss over
         LayerNorm(pred) vs LayerNorm(target). layer_loss = (cos + mse) * weight; averaged over layers."""
-        target = target.detach()
+        pred = pred.reshape(-1, *pred.shape[-3:])
+        target = target.detach().reshape(-1, *target.shape[-3:])
         dim = pred.shape[-1]
         pred_n = F.normalize(pred, dim=-1)
         target_n = F.normalize(target, dim=-1)
@@ -2576,22 +2687,48 @@ class PlannerWrapper(nn.Module):
             plans = self.predict_current_future_plans(**model_inputs)
             return plans["future_dino"], plans["future_depth"]
         image_hidden, plan_hidden = self._forward_hiddens(**model_inputs)
-        future_image_hidden = image_hidden.detach()
         dino_hidden, depth_hidden = self.split_lingbot_query_hidden(plan_hidden)
         dino_dtype = next(self.plan_head.parameters()).dtype
         depth_dtype = next(self.depth_head.parameters()).dtype
-        dino_plan = self.plan_head(
-            future_image_hidden.to(dtype=dino_dtype),
-            dino_hidden.to(dtype=dino_dtype),
-        ).float()
-        depth_plan = self.depth_head(
-            future_image_hidden.to(dtype=depth_dtype),
-            depth_hidden.to(dtype=depth_dtype),
-        ).float()
-        if dino_plan.shape != depth_plan.shape:
+        num_views = getattr(self, "num_camera_views", 1)
+        if num_views == 1:
+            image_hiddens = (image_hidden,)
+        else:
+            if image_hidden.ndim != 4 or image_hidden.shape[1] != num_views:
+                raise RuntimeError(
+                    f"expected image hidden [B,{num_views},N,H], got "
+                    f"{tuple(image_hidden.shape)}"
+                )
+            image_hiddens = image_hidden.unbind(dim=1)
+        dino_views = []
+        depth_views = []
+        for view_image_hidden in image_hiddens:
+            future_image_hidden = view_image_hidden.detach()
+            dino_views.append(
+                self.plan_head(
+                    future_image_hidden.to(dtype=dino_dtype),
+                    dino_hidden.to(dtype=dino_dtype),
+                ).float()
+            )
+            depth_views.append(
+                self._reshape_depth_plan(
+                    self.depth_head(
+                        future_image_hidden.to(dtype=depth_dtype),
+                        depth_hidden.to(dtype=depth_dtype),
+                    ).float()
+                )
+            )
+        dino_plan = dino_views[0] if num_views == 1 else torch.stack(dino_views, dim=1)
+        depth_plan = depth_views[0] if num_views == 1 else torch.stack(depth_views, dim=1)
+        depth_geometry = (
+            depth_plan.shape[:-2]
+            if self.da3_align_strategy == "wsa_multilayer"
+            else depth_plan.shape[:-1]
+        )
+        if dino_plan.shape[:-1] != depth_geometry:
             raise RuntimeError(
-                "DINO/depth head output mismatch: "
-                f"{tuple(dino_plan.shape)} != {tuple(depth_plan.shape)}"
+                "DINO/depth head batch, view, or token mismatch: "
+                f"{tuple(dino_plan.shape)} vs {tuple(depth_plan.shape)}"
             )
         return dino_plan, depth_plan
 
@@ -2663,20 +2800,32 @@ class PlannerWrapper(nn.Module):
             self, "use_current_alignment", False
         ):
             return self.predict_current_future_plans(**inputs)["future_dino"]
+        if self.plan_head_type == "lingbot_dino" and self.depth_head is not None:
+            return self.predict_dino_depth_plan(**inputs)[0]
         image_hidden, plan_hidden = self._forward_hiddens(**inputs)
         head_dtype = next(self.plan_head.parameters()).dtype
         if self.plan_head_type == "lingbot_dino":
-            if self.depth_head is not None:
-                plan_hidden, _ = self.split_lingbot_query_hidden(plan_hidden)
-            return self.plan_head(
-                image_hidden.detach().to(dtype=head_dtype),
-                plan_hidden.to(dtype=head_dtype),
-            ).float()
+            num_views = getattr(self, "num_camera_views", 1)
+            image_hiddens = (
+                (image_hidden,)
+                if num_views == 1
+                else image_hidden.unbind(dim=1)
+            )
+            plans = [
+                self.plan_head(
+                    view_hidden.detach().to(dtype=head_dtype),
+                    plan_hidden.to(dtype=head_dtype),
+                ).float()
+                for view_hidden in image_hiddens
+            ]
+            return plans[0] if num_views == 1 else torch.stack(plans, dim=1)
         return self.plan_head(plan_hidden.to(dtype=head_dtype)).float()
 
     def compute_plan_losses(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
         eps = 1e-6
         mse = F.mse_loss(pred, target)
+        pred = pred.reshape(-1, *pred.shape[-2:])
+        target = target.reshape(-1, *target.shape[-2:])
         cosine = 1.0 - F.cosine_similarity(pred.flatten(0, 1), target.flatten(0, 1), dim=-1).mean()
 
         pred_norm_B_L = pred.norm(dim=-1)
@@ -2782,29 +2931,30 @@ class PlannerWrapper(nn.Module):
                             / targets[name].norm(dim=-1).mean().clamp_min(1e-6)
                         ).detach()
                 return out
-            # One VLM forward feeds BOTH the video head and (optionally) the auxiliary depth head.
-            image_hidden, plan_hidden = self._forward_hiddens(**inputs)
-            dino_hidden = plan_hidden
-            depth_hidden = None
             if self.depth_head is not None:
-                dino_hidden, depth_hidden = self.split_lingbot_query_hidden(plan_hidden)
-            future_image_hidden = image_hidden.detach()
-            dino_dtype = next(self.plan_head.parameters()).dtype
-            pred = self.plan_head(
-                future_image_hidden.to(dino_dtype),
-                dino_hidden.to(dino_dtype),
-            ).float()
-            if pred.shape[0] != batch or pred.shape[1] != self.target_len:
-                raise RuntimeError(f"Prediction {tuple(pred.shape[:2])} != ({batch}, {self.target_len})")
+                pred, depth_pred = self.predict_dino_depth_plan(**inputs)
+            else:
+                pred = self.predict_semantic_plan(**inputs)
+                depth_pred = None
+            if pred.shape[0] != batch or pred.shape[-2] != self.target_len:
+                raise RuntimeError(
+                    f"Prediction batch/tokens {pred.shape[0]}/{pred.shape[-2]} != "
+                    f"{batch}/{self.target_len}"
+                )
             out = self.compute_plan_losses(pred, semantic_plan_labels.to(device=pred.device, dtype=torch.float32))
-            if self.depth_head is not None and depth_plan_labels is not None:
-                depth_dtype = next(self.depth_head.parameters()).dtype
-                depth_pred = self.depth_head(
-                    future_image_hidden.to(depth_dtype),
-                    depth_hidden.to(depth_dtype),
-                ).float()
-                depth_target = depth_plan_labels.to(device=pred.device, dtype=torch.float32)
-                depth_l = F.smooth_l1_loss(depth_pred, depth_target)  # lingbot depth loss (_emb_loss)
+            if depth_pred is not None and depth_plan_labels is not None:
+                depth_target = self._reshape_depth_target(
+                    depth_plan_labels.to(device=pred.device, dtype=torch.float32)
+                )
+                if self.da3_align_strategy == "wsa_multilayer":
+                    depth_l, depth_cos, depth_mse = self._wsa_layer_loss(
+                        depth_pred,
+                        depth_target,
+                    )
+                    out["depth_cos"] = depth_cos.detach()
+                    out["depth_lnmse"] = depth_mse.detach()
+                else:
+                    depth_l = F.smooth_l1_loss(depth_pred, depth_target)
                 out["loss"] = out["loss"] + self.depth_loss_weight * depth_l
                 out["depth_smooth_l1"] = depth_l.detach()
                 out["depth_norm_ratio"] = (
@@ -3295,7 +3445,21 @@ def save_checkpoint(
         }
     )
     if num_camera_views == 2:
-        meta.update(DUAL_CAMERA_EXPORT_METADATA)
+        if module.target_len % module.num_keyframes != 0:
+            raise ValueError(
+                "dual-camera target_len must divide evenly across keyframes: "
+                f"{module.target_len} / {module.num_keyframes}"
+            )
+        meta.update(
+            build_dual_camera_export_metadata(
+                future_keyframe_offsets=offsets,
+                num_keyframes=module.num_keyframes,
+                target_tokens_per_keyframe=(
+                    module.target_len // module.num_keyframes
+                ),
+                planner_token_count=module.latent_len,
+            )
+        )
         validate_dual_camera_export_metadata(meta)
     (ckpt / "planner_meta.json").write_text(
         json.dumps(meta, indent=2, sort_keys=True) + "\n",

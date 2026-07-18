@@ -24,6 +24,9 @@ if str(PLANNER_ROOT) not in sys.path:
 
 from qwen3_vl_semantic_planner import train_qwen3vl4b_lingbot_dino_planner as planner
 from qwen3_vl_semantic_planner import qwen3vl_wrapper as qwen_helper
+from qwen3_vl_semantic_planner.dinov3_da3_2b.depth_anything3_target import (
+    DepthAnything3TargetEncoder,
+)
 
 PlannerWrapper = planner.PlannerWrapper
 
@@ -99,6 +102,23 @@ class ViewAwareHead(nn.Module):
         batch = image_hidden.shape[0]
         view_value = image_hidden.mean(dim=(1, 2)).reshape(batch, 1, 1)
         return self.scale * view_value.expand(batch, 256, 1024)
+
+
+class K4ViewAwareHead(nn.Module):
+    def __init__(self, feature_dim: int) -> None:
+        super().__init__()
+        self.feature_dim = int(feature_dim)
+        self.scale = nn.Parameter(torch.ones(()))
+
+    def forward(
+        self,
+        image_hidden: torch.Tensor,
+        task_hidden: torch.Tensor,
+    ) -> torch.Tensor:
+        assert task_hidden.shape[1] == 4 * 64
+        batch = image_hidden.shape[0]
+        view_value = image_hidden.mean(dim=(1, 2)).reshape(batch, 1, 1)
+        return self.scale * view_value.expand(batch, 4 * 256, self.feature_dim)
 
 
 class CheckpointHead(nn.Module):
@@ -382,6 +402,37 @@ def make_fake_alignment_wrapper(*, num_camera_views: int) -> PlannerWrapper:
     return wrapper
 
 
+def make_fake_future_k4_wrapper() -> PlannerWrapper:
+    wrapper = PlannerWrapper.__new__(PlannerWrapper)
+    nn.Module.__init__(wrapper)
+    wrapper.use_current_alignment = False
+    wrapper.num_keyframes = 4
+    wrapper.num_camera_views = 2
+    wrapper.shared_latent_per_keyframe = 32
+    wrapper.private_latent_per_keyframe = 32
+    wrapper.branch_latent_per_keyframe = 64
+    wrapper.total_unique_latent_per_keyframe = 96
+    wrapper.latent_len = 4 * 96
+    wrapper.plan_head_type = "lingbot_dino"
+    wrapper.da3_align_strategy = "wsa_multilayer"
+    wrapper.da3_num_layers = 4
+    wrapper.depth_per_layer_dim = 8
+    wrapper.plan_head = K4ViewAwareHead(feature_dim=8)
+    wrapper.depth_head = K4ViewAwareHead(feature_dim=4 * 8)
+
+    def forward_hiddens(**inputs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        batch = inputs["input_ids"].shape[0]
+        image_hidden = torch.stack(
+            [torch.zeros(batch, 2, 4), torch.full((batch, 2, 4), 10.0)],
+            dim=1,
+        )
+        task_hidden = torch.zeros(batch, wrapper.latent_len, 4)
+        return image_hidden, task_hidden
+
+    wrapper._forward_hiddens = forward_hiddens
+    return wrapper
+
+
 def make_loss_only_wrapper_with_unit_branch_weights() -> PlannerWrapper:
     wrapper = PlannerWrapper.__new__(PlannerWrapper)
     nn.Module.__init__(wrapper)
@@ -570,6 +621,92 @@ def test_single_camera_wrapper_keeps_legacy_output_shape() -> None:
     )
 
     assert all(value.shape == (2, 256, 1024) for value in plans.values())
+
+
+def test_future_only_k4_wsa_wrapper_uses_384_queries() -> None:
+    wrapper = PlannerWrapper(
+        model=nn.Module(),
+        hidden_size=8,
+        semantic_dim=8,
+        plan_token_ids=list(range(384)),
+        target_len=4 * 256,
+        num_keyframes=4,
+        grid_size=16,
+        plan_head_type="lingbot_dino",
+        use_depth=True,
+        depth_dim=8,
+        depth_grid_size=16,
+        shared_latent_per_keyframe=32,
+        private_latent_per_keyframe=32,
+        use_current_alignment=False,
+        da3_align_strategy="wsa_multilayer",
+        da3_num_layers=4,
+        num_camera_views=2,
+    )
+
+    assert wrapper.latent_len == 384
+    assert wrapper.num_latent_per_keyframe == 64
+    assert wrapper.plan_head is not wrapper.depth_head
+
+
+def test_future_only_k4_wsa_prediction_preserves_views_and_layers() -> None:
+    wrapper = make_fake_future_k4_wrapper()
+
+    dino, depth = wrapper.predict_dino_depth_plan(
+        input_ids=torch.ones(2, 1, dtype=torch.long)
+    )
+
+    assert dino.shape == (2, 2, 4 * 256, 8)
+    assert depth.shape == (2, 2, 4 * 256, 4, 8)
+    assert not torch.equal(dino[:, 0], dino[:, 1])
+    assert not torch.equal(depth[:, 0], depth[:, 1])
+    torch.testing.assert_close(
+        wrapper.predict_semantic_plan(input_ids=torch.ones(2, 1, dtype=torch.long)),
+        dino,
+    )
+
+
+def test_wsa_depth_target_reshape_preserves_dual_camera_dimension() -> None:
+    wrapper = make_fake_future_k4_wrapper()
+    target = torch.arange(2 * 2 * 4 * 1024 * 8).reshape(2, 2, 4, 1024, 8)
+
+    reshaped = wrapper._reshape_depth_target(target)
+
+    assert reshaped.shape == (2, 2, 1024, 4, 8)
+    torch.testing.assert_close(reshaped[:, :, 0, 3], target[:, :, 3, 0])
+
+
+def test_da3_wsa_future_keyframes_concatenate_time_inside_each_layer() -> None:
+    encoder = DepthAnything3TargetEncoder.__new__(DepthAnything3TargetEncoder)
+    nn.Module.__init__(encoder)
+    encoder.align_strategy = "wsa_multilayer"
+    encoder._prep = lambda frames: frames
+
+    def patch_tokens(batch: torch.Tensor) -> torch.Tensor:
+        values = batch[:, 0, 0, 0].reshape(-1, 1, 1, 1)
+        layer_offsets = torch.arange(4).reshape(1, 4, 1, 1) * 100
+        token_offsets = torch.arange(2).reshape(1, 1, 2, 1) * 10
+        return (values + layer_offsets + token_offsets).expand(-1, -1, -1, 3)
+
+    encoder._patch_tokens = patch_tokens
+    keyframes = [
+        torch.full((2, 3, 1, 1), float(keyframe * 10 + batch))
+        for keyframe in range(4)
+        for batch in [0]
+    ]
+    for keyframe, frames in enumerate(keyframes):
+        frames[1].fill_(float(keyframe * 10 + 1))
+
+    encoded = encoder.encode_future_keyframes(keyframes).float()
+
+    assert encoded.shape == (2, 4, 4 * 2, 3)
+    assert encoded[0, 0, :, 0].tolist() == [0, 10, 10, 20, 20, 30, 30, 40]
+    torch.testing.assert_close(
+        encoded[1, 3, :, 0],
+        torch.tensor([301, 311, 311, 321, 321, 331, 331, 341], dtype=torch.float32),
+        rtol=0,
+        atol=1,
+    )
 
 
 def test_dual_camera_loss_detects_swapped_teacher_views() -> None:
@@ -1102,6 +1239,34 @@ def test_dual_camera_metadata_accepts_exact_separate_view_contract() -> None:
     metadata = valid_dual_camera_metadata()
 
     assert planner.validate_dual_camera_export_metadata(metadata) == metadata
+
+
+def test_dual_camera_k4_metadata_is_geometry_derived_and_strict() -> None:
+    metadata = planner.build_dual_camera_export_metadata(
+        future_keyframe_offsets=(2, 4, 6, 8),
+        num_keyframes=4,
+        target_tokens_per_keyframe=256,
+        planner_token_count=384,
+    )
+
+    assert metadata == {
+        "planner_input_layout": "separate_camera_images",
+        "camera_names": ["main", "wrist"],
+        "num_camera_views": 2,
+        "camera_head_sharing": "shared_head_per_view_image_context",
+        "semantic_output_layout": "batch_view_keyframe_token_feature",
+        "semantic_teacher": "siglip2-large-patch16-256",
+        "future_keyframe_offsets": [2, 4, 6, 8],
+        "num_keyframes": 4,
+        "target_tokens_per_keyframe": 256,
+        "planner_token_count": 384,
+    }
+    assert planner.validate_dual_camera_export_metadata(metadata) == metadata
+
+    corrupted = dict(metadata)
+    corrupted["planner_token_count"] = 256
+    with pytest.raises(ValueError, match="planner_token_count"):
+        planner.validate_dual_camera_export_metadata(corrupted)
 
 
 def test_dual_camera_exported_checkpoint_rejects_composite_before_model_build(
