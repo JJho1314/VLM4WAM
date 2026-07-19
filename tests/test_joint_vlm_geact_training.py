@@ -1,16 +1,29 @@
 from __future__ import annotations
 
+import argparse
+import ast
+import importlib.util
+import json
+import math
+import os
 import sys
+from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Dict, List
 
 import pytest
 import torch
 import torch.nn as nn
+from yaml import Loader, load
 
 
 GE_ACT_ROOT = Path(__file__).resolve().parents[1] / "ge_act"
 if str(GE_ACT_ROOT) not in sys.path:
     sys.path.insert(0, str(GE_ACT_ROOT))
+GE_TRAINER_PATH = GE_ACT_ROOT / "runner" / "ge_trainer.py"
+GE_MAIN_PATH = GE_ACT_ROOT / "main.py"
 
 from models.ltx_models.joint_vlm_geact import (  # noqa: E402
     JointVLMGEActModel,
@@ -24,6 +37,50 @@ TOKENS_PER_KEYFRAME = 2
 SEMANTIC_DIM = 1024
 DEPTH_LAYERS = 4
 DEPTH_DIM = 2048
+
+
+def _load_ge_trainer_symbols(*names: str) -> SimpleNamespace:
+    """Load selected light contracts without importing the broken local diffusers."""
+
+    tree = ast.parse(GE_TRAINER_PATH.read_text(encoding="utf-8"))
+    requested = set(names)
+    nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in requested
+    ]
+    found = {node.name for node in nodes}
+    assert found == requested, f"missing trainer contracts: {sorted(requested - found)}"
+    namespace = {
+        "Any": Any,
+        "Dict": Dict,
+        "List": List,
+        "Accelerator": object,
+        "DistributedType": SimpleNamespace(DEEPSPEED="deepspeed"),
+        "JointVLMGEActModel": JointVLMGEActModel,
+        "Path": Path,
+        "SummaryWriter": lambda *_args, **_kwargs: None,
+        "argparse": argparse,
+        "build_joint_optimizer_parameter_groups": (
+            build_joint_optimizer_parameter_groups
+        ),
+        "datetime": datetime,
+        "deepcopy": deepcopy,
+        "dist": SimpleNamespace(broadcast=lambda *_args, **_kwargs: None),
+        "json": json,
+        "load": load,
+        "Loader": Loader,
+        "logger": SimpleNamespace(info=lambda *_args, **_kwargs: None),
+        "math": math,
+        "os": os,
+        "torch": torch,
+        "init_logging": lambda *_args, **_kwargs: None,
+    }
+    exec(
+        compile(ast.Module(body=nodes, type_ignores=[]), GE_TRAINER_PATH, "exec"),
+        namespace,
+    )
+    return SimpleNamespace(**namespace)
 
 
 def _finite_nonzero(value: torch.Tensor | None) -> bool:
@@ -523,3 +580,500 @@ def test_joint_optimizer_groups_reject_unclassified_parameters() -> None:
             qwen_lr=1e-6,
             planner_head_lr=3e-5,
         )
+
+
+def test_joint_teacher_frames_match_planner_training_offsets() -> None:
+    contracts = _load_ge_trainer_symbols("select_joint_planner_frames")
+    video = torch.arange(1 * 3 * 2 * 13 * 2 * 2).reshape(1, 3, 2, 13, 2, 2)
+
+    current, future = contracts.select_joint_planner_frames(
+        video,
+        n_previous=4,
+        offsets=(2, 4, 6, 8),
+    )
+
+    torch.testing.assert_close(
+        current,
+        video[:, :, :, 3].permute(0, 2, 3, 4, 1),
+    )
+    for keyframe, source_index in enumerate((6, 8, 10, 12)):
+        torch.testing.assert_close(
+            future[:, :, keyframe],
+            video[:, :, :, source_index].permute(0, 2, 3, 4, 1),
+        )
+    leaked_indices = (5, 7, 9, 11)
+    assert all(
+        not torch.equal(
+            future[:, :, keyframe], video[:, :, :, leaked].permute(0, 2, 3, 4, 1)
+        )
+        for keyframe, leaked in enumerate(leaked_indices)
+    )
+
+
+def test_joint_teacher_frames_reject_boundary_instead_of_leaking_wrong_frame() -> None:
+    contracts = _load_ge_trainer_symbols("select_joint_planner_frames")
+    video = torch.zeros(1, 3, 2, 12, 2, 2)
+
+    with pytest.raises(ValueError, match=r"source index 12.*T=12"):
+        contracts.select_joint_planner_frames(
+            video,
+            n_previous=4,
+            offsets=(2, 4, 6, 8),
+        )
+
+
+def test_joint_teacher_targets_are_encoded_under_no_grad() -> None:
+    contracts = _load_ge_trainer_symbols("encode_joint_planner_targets")
+    grad_states: list[bool] = []
+
+    def target_encoder(current, future, *, appearance_encoder, depth_encoder):
+        grad_states.append(torch.is_grad_enabled())
+        assert appearance_encoder == "siglip"
+        assert depth_encoder == "da3"
+        return {
+            "semantic_plan_labels": future.new_zeros(1, 2, 1024, 1024),
+            "depth_plan_labels": future.new_zeros(1, 2, 4, 1024, 2048),
+        }
+
+    current = torch.zeros(1, 2, 2, 2, 3, requires_grad=True)
+    future = torch.zeros(1, 2, 4, 2, 2, 3, requires_grad=True)
+    targets = contracts.encode_joint_planner_targets(
+        current,
+        future,
+        semantic_teacher="siglip",
+        depth_teacher="da3",
+        target_encoder=target_encoder,
+    )
+
+    assert grad_states == [False]
+    assert all(not value.requires_grad for value in targets.values())
+
+
+def test_joint_loss_uses_configured_planner_weight() -> None:
+    contracts = _load_ge_trainer_symbols("combine_joint_training_loss")
+    video_loss = torch.tensor(2.0, requires_grad=True)
+    planner_loss = torch.tensor(3.0, requires_grad=True)
+
+    total = contracts.combine_joint_training_loss(
+        video_loss,
+        {"loss": planner_loss},
+        planner_loss_weight=0.1,
+    )
+
+    torch.testing.assert_close(total, torch.tensor(2.3))
+    total.backward()
+    torch.testing.assert_close(video_loss.grad, torch.tensor(1.0))
+    torch.testing.assert_close(planner_loss.grad, torch.tensor(0.1))
+
+
+def test_joint_teacher_parameters_are_frozen_and_excluded() -> None:
+    contracts = _load_ge_trainer_symbols(
+        "State",
+        "Trainer",
+        "_configure_qwen_gradient_checkpointing",
+        "_joint_training_enabled",
+        "compute_effective_video_fps",
+        "freeze_conditioning_modules",
+    )
+    trainer = contracts.Trainer.__new__(contracts.Trainer)
+    planner = TinyPlanner()
+    planner.requires_grad_(False)
+    planner.eval()
+    planner.model.gradient_checkpointing_enable = lambda **_kwargs: setattr(
+        planner.model,
+        "is_gradient_checkpointing",
+        True,
+    )
+    planner.model.enable_input_require_grads = lambda: setattr(
+        planner.model,
+        "input_grads_enabled",
+        True,
+    )
+    ltx = TinyGateOpenLTX()
+    ltx.enable_gradient_checkpointing = lambda: setattr(
+        ltx,
+        "gradient_checkpointing_enabled",
+        True,
+    )
+    trainer.semantic_planner = SimpleNamespace(wrapper=planner)
+    trainer.semantic_teacher = nn.Linear(2, 2)
+    trainer.depth_teacher = nn.Linear(2, 2)
+    trainer.semantic_encoder = None
+    trainer.text_encoder = nn.Linear(2, 2)
+    trainer.vae = nn.Linear(2, 2)
+    trainer.diffusion_model = ltx
+    trainer.joint_model = JointVLMGEActModel(
+        planner,
+        ltx,
+        num_keyframes=4,
+        tokens_per_keyframe=TOKENS_PER_KEYFRAME,
+    )
+    trainer.args = SimpleNamespace(
+        joint_training={
+            "enabled": True,
+            "qwen_gradient_checkpointing": True,
+            "qwen_lr": 1e-6,
+            "planner_head_lr": 3e-5,
+        },
+        gradient_checkpointing=True,
+        allow_tf32=False,
+        train_epochs=1,
+        train_steps=1,
+        mixed_precision="bf16",
+        lr=2e-5,
+        semantic_lr=1e-4,
+        scale_lr=False,
+        gradient_accumulation_steps=1,
+        batch_size=1,
+        optimizer="adamw",
+        beta1=0.9,
+        beta2=0.95,
+        beta3=None,
+        epsilon=1e-8,
+        weight_decay=1e-5,
+        optimizer_8bit=False,
+        optimizer_torchao=False,
+        lr_scheduler="constant",
+        lr_warmup_steps=1000,
+        lr_num_cycles=1,
+        lr_power=1.0,
+        max_grad_norm=1.0,
+    )
+    trainer.state = SimpleNamespace(
+        weight_dtype=torch.bfloat16,
+        accelerator=SimpleNamespace(num_processes=1),
+    )
+    trainer.train_dataloader = [object()]
+
+    captured: dict[str, object] = {}
+
+    class FakeOptimizer:
+        def __init__(self, groups):
+            self.param_groups = groups
+
+    method_globals = contracts.Trainer.prepare_optimizer.__globals__
+    method_globals["get_optimizer"] = lambda *, params_to_optimize, **_kwargs: (
+        captured.setdefault("groups", params_to_optimize)
+        or FakeOptimizer(params_to_optimize)
+    )
+    method_globals["get_scheduler"] = lambda **_kwargs: object()
+    method_globals["cast_training_params"] = lambda *_args, **_kwargs: None
+
+    trainer.prepare_trainable_parameters()
+    trainer.prepare_optimizer()
+
+    assert all(not p.requires_grad for p in trainer.semantic_teacher.parameters())
+    assert all(not p.requires_grad for p in trainer.depth_teacher.parameters())
+    assert not trainer.semantic_teacher.training
+    assert not trainer.depth_teacher.training
+    assert planner.training
+    assert all(parameter.requires_grad for parameter in planner.parameters())
+    assert planner.model.is_gradient_checkpointing
+    assert planner.model.input_grads_enabled
+    assert ltx.gradient_checkpointing_enabled
+    groups = captured["groups"]
+    assert [group["name"] for group in groups] == [
+        "base_ltx",
+        "semantic_ltx",
+        "qwen",
+        "planner_heads",
+    ]
+    assert [group["lr"] for group in groups] == [2e-5, 1e-4, 1e-6, 3e-5]
+    optimized_ids = {id(parameter) for group in groups for parameter in group["params"]}
+    teacher_ids = {
+        id(parameter)
+        for teacher in (trainer.semantic_teacher, trainer.depth_teacher)
+        for parameter in teacher.parameters()
+    }
+    assert optimized_ids.isdisjoint(teacher_ids)
+
+
+def test_joint_prepare_passes_exactly_one_composite_model() -> None:
+    contracts = _load_ge_trainer_symbols("State", "Trainer")
+    trainer = contracts.Trainer.__new__(contracts.Trainer)
+    trainer.joint_model = _make_tiny_joint_model()
+    trainer.diffusion_model = trainer.joint_model.ltx
+    trainer.optimizer = object()
+    trainer.train_dataloader = object()
+    trainer.lr_scheduler = object()
+    trainer.args = SimpleNamespace(joint_training={"enabled": True})
+    calls: list[tuple[object, ...]] = []
+
+    def prepare(*values):
+        calls.append(values)
+        return values
+
+    trainer.state = SimpleNamespace(accelerator=SimpleNamespace(prepare=prepare))
+    contracts.Trainer.prepare_for_training.__globals__["_joint_training_enabled"] = (
+        lambda args: bool(args.joint_training["enabled"])
+    )
+
+    trainer.prepare_for_training()
+
+    assert calls == [
+        (
+            trainer.joint_model,
+            trainer.optimizer,
+            trainer.train_dataloader,
+            trainer.lr_scheduler,
+        )
+    ]
+
+
+def test_trainer_overrides_are_visible_during_distributed_initialization(
+    tmp_path: Path,
+) -> None:
+    contracts = _load_ge_trainer_symbols(
+        "State",
+        "Trainer",
+        "compute_effective_video_fps",
+    )
+    config_path = tmp_path / "tiny.yaml"
+    config_path.write_text(
+        "\n".join(
+            (
+                "lr: 2.0e-5",
+                "semantic_lr: 1.0e-4",
+                "epsilon: 1.0e-8",
+                "weight_decay: 1.0e-5",
+                "batch_size: 8",
+                "gradient_accumulation_steps: 16",
+                "use_deepspeed: true",
+                "load_weights: true",
+                f"output_dir: {tmp_path / 'out'}",
+                "model_name: tiny",
+                "data:",
+                "  train:",
+                "    source_fps: 20",
+                "    chunk: 9",
+                "    action_chunk: 36",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    class TinyTrainer(contracts.Trainer):
+        def _init_distributed(self):
+            self.observed_during_init = (
+                self.args.batch_size,
+                self.args.gradient_accumulation_steps,
+                self.args.use_deepspeed,
+            )
+            self.state.accelerator = SimpleNamespace(
+                is_main_process=True,
+                device=torch.device("cpu"),
+                process_index=0,
+            )
+
+        def _init_logging(self):
+            return None
+
+        def _init_directories_and_repositories(self):
+            return None
+
+    trainer = TinyTrainer(
+        config_path,
+        config_overrides={
+            "batch_size": 1,
+            "gradient_accumulation_steps": 1,
+            "use_deepspeed": False,
+        },
+        to_log=False,
+    )
+
+    assert trainer.observed_during_init == (1, 1, False)
+
+
+def test_main_smoke_flags_are_forwarded_as_constructor_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    spec = importlib.util.spec_from_file_location("ge_act_main_task4", GE_MAIN_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    captured: dict[str, object] = {}
+
+    class FakeRunner:
+        def __init__(self, config_file, *, config_overrides=None):
+            captured["config_file"] = config_file
+            captured["config_overrides"] = config_overrides
+            self.args = SimpleNamespace(train_steps=99)
+
+        def __getattr__(self, _name):
+            return lambda *_args, **_kwargs: None
+
+    monkeypatch.setattr(module, "import_custom_class", lambda *_args: FakeRunner)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ge_act/main.py",
+            "--config_file",
+            str(tmp_path / "config.yaml"),
+            "--max_train_steps",
+            "1",
+            "--batch_size_override",
+            "1",
+            "--gradient_accumulation_steps_override",
+            "1",
+            "--disable_deepspeed",
+        ],
+    )
+
+    module.main()
+
+    assert captured["config_overrides"] == {
+        "batch_size": 1,
+        "gradient_accumulation_steps": 1,
+        "use_deepspeed": False,
+    }
+
+
+class _SaveableModule(nn.Module):
+    def __init__(self, marker: str) -> None:
+        super().__init__()
+        self.marker = marker
+        self.weight = nn.Parameter(torch.ones(1))
+
+    def save_pretrained(self, path, **_kwargs) -> None:
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / f"{self.marker}.txt").write_text(self.marker, encoding="utf-8")
+
+
+def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
+    tmp_path: Path,
+) -> None:
+    contracts = _load_ge_trainer_symbols(
+        "_export_joint_planner",
+        "save_joint_checkpoint",
+    )
+    source_planner = tmp_path / "source_planner"
+    source_planner.mkdir()
+    (source_planner / "planner_meta.json").write_text(
+        json.dumps(
+            {
+                "future_keyframe_offsets": [2, 4, 6, 8],
+                "num_keyframes": 4,
+                "target_tokens_per_keyframe": 256,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    planner = TinyPlanner()
+    planner.model = _SaveableModule("qwen")
+    provider = SimpleNamespace(
+        wrapper=planner,
+        processor=_SaveableModule("processor"),
+    )
+    composite = SimpleNamespace(
+        ltx=_SaveableModule("ltx"),
+        planner=planner,
+    )
+    saved_states: list[Path] = []
+    accelerator = SimpleNamespace(
+        is_main_process=True,
+        num_processes=8,
+        unwrap_model=lambda model: model,
+        wait_for_everyone=lambda: None,
+        save_state=lambda path: saved_states.append(Path(path)),
+    )
+    args = SimpleNamespace(
+        semantic_plan={"planner_checkpoint": str(source_planner)},
+        diffusion_model={"model_path": "/checkpoints/ltx_step_50000"},
+        joint_training={
+            "planner_loss_weight": 0.1,
+            "qwen_lr": 1e-6,
+            "planner_head_lr": 3e-5,
+        },
+        lr=2e-5,
+        semantic_lr=1e-4,
+        batch_size=1,
+        gradient_accumulation_steps=16,
+    )
+    step_dir = tmp_path / "step_20000"
+
+    contracts.save_joint_checkpoint(
+        accelerator=accelerator,
+        joint_model=composite,
+        planner_provider=provider,
+        step_dir=step_dir,
+        args=args,
+        global_step=20000,
+    )
+
+    assert (step_dir / "ltx" / "ltx.txt").is_file()
+    assert (step_dir / "planner" / "qwen3vl_lora_or_model" / "qwen.txt").is_file()
+    assert (step_dir / "planner" / "processor" / "processor.txt").is_file()
+    for filename in (
+        "plan_head.pt",
+        "depth_head.pt",
+        "plan_token_embedding.pt",
+        "planner_meta.json",
+    ):
+        assert (step_dir / "planner" / filename).is_file()
+    joint_meta = json.loads((step_dir / "joint_meta.json").read_text(encoding="utf-8"))
+    assert joint_meta["global_step"] == 20000
+    assert joint_meta["source_planner_checkpoint"] == str(source_planner)
+    assert joint_meta["optimizer_group_lrs"] == {
+        "base_ltx": 2e-5,
+        "semantic_ltx": 1e-4,
+        "qwen": 1e-6,
+        "planner_heads": 3e-5,
+    }
+    assert joint_meta["future_keyframe_offsets"] == [2, 4, 6, 8]
+    assert saved_states == [step_dir / "training_state"]
+
+
+def test_joint_checkpoint_calls_save_state_on_non_main_rank(tmp_path: Path) -> None:
+    contracts = _load_ge_trainer_symbols(
+        "_export_joint_planner",
+        "save_joint_checkpoint",
+    )
+    saved_states: list[Path] = []
+    accelerator = SimpleNamespace(
+        is_main_process=False,
+        num_processes=8,
+        wait_for_everyone=lambda: None,
+        save_state=lambda path: saved_states.append(Path(path)),
+    )
+
+    contracts.save_joint_checkpoint(
+        accelerator=accelerator,
+        joint_model=object(),
+        planner_provider=object(),
+        step_dir=tmp_path / "step_20000",
+        args=SimpleNamespace(),
+        global_step=20000,
+    )
+
+    assert saved_states == [tmp_path / "step_20000" / "training_state"]
+
+
+def test_joint_train_source_has_single_composite_and_required_logs() -> None:
+    source = GE_TRAINER_PATH.read_text(encoding="utf-8")
+    required_log_keys = (
+        '"loss_video"',
+        '"planner_loss"',
+        '"planner_semantic_mse"',
+        '"planner_depth_wsa_loss"',
+        '"vlm_grad_norm"',
+        '"ltx_grad_norm"',
+        '"lr/base_ltx"',
+        '"lr/semantic_ltx"',
+        '"lr/qwen"',
+        '"lr/planner_heads"',
+        '"peak_memory_allocated"',
+    )
+
+    assert "accelerator.accumulate(self.joint_model)" in source
+    assert "accelerator.clip_grad_norm_(" in source
+    assert "self.joint_model.parameters()" in source
+    assert (
+        "self.joint_model, self.optimizer, self.train_dataloader, self.lr_scheduler"
+        in source
+    )
+    for key in required_log_keys:
+        assert key in source

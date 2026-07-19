@@ -31,6 +31,23 @@ def main():
         default=None,
         help='bounded training-step override for smoke tests',
     )
+    parser.add_argument(
+        '--batch_size_override',
+        type=positive_int,
+        default=None,
+        help='per-device batch-size override for smoke tests',
+    )
+    parser.add_argument(
+        '--gradient_accumulation_steps_override',
+        type=positive_int,
+        default=None,
+        help='gradient-accumulation override for smoke tests',
+    )
+    parser.add_argument(
+        '--disable_deepspeed',
+        action='store_true',
+        help='disable DeepSpeed for a bounded single-process smoke test',
+    )
 
     args = parser.parse_args()
     Runner = import_custom_class(
@@ -40,7 +57,16 @@ def main():
 
     if args.mode == "train":
         ### Trainer
-        runner = Runner(args.config_file)
+        config_overrides = {}
+        if args.batch_size_override is not None:
+            config_overrides["batch_size"] = args.batch_size_override
+        if args.gradient_accumulation_steps_override is not None:
+            config_overrides["gradient_accumulation_steps"] = (
+                args.gradient_accumulation_steps_override
+            )
+        if args.disable_deepspeed:
+            config_overrides["use_deepspeed"] = False
+        runner = Runner(args.config_file, config_overrides=config_overrides)
         if args.max_train_steps is not None:
             runner.args.train_steps = args.max_train_steps
         runner.prepare_dataset()
