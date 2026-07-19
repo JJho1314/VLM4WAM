@@ -172,11 +172,11 @@ def test_build_vlm_semantic_condition_accepts_metadata_driven_k4() -> None:
     assert times.shape == (4, 4)
 
 
-def test_main_exposes_a_positive_bounded_smoke_step_override() -> None:
+def test_main_applies_a_positive_bounded_smoke_step_override_before_init() -> None:
     source = (GE_ACT_ROOT / "main.py").read_text()
 
     assert "--max_train_steps" in source
-    assert "runner.args.train_steps = args.max_train_steps" in source
+    assert 'config_overrides["train_steps"] = args.max_train_steps' in source
 
 
 def test_training_loop_checks_step_limit_before_entering_each_epoch() -> None:
