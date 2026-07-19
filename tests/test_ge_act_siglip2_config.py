@@ -284,11 +284,12 @@ def test_joint_vlm_geact_config_matches_approved_recipe() -> None:
 
     assert config["train_steps"] == 30_000
     assert config["save_steps"] == [20_000, 25_000, 30_000]
-    assert config["batch_size"] == 2
-    assert config["gradient_accumulation_steps"] == 8
+    assert config["batch_size"] == 4
+    assert config["gradient_accumulation_steps"] == 4
     assert config["batch_size"] * config["gradient_accumulation_steps"] * 8 == 128
     assert config["mixed_precision"] == "bf16"
     assert config["gradient_checkpointing"] is False
+    assert config["enable_slicing"] is False
     assert config["lr"] == 2e-5
     assert config["semantic_lr"] == 1e-4
     assert config["lr_warmup_steps"] == 1_000
@@ -309,6 +310,9 @@ def test_joint_vlm_geact_config_matches_approved_recipe() -> None:
     assert joint["qwen_lr"] == 1e-6
     assert joint["planner_head_lr"] == 3e-5
     assert joint["qwen_gradient_checkpointing"] is False
+    assert joint["prewarm_text_condition_cache"] is True
+    assert joint["text_condition_cache_batch_size"] == 8
+    assert joint["offload_text_encoder_after_cache"] is True
     assert joint["bidirectional_plan_attn"] is False
     assert joint["future_keyframe_offsets"] == [2, 4, 6, 8]
     assert joint["num_camera_views"] == 2
@@ -364,13 +368,15 @@ def test_joint_preflight_rejects_geometry_lr_batch_and_checkpointing_drift() -> 
     config["diffusion_model"]["config"]["semantic_plan_num_views"] = 1
     config["lr"] = 3e-5
     config["semantic_lr"] = 2e-4
-    config["batch_size"] = 1
-    config["gradient_accumulation_steps"] = 16
+    config["batch_size"] = 2
+    config["gradient_accumulation_steps"] = 8
+    config["enable_slicing"] = True
     config["gradient_checkpointing"] = True
     joint = config["joint_training"]
     joint["qwen_lr"] = 2e-6
     joint["planner_head_lr"] = 4e-5
     joint["qwen_gradient_checkpointing"] = True
+    joint["offload_text_encoder_after_cache"] = False
     joint["future_keyframe_offsets"] = [1, 3, 5, 7]
     joint["num_camera_views"] = 1
     joint["tokens_per_keyframe"] = 128
@@ -383,7 +389,9 @@ def test_joint_preflight_rejects_geometry_lr_batch_and_checkpointing_drift() -> 
 
     for expected in (
         "joint VLM planner keyframe offsets must be [2, 4, 6, 8]",
-        "joint training requires per-GPU batch 2 and accumulation 8",
+        "joint training requires per-GPU batch 4 and accumulation 4",
+        "joint training requires VAE slicing to be disabled",
+        "joint training requires cached T5 offload",
         "joint LTX base lr must be 2e-5",
         "joint LTX semantic lr must be 1e-4",
         "joint Qwen lr must be 1e-6",
@@ -617,6 +625,7 @@ def test_joint_ola_launcher_has_formal_and_bounded_smoke_modes() -> None:
         "MKL_NUM_THREADS",
         "OPENBLAS_NUM_THREADS",
         "NUMEXPR_NUM_THREADS",
+        "PYTORCH_CUDA_ALLOC_CONF",
     ):
         assert f"export {variable}=" in launcher
 

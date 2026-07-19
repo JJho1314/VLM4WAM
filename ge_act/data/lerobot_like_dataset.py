@@ -318,6 +318,11 @@ class CustomLeRobotDataset(Dataset):
     def set_deterministic_sampling_seed(self, seed):
         self.deterministic_sampling_seed = int(seed)
 
+    def unique_captions(self):
+        """Return the finite task vocabulary used by this episode dataset."""
+
+        return tuple(sorted({str(sample[6]) for sample in self.dataset}))
+
     def _make_sample_rngs(self, index, epoch):
         if self.deterministic_sampling_seed is None:
             raise RuntimeError(

@@ -45,14 +45,14 @@ allow_tf32: true
 nccl_timeout: 600
 seed: 42
 
-enable_slicing: true
+enable_slicing: false
 enable_tiling: true
 add_state: false
 caption_dropout_p: 0.06
 
-# 2 samples/GPU * 8 GPUs * 8 accumulation = global batch 128.
-batch_size: 2
-gradient_accumulation_steps: 8
+# 4 samples/GPU * 8 GPUs * 4 accumulation = global batch 128.
+batch_size: 4
+gradient_accumulation_steps: 4
 dataloader_num_workers: 8
 dataloader_prefetch_factor: 4
 pin_memory: true
@@ -103,6 +103,9 @@ joint_training:
   qwen_lr: 1.0e-6
   planner_head_lr: 3.0e-5
   qwen_gradient_checkpointing: false
+  prewarm_text_condition_cache: true
+  text_condition_cache_batch_size: 8
+  offload_text_encoder_after_cache: true
   bidirectional_plan_attn: false
   future_keyframe_offsets: [2, 4, 6, 8]
   num_keyframes: 4

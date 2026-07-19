@@ -182,10 +182,18 @@ def collect_preflight_errors(
         if int(world_size) != 8:
             errors.append("joint formal training requires world size 8")
         if (
-            config.get("batch_size") != 2
-            or config.get("gradient_accumulation_steps") != 8
+            config.get("batch_size") != 4
+            or config.get("gradient_accumulation_steps") != 4
         ):
-            errors.append("joint training requires per-GPU batch 2 and accumulation 8")
+            errors.append("joint training requires per-GPU batch 4 and accumulation 4")
+        if bool(config.get("enable_slicing", True)):
+            errors.append("joint training requires VAE slicing to be disabled")
+        if (
+            not bool(joint.get("prewarm_text_condition_cache", False))
+            or joint.get("text_condition_cache_batch_size") != 8
+            or not bool(joint.get("offload_text_encoder_after_cache", False))
+        ):
+            errors.append("joint training requires cached T5 offload")
         if config.get("lr") != 2e-5:
             errors.append("joint LTX base lr must be 2e-5")
         if config.get("semantic_lr") != 1e-4:

@@ -93,6 +93,189 @@ def _finite_nonzero(value: torch.Tensor | None) -> bool:
     )
 
 
+def test_scalar_metric_reduction_skips_gradient_accumulation_microsteps() -> None:
+    symbols = _load_ge_trainer_symbols(
+        "reduce_scalar_metrics_at_accumulation_boundary"
+    )
+
+    class FakeAccelerator:
+        def __init__(self) -> None:
+            self.reduce_calls = 0
+
+        def reduce(self, _value: torch.Tensor, *, reduction: str) -> torch.Tensor:
+            self.reduce_calls += 1
+            raise AssertionError("non-boundary microsteps must not communicate")
+
+    accelerator = FakeAccelerator()
+    reduced = symbols.reduce_scalar_metrics_at_accumulation_boundary(
+        accelerator,
+        {"loss": torch.tensor(1.0), "video": torch.tensor(2.0)},
+        sync_gradients=False,
+    )
+
+    assert reduced is None
+    assert accelerator.reduce_calls == 0
+
+
+def test_scalar_metric_reduction_packs_one_collective_on_boundary() -> None:
+    symbols = _load_ge_trainer_symbols(
+        "reduce_scalar_metrics_at_accumulation_boundary"
+    )
+
+    class FakeAccelerator:
+        def __init__(self) -> None:
+            self.reduce_calls = 0
+
+        def reduce(self, value: torch.Tensor, *, reduction: str) -> torch.Tensor:
+            self.reduce_calls += 1
+            assert reduction == "mean"
+            assert torch.equal(value, torch.tensor([1.0, 2.0, 3.0]))
+            return value + 10.0
+
+    accelerator = FakeAccelerator()
+    reduced = symbols.reduce_scalar_metrics_at_accumulation_boundary(
+        accelerator,
+        {
+            "loss": torch.tensor(1.0),
+            "video": torch.tensor(2.0),
+            "planner": torch.tensor(3.0),
+        },
+        sync_gradients=True,
+    )
+
+    assert accelerator.reduce_calls == 1
+    assert reduced is not None
+    assert set(reduced) == {"loss", "video", "planner"}
+    assert reduced["loss"].item() == 11.0
+    assert reduced["video"].item() == 12.0
+    assert reduced["planner"].item() == 13.0
+
+
+@pytest.mark.parametrize(
+    ("sync_gradients", "global_step", "expected"),
+    [
+        (False, 20, False),
+        (True, 0, False),
+        (True, 19, False),
+        (True, 20, True),
+    ],
+)
+def test_training_scalar_logging_only_runs_on_completed_update(
+    sync_gradients: bool,
+    global_step: int,
+    expected: bool,
+) -> None:
+    symbols = _load_ge_trainer_symbols("should_log_training_scalars")
+
+    assert symbols.should_log_training_scalars(
+        sync_gradients=sync_gradients,
+        global_step=global_step,
+        interval=20,
+    ) is expected
+
+
+def test_frozen_text_conditions_are_cached_per_unique_instruction() -> None:
+    symbols = _load_ge_trainer_symbols("get_cached_text_conditions")
+    encode_calls: list[list[str]] = []
+
+    def encode(prompts: list[str]) -> dict[str, torch.Tensor]:
+        encode_calls.append(list(prompts))
+        values = torch.tensor(
+            [[{"pick": 1.0, "place": 2.0}[prompt]] for prompt in prompts]
+        )
+        return {
+            "prompt_embeds": values[:, None, :].requires_grad_(True),
+            "prompt_attention_mask": torch.ones(
+                len(prompts), 1, dtype=torch.bool
+            ),
+        }
+
+    cache: dict[str, dict[str, torch.Tensor]] = {}
+    first = symbols.get_cached_text_conditions(
+        ["pick", "place", "pick"],
+        cache=cache,
+        encode_missing=encode,
+    )
+    second = symbols.get_cached_text_conditions(
+        ["place", "pick"],
+        cache=cache,
+        encode_missing=encode,
+    )
+
+    assert encode_calls == [["pick", "place"]]
+    assert set(cache) == {"pick", "place"}
+    assert first["prompt_embeds"].flatten().tolist() == [1.0, 2.0, 1.0]
+    assert second["prompt_embeds"].flatten().tolist() == [2.0, 1.0]
+    assert not first["prompt_embeds"].requires_grad
+    assert torch.equal(
+        first["prompt_attention_mask"],
+        torch.ones(3, 1, dtype=torch.bool),
+    )
+
+
+def test_text_condition_cache_prewarm_uses_bounded_batches() -> None:
+    symbols = _load_ge_trainer_symbols(
+        "get_cached_text_conditions",
+        "prewarm_text_condition_cache",
+    )
+    encode_calls: list[list[str]] = []
+
+    def encode(prompts: list[str]) -> dict[str, torch.Tensor]:
+        encode_calls.append(list(prompts))
+        return {
+            "prompt_embeds": torch.arange(len(prompts)).reshape(-1, 1, 1),
+            "prompt_attention_mask": torch.ones(
+                len(prompts), 1, dtype=torch.bool
+            ),
+        }
+
+    cache: dict[str, dict[str, torch.Tensor]] = {}
+    symbols.prewarm_text_condition_cache(
+        ["pick", "place", "open", "pick"],
+        cache=cache,
+        encode_missing=encode,
+        batch_size=2,
+    )
+
+    assert encode_calls == [["pick", "place"], ["open"]]
+    assert set(cache) == {"pick", "place", "open"}
+
+
+def test_offloaded_module_is_restored_only_for_bounded_validation() -> None:
+    symbols = _load_ge_trainer_symbols("run_with_temporarily_restored_module")
+
+    class FakeModule:
+        def __init__(self) -> None:
+            self.moves: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+        def to(self, *args: Any, **kwargs: Any) -> "FakeModule":
+            self.moves.append((args, kwargs))
+            return self
+
+    module = FakeModule()
+    callback_calls = 0
+
+    def callback() -> str:
+        nonlocal callback_calls
+        callback_calls += 1
+        return "validated"
+
+    result = symbols.run_with_temporarily_restored_module(
+        module,
+        offloaded=True,
+        device="cuda:0",
+        dtype=torch.bfloat16,
+        callback=callback,
+    )
+
+    assert result == "validated"
+    assert callback_calls == 1
+    assert module.moves == [
+        ((), {"device": "cuda:0", "dtype": torch.bfloat16}),
+        (("cpu",), {}),
+    ]
+
+
 class TinyQwenModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -609,6 +792,21 @@ def test_joint_teacher_frames_match_planner_training_offsets() -> None:
             future[:, :, keyframe], video[:, :, :, leaked].permute(0, 2, 3, 4, 1)
         )
         for keyframe, leaked in enumerate(leaked_indices)
+    )
+
+
+def test_joint_planner_current_images_convert_bvhwc_to_bvchw() -> None:
+    contracts = _load_ge_trainer_symbols(
+        "prepare_joint_planner_current_images"
+    )
+    current = torch.arange(1 * 2 * 3 * 4 * 3).reshape(1, 2, 3, 4, 3)
+
+    planner_images = contracts.prepare_joint_planner_current_images(current)
+
+    assert planner_images.shape == (1, 2, 3, 3, 4)
+    torch.testing.assert_close(
+        planner_images,
+        current.permute(0, 1, 4, 2, 3).contiguous(),
     )
 
 
@@ -1454,6 +1652,19 @@ def test_epoch_seeded_sampler_reconstructs_exact_remaining_order() -> None:
     assert list(resumed) != full_order
 
 
+def test_epoch_seeded_sampler_truncates_to_full_optimizer_updates() -> None:
+    contracts = _load_ge_trainer_symbols("EpochSeededRandomSampler")
+    sampler = contracts.EpochSeededRandomSampler(
+        range(17),
+        seed=42,
+        num_samples=16,
+    )
+
+    assert len(sampler) == 16
+    assert len(list(sampler)) == 16
+    assert len({index for index, _epoch in sampler}) == 16
+
+
 def test_joint_prepare_dataset_uses_epoch_seeded_sampler() -> None:
     contracts = _load_ge_trainer_symbols("EpochSeededRandomSampler", "Trainer")
 
@@ -1477,10 +1688,14 @@ def test_joint_prepare_dataset_uses_epoch_seeded_sampler() -> None:
         train_data_class_path="unused.py",
         data={"train": {}},
         batch_size=2,
+        gradient_accumulation_steps=2,
         dataloader_num_workers=0,
         pin_memory=False,
         joint_training={"enabled": True},
         seed=42,
+    )
+    trainer.state = SimpleNamespace(
+        accelerator=SimpleNamespace(num_processes=1),
     )
     method_globals = contracts.Trainer.prepare_dataset.__globals__
     method_globals["_joint_training_enabled"] = lambda _args: True
@@ -1496,6 +1711,7 @@ def test_joint_prepare_dataset_uses_epoch_seeded_sampler() -> None:
         trainer.train_dataloader.sampler,
         contracts.EpochSeededRandomSampler,
     )
+    assert len(trainer.train_dataloader.sampler) == 8
     assert trainer.train_dataloader.generator is not None
     cpu_rng_before_iterator = torch.random.get_rng_state()
     iter(trainer.train_dataloader)
@@ -1536,6 +1752,19 @@ def test_lerobot_tuple_index_rebuilds_sample_rng_independent_of_worker_state() -
     torch.testing.assert_close(first["video"], second["video"])
     torch.testing.assert_close(first["actions"], second["actions"])
     assert not torch.equal(first["video"], other_epoch["video"])
+
+
+def test_lerobot_dataset_exposes_stable_unique_instruction_vocabulary() -> None:
+    from data.lerobot_like_dataset import CustomLeRobotDataset
+
+    dataset = CustomLeRobotDataset.__new__(CustomLeRobotDataset)
+    dataset.dataset = [
+        [None, None, None, None, None, None, "place"],
+        [None, None, None, None, None, None, "pick"],
+        [None, None, None, None, None, None, "place"],
+    ]
+
+    assert dataset.unique_captions() == ("pick", "place")
 
 
 def test_nonfinite_loss_guard_rejects_inf_with_component_diagnostics() -> None:

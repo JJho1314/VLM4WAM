@@ -77,9 +77,22 @@ logger.setLevel(LOG_LEVEL)
 class EpochSeededRandomSampler(torch.utils.data.Sampler):
     """Rebuild the same shuffled `(sample_index, epoch)` stream on resume."""
 
-    def __init__(self, data_source, *, seed: int) -> None:
+    def __init__(
+        self,
+        data_source,
+        *,
+        seed: int,
+        num_samples: int | None = None,
+    ) -> None:
         self.data_source = data_source
         self.seed = int(seed)
+        self.num_samples = (
+            len(data_source) if num_samples is None else int(num_samples)
+        )
+        if self.num_samples <= 0 or self.num_samples > len(data_source):
+            raise ValueError(
+                "sampler num_samples must be in [1, len(data_source)]"
+            )
         self.epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
@@ -88,11 +101,13 @@ class EpochSeededRandomSampler(torch.utils.data.Sampler):
     def __iter__(self):
         generator = torch.Generator()
         generator.manual_seed(self.seed + self.epoch)
-        order = torch.randperm(len(self.data_source), generator=generator).tolist()
+        order = torch.randperm(len(self.data_source), generator=generator)[
+            : self.num_samples
+        ].tolist()
         return iter((int(index), self.epoch) for index in order)
 
     def __len__(self) -> int:
-        return len(self.data_source)
+        return self.num_samples
 
 
 def compute_effective_video_fps(data_config: Dict[str, Any], default_source_fps: float = 30.0) -> float:
@@ -157,6 +172,19 @@ def select_joint_planner_frames(
         dim=2,
     ).contiguous()
     return current, future
+
+
+def prepare_joint_planner_current_images(
+    current_frames: torch.Tensor,
+) -> torch.Tensor:
+    """Convert planner current frames from ``[B,V,H,W,C]`` to ``[B,V,C,H,W]``."""
+
+    if current_frames.ndim != 5 or current_frames.shape[-1] != 3:
+        raise ValueError(
+            "current_frames must be [B,V,H,W,3], got "
+            f"{tuple(current_frames.shape)}"
+        )
+    return current_frames.permute(0, 1, 4, 2, 3).contiguous()
 
 
 def encode_joint_planner_targets(
@@ -725,6 +753,120 @@ def require_finite_training_loss(
     )
 
 
+def reduce_scalar_metrics_at_accumulation_boundary(
+    accelerator: Accelerator,
+    metrics: Dict[str, torch.Tensor],
+    *,
+    sync_gradients: bool,
+) -> Dict[str, torch.Tensor] | None:
+    """Reduce packed scalar metrics only after a complete optimizer update."""
+
+    if not sync_gradients:
+        return None
+    names = list(metrics)
+    values = []
+    for name in names:
+        value = metrics[name]
+        if not torch.is_tensor(value) or value.numel() != 1:
+            raise ValueError(f"training metric {name} must be a scalar tensor")
+        values.append(value.detach().float().reshape(()))
+    if not values:
+        return {}
+    reduced = accelerator.reduce(torch.stack(values), reduction="mean")
+    return {name: reduced[index] for index, name in enumerate(names)}
+
+
+def should_log_training_scalars(
+    *,
+    sync_gradients: bool,
+    global_step: int,
+    interval: int,
+) -> bool:
+    """Log once per requested completed optimizer step, never per microstep."""
+
+    return bool(
+        sync_gradients
+        and global_step > 0
+        and interval > 0
+        and global_step % interval == 0
+    )
+
+
+def get_cached_text_conditions(
+    prompts: Sequence[str],
+    *,
+    cache: Dict[str, Dict[str, torch.Tensor]],
+    encode_missing: Callable[[List[str]], Dict[str, torch.Tensor]],
+) -> Dict[str, torch.Tensor]:
+    """Encode each frozen text condition once and reuse it by instruction."""
+
+    normalized_prompts = [str(prompt) for prompt in prompts]
+    if not normalized_prompts:
+        raise ValueError("text-condition cache requires at least one prompt")
+    missing = list(
+        dict.fromkeys(
+            prompt for prompt in normalized_prompts if prompt not in cache
+        )
+    )
+    if missing:
+        encoded = encode_missing(missing)
+        for name, value in encoded.items():
+            if not torch.is_tensor(value) or value.shape[0] != len(missing):
+                raise ValueError(
+                    f"encoded text condition {name} must have batch "
+                    f"dimension {len(missing)}"
+                )
+        for index, prompt in enumerate(missing):
+            cache[prompt] = {
+                name: value[index : index + 1].detach()
+                for name, value in encoded.items()
+            }
+    names = tuple(cache[normalized_prompts[0]])
+    return {
+        name: torch.cat([cache[prompt][name] for prompt in normalized_prompts])
+        for name in names
+    }
+
+
+def prewarm_text_condition_cache(
+    prompts: Sequence[str],
+    *,
+    cache: Dict[str, Dict[str, torch.Tensor]],
+    encode_missing: Callable[[List[str]], Dict[str, torch.Tensor]],
+    batch_size: int,
+) -> None:
+    """Populate a frozen text cache without a large one-shot T5 batch."""
+
+    if batch_size <= 0:
+        raise ValueError("text-condition prewarm batch size must be positive")
+    unique_prompts = list(dict.fromkeys(str(prompt) for prompt in prompts))
+    for start in range(0, len(unique_prompts), batch_size):
+        get_cached_text_conditions(
+            unique_prompts[start : start + batch_size],
+            cache=cache,
+            encode_missing=encode_missing,
+        )
+
+
+def run_with_temporarily_restored_module(
+    module: Any,
+    *,
+    offloaded: bool,
+    device: torch.device | str,
+    dtype: torch.dtype,
+    callback: Callable[[], Any],
+) -> Any:
+    """Restore a cached frozen module for validation, then offload it again."""
+
+    if not offloaded:
+        return callback()
+    module.to(device=device, dtype=dtype)
+    try:
+        return callback()
+    finally:
+        module.to("cpu")
+
+
 class State:
     # Training state
     seed: int = None
@@ -933,9 +1075,28 @@ class Trainer:
                 )
             configure_sampling(sampler_seed)
             self.train_sampler_seed = sampler_seed
+            samples_per_update = (
+                int(self.args.batch_size)
+                * int(self.state.accelerator.num_processes)
+                * int(self.args.gradient_accumulation_steps)
+            )
+            sampler_samples = (
+                len(self.train_dataset) // samples_per_update
+            ) * samples_per_update
+            if sampler_samples <= 0:
+                raise ValueError(
+                    "joint dataset must contain at least one complete global batch"
+                )
             train_sampler = EpochSeededRandomSampler(
                 self.train_dataset,
                 seed=sampler_seed,
+                num_samples=sampler_samples,
+            )
+            logger.info(
+                "Joint sampler uses %d/%d samples per epoch in complete "
+                "global batches",
+                sampler_samples,
+                len(self.train_dataset),
             )
             # DataLoader iterator construction samples a worker base seed. Keep
             # that draw off the global CPU RNG restored by Accelerate, otherwise
@@ -1016,6 +1177,51 @@ class Trainer:
         self.text_uncond = get_text_conditions(self.tokenizer, self.text_encoder, prompt="")
         self.uncond_prompt_embeds = self.text_uncond['prompt_embeds']
         self.uncond_prompt_attention_mask = self.text_uncond['prompt_attention_mask']
+        self.text_condition_cache: Dict[str, Dict[str, torch.Tensor]] = {}
+        self.text_encoder_offloaded = False
+        if _joint_training_enabled(self.args):
+            joint_config = self.args.joint_training
+            if bool(joint_config.get("prewarm_text_condition_cache", False)):
+                caption_provider = getattr(
+                    self.train_dataset,
+                    "unique_captions",
+                    None,
+                )
+                if caption_provider is None:
+                    raise TypeError(
+                        "text-condition prewarm requires a dataset with "
+                        "unique_captions()"
+                    )
+                captions = tuple(caption_provider())
+                prewarm_text_condition_cache(
+                    captions,
+                    cache=self.text_condition_cache,
+                    encode_missing=lambda missing: get_text_conditions(
+                        self.tokenizer,
+                        self.text_encoder,
+                        missing,
+                    ),
+                    batch_size=int(
+                        joint_config.get(
+                            "text_condition_cache_batch_size",
+                            8,
+                        )
+                    ),
+                )
+                logger.info(
+                    "Prewarmed %d frozen text conditions",
+                    len(self.text_condition_cache),
+                )
+                if bool(
+                    joint_config.get(
+                        "offload_text_encoder_after_cache",
+                        False,
+                    )
+                ):
+                    self.text_encoder.to("cpu")
+                    self.text_encoder_offloaded = True
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
         ### Load VAE
         vae_class = import_custom_class(
@@ -1194,6 +1400,21 @@ class Trainer:
         # Enable TF32 for faster training on Ampere GPUs: https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
         if self.args.allow_tf32 and torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_tf32 = True
+
+    def _encode_missing_text_conditions(
+        self,
+        missing: List[str],
+    ) -> Dict[str, torch.Tensor]:
+        if self.text_encoder_offloaded:
+            raise RuntimeError(
+                "training instruction was absent from the prewarmed text cache: "
+                f"{missing}"
+            )
+        return get_text_conditions(
+            self.tokenizer,
+            self.text_encoder,
+            missing,
+        )
 
 
     def prepare_optimizer(self):
@@ -1448,7 +1669,9 @@ class Trainer:
             else:
                 self.diffusion_model.train()
 
-            running_loss = 0.0
+            running_loss = torch.zeros(
+                (), device=accelerator.device, dtype=torch.float32
+            )
             if hasattr(self.train_dataloader, "set_epoch"):
                 self.train_dataloader.set_epoch(epoch)
             active_dataloader = self.train_dataloader
@@ -1475,10 +1698,12 @@ class Trainer:
                 )
                 with accumulation_context:
                     
-                    video = batch['video']
-
                     # shape: {b, c, v, t, h, w}; ranging from -1 to 1
-                    video = video.to(accelerator.device, dtype=weight_dtype).contiguous()
+                    video = batch['video'].to(
+                        accelerator.device,
+                        dtype=weight_dtype,
+                        non_blocking=True,
+                    ).contiguous()
                     batch_size, c, n_view, _, h, w = video.shape
                     session_samples_seen += (
                         batch_size * accelerator.num_processes
@@ -1498,7 +1723,7 @@ class Trainer:
                             offsets=self.semantic_planner.future_keyframe_offsets,
                         )
                         planner_inputs = self.semantic_planner.prepare_inputs(
-                            current_frames.permute(0, 1, 4, 2, 3).contiguous(),
+                            prepare_joint_planner_current_images(current_frames),
                             batch['caption'],
                         )
                         planner_targets = encode_joint_planner_targets(
@@ -1614,7 +1839,11 @@ class Trainer:
                     latents = rearrange(latents, 'bv c f h w -> bv (f h w) c')
 
                     captions = batch['caption']
-                    text_conds = get_text_conditions(self.tokenizer,self.text_encoder,captions)
+                    text_conds = get_cached_text_conditions(
+                        captions,
+                        cache=self.text_condition_cache,
+                        encode_missing=self._encode_missing_text_conditions,
+                    )
                     prompt_embeds = text_conds['prompt_embeds']
                     prompt_attention_mask = text_conds['prompt_attention_mask']
                     prompt_embeds = self.uncond_prompt_embeds.repeat(batch_size,1,1)*dropout_mask_prompt + \
@@ -1808,40 +2037,45 @@ class Trainer:
                     self.optimizer.zero_grad()
                 
 
-                loss = accelerator.reduce(loss.detach(), reduction='mean')
-                if self.args.train_mode == 'all' or self.args.train_mode == 'action_only' or self.args.train_mode == 'action_full':
-                    loss_action = accelerator.reduce(loss_action.detach(), reduction='mean')
-                if self.args.train_mode == 'all' or self.args.train_mode == 'video_only':
-                    loss_video = accelerator.reduce(loss_video.detach(), reduction='mean')
+                running_loss = running_loss + loss.detach().float()
+                scalar_metrics = {"loss": loss}
+                if self.args.train_mode in ("all", "action_only", "action_full"):
+                    scalar_metrics["loss_action"] = loss_action
+                if self.args.train_mode in ("all", "video_only"):
+                    scalar_metrics["loss_video"] = loss_video
                 if joint_enabled:
-                    planner_loss = accelerator.reduce(
-                        planner_metrics["loss"].detach(),
-                        reduction="mean",
-                    )
-                    semantic_metric = planner_metrics.get(
+                    scalar_metrics["planner_loss"] = planner_metrics["loss"]
+                    scalar_metrics["planner_semantic_mse"] = planner_metrics.get(
                         "semantic_mse",
                         planner_metrics.get("mse"),
                     )
-                    depth_metric = planner_metrics.get(
+                    scalar_metrics["planner_depth_wsa_loss"] = planner_metrics.get(
                         "depth_wsa_loss",
                         planner_metrics.get("depth_smooth_l1"),
                     )
-                    planner_semantic_mse = accelerator.reduce(
-                        semantic_metric.detach(),
-                        reduction="mean",
-                    )
-                    planner_depth_wsa_loss = accelerator.reduce(
-                        depth_metric.detach(),
-                        reduction="mean",
-                    )
                     lm_plan_ce_metric = planner_metrics.get("lm_plan_ce")
                     if lm_plan_ce_metric is not None:
-                        lm_plan_ce_metric = accelerator.reduce(
-                            lm_plan_ce_metric.detach(),
-                            reduction="mean",
-                        )
-
-                running_loss += loss.item()
+                        scalar_metrics["lm_plan_ce"] = lm_plan_ce_metric
+                reduced_metrics = reduce_scalar_metrics_at_accumulation_boundary(
+                    accelerator,
+                    scalar_metrics,
+                    sync_gradients=accelerator.sync_gradients,
+                )
+                if reduced_metrics is not None:
+                    loss = reduced_metrics["loss"]
+                    if "loss_action" in reduced_metrics:
+                        loss_action = reduced_metrics["loss_action"]
+                    if "loss_video" in reduced_metrics:
+                        loss_video = reduced_metrics["loss_video"]
+                    if joint_enabled:
+                        planner_loss = reduced_metrics["planner_loss"]
+                        planner_semantic_mse = reduced_metrics[
+                            "planner_semantic_mse"
+                        ]
+                        planner_depth_wsa_loss = reduced_metrics[
+                            "planner_depth_wsa_loss"
+                        ]
+                        lm_plan_ce_metric = reduced_metrics.get("lm_plan_ce")
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
@@ -1897,7 +2131,11 @@ class Trainer:
                     logger.info(">>> max train step reached")
                     break
 
-                if global_step % self.args.steps_to_log == 0:
+                if should_log_training_scalars(
+                    sync_gradients=accelerator.sync_gradients,
+                    global_step=global_step,
+                    interval=self.args.steps_to_log,
+                ):
                     if accelerator.is_main_process:
                         if self.writer is not None:
                             self.writer.add_scalar("Training Loss", loss.item(), global_step)
@@ -1912,18 +2150,27 @@ class Trainer:
                     if accelerator.is_main_process:
                         model_save_dir = os.path.join(self.save_folder,f'Validation_step_{global_step}')
                         if joint_enabled:
-                            _run_joint_validation(
-                                self.joint_model,
-                                lambda: self.validate(
-                                    accelerator,
-                                    model_save_dir,
-                                    global_step,
-                                    n_view=n_view,
-                                    n_chunk=1,
+                            run_with_temporarily_restored_module(
+                                self.text_encoder,
+                                offloaded=self.text_encoder_offloaded,
+                                device=accelerator.device,
+                                dtype=weight_dtype,
+                                callback=lambda: _run_joint_validation(
+                                    self.joint_model,
+                                    lambda: self.validate(
+                                        accelerator,
+                                        model_save_dir,
+                                        global_step,
+                                        n_view=n_view,
+                                        n_chunk=1,
+                                    ),
                                 ),
                             )
+                            if self.text_encoder_offloaded and torch.cuda.is_available():
+                                torch.cuda.empty_cache()
                         else:
                             self.validate(accelerator, model_save_dir, global_step, n_view=n_view, n_chunk=1)
+                    accelerator.wait_for_everyone()
 
                 
                 if accelerator.sync_gradients and should_save_checkpoint(global_step, self.args):
@@ -1962,7 +2209,7 @@ class Trainer:
             logger.info(f"Memory after epoch {epoch + 1}: {json.dumps(memory_statistics, indent=4)}")
 
             if accelerator.is_main_process and self.writer is not None:
-                avg_loss = running_loss / len(self.train_dataloader)
+                avg_loss = (running_loss / len(self.train_dataloader)).item()
                 self.writer.add_scalar("Average Training Loss", avg_loss, epoch)
 
         accelerator.wait_for_everyone()
