@@ -63,6 +63,9 @@ from models.ltx_models.semantic_conditioning import (
     select_future_keyframes,
 )
 from models.ltx_models.vlm_semantic_planner import FrozenDualCameraVLMPlanner
+from models.ltx_models.joint_vlm_geact import (  # noqa: F401
+    build_joint_optimizer_parameter_groups,
+)
 
 LOG_LEVEL = "INFO"
 # LOG_LEVEL = "DEBUG"
