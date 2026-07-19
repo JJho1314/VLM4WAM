@@ -31,7 +31,7 @@ VLM_TRAIN_LAUNCHER = GE_ACT_ROOT / "scripts/train_ltx_vlm_planner.sh"
 VLM_SBATCH_LAUNCHER = GE_ACT_ROOT / "scripts/sbatch_train_ltx_vlm_planner_hpc3.sh"
 JOINT_CONFIG_PATH = (
     GE_ACT_ROOT
-    / "configs/ltx_model/libero/video_model_libero_joint_vlm_geact_k4_hdf5.yaml"
+    / "configs/ltx_model/libero/video_model_libero_joint_vlm_geact_k4_predecoded.yaml"
 )
 JOINT_TRAIN_LAUNCHER = GE_ACT_ROOT / "scripts/train_joint_vlm_geact_ola.sh"
 
@@ -129,6 +129,11 @@ def _redirect_formal_recipe_to_tmp_paths(
         config["data"][split]["stat_file"] = str(stat_file)
 
     monkeypatch.setattr(preflight_module, "REQUIRED_MODULES", ())
+    monkeypatch.setattr(
+        preflight_module.importlib.util,
+        "find_spec",
+        lambda _module_name: object(),
+    )
     redirected = {
         "ltx_components": str(pretrained),
         "ltx_checkpoint": str(ltx_checkpoint),
@@ -579,6 +584,7 @@ def test_joint_ola_launcher_has_formal_and_bounded_smoke_modes() -> None:
     launcher = JOINT_TRAIN_LAUNCHER.read_text()
 
     assert "RUN_KIND=${RUN_KIND:-formal}" in launcher
+    assert '"$RUN_KIND" == "smoke8"' in launcher
     assert "NUM_GPUS=8" in launcher
     assert '--nproc_per_node="$NUM_GPUS"' in launcher
     assert "predecode_lerobot_videos.py" in launcher
@@ -592,6 +598,8 @@ def test_joint_ola_launcher_has_formal_and_bounded_smoke_modes() -> None:
         "--disable_deepspeed",
     ):
         assert argument in launcher
+    assert "--max_train_steps 10" in launcher
+    assert "RUN_KIND must be formal, smoke, or smoke8" in launcher
     for variable in (
         "HF_HUB_OFFLINE",
         "TRANSFORMERS_OFFLINE",
@@ -602,6 +610,30 @@ def test_joint_ola_launcher_has_formal_and_bounded_smoke_modes() -> None:
         "NUMEXPR_NUM_THREADS",
     ):
         assert f"export {variable}=" in launcher
+
+
+def test_runtime_preflight_requires_deepspeed_when_enabled(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = copy.deepcopy(yaml.safe_load(JOINT_CONFIG_PATH.read_text()))
+    _redirect_formal_recipe_to_tmp_paths(config, tmp_path, monkeypatch)
+
+    real_find_spec = importlib.util.find_spec
+
+    def fake_find_spec(module_name: str):
+        if module_name == "deepspeed":
+            return None
+        return real_find_spec(module_name)
+
+    monkeypatch.setattr(preflight_module.importlib.util, "find_spec", fake_find_spec)
+    errors = collect_preflight_errors(
+        config,
+        world_size=8,
+        check_paths=True,
+        minimum_free_gb=0.0,
+    )
+
+    assert "missing Python module: deepspeed" in errors
 
 
 def test_required_joint_formal_mode_rejects_disabled_or_missing_joint_config() -> None:

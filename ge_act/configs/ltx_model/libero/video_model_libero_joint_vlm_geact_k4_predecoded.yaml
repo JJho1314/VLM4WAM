@@ -1,7 +1,6 @@
-# The filename preserves the approved historical recipe name. OLA has no FastWAM
-# HDF5 manifest, so this launch-ready config uses the verified 407G predecoded RGB
-# cache through CustomLeRobotDataset with require_predecoded=true. It never decodes
-# source videos online; a future HDF5 migration only needs to replace this backend.
+# OLA has no FastWAM HDF5 manifest. This formal recipe uses the verified 407G
+# predecoded RGB cache through CustomLeRobotDataset with require_predecoded=true,
+# so source videos are never decoded online during training.
 model_name: ltx_train
 is_i2v: true
 report_to: None

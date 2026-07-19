@@ -48,6 +48,12 @@ def main():
         action='store_true',
         help='disable DeepSpeed for a bounded single-process smoke test',
     )
+    parser.add_argument(
+        '--resume_from_checkpoint',
+        type=str,
+        default=None,
+        help='joint step directory (or its training_state directory) to resume',
+    )
 
     args = parser.parse_args()
     Runner = import_custom_class(
@@ -68,6 +74,10 @@ def main():
             )
         if args.disable_deepspeed:
             config_overrides["use_deepspeed"] = False
+        if args.resume_from_checkpoint is not None:
+            config_overrides["resume_from_checkpoint"] = (
+                args.resume_from_checkpoint
+            )
         runner = Runner(args.config_file, config_overrides=config_overrides)
         runner.prepare_dataset()
         runner.prepare_models()

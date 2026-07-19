@@ -11,7 +11,10 @@ The run starts from:
 
 - VLM planner: dual-camera K4 WSA `step_030000`.
 - GE-Act: OLA `ltx_step_50000`.
-- Data: predecoded LIBERO FastWAM HDF5, with separate main and wrist cameras.
+- Data: verified LIBERO FastWAM predecoded RGB cache, with separate main and wrist
+  cameras and `require_predecoded=true`. OLA currently has no compatible FastWAM
+  HDF5 manifest, so this recipe performs no online video decode and does not claim
+  an HDF5 backend.
 
 ## Architecture
 
@@ -92,6 +95,9 @@ Each keeper step stores a self-contained joint checkpoint with:
 - an exported planner directory compatible with the existing standalone planner
   loader;
 - DeepSpeed optimizer and scheduler state for exact resume;
+- trainer progress metadata (global step, epoch, next prepared-dataloader batch,
+  world size, accumulation, and batches per epoch), restored only after
+  `accelerator.prepare` and validated before `accelerator.load_state`;
 - joint metadata recording source checkpoints, loss weights, all optimizer-group
   learning rates, K4 geometry, global batch size, and trainable parameter counts.
 
@@ -118,11 +124,15 @@ Unit and integration tests must prove:
 
 1. K1 and K4 provider shapes are metadata-driven and backward compatible.
 2. One planner forward returns K4 semantic/depth predictions and auxiliary losses.
-3. Backpropagating only GE-Act video loss produces a finite non-zero gradient on a
-   Qwen parameter and on an LTX semantic cross-attention parameter.
+3. With the real zero-initialized semantic gate, the first combined step updates
+   Qwen through planner alignment and opens the LTX semantic gate; on the following
+   step, GE-Act video loss produces finite non-zero gradients on Qwen and LTX
+   semantic cross-attention parameters.
 4. Frozen SigLIP2 and DA3 teachers have no gradients.
 5. Optimizer groups are disjoint, complete, and use the specified learning rates.
-6. Joint save/load preserves both planner and LTX outputs and resume state.
+6. Joint save/load preserves both planner and LTX outputs and resumes optimizer,
+   scheduler, global step, epoch, and dataloader position without changing the
+   distributed batch geometry.
 7. A one-GPU one-step smoke passes before an 8-GPU ten-step smoke; the formal launch
    is permitted only after both smoke tests have finite losses and bounded memory.
 

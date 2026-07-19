@@ -397,7 +397,7 @@ Use `accelerator.accumulate(self.joint_model)` and clip `self.joint_model.parame
 
 - [ ] **Step 6: Add joint checkpoint export and exact resume state**
 
-At keeper steps, unwrap the composite, save `model.ltx.save_pretrained(step_dir / "ltx")`, export planner model/head/processor under `step_dir / "planner"`, write `joint_meta.json`, then call `accelerator.save_state(step_dir / "training_state")` on every rank. Preserve the existing LTX-only save path when joint mode is disabled.
+At keeper steps, unwrap the composite, save `model.ltx.save_pretrained(step_dir / "ltx")`, export planner model/head/processor under `step_dir / "planner"`, write `joint_meta.json` and `trainer_state.json`, then call `accelerator.save_state(step_dir / "training_state")` on every rank. After `accelerator.prepare`, an explicit `--resume_from_checkpoint` loads distributed state and restores global step, epoch, and prepared-dataloader position after validating world size, accumulation, and batches per epoch. Preserve the existing LTX-only save path when joint mode is disabled.
 
 - [ ] **Step 7: Apply smoke overrides before distributed initialization**
 
@@ -436,7 +436,7 @@ git commit -m "feat(ge-act): train VLM and LTX in one distributed step"
 ### Task 5: Joint config, preflight, and OLA launcher
 
 **Files:**
-- Create: `ge_act/configs/ltx_model/libero/video_model_libero_joint_vlm_geact_k4_hdf5.yaml`
+- Create: `ge_act/configs/ltx_model/libero/video_model_libero_joint_vlm_geact_k4_predecoded.yaml`
 - Create: `ge_act/scripts/train_joint_vlm_geact_ola.sh`
 - Modify: `ge_act/scripts/preflight_ltx_siglip2.py`
 - Modify: `tests/test_ge_act_siglip2_config.py`
@@ -475,7 +475,9 @@ Expected: FAIL because the config does not exist.
 
 - [ ] **Step 3: Add the exact formal YAML**
 
-Copy stable LTX/HDF5 fields from the existing VLM planner YAML, then set:
+Use the verified OLA predecoded RGB cache with `CustomLeRobotDataset`, ordered
+main/wrist cameras, and `require_predecoded=true`; OLA has no compatible FastWAM
+HDF5 manifest. Then set:
 
 ```yaml
 batch_size: 1
@@ -513,7 +515,12 @@ Require K4 offsets, WSA metadata, two views, width 1024, batch contract 128, all
 
 - [ ] **Step 5: Add the OLA launcher**
 
-The launcher exports offline HF settings, constrains CPU math threads, verifies HDF5/predecoded data, runs preflight, and launches `torchrun --nproc_per_node=8`. `RUN_KIND=smoke` selects one GPU and passes `--max_train_steps 1 --batch_size_override 1 --gradient_accumulation_steps_override 1 --disable_deepspeed`, without editing the formal YAML.
+The launcher exports offline HF settings, constrains CPU math threads, verifies all
+predecoded caches, runs preflight, and launches `torchrun`. `RUN_KIND=smoke` selects
+one GPU and passes `--max_train_steps 1 --batch_size_override 1
+--gradient_accumulation_steps_override 1 --disable_deepspeed`; `RUN_KIND=smoke8`
+keeps eight GPUs and ZeRO-2 enabled but bounds the run to ten optimizer steps with
+per-GPU batch and accumulation both set to one. Neither mode edits the formal YAML.
 
 - [ ] **Step 6: Run config/preflight tests**
 
@@ -524,7 +531,7 @@ Expected: all tests pass and existing configs remain accepted.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add ge_act/configs/ltx_model/libero/video_model_libero_joint_vlm_geact_k4_hdf5.yaml ge_act/scripts/train_joint_vlm_geact_ola.sh ge_act/scripts/preflight_ltx_siglip2.py tests/test_ge_act_siglip2_config.py
+git add ge_act/configs/ltx_model/libero/video_model_libero_joint_vlm_geact_k4_predecoded.yaml ge_act/scripts/train_joint_vlm_geact_ola.sh ge_act/scripts/preflight_ltx_siglip2.py tests/test_ge_act_siglip2_config.py
 git commit -m "feat(joint): configure K4 VLM GE-Act training on OLA"
 ```
 
@@ -571,7 +578,7 @@ Expected: exit 0 and no whitespace errors.
 
 - [ ] **Step 3: Sync only committed source to OLA and run preflight**
 
-Push the branch and fast-forward the clean OLA checkout. Run the joint launcher preflight against the real K4 metadata, LTX step50k, HDF5 manifest, SigLIP2, and DA3 paths.
+Push the branch and fast-forward the clean OLA checkout. Run the joint launcher preflight against the real K4 metadata, LTX step50k, all verified predecoded RGB caches, SigLIP2, and DA3 paths.
 
 - [ ] **Step 4: Run one-GPU one-step smoke**
 
@@ -581,7 +588,9 @@ Expected: finite total/video/planner losses, finite non-zero Qwen and LTX semant
 
 - [ ] **Step 5: Run 8-GPU ten-step smoke**
 
-Run the launcher with `--max_train_steps 10 --batch_size_override 1 --gradient_accumulation_steps_override 1` on 8 GPUs, leaving DeepSpeed enabled. Verify every rank reaches step 10, DeepSpeed reports one composite engine, loss remains finite, and peak memory stays below 80 GB/GPU.
+Run: `RUN_KIND=smoke8 bash ge_act/scripts/train_joint_vlm_geact_ola.sh`.
+Verify every rank reaches step 10, DeepSpeed reports one composite engine, loss
+remains finite, and peak memory stays below 80 GB/GPU.
 
 - [ ] **Step 6: Verify checkpoint round trip**
 

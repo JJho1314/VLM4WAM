@@ -300,7 +300,10 @@ def collect_preflight_errors(
     if not check_paths:
         return errors
 
-    for module_name in REQUIRED_MODULES:
+    required_modules = list(REQUIRED_MODULES)
+    if config.get("use_deepspeed", False):
+        required_modules.append("deepspeed")
+    for module_name in dict.fromkeys(required_modules):
         if importlib.util.find_spec(module_name) is None:
             errors.append(f"missing Python module: {module_name}")
 

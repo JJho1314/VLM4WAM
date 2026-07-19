@@ -1108,6 +1108,8 @@ def test_main_smoke_flags_are_forwarded_as_constructor_overrides(
             "--gradient_accumulation_steps_override",
             "1",
             "--disable_deepspeed",
+            "--resume_from_checkpoint",
+            str(tmp_path / "step_000010"),
         ],
     )
 
@@ -1118,6 +1120,7 @@ def test_main_smoke_flags_are_forwarded_as_constructor_overrides(
         "batch_size": 1,
         "gradient_accumulation_steps": 1,
         "use_deepspeed": False,
+        "resume_from_checkpoint": str(tmp_path / "step_000010"),
     }
 
 
@@ -1204,6 +1207,9 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
         step_dir=step_dir,
         args=args,
         global_step=20000,
+        epoch=3,
+        next_batch_in_epoch=17,
+        num_batches_per_epoch=100,
     )
 
     assert (step_dir / "ltx" / "ltx.txt").is_file()
@@ -1227,6 +1233,18 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
         "planner_heads": 6e-5,
     }
     assert joint_meta["future_keyframe_offsets"] == [2, 4, 6, 8]
+    trainer_state = json.loads(
+        (step_dir / "trainer_state.json").read_text(encoding="utf-8")
+    )
+    assert trainer_state == {
+        "epoch": 3,
+        "global_step": 20000,
+        "gradient_accumulation_steps": 16,
+        "next_batch_in_epoch": 17,
+        "num_batches_per_epoch": 100,
+        "schema_version": 1,
+        "world_size": 8,
+    }
     assert saved_states == [step_dir / "training_state"]
 
 
@@ -1251,9 +1269,163 @@ def test_joint_checkpoint_calls_save_state_on_non_main_rank(tmp_path: Path) -> N
         step_dir=tmp_path / "step_20000",
         args=SimpleNamespace(),
         global_step=20000,
+        epoch=3,
+        next_batch_in_epoch=17,
+        num_batches_per_epoch=100,
     )
 
     assert saved_states == [tmp_path / "step_20000" / "training_state"]
+
+
+def test_joint_resume_loads_distributed_state_and_validates_progress(
+    tmp_path: Path,
+) -> None:
+    contracts = _load_ge_trainer_symbols("load_joint_resume_state")
+    step_dir = tmp_path / "step_000010"
+    (step_dir / "training_state").mkdir(parents=True)
+    (step_dir / "trainer_state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "global_step": 10,
+                "epoch": 2,
+                "next_batch_in_epoch": 3,
+                "num_batches_per_epoch": 8,
+                "gradient_accumulation_steps": 1,
+                "world_size": 8,
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded_paths: list[Path] = []
+    accelerator = SimpleNamespace(
+        num_processes=8,
+        load_state=lambda path: loaded_paths.append(Path(path)),
+    )
+
+    state = contracts.load_joint_resume_state(
+        accelerator=accelerator,
+        checkpoint_dir=step_dir,
+        num_batches_per_epoch=8,
+        gradient_accumulation_steps=1,
+    )
+
+    assert state["global_step"] == 10
+    assert state["epoch"] == 2
+    assert state["next_batch_in_epoch"] == 3
+    assert loaded_paths == [step_dir / "training_state"]
+
+
+def test_joint_resume_rejects_changed_batch_geometry(tmp_path: Path) -> None:
+    contracts = _load_ge_trainer_symbols("load_joint_resume_state")
+    step_dir = tmp_path / "step_000010"
+    (step_dir / "training_state").mkdir(parents=True)
+    (step_dir / "trainer_state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "global_step": 10,
+                "epoch": 2,
+                "next_batch_in_epoch": 3,
+                "num_batches_per_epoch": 8,
+                "gradient_accumulation_steps": 1,
+                "world_size": 8,
+            }
+        ),
+        encoding="utf-8",
+    )
+    accelerator = SimpleNamespace(
+        num_processes=8,
+        load_state=lambda _path: pytest.fail("invalid state must not be loaded"),
+    )
+
+    with pytest.raises(ValueError, match="num_batches_per_epoch"):
+        contracts.load_joint_resume_state(
+            accelerator=accelerator,
+            checkpoint_dir=step_dir,
+            num_batches_per_epoch=9,
+            gradient_accumulation_steps=1,
+        )
+
+
+def test_joint_prepare_restores_after_accelerator_prepare(tmp_path: Path) -> None:
+    contracts = _load_ge_trainer_symbols(
+        "State",
+        "Trainer",
+        "load_joint_resume_state",
+    )
+    step_dir = tmp_path / "step_000010"
+    (step_dir / "training_state").mkdir(parents=True)
+    (step_dir / "trainer_state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "global_step": 10,
+                "epoch": 2,
+                "next_batch_in_epoch": 3,
+                "num_batches_per_epoch": 8,
+                "gradient_accumulation_steps": 1,
+                "world_size": 8,
+            }
+        ),
+        encoding="utf-8",
+    )
+    events: list[str] = []
+
+    class FakeAccelerator:
+        num_processes = 8
+
+        def prepare(self, *values):
+            events.append("prepare")
+            return values
+
+        def load_state(self, _path):
+            events.append("load_state")
+
+    trainer = contracts.Trainer.__new__(contracts.Trainer)
+    trainer.joint_model = object()
+    trainer.diffusion_model = object()
+    trainer.optimizer = object()
+    trainer.train_dataloader = list(range(8))
+    trainer.lr_scheduler = object()
+    trainer.args = SimpleNamespace(
+        joint_training={"enabled": True},
+        resume_from_checkpoint=str(step_dir),
+        gradient_accumulation_steps=1,
+    )
+    trainer.state = SimpleNamespace(accelerator=FakeAccelerator())
+    contracts.Trainer.prepare_for_training.__globals__["_joint_training_enabled"] = (
+        lambda args: bool(args.joint_training["enabled"])
+    )
+    contracts.Trainer.prepare_for_training.__globals__["load_joint_resume_state"] = (
+        contracts.load_joint_resume_state
+    )
+
+    trainer.prepare_for_training()
+
+    assert events == ["prepare", "load_state"]
+    assert trainer.resume_state["global_step"] == 10
+
+
+def test_nonfinite_loss_guard_rejects_inf_with_component_diagnostics() -> None:
+    contracts = _load_ge_trainer_symbols("require_finite_training_loss")
+
+    with pytest.raises(
+        FloatingPointError,
+        match=r"total=inf.*loss_video=1.*planner_loss=2",
+    ):
+        contracts.require_finite_training_loss(
+            torch.tensor(float("inf")),
+            {
+                "loss_video": torch.tensor(1.0),
+                "planner_loss": torch.tensor(2.0),
+            },
+        )
+
+    contracts.require_finite_training_loss(
+        torch.tensor(3.0),
+        {"loss_video": torch.tensor(1.0)},
+    )
 
 
 def test_joint_train_source_has_single_composite_and_required_logs() -> None:
@@ -1269,6 +1441,7 @@ def test_joint_train_source_has_single_composite_and_required_logs() -> None:
         '"lr/semantic_ltx"',
         '"lr/qwen"',
         '"lr/planner_heads"',
+        '"samples_per_second"',
         '"peak_memory_allocated"',
     )
 

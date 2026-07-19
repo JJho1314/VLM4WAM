@@ -5,7 +5,7 @@ set -euo pipefail
 GE_ACT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(dirname "$GE_ACT_ROOT")"
 CALLER_PWD="$PWD"
-CONFIG="${CONFIG:-${1:-$GE_ACT_ROOT/configs/ltx_model/libero/video_model_libero_joint_vlm_geact_k4_hdf5.yaml}}"
+CONFIG="${CONFIG:-${1:-$GE_ACT_ROOT/configs/ltx_model/libero/video_model_libero_joint_vlm_geact_k4_predecoded.yaml}}"
 if [[ "$CONFIG" != /* ]]; then
   CONFIG="$CALLER_PWD/$CONFIG"
 fi
@@ -48,8 +48,14 @@ if [[ "$RUN_KIND" == "smoke" ]]; then
     --gradient_accumulation_steps_override 1
     --disable_deepspeed
   )
+elif [[ "$RUN_KIND" == "smoke8" ]]; then
+  MAIN_ARGS+=(
+    --max_train_steps 10
+    --batch_size_override 1
+    --gradient_accumulation_steps_override 1
+  )
 elif [[ "$RUN_KIND" != "formal" ]]; then
-  echo "RUN_KIND must be formal or smoke, got '$RUN_KIND'" >&2
+  echo "RUN_KIND must be formal, smoke, or smoke8, got '$RUN_KIND'" >&2
   exit 2
 fi
 

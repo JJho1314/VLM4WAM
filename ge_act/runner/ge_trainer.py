@@ -1,4 +1,4 @@
-import os, random, math
+import os, random, math, time
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 from pathlib import Path
@@ -470,10 +470,26 @@ def save_joint_checkpoint(
     step_dir: str | Path,
     args: argparse.Namespace,
     global_step: int,
+    epoch: int,
+    next_batch_in_epoch: int,
+    num_batches_per_epoch: int,
 ) -> None:
     """Save model exports on main and exact distributed state on every rank."""
 
     step_dir = Path(step_dir)
+    epoch = int(epoch)
+    next_batch_in_epoch = int(next_batch_in_epoch)
+    num_batches_per_epoch = int(num_batches_per_epoch)
+    if epoch < 0 or num_batches_per_epoch <= 0:
+        raise ValueError("checkpoint epoch/batch geometry must be positive")
+    if not 0 <= next_batch_in_epoch <= num_batches_per_epoch:
+        raise ValueError(
+            "next_batch_in_epoch must be within the prepared dataloader; "
+            f"got {next_batch_in_epoch}/{num_batches_per_epoch}"
+        )
+    if next_batch_in_epoch == num_batches_per_epoch:
+        epoch += 1
+        next_batch_in_epoch = 0
     if accelerator.is_main_process:
         step_dir.mkdir(parents=True, exist_ok=True)
         model = accelerator.unwrap_model(joint_model)
@@ -567,9 +583,114 @@ def save_joint_checkpoint(
             json.dumps(metadata, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        trainer_state = {
+            "schema_version": 1,
+            "global_step": int(global_step),
+            "epoch": epoch,
+            "next_batch_in_epoch": next_batch_in_epoch,
+            "num_batches_per_epoch": num_batches_per_epoch,
+            "gradient_accumulation_steps": int(
+                args.gradient_accumulation_steps
+            ),
+            "world_size": int(accelerator.num_processes),
+        }
+        (step_dir / "trainer_state.json").write_text(
+            json.dumps(trainer_state, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     accelerator.wait_for_everyone()
     accelerator.save_state(step_dir / "training_state")
     accelerator.wait_for_everyone()
+
+
+def load_joint_resume_state(
+    *,
+    accelerator: Accelerator,
+    checkpoint_dir: str | Path,
+    num_batches_per_epoch: int,
+    gradient_accumulation_steps: int,
+) -> dict[str, int]:
+    """Restore prepared distributed state and exact loop progress."""
+
+    checkpoint_dir = Path(checkpoint_dir).expanduser().resolve()
+    if checkpoint_dir.name == "training_state":
+        step_dir = checkpoint_dir.parent
+        training_state_dir = checkpoint_dir
+    else:
+        step_dir = checkpoint_dir
+        training_state_dir = step_dir / "training_state"
+    progress_path = step_dir / "trainer_state.json"
+    if not training_state_dir.is_dir():
+        raise FileNotFoundError(
+            f"joint resume training state is missing: {training_state_dir}"
+        )
+    if not progress_path.is_file():
+        raise FileNotFoundError(
+            f"joint resume progress metadata is missing: {progress_path}"
+        )
+    try:
+        state = json.loads(progress_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid joint resume metadata: {progress_path}") from error
+    required_values = {
+        "schema_version": 1,
+        "num_batches_per_epoch": int(num_batches_per_epoch),
+        "gradient_accumulation_steps": int(gradient_accumulation_steps),
+        "world_size": int(accelerator.num_processes),
+    }
+    for name, expected in required_values.items():
+        if state.get(name) != expected:
+            raise ValueError(
+                f"joint resume {name} mismatch: checkpoint={state.get(name)!r}, "
+                f"runtime={expected!r}"
+            )
+    for name in ("global_step", "epoch", "next_batch_in_epoch"):
+        value = state.get(name)
+        if not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"joint resume {name} must be a non-negative integer, got {value!r}"
+            )
+    if state["next_batch_in_epoch"] >= int(num_batches_per_epoch):
+        raise ValueError(
+            "joint resume next_batch_in_epoch must be smaller than "
+            "num_batches_per_epoch"
+        )
+    accelerator.load_state(training_state_dir)
+    return state
+
+
+def require_finite_training_loss(
+    loss: torch.Tensor,
+    components: Dict[str, Any] | None = None,
+) -> None:
+    """Fail before backward if total loss is NaN or infinite."""
+
+    if bool(torch.isfinite(loss).all().item()):
+        return
+
+    def describe(value: Any) -> str:
+        if isinstance(value, torch.Tensor):
+            detached = value.detach()
+            if detached.numel() == 1:
+                return str(detached.float().item())
+            finite = detached[torch.isfinite(detached)]
+            if finite.numel() == 0:
+                return "nonfinite"
+            return (
+                f"shape={tuple(detached.shape)},"
+                f"finite_min={finite.float().min().item()},"
+                f"finite_max={finite.float().max().item()}"
+            )
+        return str(value)
+
+    diagnostics = [f"total={describe(loss)}"]
+    diagnostics.extend(
+        f"{name}={describe(value)}"
+        for name, value in (components or {}).items()
+    )
+    raise FloatingPointError(
+        "non-finite training loss before backward: " + ", ".join(diagnostics)
+    )
 
 
 class State:
@@ -633,6 +754,7 @@ class Trainer:
         self.depth_teacher = None
         self.joint_model = None
         self.joint_target_encoder = None
+        self.resume_state = None
         self.video_frame_rate = compute_effective_video_fps(self.args.data["train"])
 
         self._init_distributed()
@@ -1169,7 +1291,25 @@ class Trainer:
                     self.lr_scheduler,
                 )
             )
+            resume_from_checkpoint = getattr(
+                self.args,
+                "resume_from_checkpoint",
+                None,
+            )
+            if resume_from_checkpoint:
+                self.resume_state = load_joint_resume_state(
+                    accelerator=self.state.accelerator,
+                    checkpoint_dir=resume_from_checkpoint,
+                    num_batches_per_epoch=len(self.train_dataloader),
+                    gradient_accumulation_steps=(
+                        self.args.gradient_accumulation_steps
+                    ),
+                )
         else:
+            if getattr(self.args, "resume_from_checkpoint", None):
+                raise ValueError(
+                    "resume_from_checkpoint is supported only for joint training"
+                )
             self.diffusion_model, self.optimizer, self.train_dataloader, self.lr_scheduler = self.state.accelerator.prepare(
                 self.diffusion_model, self.optimizer, self.train_dataloader, self.lr_scheduler
             )
@@ -1201,11 +1341,15 @@ class Trainer:
         }
         logger.info(f"Training configuration: {json.dumps(info, indent=4)}")
         
-        global_step = 0
-        first_epoch = 0
-        initial_global_step = 0
+        resume_state = self.resume_state or {}
+        global_step = int(resume_state.get("global_step", 0))
+        first_epoch = int(resume_state.get("epoch", 0))
+        resume_batch_in_epoch = int(
+            resume_state.get("next_batch_in_epoch", 0)
+        )
+        initial_global_step = global_step
         progress_bar = tqdm(
-            range(0, self.state.train_steps),
+            total=self.state.train_steps,
             initial=initial_global_step,
             desc="Training steps",
             disable=not self.state.accelerator.is_local_main_process,
@@ -1222,6 +1366,9 @@ class Trainer:
         # loss spikes
         anomalies = []
         joint_enabled = _joint_training_enabled(self.args)
+        session_start_time = time.monotonic()
+        last_epoch = first_epoch
+        next_batch_in_epoch = resume_batch_in_epoch
 
         for epoch in range(first_epoch, self.state.train_epochs):
             if global_step >= self.state.train_steps:
@@ -1235,7 +1382,22 @@ class Trainer:
                 self.diffusion_model.train()
 
             running_loss = 0.0
-            for step, batch in enumerate(self.train_dataloader):
+            if hasattr(self.train_dataloader, "set_epoch"):
+                self.train_dataloader.set_epoch(epoch)
+            active_dataloader = self.train_dataloader
+            step_offset = 0
+            if epoch == first_epoch and resume_batch_in_epoch > 0:
+                active_dataloader = accelerator.skip_first_batches(
+                    self.train_dataloader,
+                    resume_batch_in_epoch,
+                )
+                step_offset = resume_batch_in_epoch
+            for step, batch in enumerate(
+                active_dataloader,
+                start=step_offset,
+            ):
+                last_epoch = epoch
+                next_batch_in_epoch = step + 1
                 logger.debug(f"Starting step {step + 1}")
                 logs = {}
                 joint_grad_metrics = {}
@@ -1534,7 +1696,16 @@ class Trainer:
                     else:
                         loss = loss_video + action_loss_scale * loss_action
 
-                    assert torch.isnan(loss) == False, "NaN loss detected"
+                    loss_components = {"loss_video": loss_video}
+                    if joint_enabled:
+                        loss_components["planner_loss"] = planner_metrics["loss"]
+                    elif self.args.train_mode in (
+                        "all",
+                        "action_only",
+                        "action_full",
+                    ):
+                        loss_components["loss_action"] = loss_action
+                    require_finite_training_loss(loss, loss_components)
                     accelerator.backward(loss)
                     if accelerator.sync_gradients and joint_enabled:
                         unwrapped_joint = accelerator.unwrap_model(self.joint_model)
@@ -1607,41 +1778,52 @@ class Trainer:
                     progress_bar.update(1)
                     global_step += 1
 
-                if joint_enabled:
-                    logs = {
-                        "loss": loss.detach().item(),
-                        "loss_video": loss_video.detach().item(),
-                        "planner_loss": planner_loss.detach().item(),
-                        "planner_semantic_mse": planner_semantic_mse.detach().item(),
-                        "planner_depth_wsa_loss": planner_depth_wsa_loss.detach().item(),
-                        "peak_memory_allocated": (
-                            int(torch.cuda.max_memory_allocated(accelerator.device))
-                            if torch.cuda.is_available()
-                            else 0
-                        ),
-                    }
-                    for name, value in joint_grad_metrics.items():
-                        logs[name] = value.item()
-                    if lm_plan_ce_metric is not None:
-                        logs["lm_plan_ce"] = lm_plan_ce_metric.item()
-                    logs.setdefault("vlm_grad_norm", 0.0)
-                    logs.setdefault("ltx_grad_norm", 0.0)
-                    lr_log_keys = {
-                        "base_ltx": "lr/base_ltx",
-                        "semantic_ltx": "lr/semantic_ltx",
-                        "qwen": "lr/qwen",
-                        "planner_heads": "lr/planner_heads",
-                    }
-                    for group in self.optimizer.param_groups:
-                        group_name = group.get("name")
-                        if group_name in lr_log_keys:
-                            logs[lr_log_keys[group_name]] = float(group["lr"])
-                    for log_key in lr_log_keys.values():
-                        logs.setdefault(log_key, 0.0)
-                else:
-                    logs = {"loss": loss.detach().item(), "lr": self.lr_scheduler.get_last_lr()[0]}
-                progress_bar.set_postfix(logs)
-                accelerator.log(logs, step=global_step)
+                if accelerator.sync_gradients:
+                    if joint_enabled:
+                        elapsed = max(time.monotonic() - session_start_time, 1e-9)
+                        completed_session_steps = global_step - initial_global_step
+                        logs = {
+                            "loss": loss.detach().item(),
+                            "loss_video": loss_video.detach().item(),
+                            "planner_loss": planner_loss.detach().item(),
+                            "planner_semantic_mse": planner_semantic_mse.detach().item(),
+                            "planner_depth_wsa_loss": planner_depth_wsa_loss.detach().item(),
+                            "samples_per_second": (
+                                completed_session_steps
+                                * self.state.train_batch_size
+                                / elapsed
+                            ),
+                            "peak_memory_allocated": (
+                                int(torch.cuda.max_memory_allocated(accelerator.device))
+                                if torch.cuda.is_available()
+                                else 0
+                            ),
+                        }
+                        for name, value in joint_grad_metrics.items():
+                            logs[name] = value.item()
+                        if lm_plan_ce_metric is not None:
+                            logs["lm_plan_ce"] = lm_plan_ce_metric.item()
+                        logs.setdefault("vlm_grad_norm", 0.0)
+                        logs.setdefault("ltx_grad_norm", 0.0)
+                        lr_log_keys = {
+                            "base_ltx": "lr/base_ltx",
+                            "semantic_ltx": "lr/semantic_ltx",
+                            "qwen": "lr/qwen",
+                            "planner_heads": "lr/planner_heads",
+                        }
+                        for group in self.optimizer.param_groups:
+                            group_name = group.get("name")
+                            if group_name in lr_log_keys:
+                                logs[lr_log_keys[group_name]] = float(group["lr"])
+                        for log_key in lr_log_keys.values():
+                            logs.setdefault(log_key, 0.0)
+                    else:
+                        logs = {
+                            "loss": loss.detach().item(),
+                            "lr": self.lr_scheduler.get_last_lr()[0],
+                        }
+                    progress_bar.set_postfix(logs)
+                    accelerator.log(logs, step=global_step)
 
                 if global_step >= self.state.train_steps:
                     logger.info(">>> max train step reached")
@@ -1686,6 +1868,9 @@ class Trainer:
                             step_dir=Path(self.save_folder) / f"step_{global_step}",
                             args=self.args,
                             global_step=global_step,
+                            epoch=epoch,
+                            next_batch_in_epoch=next_batch_in_epoch,
+                            num_batches_per_epoch=len(self.train_dataloader),
                         )
                     else:
                         accelerator.wait_for_everyone()
@@ -1720,6 +1905,9 @@ class Trainer:
                 step_dir=Path(self.save_folder) / f"step_{global_step}",
                 args=self.args,
                 global_step=global_step,
+                epoch=last_epoch,
+                next_batch_in_epoch=next_batch_in_epoch,
+                num_batches_per_epoch=len(self.train_dataloader),
             )
         elif accelerator.is_main_process:
             self.diffusion_model = unwrap_model(accelerator, self.diffusion_model)
