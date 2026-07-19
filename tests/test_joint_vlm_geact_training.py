@@ -14,6 +14,7 @@ if str(GE_ACT_ROOT) not in sys.path:
 
 from models.ltx_models.joint_vlm_geact import (  # noqa: E402
     JointVLMGEActModel,
+    _require_tensor_shape,
     build_joint_optimizer_parameter_groups,
 )
 
@@ -43,8 +44,9 @@ class TinyQwenModel(nn.Module):
 
 
 class TinyPlanner(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, tokens_per_keyframe: int = TOKENS_PER_KEYFRAME) -> None:
         super().__init__()
+        self.tokens_per_keyframe = int(tokens_per_keyframe)
         self.model = TinyQwenModel()
         self.plan_head = nn.Linear(1, 1, bias=False)
         self.depth_head = nn.Linear(1, 1, bias=False)
@@ -52,6 +54,8 @@ class TinyPlanner(nn.Module):
         self.shared_query_bank = nn.Parameter(torch.ones(1, 1))
         self.private_query_bank = nn.Parameter(torch.ones(1, 1))
         self.forward_calls = 0
+        nn.init.constant_(self.plan_head.weight, 0.25)
+        nn.init.constant_(self.depth_head.weight, 0.125)
 
     def predict_dino_depth_plan_with_losses(
         self,
@@ -65,16 +69,24 @@ class TinyPlanner(nn.Module):
         qwen_hidden = self.model.proj(input_ids.float()).mean(dim=1)
         plan_value = self.plan_head(qwen_hidden)
         depth_value = self.depth_head(qwen_hidden)
-        semantic = plan_value.reshape(batch_size, 1, 1, 1).expand(
+        semantic_base = plan_value.new_zeros(SEMANTIC_DIM)
+        semantic_base[1] = 1.0
+        semantic_direction = plan_value.new_zeros(SEMANTIC_DIM)
+        semantic_direction[0] = 1.0
+        semantic_features = semantic_base.unsqueeze(0)
+        semantic_features = (
+            semantic_features + plan_value * semantic_direction.unsqueeze(0)
+        )
+        semantic = semantic_features.reshape(batch_size, 1, 1, SEMANTIC_DIM).expand(
             batch_size,
             2,
-            NUM_KEYFRAMES * TOKENS_PER_KEYFRAME,
+            NUM_KEYFRAMES * self.tokens_per_keyframe,
             SEMANTIC_DIM,
         )
         depth = depth_value.reshape(batch_size, 1, 1, 1, 1).expand(
             batch_size,
             2,
-            NUM_KEYFRAMES * TOKENS_PER_KEYFRAME,
+            NUM_KEYFRAMES * self.tokens_per_keyframe,
             DEPTH_LAYERS,
             DEPTH_DIM,
         )
@@ -92,7 +104,7 @@ class TinyPlanner(nn.Module):
         )
 
 
-class TinyLTX(nn.Module):
+class TinyGateOpenLTX(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.base_proj = nn.Linear(2, 2, bias=False)
@@ -117,18 +129,21 @@ class TinyLTX(nn.Module):
         return ({"video": self.base_proj(hidden_states) + semantic_update},)
 
 
-def _planner_labels(batch_size: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+def _planner_labels(
+    batch_size: int = 1,
+    tokens_per_keyframe: int = TOKENS_PER_KEYFRAME,
+) -> tuple[torch.Tensor, torch.Tensor]:
     semantic = torch.zeros(
         batch_size,
         2,
-        NUM_KEYFRAMES * TOKENS_PER_KEYFRAME,
+        NUM_KEYFRAMES * tokens_per_keyframe,
         SEMANTIC_DIM,
     )
     depth = torch.zeros(
         batch_size,
         2,
         DEPTH_LAYERS,
-        NUM_KEYFRAMES * TOKENS_PER_KEYFRAME,
+        NUM_KEYFRAMES * tokens_per_keyframe,
         DEPTH_DIM,
     )
     return semantic, depth
@@ -154,26 +169,90 @@ def _ltx_inputs(batch_size: int = 1) -> dict[str, object]:
     }
 
 
-def _make_tiny_joint_model() -> JointVLMGEActModel:
+def _real_ltx_inputs(batch_size: int = 1) -> dict[str, object]:
+    batch_views = batch_size * 2
+    return {
+        "prompt_embeds": torch.randn(batch_size, 3, 8),
+        "prompt_attention_mask": torch.ones(batch_size, 3),
+        "noisy_latents": torch.randn(batch_views, 2, 4),
+        "timesteps": torch.ones(batch_views, 2),
+        "num_frames": 2,
+        "height": 1,
+        "width": 1,
+        "n_view": 2,
+        "frame_rate": 5,
+        "temporal_compression_ratio": 8,
+        "spatial_compression_ratio": 32,
+        "semantic_plan_times": torch.tensor([[0.25, 0.5, 0.75, 1.0]]).repeat(
+            batch_views, 1
+        ),
+        "semantic_condition_mask": torch.ones(batch_views),
+    }
+
+
+@pytest.fixture(scope="module")
+def real_ltx_class():
+    try:
+        from models.ltx_models.transformer_ltx_multiview import (  # noqa: PLC0415
+            LTXVideoTransformer3DModel,
+        )
+    except (ImportError, RuntimeError) as error:
+        if "HybridCache" in str(error):
+            pytest.skip(f"local diffusers/transformers mismatch: {error}")
+        raise
+    return LTXVideoTransformer3DModel
+
+
+def _make_real_zero_gate_joint(real_ltx_class) -> JointVLMGEActModel:
+    torch.manual_seed(17)
+    ltx = real_ltx_class(
+        in_channels=4,
+        out_channels=4,
+        num_attention_heads=2,
+        attention_head_dim=6,
+        cross_attention_dim=12,
+        caption_channels=8,
+        num_layers=1,
+        semantic_plan_context=True,
+        semantic_plan_in_dim=SEMANTIC_DIM,
+        semantic_plan_coordinate_dim=4,
+        semantic_plan_num_keyframes=NUM_KEYFRAMES,
+        semantic_plan_num_views=2,
+        semantic_plan_adaln_rank=4,
+    )
+    return _make_tiny_joint_model(ltx=ltx, tokens_per_keyframe=4)
+
+
+def _make_tiny_joint_model(
+    *,
+    ltx: nn.Module | None = None,
+    tokens_per_keyframe: int = TOKENS_PER_KEYFRAME,
+) -> JointVLMGEActModel:
     return JointVLMGEActModel(
-        TinyPlanner(),
-        TinyLTX(),
+        TinyPlanner(tokens_per_keyframe=tokens_per_keyframe),
+        TinyGateOpenLTX() if ltx is None else ltx,
         num_keyframes=NUM_KEYFRAMES,
-        tokens_per_keyframe=TOKENS_PER_KEYFRAME,
+        tokens_per_keyframe=tokens_per_keyframe,
     )
 
 
-def _run_joint(joint: JointVLMGEActModel):
-    semantic_labels, depth_labels = _planner_labels()
+def _run_joint(
+    joint: JointVLMGEActModel,
+    *,
+    ltx_inputs: dict[str, object] | None = None,
+):
+    semantic_labels, depth_labels = _planner_labels(
+        tokens_per_keyframe=joint.tokens_per_keyframe
+    )
     return joint(
         planner_inputs={"input_ids": torch.ones(1, 1, dtype=torch.long)},
         semantic_labels=semantic_labels,
         depth_labels=depth_labels,
-        ltx_inputs=_ltx_inputs(),
+        ltx_inputs=_ltx_inputs() if ltx_inputs is None else ltx_inputs,
     )
 
 
-def test_video_loss_reaches_qwen_and_ltx_semantic_parameters() -> None:
+def test_gate_open_tiny_contract_reaches_qwen_and_semantic_parameters() -> None:
     joint = _make_tiny_joint_model()
 
     output = _run_joint(joint)
@@ -199,6 +278,84 @@ def test_video_loss_reaches_qwen_and_ltx_semantic_parameters() -> None:
     assert output.planner_losses["loss"].requires_grad
     assert _finite_nonzero(joint.planner.model.proj.weight.grad)
     assert _finite_nonzero(joint.ltx.semantic_attn.weight.grad)
+
+
+def test_real_ltx_first_video_backward_only_opens_zero_gate(real_ltx_class) -> None:
+    joint = _make_real_zero_gate_joint(real_ltx_class)
+    block = joint.ltx.transformer_blocks[0]
+    gate = block.semantic_modulation[-1].weight
+    assert torch.count_nonzero(gate) == 0
+
+    output = _run_joint(joint, ltx_inputs=_real_ltx_inputs())
+    output.ltx_predictions["video"].square().mean().backward()
+
+    assert _finite_nonzero(gate.grad)
+    assert not _finite_nonzero(block.semantic_attn.to_k.weight.grad)
+    assert not _finite_nonzero(joint.planner.model.proj.weight.grad)
+
+
+def test_real_ltx_first_combined_backward_updates_qwen_via_alignment(
+    real_ltx_class,
+) -> None:
+    joint = _make_real_zero_gate_joint(real_ltx_class)
+
+    output = _run_joint(joint, ltx_inputs=_real_ltx_inputs())
+    video_loss = output.ltx_predictions["video"].square().mean()
+    qwen_weight = joint.planner.model.proj.weight
+    video_qwen_grad = torch.autograd.grad(
+        video_loss,
+        qwen_weight,
+        retain_graph=True,
+        allow_unused=True,
+    )[0]
+    alignment_qwen_grad = torch.autograd.grad(
+        output.planner_losses["loss"],
+        qwen_weight,
+        retain_graph=True,
+    )[0]
+    assert not _finite_nonzero(video_qwen_grad)
+    assert _finite_nonzero(alignment_qwen_grad)
+
+    combined_loss = video_loss + 0.1 * output.planner_losses["loss"]
+    combined_loss.backward()
+
+    assert _finite_nonzero(qwen_weight.grad)
+    gate_grad = joint.ltx.transformer_blocks[0].semantic_modulation[-1].weight.grad
+    assert _finite_nonzero(gate_grad)
+
+
+def test_real_ltx_second_video_backward_reaches_attention_and_qwen(
+    real_ltx_class,
+) -> None:
+    joint = _make_real_zero_gate_joint(real_ltx_class)
+    block = joint.ltx.transformer_blocks[0]
+    gate = block.semantic_modulation[-1].weight
+
+    first_output = _run_joint(joint, ltx_inputs=_real_ltx_inputs())
+    first_output.ltx_predictions["video"].square().mean().backward()
+    assert _finite_nonzero(gate.grad)
+    with torch.no_grad():
+        gate.add_(gate.grad, alpha=-1e-2)
+    joint.zero_grad(set_to_none=True)
+
+    second_output = _run_joint(joint, ltx_inputs=_real_ltx_inputs())
+    second_output.ltx_predictions["video"].square().mean().backward()
+
+    assert _finite_nonzero(block.semantic_attn.to_k.weight.grad)
+    assert _finite_nonzero(joint.planner.model.proj.weight.grad)
+
+
+def test_joint_documents_zero_gate_warmup_contract() -> None:
+    doc = JointVLMGEActModel.__doc__ or ""
+
+    assert "zero-initialized semantic gates" in doc
+    assert "planner alignment loss" in doc
+
+
+def test_shape_validation_does_not_scan_tensor_values() -> None:
+    value = torch.tensor([float("nan")])
+
+    assert _require_tensor_shape(value, (1,), name="value") is value
 
 
 def test_joint_casts_semantic_plan_to_ltx_dtype_without_detaching() -> None:

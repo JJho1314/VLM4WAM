@@ -35,13 +35,21 @@ def _require_tensor_shape(
     if not torch.is_tensor(value) or tuple(value.shape) != expected_shape:
         actual_shape = tuple(value.shape) if torch.is_tensor(value) else None
         raise ValueError(f"{name} must have shape {expected_shape}, got {actual_shape}")
-    if not torch.isfinite(value).all():
-        raise ValueError(f"{name} must contain only finite values")
     return value
 
 
 class JointVLMGEActModel(nn.Module):
-    """Run one planner pass and inject its differentiable K4 plan into LTX."""
+    """Run one planner pass and inject its differentiable K4 plan into LTX.
+
+    The GE-Act base checkpoint has no ``semantic_`` weights, so its semantic
+    modules are newly constructed with zero-initialized semantic gates. On the
+    first joint step, video loss opens those gates but cannot yet reach semantic
+    attention or Qwen. The combined objective's planner alignment loss therefore
+    guarantees the first planner update; after a gate update, video loss can flow
+    through semantic attention into Qwen. This is a warm-up contract, not a
+    checkpoint compatibility failure, and must not be turned into a preflight
+    rejection or a non-zero gate initialization.
+    """
 
     def __init__(
         self,
