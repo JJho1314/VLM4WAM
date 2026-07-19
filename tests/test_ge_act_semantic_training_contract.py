@@ -39,6 +39,9 @@ class TinySemanticModel(nn.Module):
 
 
 class RecordingPlannerProvider:
+    num_keyframes = 1
+    target_tokens_per_keyframe = 256
+
     def __init__(self) -> None:
         self.images = None
         self.instructions = None
@@ -52,6 +55,23 @@ class RecordingPlannerProvider:
             {
                 "semantic_tokens": torch.zeros(2, 2, 1, 256, 1024),
                 "times": torch.ones(4, 1),
+            },
+        )()
+
+
+class RecordingK4PlannerProvider(RecordingPlannerProvider):
+    num_keyframes = 4
+    target_tokens_per_keyframe = 256
+
+    def predict(self, images, instructions):
+        self.images = images.clone()
+        self.instructions = list(instructions)
+        return type(
+            "Plan",
+            (),
+            {
+                "semantic_tokens": torch.zeros(2, 2, 4, 256, 1024),
+                "times": torch.tensor([0.25, 0.5, 0.75, 1.0]).repeat(4, 1),
             },
         )()
 
@@ -140,6 +160,16 @@ def test_build_vlm_semantic_condition_uses_current_observation_only() -> None:
     assert provider.instructions == ["pick", "place"]
     assert tokens.shape == (2, 2, 1, 256, 1024)
     assert times.shape == (4, 1)
+
+
+def test_build_vlm_semantic_condition_accepts_metadata_driven_k4() -> None:
+    video = torch.zeros(2, 3, 2, 13, 2, 2)
+    tokens, times = build_vlm_semantic_condition(
+        RecordingK4PlannerProvider(), video, ["pick", "place"], n_previous=4
+    )
+
+    assert tokens.shape == (2, 2, 4, 256, 1024)
+    assert times.shape == (4, 4)
 
 
 def test_main_exposes_a_positive_bounded_smoke_step_override() -> None:

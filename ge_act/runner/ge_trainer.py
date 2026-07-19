@@ -145,8 +145,16 @@ def build_vlm_semantic_condition(
         )
     current_images = video[:, :, :, current_index].permute(0, 2, 1, 3, 4)
     plan = provider.predict(current_images.contiguous(), instructions)
-    expected_tokens = (video.shape[0], 2, 1, 256, 1024)
-    expected_times = (video.shape[0] * 2, 1)
+    num_keyframes = int(provider.num_keyframes)
+    tokens_per_keyframe = int(provider.target_tokens_per_keyframe)
+    expected_tokens = (
+        video.shape[0],
+        2,
+        num_keyframes,
+        tokens_per_keyframe,
+        1024,
+    )
+    expected_times = (video.shape[0] * 2, num_keyframes)
     if tuple(plan.semantic_tokens.shape) != expected_tokens:
         raise RuntimeError(
             "VLM semantic tokens must have shape "
