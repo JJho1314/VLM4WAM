@@ -440,6 +440,19 @@ def make_fake_future_k4_wrapper() -> PlannerWrapper:
     return wrapper
 
 
+def make_fake_future_k4_loss_wrapper() -> PlannerWrapper:
+    wrapper = make_fake_future_k4_wrapper()
+    wrapper.mse_loss_weight = 1.0
+    wrapper.cosine_loss_weight = 0.0
+    wrapper.norm_loss_weight = 0.0
+    wrapper.variance_loss_weight = 0.0
+    wrapper.infonce_loss_weight = 0.0
+    wrapper.infonce_temperature = 0.07
+    wrapper.depth_loss_weight = 0.004
+    wrapper.da3_layer_weights = torch.ones(4)
+    return wrapper
+
+
 def make_loss_only_wrapper_with_unit_branch_weights() -> PlannerWrapper:
     wrapper = PlannerWrapper.__new__(PlannerWrapper)
     nn.Module.__init__(wrapper)
@@ -674,15 +687,7 @@ def test_future_only_k4_wsa_prediction_preserves_views_and_layers() -> None:
 
 
 def test_future_only_k4_wsa_prediction_with_losses_runs_one_pass() -> None:
-    wrapper = make_fake_future_k4_wrapper()
-    wrapper.mse_loss_weight = 1.0
-    wrapper.cosine_loss_weight = 0.0
-    wrapper.norm_loss_weight = 0.0
-    wrapper.variance_loss_weight = 0.0
-    wrapper.infonce_loss_weight = 0.0
-    wrapper.infonce_temperature = 0.07
-    wrapper.depth_loss_weight = 0.004
-    wrapper.da3_layer_weights = torch.ones(4)
+    wrapper = make_fake_future_k4_loss_wrapper()
     semantic_target = torch.ones(1, 2, 4 * 256, 8)
     depth_target = torch.ones(1, 2, 4, 4 * 256, 8)
     input_ids = torch.ones(1, 1, dtype=torch.long)
@@ -706,6 +711,49 @@ def test_future_only_k4_wsa_prediction_with_losses_runs_one_pass() -> None:
     assert semantic.shape == semantic_target.shape
     assert depth.shape == (1, 2, 1024, 4, 8)
     assert torch.isfinite(losses["loss"])
+
+
+def test_one_pass_alignment_rejects_semantic_shape_mismatch() -> None:
+    wrapper = make_fake_future_k4_loss_wrapper()
+
+    with pytest.raises(ValueError, match="semantic prediction/target shape mismatch"):
+        wrapper.predict_dino_depth_plan_with_losses(
+            semantic_plan_labels=torch.ones(2, 1, 4 * 256, 8),
+            depth_plan_labels=torch.ones(1, 2, 4, 4 * 256, 8),
+            input_ids=torch.ones(1, 1, dtype=torch.long),
+        )
+
+
+def test_one_pass_alignment_rejects_reshaped_depth_shape_mismatch() -> None:
+    wrapper = make_fake_future_k4_loss_wrapper()
+
+    with pytest.raises(ValueError, match="depth prediction/target shape mismatch"):
+        wrapper.predict_dino_depth_plan_with_losses(
+            semantic_plan_labels=torch.ones(1, 2, 4 * 256, 8),
+            depth_plan_labels=torch.ones(2, 1, 4, 4 * 256, 8),
+            input_ids=torch.ones(1, 1, dtype=torch.long),
+        )
+
+
+def test_one_pass_alignment_predictions_and_loss_keep_gradients() -> None:
+    wrapper = make_fake_future_k4_loss_wrapper()
+
+    semantic, depth, losses = wrapper.predict_dino_depth_plan_with_losses(
+        semantic_plan_labels=torch.zeros(1, 2, 4 * 256, 8),
+        depth_plan_labels=torch.ones(1, 2, 4, 4 * 256, 8),
+        input_ids=torch.ones(1, 1, dtype=torch.long),
+    )
+
+    assert semantic.requires_grad
+    assert depth.requires_grad
+    assert losses["loss"].requires_grad
+
+    losses["loss"].backward()
+
+    grad = wrapper.plan_head.scale.grad
+    assert grad is not None
+    assert torch.isfinite(grad)
+    assert grad.abs() > 0
 
 
 def test_future_only_k4_forward_reuses_prediction_with_losses() -> None:

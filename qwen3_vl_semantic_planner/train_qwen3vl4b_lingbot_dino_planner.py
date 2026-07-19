@@ -2753,13 +2753,23 @@ class PlannerWrapper(nn.Module):
         **inputs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         semantic, depth = self.predict_dino_depth_plan(**inputs)
-        losses = self.compute_plan_losses(
-            semantic,
-            semantic_plan_labels.to(device=semantic.device, dtype=torch.float32),
+        semantic_target = semantic_plan_labels.to(
+            device=semantic.device,
+            dtype=torch.float32,
         )
         depth_target = self._reshape_depth_target(
             depth_plan_labels.to(device=depth.device, dtype=torch.float32)
         )
+        for name, prediction, target in (
+            ("semantic", semantic, semantic_target),
+            ("depth", depth, depth_target),
+        ):
+            if prediction.shape != target.shape:
+                raise ValueError(
+                    f"{name} prediction/target shape mismatch: prediction "
+                    f"{tuple(prediction.shape)} != target {tuple(target.shape)}"
+                )
+        losses = self.compute_plan_losses(semantic, semantic_target)
         if self.da3_align_strategy == "wsa_multilayer":
             depth_loss, depth_cos, depth_lnmse = self._wsa_layer_loss(
                 depth,
