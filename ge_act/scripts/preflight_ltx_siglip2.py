@@ -22,6 +22,28 @@ REQUIRED_MODULES = (
     "av",
     "safetensors",
 )
+JOINT_FORMAL_RECIPE = {
+    "ltx_components": "/data/users/junjie/Genie-Envisioner-V1/weights/LTX-Video",
+    "ltx_checkpoint": "/data/users/junjie/Genie-Envisioner-V1/weights/ltx_step_50000",
+    "planner_checkpoint": (
+        "/data/users/junjie/code/VLM4WAM_dual_camera_k4/outputs/"
+        "qwen3vl2b_siglip2_da3_libero_dual_camera_k4_wsa_predecoded_b8_restart/"
+        "step_030000"
+    ),
+    "siglip2_teacher": (
+        "/data/users/junjie/vlm4wam_2b/weights/siglip2-large-patch16-256"
+    ),
+    "da3_checkpoint": "/data/users/junjie/vlm4wam_2b/weights/DA3-LARGE-1.1",
+    "da3_code_root": "/data/users/junjie/vlm4wam_2b/code/Depth-Anything-3",
+    "data_root": "/data/shared/datasets/libero_fastwam",
+    "predecoded_root": "/data/shared/datasets/libero_fastwam-predecoded-rgb",
+    "domains": [
+        "libero_10_no_noops_lerobot",
+        "libero_goal_no_noops_lerobot",
+        "libero_object_no_noops_lerobot",
+        "libero_spatial_no_noops_lerobot",
+    ],
+}
 
 
 def _nearest_existing_parent(path: Path) -> Path:
@@ -171,8 +193,8 @@ def collect_preflight_errors(
             errors.append("joint planner head lr must be 3e-5")
         if joint.get("planner_loss_weight") != 0.1:
             errors.append("joint planner_loss_weight must be 0.1")
-        if float(joint.get("lm_plan_loss_weight", 0.0)) <= 0.0:
-            errors.append("joint lm_plan_loss_weight must be positive")
+        if joint.get("lm_plan_loss_weight") != 1e-3:
+            errors.append("joint lm_plan_loss_weight must be 1e-3")
         if bool(joint.get("bidirectional_plan_attn", True)):
             errors.append("joint planner checkpoint must use causal attention")
         if not config.get("gradient_checkpointing", False):
@@ -198,6 +220,62 @@ def collect_preflight_errors(
             errors.append("joint DA3 teacher checkpoint is required")
         if not joint.get("da3_code_root"):
             errors.append("joint DA3 code root is required")
+        formal_path_contract = (
+            (
+                config.get("pretrained_model_name_or_path"),
+                JOINT_FORMAL_RECIPE["ltx_components"],
+                "joint formal LTX components path does not match the approved recipe",
+            ),
+            (
+                config.get("diffusion_model", {}).get("model_path"),
+                JOINT_FORMAL_RECIPE["ltx_checkpoint"],
+                "joint formal LTX checkpoint path does not match the approved recipe",
+            ),
+            (
+                semantic.get("planner_checkpoint"),
+                JOINT_FORMAL_RECIPE["planner_checkpoint"],
+                "joint formal planner checkpoint path does not match the approved recipe",
+            ),
+            (
+                joint.get("siglip2_model_dir"),
+                JOINT_FORMAL_RECIPE["siglip2_teacher"],
+                "joint formal SigLIP2 teacher path does not match the approved recipe",
+            ),
+            (
+                joint.get("da3_ckpt_dir"),
+                JOINT_FORMAL_RECIPE["da3_checkpoint"],
+                "joint formal DA3 checkpoint path does not match the approved recipe",
+            ),
+            (
+                joint.get("da3_code_root"),
+                JOINT_FORMAL_RECIPE["da3_code_root"],
+                "joint formal DA3 code root does not match the approved recipe",
+            ),
+        )
+        for actual, expected, message in formal_path_contract:
+            if actual != expected:
+                errors.append(message)
+        expected_data_roots = [JOINT_FORMAL_RECIPE["data_root"]] * 4
+        if any(
+            data_config.get("data_roots") != expected_data_roots
+            for data_config in (train_data, val_data)
+        ):
+            errors.append(
+                "joint formal training data roots do not match the approved recipe"
+            )
+        if any(
+            data_config.get("predecoded_video_root")
+            != JOINT_FORMAL_RECIPE["predecoded_root"]
+            for data_config in (train_data, val_data)
+        ):
+            errors.append(
+                "joint formal predecoded root does not match the approved recipe"
+            )
+        if any(
+            data_config.get("domains") != JOINT_FORMAL_RECIPE["domains"]
+            for data_config in (train_data, val_data)
+        ):
+            errors.append("joint formal domains do not match the approved recipe")
         if not hdf5_backend:
             expected_cameras = [
                 "observation.images.image",
@@ -293,52 +371,51 @@ def collect_preflight_errors(
             except (OSError, json.JSONDecodeError, TypeError) as error:
                 errors.append(f"invalid planner metadata: {planner_meta_path}: {error}")
         if planner_meta is not None:
-            metadata_contract = (
-                (
-                    "future_keyframe_offsets",
-                    [2, 4, 6, 8],
-                    "planner metadata offsets must be [2, 4, 6, 8]",
-                ),
-                (
-                    "num_camera_views",
-                    2,
-                    "planner metadata must describe two camera views",
-                ),
-                ("num_keyframes", 4, "planner metadata must describe K4"),
-                (
-                    "target_tokens_per_keyframe",
-                    256,
-                    "planner metadata must use 256 tokens per keyframe",
-                ),
-                (
-                    "semantic_dim",
-                    1024,
-                    "planner metadata semantic width must be 1024",
-                ),
-                (
-                    "da3_align_strategy",
-                    "wsa_multilayer",
-                    "planner metadata DA3 strategy must be wsa_multilayer",
-                ),
-                (
-                    "da3_teacher_layers",
-                    [11, 15, 19, 23],
-                    "planner metadata DA3 teacher layers must be [11, 15, 19, 23]",
-                ),
-                (
-                    "depth_feature_dim",
-                    2048,
-                    "planner metadata DA3 feature width must be 2048",
-                ),
-                (
-                    "bidirectional_plan_attn",
-                    False,
-                    "planner metadata must set bidirectional_plan_attn=false",
-                ),
+            required_checkpoint_files = [
+                "planner_meta.json",
+                "plan_head.pt",
+                "depth_head.pt",
+                "plan_token_embedding.pt",
+            ]
+            if bool(planner_meta.get("use_current_alignment", False)):
+                required_checkpoint_files.extend(
+                    ["current_plan_head.pt", "current_depth_head.pt"]
+                )
+            for filename in required_checkpoint_files:
+                if not (planner_path / filename).is_file():
+                    errors.append(
+                        f"planner checkpoint is missing required file: {filename}"
+                    )
+            for directory in ("qwen3vl_lora_or_model", "processor"):
+                component_path = planner_path / directory
+                if not component_path.is_dir() or not any(
+                    child.is_file() for child in component_path.rglob("*")
+                ):
+                    errors.append(
+                        "planner checkpoint directory is missing or empty: "
+                        f"{directory}/"
+                    )
+
+            from ge_act.models.ltx_models.vlm_semantic_planner import (
+                validate_dual_camera_planner_metadata,
             )
-            for field, expected, message in metadata_contract:
-                if planner_meta.get(field) != expected:
-                    errors.append(message)
+
+            try:
+                validate_dual_camera_planner_metadata(planner_meta)
+            except ValueError as error:
+                errors.append(str(error))
+            if planner_meta.get("num_keyframes") != 4:
+                errors.append("planner metadata must describe exact K4 geometry")
+            if planner_meta.get("da3_align_strategy") != "wsa_multilayer":
+                errors.append("planner metadata DA3 strategy must be wsa_multilayer")
+            if planner_meta.get("da3_teacher_layers") != [11, 15, 19, 23]:
+                errors.append(
+                    "planner metadata DA3 teacher layers must be [11, 15, 19, 23]"
+                )
+            if planner_meta.get("depth_feature_dim") != 2048:
+                errors.append("planner metadata DA3 feature width must be 2048")
+            if planner_meta.get("bidirectional_plan_attn") is not False:
+                errors.append("planner metadata must set bidirectional_plan_attn=false")
 
     output_path = _nearest_existing_parent(Path(config.get("output_dir", ".")))
     if not os.access(output_path, os.W_OK):

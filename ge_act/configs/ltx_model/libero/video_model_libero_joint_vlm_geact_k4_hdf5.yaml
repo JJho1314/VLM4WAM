@@ -94,6 +94,9 @@ semantic_plan:
   dropout: 0.15
   validation_mode: planner
 
+# Geometry and ownership fields below intentionally duplicate checkpoint metadata.
+# They are a declarative formal-preflight contract; Trainer uses provider metadata
+# for live geometry and its fixed four-layer WSA teacher construction at runtime.
 joint_training:
   enabled: true
   planner_loss_weight: 0.1

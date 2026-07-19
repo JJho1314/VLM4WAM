@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
 
@@ -38,6 +40,110 @@ OLA_PLANNER_CHECKPOINT = (
     "qwen3vl2b_siglip2_da3_libero_dual_camera_k4_wsa_predecoded_b8_restart/"
     "step_030000"
 )
+OLA_LTX_COMPONENTS = "/data/users/junjie/Genie-Envisioner-V1/weights/LTX-Video"
+OLA_LTX_CHECKPOINT = "/data/users/junjie/Genie-Envisioner-V1/weights/ltx_step_50000"
+OLA_SIGLIP2_TEACHER = "/data/users/junjie/vlm4wam_2b/weights/siglip2-large-patch16-256"
+OLA_DA3_CHECKPOINT = "/data/users/junjie/vlm4wam_2b/weights/DA3-LARGE-1.1"
+OLA_DA3_CODE_ROOT = "/data/users/junjie/vlm4wam_2b/code/Depth-Anything-3"
+OLA_DATA_ROOT = "/data/shared/datasets/libero_fastwam"
+OLA_PREDECODED_ROOT = "/data/shared/datasets/libero_fastwam-predecoded-rgb"
+OLA_DOMAINS = [
+    "libero_10_no_noops_lerobot",
+    "libero_goal_no_noops_lerobot",
+    "libero_object_no_noops_lerobot",
+    "libero_spatial_no_noops_lerobot",
+]
+
+
+def _complete_k4_planner_metadata() -> dict[str, object]:
+    return {
+        "planner_input_layout": "separate_camera_images",
+        "camera_names": ["main", "wrist"],
+        "num_camera_views": 2,
+        "camera_head_sharing": "shared_head_per_view_image_context",
+        "semantic_teacher": "siglip2-large-patch16-256",
+        "future_keyframe_offsets": [2, 4, 6, 8],
+        "num_keyframes": 4,
+        "semantic_output_layout": "batch_view_keyframe_token_feature",
+        "sequence_length": 9,
+        "grid_size": 16,
+        "semantic_dim": 1024,
+        "target_tokens": 1024,
+        "target_tokens_per_keyframe": 256,
+        "planner_token_count": 384,
+        "video_target_type": "siglip2",
+        "use_current_alignment": False,
+        "plan_token_strings": [f"<|sem_plan_{index}|>" for index in range(384)],
+        "da3_align_strategy": "wsa_multilayer",
+        "da3_teacher_layers": [11, 15, 19, 23],
+        "depth_feature_dim": 2048,
+        "bidirectional_plan_attn": False,
+    }
+
+
+def _write_complete_planner_checkpoint(path: Path) -> dict[str, object]:
+    path.mkdir()
+    metadata = _complete_k4_planner_metadata()
+    (path / "planner_meta.json").write_text(json.dumps(metadata))
+    for filename in ("plan_head.pt", "depth_head.pt", "plan_token_embedding.pt"):
+        (path / filename).write_bytes(b"checkpoint")
+    for directory in ("qwen3vl_lora_or_model", "processor"):
+        component = path / directory
+        component.mkdir()
+        (component / "config.json").write_text("{}")
+    return metadata
+
+
+def _redirect_formal_recipe_to_tmp_paths(
+    config: dict,
+    tmp_path: Path,
+    monkeypatch,
+) -> tuple[Path, Path]:
+    pretrained = tmp_path / "LTX-Video"
+    for component in ("tokenizer", "text_encoder", "vae"):
+        (pretrained / component).mkdir(parents=True)
+    ltx_checkpoint = tmp_path / "ltx_step_50000"
+    ltx_checkpoint.mkdir()
+    planner = tmp_path / "planner"
+    _write_complete_planner_checkpoint(planner)
+    siglip = tmp_path / "siglip2"
+    da3 = tmp_path / "da3"
+    da3_code = tmp_path / "da3-code"
+    cache = tmp_path / "predecoded"
+    data_root = tmp_path / "data"
+    for path in (siglip, da3, da3_code, cache, data_root):
+        path.mkdir()
+    stat_file = tmp_path / "stats.json"
+    stat_file.write_text("{}")
+
+    config["pretrained_model_name_or_path"] = str(pretrained)
+    config["diffusion_model"]["model_path"] = str(ltx_checkpoint)
+    config["semantic_plan"]["planner_checkpoint"] = str(planner)
+    config["joint_training"]["siglip2_model_dir"] = str(siglip)
+    config["joint_training"]["da3_ckpt_dir"] = str(da3)
+    config["joint_training"]["da3_code_root"] = str(da3_code)
+    config["output_dir"] = str(tmp_path / "output")
+    for split in ("train", "val"):
+        config["data"][split]["data_roots"] = [str(data_root)] * 4
+        config["data"][split]["predecoded_video_root"] = str(cache)
+        config["data"][split]["stat_file"] = str(stat_file)
+
+    monkeypatch.setattr(preflight_module, "REQUIRED_MODULES", ())
+    redirected = {
+        "ltx_components": str(pretrained),
+        "ltx_checkpoint": str(ltx_checkpoint),
+        "planner_checkpoint": str(planner),
+        "siglip2_teacher": str(siglip),
+        "da3_checkpoint": str(da3),
+        "da3_code_root": str(da3_code),
+        "data_root": str(data_root),
+        "predecoded_root": str(cache),
+        "domains": OLA_DOMAINS,
+    }
+    monkeypatch.setattr(
+        preflight_module, "JOINT_FORMAL_RECIPE", redirected, raising=False
+    )
+    return planner, cache
 
 
 def test_siglip2_training_config_matches_the_approved_recipe() -> None:
@@ -206,13 +312,12 @@ def test_joint_vlm_geact_config_matches_approved_recipe() -> None:
     assert joint["da3_align_strategy"] == "wsa_multilayer"
     assert joint["da3_teacher_layers"] == [11, 15, 19, 23]
     assert joint["da3_feature_dim"] == 2048
+    assert joint["siglip2_model_dir"] == OLA_SIGLIP2_TEACHER
+    assert joint["da3_ckpt_dir"] == OLA_DA3_CHECKPOINT
+    assert joint["da3_code_root"] == OLA_DA3_CODE_ROOT
 
-    assert config["pretrained_model_name_or_path"] == (
-        "/data/users/junjie/Genie-Envisioner-V1/weights/LTX-Video"
-    )
-    assert config["diffusion_model"]["model_path"] == (
-        "/data/users/junjie/Genie-Envisioner-V1/weights/ltx_step_50000"
-    )
+    assert config["pretrained_model_name_or_path"] == OLA_LTX_COMPONENTS
+    assert config["diffusion_model"]["model_path"] == OLA_LTX_CHECKPOINT
     model = config["diffusion_model"]["config"]
     assert model["semantic_plan_num_keyframes"] == 4
     assert model["semantic_plan_num_views"] == 2
@@ -232,9 +337,9 @@ def test_joint_vlm_geact_config_uses_verified_predecoded_ola_data() -> None:
     for split in ("train", "val"):
         data = config["data"][split]
         assert data["require_predecoded"] is True
-        assert data["predecoded_video_root"] == (
-            "/data/shared/datasets/libero_fastwam-predecoded-rgb"
-        )
+        assert data["data_roots"] == [OLA_DATA_ROOT] * 4
+        assert data["domains"] == OLA_DOMAINS
+        assert data["predecoded_video_root"] == OLA_PREDECODED_ROOT
         assert data["valid_cam"] == [
             "observation.images.image",
             "observation.images.wrist_image",
@@ -301,7 +406,7 @@ def test_joint_preflight_rejects_unsafe_lm_objective_and_missing_owners() -> Non
 
     errors = collect_preflight_errors(config, world_size=8, check_paths=False)
 
-    assert "joint lm_plan_loss_weight must be positive" in errors
+    assert "joint lm_plan_loss_weight must be 1e-3" in errors
     assert "joint planner checkpoint must use causal attention" in errors
     assert "joint SigLIP2 teacher path is required" in errors
     assert "joint DA3 teacher checkpoint is required" in errors
@@ -312,49 +417,9 @@ def test_joint_runtime_preflight_checks_checkpoint_metadata_and_all_paths(
     tmp_path: Path, monkeypatch
 ) -> None:
     config = copy.deepcopy(yaml.safe_load(JOINT_CONFIG_PATH.read_text()))
-    pretrained = tmp_path / "LTX-Video"
-    for component in ("tokenizer", "text_encoder", "vae"):
-        (pretrained / component).mkdir(parents=True)
-    ltx_checkpoint = tmp_path / "ltx_step_50000"
-    ltx_checkpoint.mkdir()
-    planner = tmp_path / "planner"
-    planner.mkdir()
-    planner_meta = {
-        "future_keyframe_offsets": [2, 4, 6, 8],
-        "num_camera_views": 2,
-        "num_keyframes": 4,
-        "target_tokens_per_keyframe": 256,
-        "semantic_dim": 1024,
-        "da3_align_strategy": "wsa_multilayer",
-        "da3_teacher_layers": [11, 15, 19, 23],
-        "depth_feature_dim": 2048,
-        "bidirectional_plan_attn": False,
-    }
-    (planner / "planner_meta.json").write_text(json.dumps(planner_meta))
-    siglip = tmp_path / "siglip2"
-    da3 = tmp_path / "da3"
-    da3_code = tmp_path / "da3-code"
-    cache = tmp_path / "predecoded"
-    for path in (siglip, da3, da3_code, cache):
-        path.mkdir()
-    data_root = tmp_path / "data"
-    data_root.mkdir()
-    stat_file = tmp_path / "stats.json"
-    stat_file.write_text("{}")
-
-    config["pretrained_model_name_or_path"] = str(pretrained)
-    config["diffusion_model"]["model_path"] = str(ltx_checkpoint)
-    config["semantic_plan"]["planner_checkpoint"] = str(planner)
-    config["joint_training"]["siglip2_model_dir"] = str(siglip)
-    config["joint_training"]["da3_ckpt_dir"] = str(da3)
-    config["joint_training"]["da3_code_root"] = str(da3_code)
-    config["output_dir"] = str(tmp_path / "output")
-    for split in ("train", "val"):
-        config["data"][split]["data_roots"] = [str(data_root)] * 4
-        config["data"][split]["predecoded_video_root"] = str(cache)
-        config["data"][split]["stat_file"] = str(stat_file)
-
-    monkeypatch.setattr(preflight_module, "REQUIRED_MODULES", ())
+    planner, _cache = _redirect_formal_recipe_to_tmp_paths(
+        config, tmp_path, monkeypatch
+    )
     assert (
         collect_preflight_errors(
             config,
@@ -365,6 +430,7 @@ def test_joint_runtime_preflight_checks_checkpoint_metadata_and_all_paths(
         == []
     )
 
+    planner_meta = json.loads((planner / "planner_meta.json").read_text())
     planner_meta["bidirectional_plan_attn"] = True
     planner_meta["da3_teacher_layers"] = [23]
     (planner / "planner_meta.json").write_text(json.dumps(planner_meta))
@@ -376,6 +442,137 @@ def test_joint_runtime_preflight_checks_checkpoint_metadata_and_all_paths(
     )
     assert "planner metadata must set bidirectional_plan_attn=false" in errors
     assert "planner metadata DA3 teacher layers must be [11, 15, 19, 23]" in errors
+
+
+def test_joint_static_preflight_rejects_any_formal_recipe_path_drift() -> None:
+    config = copy.deepcopy(yaml.safe_load(JOINT_CONFIG_PATH.read_text()))
+    config["pretrained_model_name_or_path"] = "/tmp/other-components"
+    config["diffusion_model"]["model_path"] = "/tmp/other-ltx"
+    config["semantic_plan"]["planner_checkpoint"] = "/tmp/other-planner"
+    joint = config["joint_training"]
+    joint["lm_plan_loss_weight"] = 2e-3
+    joint["siglip2_model_dir"] = "/tmp/other-siglip"
+    joint["da3_ckpt_dir"] = "/tmp/other-da3"
+    joint["da3_code_root"] = "/tmp/other-da3-code"
+    config["data"]["train"]["data_roots"] = ["/tmp/other-data"] * 4
+    config["data"]["val"]["predecoded_video_root"] = "/tmp/other-cache"
+    config["data"]["train"]["domains"] = list(reversed(OLA_DOMAINS))
+
+    errors = collect_preflight_errors(config, world_size=8, check_paths=False)
+
+    for expected in (
+        "joint lm_plan_loss_weight must be 1e-3",
+        "joint formal LTX components path does not match the approved recipe",
+        "joint formal LTX checkpoint path does not match the approved recipe",
+        "joint formal planner checkpoint path does not match the approved recipe",
+        "joint formal SigLIP2 teacher path does not match the approved recipe",
+        "joint formal DA3 checkpoint path does not match the approved recipe",
+        "joint formal DA3 code root does not match the approved recipe",
+        "joint formal training data roots do not match the approved recipe",
+        "joint formal predecoded root does not match the approved recipe",
+        "joint formal domains do not match the approved recipe",
+    ):
+        assert expected in errors
+
+
+def test_joint_runtime_preflight_rejects_incomplete_loader_artifacts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = copy.deepcopy(yaml.safe_load(JOINT_CONFIG_PATH.read_text()))
+    planner, _cache = _redirect_formal_recipe_to_tmp_paths(
+        config, tmp_path, monkeypatch
+    )
+
+    (planner / "depth_head.pt").unlink()
+    errors = collect_preflight_errors(
+        config,
+        world_size=8,
+        check_paths=True,
+        minimum_free_gb=0.0,
+    )
+    assert "planner checkpoint is missing required file: depth_head.pt" in errors
+
+    (planner / "depth_head.pt").write_bytes(b"checkpoint")
+    (planner / "processor" / "config.json").unlink()
+    errors = collect_preflight_errors(
+        config,
+        world_size=8,
+        check_paths=True,
+        minimum_free_gb=0.0,
+    )
+    assert "planner checkpoint directory is missing or empty: processor/" in errors
+
+
+def test_joint_runtime_preflight_reuses_exact_provider_k4_metadata_validator(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = copy.deepcopy(yaml.safe_load(JOINT_CONFIG_PATH.read_text()))
+    planner, _cache = _redirect_formal_recipe_to_tmp_paths(
+        config, tmp_path, monkeypatch
+    )
+    metadata_path = planner / "planner_meta.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.pop("planner_input_layout")
+    metadata_path.write_text(json.dumps(metadata))
+
+    errors = collect_preflight_errors(
+        config,
+        world_size=8,
+        check_paths=True,
+        minimum_free_gb=0.0,
+    )
+    assert any(
+        "incompatible dual-camera planner metadata field planner_input_layout" in error
+        for error in errors
+    )
+
+
+def test_main_smoke_max_steps_is_a_constructor_override(
+    monkeypatch, tmp_path: Path
+) -> None:
+    main_path = GE_ACT_ROOT / "main.py"
+    spec = importlib.util.spec_from_file_location("ge_act_main_task5", main_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    captured: dict[str, object] = {}
+
+    class FakeRunner:
+        def __init__(self, config_file, *, config_overrides=None):
+            captured["config_file"] = config_file
+            captured["config_overrides"] = config_overrides
+            self.args = SimpleNamespace(train_steps=99)
+
+        def __getattr__(self, _name):
+            return lambda *_args, **_kwargs: None
+
+    monkeypatch.setattr(module, "import_custom_class", lambda *_args: FakeRunner)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ge_act/main.py",
+            "--config_file",
+            str(tmp_path / "config.yaml"),
+            "--max_train_steps",
+            "1",
+            "--batch_size_override",
+            "1",
+            "--gradient_accumulation_steps_override",
+            "1",
+            "--disable_deepspeed",
+        ],
+    )
+
+    module.main()
+
+    assert captured["config_overrides"] == {
+        "train_steps": 1,
+        "batch_size": 1,
+        "gradient_accumulation_steps": 1,
+        "use_deepspeed": False,
+    }
+    assert "runner.args.train_steps =" not in main_path.read_text()
 
 
 def test_joint_ola_launcher_has_formal_and_bounded_smoke_modes() -> None:

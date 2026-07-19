@@ -58,6 +58,8 @@ def main():
     if args.mode == "train":
         ### Trainer
         config_overrides = {}
+        if args.max_train_steps is not None:
+            config_overrides["train_steps"] = args.max_train_steps
         if args.batch_size_override is not None:
             config_overrides["batch_size"] = args.batch_size_override
         if args.gradient_accumulation_steps_override is not None:
@@ -67,8 +69,6 @@ def main():
         if args.disable_deepspeed:
             config_overrides["use_deepspeed"] = False
         runner = Runner(args.config_file, config_overrides=config_overrides)
-        if args.max_train_steps is not None:
-            runner.args.train_steps = args.max_train_steps
         runner.prepare_dataset()
         runner.prepare_models()
         runner.prepare_trainable_parameters()

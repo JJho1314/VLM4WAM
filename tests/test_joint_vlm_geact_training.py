@@ -1114,6 +1114,7 @@ def test_main_smoke_flags_are_forwarded_as_constructor_overrides(
     module.main()
 
     assert captured["config_overrides"] == {
+        "train_steps": 1,
         "batch_size": 1,
         "gradient_accumulation_steps": 1,
         "use_deepspeed": False,
