@@ -128,6 +128,43 @@ class K4ViewAwareHead(nn.Module):
         return self.scale * view_value.expand(batch, 4 * 256, self.feature_dim)
 
 
+class TinyCausalQwen(nn.Module):
+    def __init__(self, *, hidden_size: int = 4, vocab_size: int = 512) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, hidden_size)
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+        self.config = SimpleNamespace(image_token_id=2)
+        self.forward_calls = 0
+        self.received_labels: list[torch.Tensor | None] = []
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embedding
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        labels: torch.Tensor | None = None,
+        output_hidden_states: bool,
+        use_cache: bool,
+        **_kwargs: Any,
+    ) -> SimpleNamespace:
+        assert output_hidden_states
+        assert not use_cache
+        self.forward_calls += 1
+        self.received_labels.append(None if labels is None else labels.detach().clone())
+        hidden = self.embedding(input_ids)
+        logits = self.lm_head(hidden)
+        loss = None
+        if labels is not None:
+            loss = torch.nn.functional.cross_entropy(
+                logits[:, :-1].reshape(-1, logits.shape[-1]),
+                labels[:, 1:].reshape(-1),
+                ignore_index=-100,
+            )
+        return SimpleNamespace(hidden_states=(hidden,), loss=loss)
+
+
 class CheckpointHead(nn.Module):
     def __init__(
         self,
@@ -453,6 +490,24 @@ def make_fake_future_k4_loss_wrapper() -> PlannerWrapper:
     return wrapper
 
 
+def make_causal_lm_future_k4_loss_wrapper(
+    *,
+    lm_plan_loss_weight: float,
+) -> tuple[PlannerWrapper, TinyCausalQwen, torch.Tensor]:
+    wrapper = make_fake_future_k4_loss_wrapper()
+    del wrapper._forward_hiddens
+    model = TinyCausalQwen()
+    wrapper.model = model
+    wrapper.image_token_id = model.config.image_token_id
+    wrapper.plan_token_ids = list(range(10, 10 + wrapper.latent_len))
+    wrapper.lm_plan_loss_weight = float(lm_plan_loss_weight)
+    input_ids = torch.tensor(
+        [[2, 2, 3, 2, 2, *wrapper.plan_token_ids]],
+        dtype=torch.long,
+    )
+    return wrapper, model, input_ids
+
+
 def make_loss_only_wrapper_with_unit_branch_weights() -> PlannerWrapper:
     wrapper = PlannerWrapper.__new__(PlannerWrapper)
     nn.Module.__init__(wrapper)
@@ -667,6 +722,7 @@ def test_future_only_k4_wsa_wrapper_uses_384_queries() -> None:
     assert wrapper.latent_len == 384
     assert wrapper.num_latent_per_keyframe == 64
     assert wrapper.plan_head is not wrapper.depth_head
+    assert wrapper.lm_plan_loss_weight == 0.0
 
 
 def test_future_only_k4_wsa_prediction_preserves_views_and_layers() -> None:
@@ -711,6 +767,52 @@ def test_future_only_k4_wsa_prediction_with_losses_runs_one_pass() -> None:
     assert semantic.shape == semantic_target.shape
     assert depth.shape == (1, 2, 1024, 4, 8)
     assert torch.isfinite(losses["loss"])
+
+
+def test_lm_plan_ce_uses_same_qwen_forward_and_trains_untied_lm_head() -> None:
+    wrapper, model, input_ids = make_causal_lm_future_k4_loss_wrapper(
+        lm_plan_loss_weight=1e-3,
+    )
+
+    _, _, losses = wrapper.predict_dino_depth_plan_with_losses(
+        semantic_plan_labels=torch.zeros(1, 2, 4 * 256, 8),
+        depth_plan_labels=torch.ones(1, 2, 4, 4 * 256, 8),
+        input_ids=input_ids,
+    )
+
+    assert model.forward_calls == 1
+    labels = model.received_labels[0]
+    assert labels is not None
+    plan_mask = torch.isin(input_ids, torch.as_tensor(wrapper.plan_token_ids))
+    torch.testing.assert_close(labels[plan_mask], input_ids[plan_mask])
+    assert torch.all(labels[~plan_mask] == -100)
+    assert "lm_plan_ce" in losses
+    assert torch.isfinite(losses["lm_plan_ce"])
+
+    losses["loss"].backward()
+
+    grad = model.lm_head.weight.grad
+    assert grad is not None
+    assert torch.isfinite(grad).all()
+    assert torch.count_nonzero(grad) > 0
+
+
+def test_zero_lm_plan_weight_preserves_hidden_only_qwen_path() -> None:
+    wrapper, model, input_ids = make_causal_lm_future_k4_loss_wrapper(
+        lm_plan_loss_weight=0.0,
+    )
+
+    _, _, losses = wrapper.predict_dino_depth_plan_with_losses(
+        semantic_plan_labels=torch.zeros(1, 2, 4 * 256, 8),
+        depth_plan_labels=torch.ones(1, 2, 4, 4 * 256, 8),
+        input_ids=input_ids,
+    )
+
+    assert model.forward_calls == 1
+    assert model.received_labels == [None]
+    assert "lm_plan_ce" not in losses
+    losses["loss"].backward()
+    assert model.lm_head.weight.grad is None
 
 
 def test_one_pass_alignment_rejects_semantic_shape_mismatch() -> None:

@@ -1920,8 +1920,13 @@ class PlannerWrapper(nn.Module):
         da3_num_layers: int = 1,
         da3_layer_weights: Sequence[float] | None = None,
         num_camera_views: int = 1,
+        lm_plan_loss_weight: float = 0.0,
     ) -> None:
         super().__init__()
+        self.lm_plan_loss_weight = float(lm_plan_loss_weight)
+        if self.lm_plan_loss_weight < 0:
+            raise ValueError("lm_plan_loss_weight must be non-negative")
+        self._last_lm_plan_ce = None
         self.num_camera_views = int(num_camera_views)
         if self.num_camera_views not in (1, 2):
             raise ValueError("num_camera_views must be 1 or 2")
@@ -2486,9 +2491,33 @@ class PlannerWrapper(nn.Module):
         Current alignment follows LingBot-VLA v2 and keeps the image-token gradient.  Callers
         detach the image context only when routing it into a future alignment head.
         """
+        self._last_lm_plan_ce = None
+        model_inputs = dict(inputs)
+        if float(getattr(self, "lm_plan_loss_weight", 0.0)) > 0:
+            input_ids = model_inputs["input_ids"]
+            plan_ids = torch.as_tensor(
+                self.plan_token_ids,
+                device=input_ids.device,
+                dtype=input_ids.dtype,
+            )
+            labels = torch.full_like(input_ids, -100)
+            plan_mask = torch.isin(input_ids, plan_ids)
+            labels[plan_mask] = input_ids[plan_mask]
+            model_inputs["labels"] = labels
         ctx = _bidirectional_prefix() if getattr(self, "bidirectional_plan_attn", False) else contextlib.nullcontext()
         with ctx:
-            outputs = self.model(**inputs, output_hidden_states=True, use_cache=False)
+            outputs = self.model(
+                **model_inputs,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+        if float(getattr(self, "lm_plan_loss_weight", 0.0)) > 0:
+            lm_plan_ce = getattr(outputs, "loss", None)
+            if not isinstance(lm_plan_ce, torch.Tensor):
+                raise RuntimeError(
+                    "Qwen must return a tensor loss when lm_plan_loss_weight > 0"
+                )
+            self._last_lm_plan_ce = lm_plan_ce
         hidden = outputs.hidden_states[-1]
         input_ids = inputs["input_ids"]
         plan_hidden = self.collect_plan_hidden(hidden, input_ids, self.latent_len)
@@ -2781,6 +2810,15 @@ class PlannerWrapper(nn.Module):
             depth_loss = F.smooth_l1_loss(depth, depth_target)
         losses["loss"] = losses["loss"] + self.depth_loss_weight * depth_loss
         losses["depth_smooth_l1"] = depth_loss.detach()
+        lm_plan_loss_weight = float(getattr(self, "lm_plan_loss_weight", 0.0))
+        if lm_plan_loss_weight > 0:
+            lm_plan_ce = getattr(self, "_last_lm_plan_ce", None)
+            if not isinstance(lm_plan_ce, torch.Tensor):
+                raise RuntimeError(
+                    "missing causal LM plan loss from the shared Qwen forward"
+                )
+            losses["loss"] = losses["loss"] + lm_plan_loss_weight * lm_plan_ce
+            losses["lm_plan_ce"] = lm_plan_ce.detach()
         return semantic, depth, losses
 
     def predict_current_future_plans(

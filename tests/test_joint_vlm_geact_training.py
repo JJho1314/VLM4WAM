@@ -826,6 +826,7 @@ def test_trainer_overrides_are_visible_during_distributed_initialization(
     contracts = _load_ge_trainer_symbols(
         "State",
         "Trainer",
+        "_synchronize_save_folder",
         "compute_effective_video_fps",
     )
     config_path = tmp_path / "tiny.yaml"
@@ -882,6 +883,161 @@ def test_trainer_overrides_are_visible_during_distributed_initialization(
     )
 
     assert trainer.observed_during_init == (1, 1, False)
+
+
+def test_single_process_constructor_does_not_touch_default_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    contracts = _load_ge_trainer_symbols(
+        "State",
+        "Trainer",
+        "_synchronize_save_folder",
+        "compute_effective_video_fps",
+    )
+    config_path = tmp_path / "single-process.yaml"
+    config_path.write_text(
+        "\n".join(
+            (
+                "lr: 2.0e-5",
+                "semantic_lr: 1.0e-4",
+                "epsilon: 1.0e-8",
+                "weight_decay: 1.0e-5",
+                "batch_size: 1",
+                "gradient_accumulation_steps: 1",
+                "use_deepspeed: false",
+                "load_weights: true",
+                f"output_dir: {tmp_path / 'out'}",
+                "model_name: tiny",
+                "data:",
+                "  train:",
+                "    source_fps: 20",
+                "    chunk: 9",
+                "    action_chunk: 36",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    def unexpected_collective(*_args, **_kwargs):
+        raise AssertionError("single-process constructor called dist.broadcast")
+
+    monkeypatch.setattr(torch.distributed, "broadcast", unexpected_collective)
+    contracts.Trainer.__init__.__globals__["dist"] = torch.distributed
+    contracts._synchronize_save_folder.__globals__["dist"] = torch.distributed
+
+    class SingleProcessTrainer(contracts.Trainer):
+        def _init_distributed(self):
+            self.state.accelerator = SimpleNamespace(
+                is_main_process=True,
+                num_processes=1,
+                device=torch.device("cpu"),
+                process_index=0,
+            )
+
+        def _init_logging(self):
+            return None
+
+        def _init_directories_and_repositories(self):
+            return None
+
+    trainer = SingleProcessTrainer(config_path, to_log=False)
+
+    assert Path(trainer.save_folder).is_dir()
+
+
+def test_save_folder_sync_skips_uninitialized_dist_and_broadcasts_when_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contracts = _load_ge_trainer_symbols("_synchronize_save_folder")
+    accelerator = SimpleNamespace(
+        is_main_process=True,
+        num_processes=2,
+        device=torch.device("cpu"),
+    )
+
+    def unexpected_collective(*_args, **_kwargs):
+        raise AssertionError("uninitialized process group used a collective")
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(torch.distributed, "broadcast", unexpected_collective)
+    contracts._synchronize_save_folder.__globals__["dist"] = torch.distributed
+    assert contracts._synchronize_save_folder(accelerator, "/tmp/run") == "/tmp/run"
+
+    class FakeInitializedDist:
+        def __init__(self) -> None:
+            self.payloads: list[torch.Tensor] = []
+
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        @staticmethod
+        def is_initialized() -> bool:
+            return True
+
+        def broadcast(self, value: torch.Tensor, *, src: int) -> None:
+            assert src == 0
+            self.payloads.append(value.detach().clone())
+
+    fake_dist = FakeInitializedDist()
+    contracts._synchronize_save_folder.__globals__["dist"] = fake_dist
+
+    assert contracts._synchronize_save_folder(accelerator, "/tmp/run") == "/tmp/run"
+    assert len(fake_dist.payloads) == 2
+    assert int(fake_dist.payloads[0].item()) == len("/tmp/run".encode())
+    assert bytes(fake_dist.payloads[1].tolist()).decode() == "/tmp/run"
+
+
+def test_zero2_gradient_norm_reduces_squared_sum_before_sqrt() -> None:
+    contracts = _load_ge_trainer_symbols("_global_gradient_norm")
+    first = nn.Parameter(torch.zeros(1))
+    second = nn.Parameter(torch.zeros(1))
+    first.grad = torch.tensor([3.0])
+    second.grad = torch.tensor([4.0])
+    reductions: list[tuple[torch.Tensor, str]] = []
+
+    class FakeAccelerator:
+        device = torch.device("cpu")
+
+        def reduce(self, value: torch.Tensor, *, reduction: str) -> torch.Tensor:
+            reductions.append((value.detach().clone(), reduction))
+            return value + 144.0
+
+    norm = contracts._global_gradient_norm(
+        (first, second),
+        accelerator=FakeAccelerator(),
+    )
+
+    torch.testing.assert_close(norm, torch.tensor(13.0))
+    assert len(reductions) == 1
+    torch.testing.assert_close(reductions[0][0], torch.tensor(25.0))
+    assert reductions[0][1] == "sum"
+
+
+def test_joint_validation_disables_dropout_and_restores_training_on_error() -> None:
+    contracts = _load_ge_trainer_symbols("_run_joint_validation")
+
+    class Composite(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.planner = nn.Sequential(nn.Linear(2, 2), nn.Dropout(0.5))
+
+    composite = Composite().train()
+
+    class ValidationError(RuntimeError):
+        pass
+
+    def validation_call():
+        assert not composite.training
+        assert not composite.planner.training
+        raise ValidationError("stop after observing eval mode")
+
+    with pytest.raises(ValidationError, match="observing eval mode"):
+        contracts._run_joint_validation(composite, validation_call)
+
+    assert composite.training
+    assert composite.planner.training
 
 
 def test_main_smoke_flags_are_forwarded_as_constructor_overrides(
@@ -993,12 +1149,21 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
         batch_size=1,
         gradient_accumulation_steps=16,
     )
+    optimizer = SimpleNamespace(
+        param_groups=[
+            {"name": "base_ltx", "lr": 4e-5},
+            {"name": "semantic_ltx", "lr": 2e-4},
+            {"name": "qwen", "lr": 2e-6},
+            {"name": "planner_heads", "lr": 6e-5},
+        ]
+    )
     step_dir = tmp_path / "step_20000"
 
     contracts.save_joint_checkpoint(
         accelerator=accelerator,
         joint_model=composite,
         planner_provider=provider,
+        optimizer=optimizer,
         step_dir=step_dir,
         args=args,
         global_step=20000,
@@ -1018,10 +1183,10 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
     assert joint_meta["global_step"] == 20000
     assert joint_meta["source_planner_checkpoint"] == str(source_planner)
     assert joint_meta["optimizer_group_lrs"] == {
-        "base_ltx": 2e-5,
-        "semantic_ltx": 1e-4,
-        "qwen": 1e-6,
-        "planner_heads": 3e-5,
+        "base_ltx": 4e-5,
+        "semantic_ltx": 2e-4,
+        "qwen": 2e-6,
+        "planner_heads": 6e-5,
     }
     assert joint_meta["future_keyframe_offsets"] == [2, 4, 6, 8]
     assert saved_states == [step_dir / "training_state"]
@@ -1044,6 +1209,7 @@ def test_joint_checkpoint_calls_save_state_on_non_main_rank(tmp_path: Path) -> N
         accelerator=accelerator,
         joint_model=object(),
         planner_provider=object(),
+        optimizer=object(),
         step_dir=tmp_path / "step_20000",
         args=SimpleNamespace(),
         global_step=20000,
@@ -1075,5 +1241,7 @@ def test_joint_train_source_has_single_composite_and_required_logs() -> None:
         "self.joint_model, self.optimizer, self.train_dataloader, self.lr_scheduler"
         in source
     )
+    assert "_run_joint_validation(" in source
+    assert "self.semantic_planner.wrapper.lm_plan_loss_weight" in source
     for key in required_log_keys:
         assert key in source

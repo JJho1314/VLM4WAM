@@ -191,15 +191,70 @@ def _configure_qwen_gradient_checkpointing(
         model.gradient_checkpointing_disable()
 
 
-def _gradient_norm(parameters) -> torch.Tensor:
-    gradients = [
-        parameter.grad.detach().float().norm(2)
-        for parameter in parameters
-        if parameter.grad is not None
-    ]
-    if not gradients:
-        return torch.tensor(0.0)
-    return torch.stack([gradient.to(gradients[0].device) for gradient in gradients]).norm(2)
+def _global_gradient_norm(
+    parameters,
+    *,
+    accelerator: Accelerator,
+) -> torch.Tensor:
+    local_squared_norm = torch.zeros(
+        (),
+        device=accelerator.device,
+        dtype=torch.float32,
+    )
+    for parameter in parameters:
+        if parameter.grad is not None:
+            gradient = parameter.grad.detach().float()
+            local_squared_norm = local_squared_norm + gradient.square().sum()
+    global_squared_norm = accelerator.reduce(local_squared_norm, reduction="sum")
+    return global_squared_norm.clamp_min(0).sqrt()
+
+
+def _run_joint_validation(
+    joint_model: torch.nn.Module,
+    validation_call,
+):
+    was_training = joint_model.training
+    joint_model.eval()
+    try:
+        return validation_call()
+    finally:
+        joint_model.train(was_training)
+
+
+def _synchronize_save_folder(
+    accelerator: Accelerator,
+    save_folder: str | None,
+) -> str | None:
+    if int(getattr(accelerator, "num_processes", 1)) <= 1:
+        return save_folder
+    if not dist.is_available() or not dist.is_initialized():
+        return save_folder
+    if accelerator.is_main_process:
+        if save_folder is None:
+            raise RuntimeError("main process must provide a save folder")
+        save_folder_bytes = save_folder.encode()
+        folder_len_tensor = torch.tensor(
+            [len(save_folder_bytes)],
+            device=accelerator.device,
+        )
+        dist.broadcast(folder_len_tensor, src=0)
+        folder_tensor = torch.tensor(
+            list(save_folder_bytes),
+            dtype=torch.uint8,
+            device=accelerator.device,
+        )
+        dist.broadcast(folder_tensor, src=0)
+        return save_folder
+
+    folder_len_tensor = torch.tensor([0], device=accelerator.device)
+    dist.broadcast(folder_len_tensor, src=0)
+    folder_tensor = torch.empty(
+        int(folder_len_tensor.item()),
+        dtype=torch.uint8,
+        device=accelerator.device,
+    )
+    dist.broadcast(folder_tensor, src=0)
+    return bytes(folder_tensor.tolist()).decode()
 
 
 def build_deepspeed_batch_config(
@@ -396,6 +451,7 @@ def save_joint_checkpoint(
     accelerator: Accelerator,
     joint_model: torch.nn.Module,
     planner_provider: FrozenDualCameraVLMPlanner,
+    optimizer,
     step_dir: str | Path,
     args: argparse.Namespace,
     global_step: int,
@@ -424,16 +480,33 @@ def save_joint_checkpoint(
                 encoding="utf-8"
             )
         )
+        optimizer_group_lrs = {
+            str(group.get("name")): float(group["lr"])
+            for group in optimizer.param_groups
+            if group.get("name") is not None
+        }
+        required_optimizer_groups = {
+            "base_ltx",
+            "semantic_ltx",
+            "qwen",
+            "planner_heads",
+        }
+        missing_optimizer_groups = required_optimizer_groups.difference(
+            optimizer_group_lrs
+        )
+        if missing_optimizer_groups:
+            raise ValueError(
+                "joint optimizer is missing named parameter groups: "
+                f"{sorted(missing_optimizer_groups)}"
+            )
         metadata = {
             "global_step": int(global_step),
             "source_planner_checkpoint": str(planner_checkpoint),
             "source_ltx_checkpoint": str(args.diffusion_model["model_path"]),
             "planner_loss_weight": float(joint_config["planner_loss_weight"]),
             "optimizer_group_lrs": {
-                "base_ltx": float(args.lr),
-                "semantic_ltx": float(args.semantic_lr),
-                "qwen": float(joint_config["qwen_lr"]),
-                "planner_heads": float(joint_config["planner_head_lr"]),
+                name: optimizer_group_lrs[name]
+                for name in sorted(required_optimizer_groups)
             },
             "future_keyframe_offsets": [
                 int(value)
@@ -554,35 +627,33 @@ class Trainer:
 
         current_time = datetime.now()
         start_time = current_time.strftime("%Y_%m_%d_%H_%M_%S")
+        save_folder = None
+        self.writer = None
         if self.state.accelerator.is_main_process:
 
-            self.save_folder = os.path.join(self.args.output_dir, start_time)
+            save_folder = os.path.join(self.args.output_dir, start_time)
             if getattr(self.args, "sub_folder", False):
-                self.save_folder = os.path.join(self.args.output_dir, self.args.sub_folder)
-            os.makedirs(self.save_folder, exist_ok=True)
+                save_folder = os.path.join(self.args.output_dir, self.args.sub_folder)
+            os.makedirs(save_folder, exist_ok=True)
 
             args_dict = vars(deepcopy(self.args))
             for k, v in args_dict.items():
                 args_dict[k] = str(v)
-            with open(os.path.join(self.save_folder, 'config.json'), "w") as file:
+            with open(os.path.join(save_folder, 'config.json'), "w") as file:
                 json.dump(args_dict, file, indent=4, sort_keys=False)
             
             if to_log:
-                self.writer = SummaryWriter(log_dir=self.save_folder)
-            else:
-                self.writer = None
+                self.writer = SummaryWriter(log_dir=save_folder)
 
-            save_folder_bytes = self.save_folder.encode()
-            folder_len_tensor = torch.tensor([len(save_folder_bytes)], device=self.state.accelerator.device)
-            dist.broadcast(folder_len_tensor, src=0)
-            folder_tensor = torch.ByteTensor(list(save_folder_bytes)).to(self.state.accelerator.device)
-            dist.broadcast(folder_tensor, src=0)
-        else:
-            folder_len_tensor = torch.tensor([0], device=self.state.accelerator.device)
-            dist.broadcast(folder_len_tensor, src=0)
-            folder_tensor = torch.empty(folder_len_tensor.item(), dtype=torch.uint8, device=self.state.accelerator.device)
-            dist.broadcast(folder_tensor, src=0)
-            self.save_folder = bytes(folder_tensor.tolist()).decode()
+        self.save_folder = _synchronize_save_folder(
+            self.state.accelerator,
+            save_folder,
+        )
+        if self.save_folder is None:
+            raise RuntimeError(
+                "save folder synchronization requires an initialized distributed "
+                "process group when num_processes > 1"
+            )
 
         init_logging(self.save_folder, rank=self.state.accelerator.process_index)
 
@@ -817,6 +888,11 @@ class Trainer:
                             "with offsets (2,4,6,8) and 256 tokens/keyframe"
                         )
                     joint_config = self.args.joint_training
+                    self.semantic_planner.wrapper.lm_plan_loss_weight = float(
+                        joint_config.get("lm_plan_loss_weight", 1e-3)
+                    )
+                    if self.semantic_planner.wrapper.lm_plan_loss_weight < 0:
+                        raise ValueError("lm_plan_loss_weight must be non-negative")
                     from qwen3_vl_semantic_planner.dinov3_da3_2b.siglip2_target import (
                         Siglip2TargetEncoder,
                     )
@@ -1448,11 +1524,13 @@ class Trainer:
                     if accelerator.sync_gradients and joint_enabled:
                         unwrapped_joint = accelerator.unwrap_model(self.joint_model)
                         joint_grad_metrics = {
-                            "vlm_grad_norm": _gradient_norm(
-                                unwrapped_joint.planner.parameters()
+                            "vlm_grad_norm": _global_gradient_norm(
+                                unwrapped_joint.planner.parameters(),
+                                accelerator=accelerator,
                             ),
-                            "ltx_grad_norm": _gradient_norm(
-                                unwrapped_joint.ltx.parameters()
+                            "ltx_grad_norm": _global_gradient_norm(
+                                unwrapped_joint.ltx.parameters(),
+                                accelerator=accelerator,
                             ),
                         }
                         if accelerator.distributed_type != DistributedType.DEEPSPEED:
@@ -1500,6 +1578,12 @@ class Trainer:
                         depth_metric.detach(),
                         reduction="mean",
                     )
+                    lm_plan_ce_metric = planner_metrics.get("lm_plan_ce")
+                    if lm_plan_ce_metric is not None:
+                        lm_plan_ce_metric = accelerator.reduce(
+                            lm_plan_ce_metric.detach(),
+                            reduction="mean",
+                        )
 
                 running_loss += loss.item()
 
@@ -1522,10 +1606,9 @@ class Trainer:
                         ),
                     }
                     for name, value in joint_grad_metrics.items():
-                        logs[name] = accelerator.reduce(
-                            value.to(accelerator.device),
-                            reduction="mean",
-                        ).item()
+                        logs[name] = value.item()
+                    if lm_plan_ce_metric is not None:
+                        logs["lm_plan_ce"] = lm_plan_ce_metric.item()
                     logs.setdefault("vlm_grad_norm", 0.0)
                     logs.setdefault("ltx_grad_norm", 0.0)
                     lr_log_keys = {
@@ -1563,7 +1646,19 @@ class Trainer:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         model_save_dir = os.path.join(self.save_folder,f'Validation_step_{global_step}')
-                        self.validate(accelerator, model_save_dir, global_step, n_view=n_view, n_chunk=1)
+                        if joint_enabled:
+                            _run_joint_validation(
+                                self.joint_model,
+                                lambda: self.validate(
+                                    accelerator,
+                                    model_save_dir,
+                                    global_step,
+                                    n_view=n_view,
+                                    n_chunk=1,
+                                ),
+                            )
+                        else:
+                            self.validate(accelerator, model_save_dir, global_step, n_view=n_view, n_chunk=1)
 
                 
                 if accelerator.sync_gradients and should_save_checkpoint(global_step, self.args):
@@ -1572,6 +1667,7 @@ class Trainer:
                             accelerator=accelerator,
                             joint_model=self.joint_model,
                             planner_provider=self.semantic_planner,
+                            optimizer=self.optimizer,
                             step_dir=Path(self.save_folder) / f"step_{global_step}",
                             args=self.args,
                             global_step=global_step,
@@ -1605,6 +1701,7 @@ class Trainer:
                 accelerator=accelerator,
                 joint_model=self.joint_model,
                 planner_provider=self.semantic_planner,
+                optimizer=self.optimizer,
                 step_dir=Path(self.save_folder) / f"step_{global_step}",
                 args=self.args,
                 global_step=global_step,
