@@ -191,6 +191,21 @@ def _configure_qwen_gradient_checkpointing(
         model.gradient_checkpointing_disable()
 
 
+def _configure_joint_lm_plan_objective(
+    wrapper: torch.nn.Module,
+    joint_config: Dict[str, Any],
+) -> None:
+    weight = float(joint_config.get("lm_plan_loss_weight", 1e-3))
+    wrapper.lm_plan_loss_weight = weight
+    if weight < 0:
+        raise ValueError("lm_plan_loss_weight must be non-negative")
+    if weight > 0 and bool(getattr(wrapper, "bidirectional_plan_attn", False)):
+        raise ValueError(
+            "causal plan-token CE is incompatible with "
+            "bidirectional_plan_attn=True because it causes label leakage"
+        )
+
+
 def _global_gradient_norm(
     parameters,
     *,
@@ -504,6 +519,7 @@ def save_joint_checkpoint(
             "source_planner_checkpoint": str(planner_checkpoint),
             "source_ltx_checkpoint": str(args.diffusion_model["model_path"]),
             "planner_loss_weight": float(joint_config["planner_loss_weight"]),
+            "lm_plan_loss_weight": float(model.planner.lm_plan_loss_weight),
             "optimizer_group_lrs": {
                 name: optimizer_group_lrs[name]
                 for name in sorted(required_optimizer_groups)
@@ -888,11 +904,10 @@ class Trainer:
                             "with offsets (2,4,6,8) and 256 tokens/keyframe"
                         )
                     joint_config = self.args.joint_training
-                    self.semantic_planner.wrapper.lm_plan_loss_weight = float(
-                        joint_config.get("lm_plan_loss_weight", 1e-3)
+                    _configure_joint_lm_plan_objective(
+                        self.semantic_planner.wrapper,
+                        joint_config,
                     )
-                    if self.semantic_planner.wrapper.lm_plan_loss_weight < 0:
-                        raise ValueError("lm_plan_loss_weight must be non-negative")
                     from qwen3_vl_semantic_planner.dinov3_da3_2b.siglip2_target import (
                         Siglip2TargetEncoder,
                     )

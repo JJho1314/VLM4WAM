@@ -1040,6 +1040,40 @@ def test_joint_validation_disables_dropout_and_restores_training_on_error() -> N
     assert composite.planner.training
 
 
+def test_positive_lm_plan_weight_rejects_bidirectional_attention() -> None:
+    contracts = _load_ge_trainer_symbols("_configure_joint_lm_plan_objective")
+    wrapper = SimpleNamespace(
+        lm_plan_loss_weight=0.0,
+        bidirectional_plan_attn=True,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="causal plan-token CE.*bidirectional_plan_attn.*label leakage",
+    ):
+        contracts._configure_joint_lm_plan_objective(
+            wrapper,
+            {"lm_plan_loss_weight": 1e-3},
+        )
+
+    assert wrapper.lm_plan_loss_weight == 1e-3
+
+
+def test_zero_lm_plan_weight_allows_bidirectional_legacy_path() -> None:
+    contracts = _load_ge_trainer_symbols("_configure_joint_lm_plan_objective")
+    wrapper = SimpleNamespace(
+        lm_plan_loss_weight=1.0,
+        bidirectional_plan_attn=True,
+    )
+
+    contracts._configure_joint_lm_plan_objective(
+        wrapper,
+        {"lm_plan_loss_weight": 0.0},
+    )
+
+    assert wrapper.lm_plan_loss_weight == 0.0
+
+
 def test_main_smoke_flags_are_forwarded_as_constructor_overrides(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1119,6 +1153,7 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
     )
 
     planner = TinyPlanner()
+    planner.lm_plan_loss_weight = 7e-4
     planner.model = _SaveableModule("qwen")
     provider = SimpleNamespace(
         wrapper=planner,
@@ -1141,6 +1176,7 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
         diffusion_model={"model_path": "/checkpoints/ltx_step_50000"},
         joint_training={
             "planner_loss_weight": 0.1,
+            "lm_plan_loss_weight": 1e-3,
             "qwen_lr": 1e-6,
             "planner_head_lr": 3e-5,
         },
@@ -1182,6 +1218,7 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
     joint_meta = json.loads((step_dir / "joint_meta.json").read_text(encoding="utf-8"))
     assert joint_meta["global_step"] == 20000
     assert joint_meta["source_planner_checkpoint"] == str(source_planner)
+    assert joint_meta["lm_plan_loss_weight"] == 7e-4
     assert joint_meta["optimizer_group_lrs"] == {
         "base_ltx": 4e-5,
         "semantic_ltx": 2e-4,
@@ -1242,6 +1279,6 @@ def test_joint_train_source_has_single_composite_and_required_logs() -> None:
         in source
     )
     assert "_run_joint_validation(" in source
-    assert "self.semantic_planner.wrapper.lm_plan_loss_weight" in source
+    assert "_configure_joint_lm_plan_objective(" in source
     for key in required_log_keys:
         assert key in source
