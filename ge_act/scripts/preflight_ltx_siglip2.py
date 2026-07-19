@@ -146,7 +146,7 @@ def collect_preflight_errors(
         errors.append(f"global batch must be 128, got {global_batch}")
     if config.get("train_steps") != 30_000:
         errors.append("train_steps must be 30000")
-    if not config.get("gradient_checkpointing", False):
+    if not joint_enabled and not config.get("gradient_checkpointing", False):
         errors.append("gradient checkpointing must be enabled for the initial run")
 
     if joint_enabled:
@@ -200,10 +200,14 @@ def collect_preflight_errors(
             errors.append("joint lm_plan_loss_weight must be 1e-3")
         if bool(joint.get("bidirectional_plan_attn", True)):
             errors.append("joint planner checkpoint must use causal attention")
-        if not config.get("gradient_checkpointing", False):
-            errors.append("joint training requires LTX gradient checkpointing")
-        if not joint.get("qwen_gradient_checkpointing", False):
-            errors.append("joint training requires Qwen gradient checkpointing")
+        if config.get("gradient_checkpointing", False):
+            errors.append(
+                "joint training requires LTX gradient checkpointing to be disabled"
+            )
+        if joint.get("qwen_gradient_checkpointing", False):
+            errors.append(
+                "joint training requires Qwen gradient checkpointing to be disabled"
+            )
         if config.get("mixed_precision") != "bf16":
             errors.append("joint training mixed_precision must be bf16")
         deepspeed = config.get("deepspeed", {})

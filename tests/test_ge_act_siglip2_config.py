@@ -288,7 +288,7 @@ def test_joint_vlm_geact_config_matches_approved_recipe() -> None:
     assert config["gradient_accumulation_steps"] == 8
     assert config["batch_size"] * config["gradient_accumulation_steps"] * 8 == 128
     assert config["mixed_precision"] == "bf16"
-    assert config["gradient_checkpointing"] is True
+    assert config["gradient_checkpointing"] is False
     assert config["lr"] == 2e-5
     assert config["semantic_lr"] == 1e-4
     assert config["lr_warmup_steps"] == 1_000
@@ -308,7 +308,7 @@ def test_joint_vlm_geact_config_matches_approved_recipe() -> None:
     assert joint["lm_plan_loss_weight"] == 1e-3
     assert joint["qwen_lr"] == 1e-6
     assert joint["planner_head_lr"] == 3e-5
-    assert joint["qwen_gradient_checkpointing"] is True
+    assert joint["qwen_gradient_checkpointing"] is False
     assert joint["bidirectional_plan_attn"] is False
     assert joint["future_keyframe_offsets"] == [2, 4, 6, 8]
     assert joint["num_camera_views"] == 2
@@ -366,11 +366,11 @@ def test_joint_preflight_rejects_geometry_lr_batch_and_checkpointing_drift() -> 
     config["semantic_lr"] = 2e-4
     config["batch_size"] = 1
     config["gradient_accumulation_steps"] = 16
-    config["gradient_checkpointing"] = False
+    config["gradient_checkpointing"] = True
     joint = config["joint_training"]
     joint["qwen_lr"] = 2e-6
     joint["planner_head_lr"] = 4e-5
-    joint["qwen_gradient_checkpointing"] = False
+    joint["qwen_gradient_checkpointing"] = True
     joint["future_keyframe_offsets"] = [1, 3, 5, 7]
     joint["num_camera_views"] = 1
     joint["tokens_per_keyframe"] = 128
@@ -388,8 +388,8 @@ def test_joint_preflight_rejects_geometry_lr_batch_and_checkpointing_drift() -> 
         "joint LTX semantic lr must be 1e-4",
         "joint Qwen lr must be 1e-6",
         "joint planner head lr must be 3e-5",
-        "joint training requires LTX gradient checkpointing",
-        "joint training requires Qwen gradient checkpointing",
+        "joint training requires LTX gradient checkpointing to be disabled",
+        "joint training requires Qwen gradient checkpointing to be disabled",
         "joint training requires two camera views",
         "joint semantic plan must use 256 tokens per keyframe",
         "joint semantic feature width must be 1024",
