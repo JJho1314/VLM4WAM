@@ -1192,7 +1192,7 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
         semantic_lr=1e-4,
         batch_size=1,
         gradient_accumulation_steps=16,
-        seed=42,
+        seed=None,
     )
     optimizer = SimpleNamespace(
         param_groups=[
@@ -1216,6 +1216,7 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
         next_batch_in_epoch=17,
         num_batches_per_epoch=100,
         dataset_length=1712,
+        sampler_seed=42,
     )
 
     assert (step_dir / "ltx" / "ltx.txt").is_file()
@@ -1282,6 +1283,7 @@ def test_joint_checkpoint_calls_save_state_on_non_main_rank(tmp_path: Path) -> N
         next_batch_in_epoch=17,
         num_batches_per_epoch=100,
         dataset_length=1712,
+        sampler_seed=42,
     )
 
     assert saved_states == [tmp_path / "step_20000" / "training_state"]
@@ -1493,6 +1495,13 @@ def test_joint_prepare_dataset_uses_epoch_seeded_sampler() -> None:
     assert isinstance(
         trainer.train_dataloader.sampler,
         contracts.EpochSeededRandomSampler,
+    )
+    assert trainer.train_dataloader.generator is not None
+    cpu_rng_before_iterator = torch.random.get_rng_state()
+    iter(trainer.train_dataloader)
+    torch.testing.assert_close(
+        torch.random.get_rng_state(),
+        cpu_rng_before_iterator,
     )
     assert all(
         isinstance(index, tuple) and len(index) == 2

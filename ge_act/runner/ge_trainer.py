@@ -495,6 +495,7 @@ def save_joint_checkpoint(
     next_batch_in_epoch: int,
     num_batches_per_epoch: int,
     dataset_length: int,
+    sampler_seed: int,
 ) -> None:
     """Save model exports on main and exact distributed state on every rank."""
 
@@ -613,7 +614,7 @@ def save_joint_checkpoint(
             "num_batches_per_epoch": num_batches_per_epoch,
             "per_device_batch_size": int(args.batch_size),
             "dataset_length": int(dataset_length),
-            "sampler_seed": int(args.seed),
+            "sampler_seed": int(sampler_seed),
             "gradient_accumulation_steps": int(
                 args.gradient_accumulation_steps
             ),
@@ -916,6 +917,7 @@ class Trainer:
         self.train_dataset = train_dataset_class(**self.args.data['train'])
 
         train_sampler = None
+        dataloader_generator = None
         shuffle = True
         if _joint_training_enabled(self.args):
             sampler_seed = int(self.args.seed if self.args.seed is not None else 0)
@@ -935,6 +937,12 @@ class Trainer:
                 self.train_dataset,
                 seed=sampler_seed,
             )
+            # DataLoader iterator construction samples a worker base seed. Keep
+            # that draw off the global CPU RNG restored by Accelerate, otherwise
+            # mid-epoch resume shifts later training randomness (for example
+            # prompt dropout) by one draw.
+            dataloader_generator = torch.Generator()
+            dataloader_generator.manual_seed(sampler_seed)
             shuffle = False
 
         self.train_dataloader = torch.utils.data.DataLoader(
@@ -951,6 +959,7 @@ class Trainer:
                 else None
             ),
             multiprocessing_context=None,
+            generator=dataloader_generator,
         )
         logger.info(f">>>>>>>>>>>>>Total Train Eps: {len(self.train_dataset)}<<<<<<<<<<<<<<<<<<\n")
 
@@ -1931,6 +1940,7 @@ class Trainer:
                             next_batch_in_epoch=next_batch_in_epoch,
                             num_batches_per_epoch=len(self.train_dataloader),
                             dataset_length=len(self.train_dataset),
+                            sampler_seed=self.train_sampler_seed,
                         )
                     else:
                         accelerator.wait_for_everyone()
@@ -1969,6 +1979,7 @@ class Trainer:
                 next_batch_in_epoch=next_batch_in_epoch,
                 num_batches_per_epoch=len(self.train_dataloader),
                 dataset_length=len(self.train_dataset),
+                sampler_seed=self.train_sampler_seed,
             )
         elif accelerator.is_main_process:
             self.diffusion_model = unwrap_model(accelerator, self.diffusion_model)

@@ -103,6 +103,9 @@ Each keeper step stores a self-contained joint checkpoint with:
   and NumPy RNGs derived from `(sampler_seed, epoch, sample_index)`, so shuffled
   order, frame selection, memory-frame selection, retry fallback, and random crop
   reproduce the same unprocessed suffix independently of worker scheduling;
+- a dedicated DataLoader generator for worker-base seeding, so recreating an
+  iterator during mid-epoch resume cannot consume the restored global CPU Torch RNG
+  used by later training stochasticity;
 - joint metadata recording source checkpoints, loss weights, all optimizer-group
   learning rates, K4 geometry, global batch size, and trainable parameter counts.
 
