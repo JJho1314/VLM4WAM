@@ -397,7 +397,7 @@ Use `accelerator.accumulate(self.joint_model)` and clip `self.joint_model.parame
 
 - [ ] **Step 6: Add joint checkpoint export and exact resume state**
 
-At keeper steps, unwrap the composite, save `model.ltx.save_pretrained(step_dir / "ltx")`, export planner model/head/processor under `step_dir / "planner"`, write `joint_meta.json` and `trainer_state.json`, then call `accelerator.save_state(step_dir / "training_state")` on every rank. After `accelerator.prepare`, an explicit `--resume_from_checkpoint` loads distributed state and restores global step, epoch, and prepared-dataloader position after validating world size, accumulation, and batches per epoch. Preserve the existing LTX-only save path when joint mode is disabled.
+At keeper steps, unwrap the composite, save `model.ltx.save_pretrained(step_dir / "ltx")`, export planner model/head/processor under `step_dir / "planner"`, write `joint_meta.json` and `trainer_state.json`, then call `accelerator.save_state(step_dir / "training_state")` on every rank. After `accelerator.prepare`, an explicit `--resume_from_checkpoint` loads distributed state and restores global step, epoch, and prepared-dataloader position after validating world size, per-device batch size, accumulation, dataset length, sampler seed, and batches per epoch. In joint mode, use an epoch-seeded sampler that emits `(sample_index, epoch)`; derive each sample's Python and NumPy RNGs from `(sampler_seed, epoch, sample_index)` so shuffled order, random frames, memory-frame selection, retries, and crops reproduce the same remaining suffix regardless of worker scheduling. Preserve the existing LTX-only save path when joint mode is disabled.
 
 - [ ] **Step 7: Apply smoke overrides before distributed initialization**
 

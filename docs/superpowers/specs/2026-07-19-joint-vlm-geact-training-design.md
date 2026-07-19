@@ -96,8 +96,13 @@ Each keeper step stores a self-contained joint checkpoint with:
   loader;
 - DeepSpeed optimizer and scheduler state for exact resume;
 - trainer progress metadata (global step, epoch, next prepared-dataloader batch,
-  world size, accumulation, and batches per epoch), restored only after
-  `accelerator.prepare` and validated before `accelerator.load_state`;
+  world size, per-device batch size, accumulation, dataset length, sampler seed,
+  and batches per epoch), restored only after `accelerator.prepare` and validated
+  before `accelerator.load_state`;
+- an epoch-seeded sampler that emits `(sample_index, epoch)` and per-sample Python
+  and NumPy RNGs derived from `(sampler_seed, epoch, sample_index)`, so shuffled
+  order, frame selection, memory-frame selection, retry fallback, and random crop
+  reproduce the same unprocessed suffix independently of worker scheduling;
 - joint metadata recording source checkpoints, loss weights, all optimizer-group
   learning rates, K4 geometry, global batch size, and trainable parameter counts.
 
@@ -131,8 +136,9 @@ Unit and integration tests must prove:
 4. Frozen SigLIP2 and DA3 teachers have no gradients.
 5. Optimizer groups are disjoint, complete, and use the specified learning rates.
 6. Joint save/load preserves both planner and LTX outputs and resumes optimizer,
-   scheduler, global step, epoch, and dataloader position without changing the
-   distributed batch geometry.
+   scheduler, global step, epoch, and the deterministic remaining data stream
+   without changing the distributed batch geometry, dataset length, or sampler
+   seed.
 7. A one-GPU one-step smoke passes before an 8-GPU ten-step smoke; the formal launch
    is permitted only after both smoke tests have finite losses and bounded memory.
    The single-GPU functional smoke uses an explicit 8-bit Adam override because

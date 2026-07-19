@@ -74,6 +74,27 @@ logger = get_logger("wm_runner")
 logger.setLevel(LOG_LEVEL)
 
 
+class EpochSeededRandomSampler(torch.utils.data.Sampler):
+    """Rebuild the same shuffled `(sample_index, epoch)` stream on resume."""
+
+    def __init__(self, data_source, *, seed: int) -> None:
+        self.data_source = data_source
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        order = torch.randperm(len(self.data_source), generator=generator).tolist()
+        return iter((int(index), self.epoch) for index in order)
+
+    def __len__(self) -> int:
+        return len(self.data_source)
+
+
 def compute_effective_video_fps(data_config: Dict[str, Any], default_source_fps: float = 30.0) -> float:
     """Convert source control FPS to the sampled video FPS used by GE-Act."""
 
@@ -473,6 +494,7 @@ def save_joint_checkpoint(
     epoch: int,
     next_batch_in_epoch: int,
     num_batches_per_epoch: int,
+    dataset_length: int,
 ) -> None:
     """Save model exports on main and exact distributed state on every rank."""
 
@@ -589,6 +611,9 @@ def save_joint_checkpoint(
             "epoch": epoch,
             "next_batch_in_epoch": next_batch_in_epoch,
             "num_batches_per_epoch": num_batches_per_epoch,
+            "per_device_batch_size": int(args.batch_size),
+            "dataset_length": int(dataset_length),
+            "sampler_seed": int(args.seed),
             "gradient_accumulation_steps": int(
                 args.gradient_accumulation_steps
             ),
@@ -609,6 +634,9 @@ def load_joint_resume_state(
     checkpoint_dir: str | Path,
     num_batches_per_epoch: int,
     gradient_accumulation_steps: int,
+    per_device_batch_size: int,
+    dataset_length: int,
+    sampler_seed: int,
 ) -> dict[str, int]:
     """Restore prepared distributed state and exact loop progress."""
 
@@ -636,6 +664,9 @@ def load_joint_resume_state(
         "schema_version": 1,
         "num_batches_per_epoch": int(num_batches_per_epoch),
         "gradient_accumulation_steps": int(gradient_accumulation_steps),
+        "per_device_batch_size": int(per_device_batch_size),
+        "dataset_length": int(dataset_length),
+        "sampler_seed": int(sampler_seed),
         "world_size": int(accelerator.num_processes),
     }
     for name, expected in required_values.items():
@@ -884,9 +915,32 @@ class Trainer:
         )
         self.train_dataset = train_dataset_class(**self.args.data['train'])
 
+        train_sampler = None
+        shuffle = True
+        if _joint_training_enabled(self.args):
+            sampler_seed = int(self.args.seed if self.args.seed is not None else 0)
+            configure_sampling = getattr(
+                self.train_dataset,
+                "set_deterministic_sampling_seed",
+                None,
+            )
+            if configure_sampling is None:
+                raise TypeError(
+                    "exact joint resume requires a dataset with "
+                    "set_deterministic_sampling_seed(seed)"
+                )
+            configure_sampling(sampler_seed)
+            self.train_sampler_seed = sampler_seed
+            train_sampler = EpochSeededRandomSampler(
+                self.train_dataset,
+                seed=sampler_seed,
+            )
+            shuffle = False
+
         self.train_dataloader = torch.utils.data.DataLoader(
             dataset=self.train_dataset,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=train_sampler,
             batch_size=self.args.batch_size,
             num_workers=self.args.dataloader_num_workers,
             pin_memory=getattr(self.args, "pin_memory", False),
@@ -1304,6 +1358,9 @@ class Trainer:
                     gradient_accumulation_steps=(
                         self.args.gradient_accumulation_steps
                     ),
+                    per_device_batch_size=self.args.batch_size,
+                    dataset_length=len(self.train_dataset),
+                    sampler_seed=self.train_sampler_seed,
                 )
         else:
             if getattr(self.args, "resume_from_checkpoint", None):
@@ -1367,6 +1424,7 @@ class Trainer:
         anomalies = []
         joint_enabled = _joint_training_enabled(self.args)
         session_start_time = time.monotonic()
+        session_samples_seen = 0
         last_epoch = first_epoch
         next_batch_in_epoch = resume_batch_in_epoch
 
@@ -1413,6 +1471,9 @@ class Trainer:
                     # shape: {b, c, v, t, h, w}; ranging from -1 to 1
                     video = video.to(accelerator.device, dtype=weight_dtype).contiguous()
                     batch_size, c, n_view, _, h, w = video.shape
+                    session_samples_seen += (
+                        batch_size * accelerator.num_processes
+                    )
                     mem_size = self.args.data['train']['n_previous']
                     semantic_keyframes = None
                     planner_semantic_plan = None
@@ -1789,9 +1850,7 @@ class Trainer:
                             "planner_semantic_mse": planner_semantic_mse.detach().item(),
                             "planner_depth_wsa_loss": planner_depth_wsa_loss.detach().item(),
                             "samples_per_second": (
-                                completed_session_steps
-                                * self.state.train_batch_size
-                                / elapsed
+                                session_samples_seen / elapsed
                             ),
                             "peak_memory_allocated": (
                                 int(torch.cuda.max_memory_allocated(accelerator.device))
@@ -1871,6 +1930,7 @@ class Trainer:
                             epoch=epoch,
                             next_batch_in_epoch=next_batch_in_epoch,
                             num_batches_per_epoch=len(self.train_dataloader),
+                            dataset_length=len(self.train_dataset),
                         )
                     else:
                         accelerator.wait_for_everyone()
@@ -1908,6 +1968,7 @@ class Trainer:
                 epoch=last_epoch,
                 next_batch_in_epoch=next_batch_in_epoch,
                 num_batches_per_epoch=len(self.train_dataloader),
+                dataset_length=len(self.train_dataset),
             )
         elif accelerator.is_main_process:
             self.diffusion_model = unwrap_model(accelerator, self.diffusion_model)

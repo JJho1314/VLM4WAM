@@ -6,6 +6,7 @@ import importlib.util
 import json
 import math
 import os
+import random
 import sys
 from copy import deepcopy
 from datetime import datetime
@@ -14,6 +15,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List
 
 import pytest
+import numpy as np
 import torch
 import torch.nn as nn
 from yaml import Loader, load
@@ -1190,6 +1192,7 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
         semantic_lr=1e-4,
         batch_size=1,
         gradient_accumulation_steps=16,
+        seed=42,
     )
     optimizer = SimpleNamespace(
         param_groups=[
@@ -1212,6 +1215,7 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
         epoch=3,
         next_batch_in_epoch=17,
         num_batches_per_epoch=100,
+        dataset_length=1712,
     )
 
     assert (step_dir / "ltx" / "ltx.txt").is_file()
@@ -1239,11 +1243,14 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
         (step_dir / "trainer_state.json").read_text(encoding="utf-8")
     )
     assert trainer_state == {
+        "dataset_length": 1712,
         "epoch": 3,
         "global_step": 20000,
         "gradient_accumulation_steps": 16,
         "next_batch_in_epoch": 17,
         "num_batches_per_epoch": 100,
+        "per_device_batch_size": 1,
+        "sampler_seed": 42,
         "schema_version": 1,
         "world_size": 8,
     }
@@ -1274,6 +1281,7 @@ def test_joint_checkpoint_calls_save_state_on_non_main_rank(tmp_path: Path) -> N
         epoch=3,
         next_batch_in_epoch=17,
         num_batches_per_epoch=100,
+        dataset_length=1712,
     )
 
     assert saved_states == [tmp_path / "step_20000" / "training_state"]
@@ -1294,6 +1302,9 @@ def test_joint_resume_loads_distributed_state_and_validates_progress(
                 "next_batch_in_epoch": 3,
                 "num_batches_per_epoch": 8,
                 "gradient_accumulation_steps": 1,
+                "per_device_batch_size": 1,
+                "dataset_length": 1712,
+                "sampler_seed": 42,
                 "world_size": 8,
             }
         ),
@@ -1310,6 +1321,9 @@ def test_joint_resume_loads_distributed_state_and_validates_progress(
         checkpoint_dir=step_dir,
         num_batches_per_epoch=8,
         gradient_accumulation_steps=1,
+        per_device_batch_size=1,
+        dataset_length=1712,
+        sampler_seed=42,
     )
 
     assert state["global_step"] == 10
@@ -1331,6 +1345,9 @@ def test_joint_resume_rejects_changed_batch_geometry(tmp_path: Path) -> None:
                 "next_batch_in_epoch": 3,
                 "num_batches_per_epoch": 8,
                 "gradient_accumulation_steps": 1,
+                "per_device_batch_size": 1,
+                "dataset_length": 1712,
+                "sampler_seed": 42,
                 "world_size": 8,
             }
         ),
@@ -1347,6 +1364,9 @@ def test_joint_resume_rejects_changed_batch_geometry(tmp_path: Path) -> None:
             checkpoint_dir=step_dir,
             num_batches_per_epoch=9,
             gradient_accumulation_steps=1,
+            per_device_batch_size=1,
+            dataset_length=1712,
+            sampler_seed=42,
         )
 
 
@@ -1367,6 +1387,9 @@ def test_joint_prepare_restores_after_accelerator_prepare(tmp_path: Path) -> Non
                 "next_batch_in_epoch": 3,
                 "num_batches_per_epoch": 8,
                 "gradient_accumulation_steps": 1,
+                "per_device_batch_size": 1,
+                "dataset_length": 1712,
+                "sampler_seed": 42,
                 "world_size": 8,
             }
         ),
@@ -1389,11 +1412,15 @@ def test_joint_prepare_restores_after_accelerator_prepare(tmp_path: Path) -> Non
     trainer.diffusion_model = object()
     trainer.optimizer = object()
     trainer.train_dataloader = list(range(8))
+    trainer.train_dataset = list(range(1712))
+    trainer.train_sampler_seed = 42
     trainer.lr_scheduler = object()
     trainer.args = SimpleNamespace(
         joint_training={"enabled": True},
         resume_from_checkpoint=str(step_dir),
         gradient_accumulation_steps=1,
+        batch_size=1,
+        seed=42,
     )
     trainer.state = SimpleNamespace(accelerator=FakeAccelerator())
     contracts.Trainer.prepare_for_training.__globals__["_joint_training_enabled"] = (
@@ -1407,6 +1434,99 @@ def test_joint_prepare_restores_after_accelerator_prepare(tmp_path: Path) -> Non
 
     assert events == ["prepare", "load_state"]
     assert trainer.resume_state["global_step"] == 10
+
+
+def test_epoch_seeded_sampler_reconstructs_exact_remaining_order() -> None:
+    contracts = _load_ge_trainer_symbols("EpochSeededRandomSampler")
+    uninterrupted = contracts.EpochSeededRandomSampler(range(17), seed=42)
+    resumed = contracts.EpochSeededRandomSampler(range(17), seed=42)
+    uninterrupted.set_epoch(3)
+    resumed.set_epoch(3)
+
+    full_order = list(uninterrupted)
+    resumed_order = list(resumed)[5:]
+
+    assert resumed_order == full_order[5:]
+    assert all(epoch == 3 for _index, epoch in full_order)
+    resumed.set_epoch(4)
+    assert list(resumed) != full_order
+
+
+def test_joint_prepare_dataset_uses_epoch_seeded_sampler() -> None:
+    contracts = _load_ge_trainer_symbols("EpochSeededRandomSampler", "Trainer")
+
+    class TinyDataset(torch.utils.data.Dataset):
+        def __init__(self) -> None:
+            self.seed = None
+
+        def set_deterministic_sampling_seed(self, seed: int) -> None:
+            self.seed = seed
+
+        def __len__(self) -> int:
+            return 9
+
+        def __getitem__(self, index):
+            return index
+
+    dataset = TinyDataset()
+    trainer = contracts.Trainer.__new__(contracts.Trainer)
+    trainer.args = SimpleNamespace(
+        train_data_class="TinyDataset",
+        train_data_class_path="unused.py",
+        data={"train": {}},
+        batch_size=2,
+        dataloader_num_workers=0,
+        pin_memory=False,
+        joint_training={"enabled": True},
+        seed=42,
+    )
+    method_globals = contracts.Trainer.prepare_dataset.__globals__
+    method_globals["_joint_training_enabled"] = lambda _args: True
+    method_globals["EpochSeededRandomSampler"] = (
+        contracts.EpochSeededRandomSampler
+    )
+    method_globals["import_custom_class"] = lambda *_args: lambda **_kwargs: dataset
+
+    trainer.prepare_dataset()
+
+    assert dataset.seed == 42
+    assert isinstance(
+        trainer.train_dataloader.sampler,
+        contracts.EpochSeededRandomSampler,
+    )
+    assert all(
+        isinstance(index, tuple) and len(index) == 2
+        for index in trainer.train_dataloader.sampler
+    )
+
+
+def test_lerobot_tuple_index_rebuilds_sample_rng_independent_of_worker_state() -> None:
+    from data.lerobot_like_dataset import CustomLeRobotDataset
+
+    dataset = CustomLeRobotDataset.__new__(CustomLeRobotDataset)
+    dataset.deterministic_sampling_seed = 42
+    dataset.fix_epiidx = None
+    dataset.require_predecoded = True
+    dataset.length = 20
+
+    def fake_get_batch(index, *, python_rng=None, numpy_rng=None):
+        return (
+            torch.tensor([python_rng.randint(0, 1_000_000)]),
+            torch.tensor([numpy_rng.integers(0, 1_000_000)]),
+            str(index),
+            torch.tensor([index]),
+        )
+
+    dataset.get_batch = fake_get_batch
+    first = dataset[(7, 3)]
+    random.seed(999)
+    np.random.seed(999)
+    second = dataset[(7, 3)]
+    other_epoch = dataset[(7, 4)]
+
+    torch.testing.assert_close(first["video"], second["video"])
+    torch.testing.assert_close(first["actions"], second["actions"])
+    assert not torch.equal(first["video"], other_epoch["video"])
 
 
 def test_nonfinite_loss_guard_rejects_inf_with_component_diagnostics() -> None:

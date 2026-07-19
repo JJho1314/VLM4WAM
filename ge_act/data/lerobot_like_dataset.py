@@ -310,11 +310,34 @@ class CustomLeRobotDataset(Dataset):
                 self.StatisticInfo = json.load(f)
 
         self.ignore_seek = ignore_seek
+        self.deterministic_sampling_seed = None
         ### pack per-timestep state into action tokens ([act; state] channels) and
         ### pad the history state token to the same width, following data/libero_dataset.py
         self.pack_action_state = pack_action_state
 
-    def get_frame_indexes(self, total_frames, ):
+    def set_deterministic_sampling_seed(self, seed):
+        self.deterministic_sampling_seed = int(seed)
+
+    def _make_sample_rngs(self, index, epoch):
+        if self.deterministic_sampling_seed is None:
+            raise RuntimeError(
+                "deterministic tuple indexes require a configured sampling seed"
+            )
+        seed_sequence = np.random.SeedSequence(
+            [self.deterministic_sampling_seed, int(epoch), int(index)]
+        )
+        python_seed = int(
+            seed_sequence.generate_state(1, dtype=np.uint64)[0]
+        )
+        return random.Random(python_seed), np.random.default_rng(seed_sequence)
+
+    def get_frame_indexes(
+        self,
+        total_frames,
+        *,
+        python_rng=None,
+        numpy_rng=None,
+    ):
         """
         select self.n_previous memory frames and self.action_chunk prediction frmaes
         1. randomly select the end frame
@@ -331,7 +354,12 @@ class CustomLeRobotDataset(Dataset):
             fix_mem_idx = np.clip(self.fix_mem_idx, a_min=0, a_max=total_frames-1).tolist()
             return fix_mem_idx + frame_indexes, fix_mem_idx + action_indexes
 
-        chunk_end = random.randint(self.action_chunk, total_frames+self.action_chunk)
+        python_rng = python_rng or random
+        numpy_rng = numpy_rng or np.random
+        chunk_end = python_rng.randint(
+            self.action_chunk,
+            total_frames + self.action_chunk,
+        )
 
         indexes_start = max(-self.n_previous, chunk_end-self.sample_n_frames) ### prevent indexes including too many zeros  when sample_n_frames is much larger than the length of the episode
         indexes = np.array(list(range(indexes_start, chunk_end)))
@@ -348,7 +376,7 @@ class CustomLeRobotDataset(Dataset):
             mem_indexes = [mem_candidates[int(i)] for i in np.linspace(0, len(mem_candidates)-1, self.n_previous).tolist()]
 
         elif self.previous_pick_mode == 'random':
-            mem_indexes = [mem_candidates[i] for i in sorted(np.random.choice(list(range(0,len(mem_candidates)-1)), size=self.n_previous-1, replace=False).tolist())] + [mem_candidates[-1]]
+            mem_indexes = [mem_candidates[i] for i in sorted(numpy_rng.choice(list(range(0,len(mem_candidates)-1)), size=self.n_previous-1, replace=False).tolist())] + [mem_candidates[-1]]
 
         else:
             raise NotImplementedError(f"unsupported previous_pick_mode: {self.previous_pick_mode}")
@@ -423,7 +451,15 @@ class CustomLeRobotDataset(Dataset):
         return video_list
 
 
-    def transform_video(self, videos, specific_transforms_resize, intrinsics, sample_size):
+    def transform_video(
+        self,
+        videos,
+        specific_transforms_resize,
+        intrinsics,
+        sample_size,
+        *,
+        python_rng=None,
+    ):
         """
         crop (optional) and resize the videos, and modify the intrinsic accordingly
         """
@@ -434,7 +470,13 @@ class CustomLeRobotDataset(Dataset):
             video = videos[iv]
             c, t, h, w = video.shape
             if self.random_crop:
-                h_start, w_start, h_crop, w_crop = gen_crop_config(video)
+                if python_rng is None:
+                    h_start, w_start, h_crop, w_crop = gen_crop_config(video)
+                else:
+                    h_start = python_rng.randint(0, h // 8)
+                    w_start = python_rng.randint(0, w // 8)
+                    h_crop = python_rng.randint(7 * h // 8, h - h_start)
+                    w_crop = python_rng.randint(7 * w // 8, w - w_start)
                 video = video[:,:,h_start:h_start+h_crop,w_start:w_start+w_crop]
                 if intrinsics is not None:
                     intrinsic = intrin_crop_transform(intrinsics[iv], h_start, w_start)
@@ -498,7 +540,7 @@ class CustomLeRobotDataset(Dataset):
 
 
 
-    def get_batch(self, idx):
+    def get_batch(self, idx, *, python_rng=None, numpy_rng=None):
 
         video_path = self.dataset[idx][0]
         parquet_path = self.dataset[idx][2]
@@ -508,7 +550,11 @@ class CustomLeRobotDataset(Dataset):
         total_frames = self.dataset[idx][7]
 
         sample_size, specific_transforms_resize, specific_transforms_norm = self.get_transform()
-        vid_indexes, indexes = self.get_frame_indexes(total_frames, )
+        vid_indexes, indexes = self.get_frame_indexes(
+            total_frames,
+            python_rng=python_rng,
+            numpy_rng=numpy_rng,
+        )
 
         data = pd.read_parquet(parquet_path)
 
@@ -580,7 +626,11 @@ class CustomLeRobotDataset(Dataset):
         videos = self.seek_mp4(video_path, self.valid_cam, vid_indexes)
 
         videos, _ = self.transform_video(
-            videos, specific_transforms_resize, None, sample_size
+            videos,
+            specific_transforms_resize,
+            None,
+            sample_size,
+            python_rng=python_rng,
         )
         videos = self.normalize_video(videos, specific_transforms_norm)
 
@@ -595,23 +645,41 @@ class CustomLeRobotDataset(Dataset):
 
         # video, actions, caption, state = self.get_batch(idx)
 
+        python_rng = None
+        numpy_rng = None
+        if isinstance(idx, (tuple, list)):
+            if len(idx) != 2:
+                raise ValueError(
+                    "deterministic dataset indexes must be (sample_index, epoch)"
+                )
+            idx, epoch = (int(idx[0]), int(idx[1]))
+            python_rng, numpy_rng = self._make_sample_rngs(idx, epoch)
+
         if self.fix_epiidx is not None:
-            video, actions, caption, state = self.get_batch(self.fix_epiidx)
+            video, actions, caption, state = self.get_batch(
+                self.fix_epiidx,
+                python_rng=python_rng,
+                numpy_rng=numpy_rng,
+            )
         else:
             while True:
                 try:
-                    video, actions, caption, state = self.get_batch(idx)
+                    video, actions, caption, state = self.get_batch(
+                        idx,
+                        python_rng=python_rng,
+                        numpy_rng=numpy_rng,
+                    )
                     break
                 except (PredecodedRGBFileNotFoundError, InvalidPredecodedRGBError):
                     if self.require_predecoded:
                         raise
                     traceback.print_exc()
-                    idx = random.randint(0, self.length-1)
+                    idx = (python_rng or random).randint(0, self.length-1)
                 except:
                     ### print error information to debug
                     traceback.print_exc()
                     ###
-                    idx = random.randint(0, self.length-1)
+                    idx = (python_rng or random).randint(0, self.length-1)
 
         sample = dict(
             video=video,
