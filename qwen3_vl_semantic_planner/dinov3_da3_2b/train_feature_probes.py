@@ -27,7 +27,28 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "dinov3_da3_2b"))
 
+try:
+    from .wsa_depth_probe import WSAMultiLayerDPTProbe
+except ImportError:  # direct script entry point
+    from wsa_depth_probe import WSAMultiLayerDPTProbe
+
 FRAME_CACHE = os.environ.get("FASTWAM_FRAME_CACHE_DIR", "/data/users/junjie/data/frame_cache/libero")
+
+PROBE_CHECKPOINT_STEMS = {
+    "dino": "dino_rgb",
+    "dino_up": "dino_upsample",
+    "da3": "da3_depth",
+    "da3_v2": "da3_depth_v2",
+    "da3_wsa": "da3_depth_wsa",
+}
+PROBE_CHOICES = (*PROBE_CHECKPOINT_STEMS, "both")
+
+
+def probe_checkpoint_stem(which: str) -> str:
+    try:
+        return PROBE_CHECKPOINT_STEMS[str(which)]
+    except KeyError as error:
+        raise ValueError(f"unsupported probe kind: {which!r}") from error
 
 
 class FrameCacheDataset(torch.utils.data.Dataset):
@@ -186,7 +207,7 @@ def grad_match(pred, gt, scales=(1, 2, 4)):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--which", choices=["dino", "dino_up", "da3", "da3_v2", "both"], default="both")
+    ap.add_argument("--which", choices=PROBE_CHOICES, default="both")
     ap.add_argument("--steps", type=int, default=5000)
     ap.add_argument("--batch-size", type=int, default=28)
     ap.add_argument("--lr", type=float, default=2e-4)
@@ -230,6 +251,54 @@ def main():
             def loss_fn(pred, tgt):
                 cos = F.cosine_similarity(pred, tgt, dim=-1).mean()
                 return F.mse_loss(pred, tgt) + (1.0 - cos)
+        elif w == "da3_wsa":
+            from depth_anything3_target import _import_da3, DepthAnything3TargetEncoder
+            teacher_layers = tuple(
+                int(value)
+                for value in os.environ.get(
+                    "DA3_TEACHER_LAYERS", "11,15,19,23"
+                ).split(",")
+                if value.strip()
+            )
+            enc = DepthAnything3TargetEncoder(
+                process_res=int(os.environ.get("DA3_PROCESS_RES", "224")),
+                device=device,
+                align_strategy="wsa_multilayer",
+                teacher_layers=teacher_layers,
+            )
+            in_dim = enc.feature_dim
+            DA3 = _import_da3(os.environ["DA3_CODE_ROOT"])
+            full = DA3.from_pretrained(os.environ["DA3_CKPT_DIR"]).to(device).eval()
+            for p in full.parameters():
+                p.requires_grad_(False)
+            m = full.model
+            probe = WSAMultiLayerDPTProbe(
+                in_dim=in_dim,
+                feat=256,
+                grid=enc.process_res // 14,
+                output_size=224,
+                teacher_layers=enc.teacher_layers,
+            ).to(device)
+            teacher_feats = lambda fr: enc._patch_tokens(enc._prep(fr)).float()
+
+            @torch.no_grad()
+            def target_of(fr):
+                x = enc._prep(fr).to(next(m.parameters()).dtype).unsqueeze(1)
+                feats, _aux = m.backbone(
+                    x,
+                    cam_token=None,
+                    export_feat_layers=[],
+                    ref_view_strategy="saddle_balanced",
+                )
+                with torch.autocast(device_type="cuda", enabled=False):
+                    out = m._process_depth_head(feats, 224, 224)
+                depth = (
+                    out["depth"] if hasattr(out, "keys") else out.depth
+                ).float().clamp_min(1e-3)
+                return torch.log(depth)
+
+            def loss_fn(pred, tgt):
+                return silog_loss(pred, tgt) + 0.5 * grad_match(pred, tgt)
         elif w == "da3_v2":
             from depth_anything3_target import _import_da3, DepthAnything3TargetEncoder
             enc = DepthAnything3TargetEncoder(process_res=int(os.environ.get("DA3_PROCESS_RES", "224")), device=device)
@@ -297,14 +366,23 @@ def main():
                 avg = sum(losses[-args.log_every:]) / min(len(losses), args.log_every)
                 print(f"[{w}] step {step}/{args.steps} loss={loss.item():.5f} avg{args.log_every}={avg:.5f} lr={sched.get_last_lr()[0]:.2e}", flush=True)
 
-        name = {"dino": "dino_rgb", "dino_up": "dino_upsample", "da3": "da3_depth", "da3_v2": "da3_depth_v2"}[w]
+        name = probe_checkpoint_stem(w)
         ckpt = args.out_dir / f"{name}_probe.pt"
-        torch.save({"state_dict": probe.state_dict(), "config": probe.config(),
-                    "which": w, "in_dim": in_dim, "final_loss": float(sum(losses[-100:]) / min(len(losses),100))}, ckpt)
+        checkpoint_payload = {
+            "state_dict": probe.state_dict(),
+            "config": probe.config(),
+            "which": w,
+            "in_dim": in_dim,
+            "final_loss": float(sum(losses[-100:]) / min(len(losses), 100)),
+        }
+        if w == "da3_wsa":
+            checkpoint_payload["teacher_layers"] = list(enc.teacher_layers)
+            checkpoint_payload["normalization"] = probe.NORMALIZATION
+        torch.save(checkpoint_payload, ckpt)
         (args.out_dir / f"{name}_probe_meta.json").write_text(json.dumps(probe.config()))
         print(f"[{w}] SAVED {ckpt} final_avg100={sum(losses[-100:])/min(len(losses),100):.5f}", flush=True)
         del probe, enc
-        if w in ("da3", "da3_v2"):
+        if w in ("da3", "da3_v2", "da3_wsa"):
             del full
         torch.cuda.empty_cache()
 

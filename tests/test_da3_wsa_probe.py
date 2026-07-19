@@ -5,6 +5,10 @@ import io
 import pytest
 import torch
 
+from qwen3_vl_semantic_planner.dinov3_da3_2b.train_feature_probes import (
+    PROBE_CHOICES,
+    probe_checkpoint_stem,
+)
 from qwen3_vl_semantic_planner.dinov3_da3_2b.wsa_depth_probe import (
     WSAMultiLayerDPTProbe,
 )
@@ -91,3 +95,10 @@ def test_wsa_probe_state_dict_round_trip_preserves_output() -> None:
     restored.load_state_dict(saved["state_dict"], strict=True)
 
     torch.testing.assert_close(restored(tokens), expected)
+
+
+def test_probe_training_cli_exposes_wsa_without_renaming_legacy_artifacts() -> None:
+    assert "da3_wsa" in PROBE_CHOICES
+    assert probe_checkpoint_stem("da3_wsa") == "da3_depth_wsa"
+    assert probe_checkpoint_stem("da3_v2") == "da3_depth_v2"
+    assert probe_checkpoint_stem("dino_up") == "dino_upsample"
