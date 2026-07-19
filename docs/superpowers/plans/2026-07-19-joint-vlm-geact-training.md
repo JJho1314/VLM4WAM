@@ -518,7 +518,9 @@ Require K4 offsets, WSA metadata, two views, width 1024, batch contract 128, all
 The launcher exports offline HF settings, constrains CPU math threads, verifies all
 predecoded caches, runs preflight, and launches `torchrun`. `RUN_KIND=smoke` selects
 one GPU and passes `--max_train_steps 1 --batch_size_override 1
---gradient_accumulation_steps_override 1 --disable_deepspeed`; `RUN_KIND=smoke8`
+--gradient_accumulation_steps_override 1 --disable_deepspeed
+--enable_8bit_optimizer` so the full 4.67B trainable parameters fit for the
+functional smoke; `RUN_KIND=smoke8`
 keeps eight GPUs and ZeRO-2 enabled but bounds the run to ten optimizer steps with
 per-GPU batch and accumulation both set to one. Neither mode edits the formal YAML.
 

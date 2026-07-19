@@ -135,6 +135,9 @@ Unit and integration tests must prove:
    distributed batch geometry.
 7. A one-GPU one-step smoke passes before an 8-GPU ten-step smoke; the formal launch
    is permitted only after both smoke tests have finite losses and bounded memory.
+   The single-GPU functional smoke uses an explicit 8-bit Adam override because
+   full-model standard Adam state does not fit on one 80GB H100; the 8-GPU smoke
+   and formal recipe retain standard AdamW with ZeRO-2.
 
 The first formal run should log total, video, planner semantic, planner depth, and
 per-layer DA3 losses, all four learning rates, VLM/LTX gradient norms, throughput, and

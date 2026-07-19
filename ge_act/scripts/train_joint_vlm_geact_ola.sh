@@ -47,6 +47,7 @@ if [[ "$RUN_KIND" == "smoke" ]]; then
     --batch_size_override 1
     --gradient_accumulation_steps_override 1
     --disable_deepspeed
+    --enable_8bit_optimizer
   )
 elif [[ "$RUN_KIND" == "smoke8" ]]; then
   MAIN_ARGS+=(

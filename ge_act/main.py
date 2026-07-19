@@ -49,6 +49,11 @@ def main():
         help='disable DeepSpeed for a bounded single-process smoke test',
     )
     parser.add_argument(
+        '--enable_8bit_optimizer',
+        action='store_true',
+        help='use bitsandbytes Adam for a memory-bounded single-GPU smoke test',
+    )
+    parser.add_argument(
         '--resume_from_checkpoint',
         type=str,
         default=None,
@@ -74,6 +79,8 @@ def main():
             )
         if args.disable_deepspeed:
             config_overrides["use_deepspeed"] = False
+        if args.enable_8bit_optimizer:
+            config_overrides["optimizer_8bit"] = True
         if args.resume_from_checkpoint is not None:
             config_overrides["resume_from_checkpoint"] = (
                 args.resume_from_checkpoint

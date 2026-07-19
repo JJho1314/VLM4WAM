@@ -596,6 +596,7 @@ def test_joint_ola_launcher_has_formal_and_bounded_smoke_modes() -> None:
         "--batch_size_override",
         "--gradient_accumulation_steps_override",
         "--disable_deepspeed",
+        "--enable_8bit_optimizer",
     ):
         assert argument in launcher
     assert "--max_train_steps 10" in launcher

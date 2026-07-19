@@ -1108,6 +1108,7 @@ def test_main_smoke_flags_are_forwarded_as_constructor_overrides(
             "--gradient_accumulation_steps_override",
             "1",
             "--disable_deepspeed",
+            "--enable_8bit_optimizer",
             "--resume_from_checkpoint",
             str(tmp_path / "step_000010"),
         ],
@@ -1120,6 +1121,7 @@ def test_main_smoke_flags_are_forwarded_as_constructor_overrides(
         "batch_size": 1,
         "gradient_accumulation_steps": 1,
         "use_deepspeed": False,
+        "optimizer_8bit": True,
         "resume_from_checkpoint": str(tmp_path / "step_000010"),
     }
 
