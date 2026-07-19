@@ -354,6 +354,21 @@ class FrozenDualCameraVLMPlanner:
             device=resolved_device,
         )
 
+    def prepare_inputs(
+        self,
+        current_images: torch.Tensor,
+        instructions: Sequence[str],
+    ) -> dict[str, torch.Tensor]:
+        image_pairs = normalized_bvchw_to_pil_pairs(current_images)
+        return self.input_mover(
+            self.input_builder(
+                self.processor,
+                image_pairs,
+                [str(value) for value in instructions],
+                self.plan_tokens,
+            )
+        )
+
     @torch.no_grad()
     def predict(
         self,
@@ -369,15 +384,7 @@ class FrozenDualCameraVLMPlanner:
                 "current_images/instructions batch mismatch: "
                 f"{current_images.shape[0]} != {len(instructions)}"
             )
-        image_pairs = normalized_bvchw_to_pil_pairs(current_images)
-        model_inputs = self.input_mover(
-            self.input_builder(
-                self.processor,
-                image_pairs,
-                [str(instruction) for instruction in instructions],
-                self.plan_tokens,
-            )
-        )
+        model_inputs = self.prepare_inputs(current_images, instructions)
         if bool(getattr(self.wrapper, "use_current_alignment", self.num_keyframes == 1)):
             plans = self.wrapper.predict_current_future_plans(**model_inputs)
             future = plans.get("future_dino")

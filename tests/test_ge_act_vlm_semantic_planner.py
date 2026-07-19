@@ -184,6 +184,36 @@ def test_frozen_k4_provider_reshapes_each_camera_without_copying_views() -> None
     assert wrapper.received is not None
 
 
+def test_provider_prepare_inputs_does_not_run_qwen() -> None:
+    wrapper = FakeK4DualWrapper()
+    metadata = valid_k4_metadata()
+    moved = False
+
+    def recording_mover(inputs: dict[str, Any]) -> dict[str, Any]:
+        nonlocal moved
+        moved = True
+        return inputs
+
+    provider = FrozenDualCameraVLMPlanner.from_components(
+        wrapper=wrapper,
+        processor=FakeProcessor(),
+        input_builder=flexible_fake_input_builder,
+        input_mover=recording_mover,
+        plan_tokens=metadata["plan_token_strings"],
+        metadata=metadata,
+        device="cpu",
+    )
+
+    model_inputs = provider.prepare_inputs(
+        torch.zeros(2, 2, 3, 8, 8),
+        ["pick", "place"],
+    )
+
+    assert model_inputs["input_ids"].shape == (2, 1)
+    assert moved
+    assert wrapper.received is None
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

@@ -2746,6 +2746,33 @@ class PlannerWrapper(nn.Module):
             )
         return dino_plan, depth_plan
 
+    def predict_dino_depth_plan_with_losses(
+        self,
+        semantic_plan_labels: torch.Tensor,
+        depth_plan_labels: torch.Tensor,
+        **inputs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        semantic, depth = self.predict_dino_depth_plan(**inputs)
+        losses = self.compute_plan_losses(
+            semantic,
+            semantic_plan_labels.to(device=semantic.device, dtype=torch.float32),
+        )
+        depth_target = self._reshape_depth_target(
+            depth_plan_labels.to(device=depth.device, dtype=torch.float32)
+        )
+        if self.da3_align_strategy == "wsa_multilayer":
+            depth_loss, depth_cos, depth_lnmse = self._wsa_layer_loss(
+                depth,
+                depth_target,
+            )
+            losses["depth_cos"] = depth_cos.detach()
+            losses["depth_lnmse"] = depth_lnmse.detach()
+        else:
+            depth_loss = F.smooth_l1_loss(depth, depth_target)
+        losses["loss"] = losses["loss"] + self.depth_loss_weight * depth_loss
+        losses["depth_smooth_l1"] = depth_loss.detach()
+        return semantic, depth, losses
+
     def predict_current_future_plans(
         self,
         **model_inputs: Any,
@@ -2946,34 +2973,23 @@ class PlannerWrapper(nn.Module):
                         ).detach()
                 return out
             if self.depth_head is not None:
-                pred, depth_pred = self.predict_dino_depth_plan(**inputs)
-            else:
-                pred = self.predict_semantic_plan(**inputs)
-                depth_pred = None
+                if depth_plan_labels is None:
+                    raise ValueError("DINO+depth alignment requires depth labels")
+                _pred, _depth_pred, out = (
+                    self.predict_dino_depth_plan_with_losses(
+                        semantic_plan_labels=semantic_plan_labels,
+                        depth_plan_labels=depth_plan_labels,
+                        **inputs,
+                    )
+                )
+                return out
+            pred = self.predict_semantic_plan(**inputs)
             if pred.shape[0] != batch or pred.shape[-2] != self.target_len:
                 raise RuntimeError(
                     f"Prediction batch/tokens {pred.shape[0]}/{pred.shape[-2]} != "
                     f"{batch}/{self.target_len}"
                 )
             out = self.compute_plan_losses(pred, semantic_plan_labels.to(device=pred.device, dtype=torch.float32))
-            if depth_pred is not None and depth_plan_labels is not None:
-                depth_target = self._reshape_depth_target(
-                    depth_plan_labels.to(device=pred.device, dtype=torch.float32)
-                )
-                if self.da3_align_strategy == "wsa_multilayer":
-                    depth_l, depth_cos, depth_mse = self._wsa_layer_loss(
-                        depth_pred,
-                        depth_target,
-                    )
-                    out["depth_cos"] = depth_cos.detach()
-                    out["depth_lnmse"] = depth_mse.detach()
-                else:
-                    depth_l = F.smooth_l1_loss(depth_pred, depth_target)
-                out["loss"] = out["loss"] + self.depth_loss_weight * depth_l
-                out["depth_smooth_l1"] = depth_l.detach()
-                out["depth_norm_ratio"] = (
-                    depth_pred.norm(dim=-1).mean() / depth_target.norm(dim=-1).mean().clamp_min(1e-6)
-                ).detach()
             return out
         pred = self.predict_semantic_plan(**inputs)
         if pred.shape[0] != batch:

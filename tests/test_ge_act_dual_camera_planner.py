@@ -673,6 +673,81 @@ def test_future_only_k4_wsa_prediction_preserves_views_and_layers() -> None:
     )
 
 
+def test_future_only_k4_wsa_prediction_with_losses_runs_one_pass() -> None:
+    wrapper = make_fake_future_k4_wrapper()
+    wrapper.mse_loss_weight = 1.0
+    wrapper.cosine_loss_weight = 0.0
+    wrapper.norm_loss_weight = 0.0
+    wrapper.variance_loss_weight = 0.0
+    wrapper.infonce_loss_weight = 0.0
+    wrapper.infonce_temperature = 0.07
+    wrapper.depth_loss_weight = 0.004
+    wrapper.da3_layer_weights = torch.ones(4)
+    semantic_target = torch.ones(1, 2, 4 * 256, 8)
+    depth_target = torch.ones(1, 2, 4, 4 * 256, 8)
+    input_ids = torch.ones(1, 1, dtype=torch.long)
+    calls = 0
+    original_predict = wrapper.predict_dino_depth_plan
+
+    def counted_predict(**inputs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        nonlocal calls
+        calls += 1
+        return original_predict(**inputs)
+
+    wrapper.predict_dino_depth_plan = counted_predict
+
+    semantic, depth, losses = wrapper.predict_dino_depth_plan_with_losses(
+        semantic_plan_labels=semantic_target,
+        depth_plan_labels=depth_target,
+        input_ids=input_ids,
+    )
+
+    assert calls == 1
+    assert semantic.shape == semantic_target.shape
+    assert depth.shape == (1, 2, 1024, 4, 8)
+    assert torch.isfinite(losses["loss"])
+
+
+def test_future_only_k4_forward_reuses_prediction_with_losses() -> None:
+    wrapper = make_fake_future_k4_wrapper()
+    wrapper.target_len = 4 * 256
+    semantic_target = torch.ones(1, 2, 4 * 256, 8)
+    depth_target = torch.ones(1, 2, 4, 4 * 256, 8)
+    expected_losses = {"loss": torch.tensor(3.0)}
+    calls = 0
+
+    def fail_duplicate_path(**_inputs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        raise AssertionError("forward bypassed the one-pass loss API")
+
+    def counted_with_losses(
+        semantic_plan_labels: torch.Tensor,
+        depth_plan_labels: torch.Tensor,
+        **inputs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        nonlocal calls
+        calls += 1
+        assert semantic_plan_labels is semantic_target
+        assert depth_plan_labels is depth_target
+        assert "input_ids" in inputs
+        return (
+            torch.zeros_like(semantic_target),
+            torch.zeros(1, 2, 4 * 256, 4, 8),
+            expected_losses,
+        )
+
+    wrapper.predict_dino_depth_plan = fail_duplicate_path
+    wrapper.predict_dino_depth_plan_with_losses = counted_with_losses
+
+    actual = wrapper(
+        semantic_plan_labels=semantic_target,
+        depth_plan_labels=depth_target,
+        input_ids=torch.ones(1, 1, dtype=torch.long),
+    )
+
+    assert calls == 1
+    assert actual is expected_losses
+
+
 def test_wsa_depth_target_reshape_preserves_dual_camera_dimension() -> None:
     wrapper = make_fake_future_k4_wrapper()
     target = torch.arange(2 * 2 * 4 * 1024 * 8).reshape(2, 2, 4, 1024, 8)
