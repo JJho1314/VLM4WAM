@@ -52,8 +52,6 @@ if [[ "$RUN_KIND" == "smoke" ]]; then
 elif [[ "$RUN_KIND" == "smoke8" ]]; then
   MAIN_ARGS+=(
     --max_train_steps 10
-    --batch_size_override 1
-    --gradient_accumulation_steps_override 1
   )
 elif [[ "$RUN_KIND" != "formal" ]]; then
   echo "RUN_KIND must be formal, smoke, or smoke8, got '$RUN_KIND'" >&2

@@ -284,8 +284,8 @@ def test_joint_vlm_geact_config_matches_approved_recipe() -> None:
 
     assert config["train_steps"] == 30_000
     assert config["save_steps"] == [20_000, 25_000, 30_000]
-    assert config["batch_size"] == 1
-    assert config["gradient_accumulation_steps"] == 16
+    assert config["batch_size"] == 2
+    assert config["gradient_accumulation_steps"] == 8
     assert config["batch_size"] * config["gradient_accumulation_steps"] * 8 == 128
     assert config["mixed_precision"] == "bf16"
     assert config["gradient_checkpointing"] is True
@@ -364,8 +364,8 @@ def test_joint_preflight_rejects_geometry_lr_batch_and_checkpointing_drift() -> 
     config["diffusion_model"]["config"]["semantic_plan_num_views"] = 1
     config["lr"] = 3e-5
     config["semantic_lr"] = 2e-4
-    config["batch_size"] = 2
-    config["gradient_accumulation_steps"] = 8
+    config["batch_size"] = 1
+    config["gradient_accumulation_steps"] = 16
     config["gradient_checkpointing"] = False
     joint = config["joint_training"]
     joint["qwen_lr"] = 2e-6
@@ -383,7 +383,7 @@ def test_joint_preflight_rejects_geometry_lr_batch_and_checkpointing_drift() -> 
 
     for expected in (
         "joint VLM planner keyframe offsets must be [2, 4, 6, 8]",
-        "joint training requires per-GPU batch 1 and accumulation 16",
+        "joint training requires per-GPU batch 2 and accumulation 8",
         "joint LTX base lr must be 2e-5",
         "joint LTX semantic lr must be 1e-4",
         "joint Qwen lr must be 1e-6",
@@ -599,7 +599,15 @@ def test_joint_ola_launcher_has_formal_and_bounded_smoke_modes() -> None:
         "--enable_8bit_optimizer",
     ):
         assert argument in launcher
-    assert "--max_train_steps 10" in launcher
+    smoke8_branch = launcher.split(
+        'elif [[ "$RUN_KIND" == "smoke8" ]]', 1
+    )[1]
+    smoke8_branch = smoke8_branch.split(
+        'elif [[ "$RUN_KIND" != "formal" ]]', 1
+    )[0]
+    assert "--max_train_steps 10" in smoke8_branch
+    assert "--batch_size_override" not in smoke8_branch
+    assert "--gradient_accumulation_steps_override" not in smoke8_branch
     assert "RUN_KIND must be formal, smoke, or smoke8" in launcher
     for variable in (
         "HF_HUB_OFFLINE",

@@ -50,9 +50,9 @@ enable_tiling: true
 add_state: false
 caption_dropout_p: 0.06
 
-# 1 sample/GPU * 8 GPUs * 16 accumulation = global batch 128.
-batch_size: 1
-gradient_accumulation_steps: 16
+# 2 samples/GPU * 8 GPUs * 8 accumulation = global batch 128.
+batch_size: 2
+gradient_accumulation_steps: 8
 dataloader_num_workers: 8
 dataloader_prefetch_factor: 4
 pin_memory: true
