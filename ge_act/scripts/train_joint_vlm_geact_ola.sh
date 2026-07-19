@@ -65,7 +65,8 @@ cd "$GE_ACT_ROOT"
 # changes are CLI-only and never mutate the checked-in YAML.
 "$PY" scripts/preflight_ltx_siglip2.py \
   --config "$CONFIG" \
-  --world-size 8
+  --world-size 8 \
+  --require-joint-formal
 
 exec "$TORCHRUN" \
   --standalone \

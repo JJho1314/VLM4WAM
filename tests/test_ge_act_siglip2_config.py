@@ -584,6 +584,7 @@ def test_joint_ola_launcher_has_formal_and_bounded_smoke_modes() -> None:
     assert "predecode_lerobot_videos.py" in launcher
     assert "--verify-only" in launcher
     assert "preflight_ltx_siglip2.py" in launcher
+    assert "--require-joint-formal" in launcher
     for argument in (
         "--max_train_steps",
         "--batch_size_override",
@@ -601,3 +602,32 @@ def test_joint_ola_launcher_has_formal_and_bounded_smoke_modes() -> None:
         "NUMEXPR_NUM_THREADS",
     ):
         assert f"export {variable}=" in launcher
+
+
+def test_required_joint_formal_mode_rejects_disabled_or_missing_joint_config() -> None:
+    disabled = copy.deepcopy(yaml.safe_load(JOINT_CONFIG_PATH.read_text()))
+    disabled["joint_training"]["enabled"] = False
+    missing = copy.deepcopy(disabled)
+    missing.pop("joint_training")
+
+    for config in (disabled, missing):
+        errors = collect_preflight_errors(
+            config,
+            world_size=8,
+            check_paths=False,
+            require_joint_formal=True,
+        )
+        assert "formal joint preflight requires joint_training.enabled=true" in errors
+
+
+def test_default_preflight_mode_preserves_legacy_gt_and_frozen_vlm_configs() -> None:
+    for path in (CONFIG_PATH, VLM_CONFIG_PATH):
+        config = yaml.safe_load(path.read_text())
+        assert (
+            collect_preflight_errors(
+                config,
+                world_size=8,
+                check_paths=False,
+            )
+            == []
+        )

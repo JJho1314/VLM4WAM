@@ -59,6 +59,7 @@ def collect_preflight_errors(
     check_paths: bool = True,
     ge_act_root: Path | None = None,
     minimum_free_gb: float = 100.0,
+    require_joint_formal: bool = False,
 ) -> list[str]:
     errors: list[str] = []
     ge_act_root = ge_act_root or Path(__file__).resolve().parents[1]
@@ -71,6 +72,8 @@ def collect_preflight_errors(
     semantic_source = semantic.get("source", "gt_siglip2")
     joint = config.get("joint_training", {})
     joint_enabled = isinstance(joint, dict) and bool(joint.get("enabled", False))
+    if require_joint_formal and not joint_enabled:
+        errors.append("formal joint preflight requires joint_training.enabled=true")
     hdf5_backend = config.get("train_data_class") == "LiberoFastWAMHDF5Dataset"
     if not semantic.get("enabled", False):
         errors.append("semantic_plan.enabled must be true")
@@ -434,6 +437,7 @@ def main() -> int:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--world-size", type=int, default=8)
     parser.add_argument("--minimum-free-gb", type=float, default=100.0)
+    parser.add_argument("--require-joint-formal", action="store_true")
     args = parser.parse_args()
     with args.config.open() as handle:
         config = yaml.safe_load(handle)
@@ -441,6 +445,7 @@ def main() -> int:
         config,
         world_size=args.world_size,
         minimum_free_gb=args.minimum_free_gb,
+        require_joint_formal=args.require_joint_formal,
     )
     if errors:
         print("GE-Act SigLIP2 preflight failed:")
