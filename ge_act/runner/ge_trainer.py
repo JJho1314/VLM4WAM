@@ -601,6 +601,7 @@ def save_joint_checkpoint(
             if group.get("name") is not None
         }
         required_optimizer_groups = {
+            "action_ltx",
             "base_ltx",
             "semantic_ltx",
             "qwen",
@@ -619,6 +620,8 @@ def save_joint_checkpoint(
             "source_planner_checkpoint": str(planner_checkpoint),
             "source_ltx_checkpoint": str(args.diffusion_model["model_path"]),
             "planner_loss_weight": float(joint_config["planner_loss_weight"]),
+            "action_loss_scale": float(args.action_loss_scale),
+            "train_mode": str(args.train_mode),
             "lm_plan_loss_weight": float(model.planner.lm_plan_loss_weight),
             "optimizer_group_lrs": {
                 name: optimizer_group_lrs[name]
@@ -655,6 +658,11 @@ def save_joint_checkpoint(
                     parameter.numel()
                     for parameter in model.ltx.parameters()
                     if parameter.requires_grad
+                ),
+                "action_ltx": sum(
+                    parameter.numel()
+                    for name, parameter in model.ltx.named_parameters()
+                    if parameter.requires_grad and is_action_parameter_name(name)
                 ),
                 "planner": sum(
                     parameter.numel()

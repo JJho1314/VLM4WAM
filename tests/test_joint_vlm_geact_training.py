@@ -67,6 +67,7 @@ def _load_ge_trainer_symbols(*names: str) -> SimpleNamespace:
         "build_joint_optimizer_parameter_groups": (
             build_joint_optimizer_parameter_groups
         ),
+        "is_action_parameter_name": joint_vlm_geact_module.is_action_parameter_name,
         "datetime": datetime,
         "deepcopy": deepcopy,
         "dist": SimpleNamespace(broadcast=lambda *_args, **_kwargs: None),
@@ -1417,8 +1418,10 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
         wrapper=planner,
         processor=_SaveableModule("processor"),
     )
+    ltx = _SaveableModule("ltx")
+    ltx.action_proj = nn.Linear(1, 1, bias=False)
     composite = SimpleNamespace(
-        ltx=_SaveableModule("ltx"),
+        ltx=ltx,
         planner=planner,
     )
     saved_states: list[Path] = []
@@ -1435,9 +1438,12 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
         joint_training={
             "planner_loss_weight": 0.1,
             "lm_plan_loss_weight": 1e-3,
-            "qwen_lr": 1e-6,
+            "action_lr": 5e-5,
+            "qwen_lr": 3e-6,
             "planner_head_lr": 3e-5,
         },
+        action_loss_scale=1.0,
+        train_mode="all",
         lr=2e-5,
         semantic_lr=1e-4,
         batch_size=1,
@@ -1448,7 +1454,8 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
         param_groups=[
             {"name": "base_ltx", "lr": 4e-5},
             {"name": "semantic_ltx", "lr": 2e-4},
-            {"name": "qwen", "lr": 2e-6},
+            {"name": "action_ltx", "lr": 5e-5},
+            {"name": "qwen", "lr": 3e-6},
             {"name": "planner_heads", "lr": 6e-5},
         ]
     )
@@ -1483,12 +1490,16 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
     assert joint_meta["global_step"] == 20000
     assert joint_meta["source_planner_checkpoint"] == str(source_planner)
     assert joint_meta["lm_plan_loss_weight"] == 7e-4
+    assert joint_meta["action_loss_scale"] == 1.0
+    assert joint_meta["train_mode"] == "all"
     assert joint_meta["optimizer_group_lrs"] == {
+        "action_ltx": 5e-5,
         "base_ltx": 4e-5,
         "semantic_ltx": 2e-4,
-        "qwen": 2e-6,
+        "qwen": 3e-6,
         "planner_heads": 6e-5,
     }
+    assert joint_meta["trainable_parameters"]["action_ltx"] == 1
     assert joint_meta["future_keyframe_offsets"] == [2, 4, 6, 8]
     trainer_state = json.loads(
         (step_dir / "trainer_state.json").read_text(encoding="utf-8")
