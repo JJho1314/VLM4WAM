@@ -2,7 +2,7 @@
 
 ## Objective
 
-Train one 30,000-step LIBERO model in which the dual-camera K4 Qwen planner,
+Train one 50,000-step LIBERO model in which the dual-camera K4 Qwen planner,
 the semantic-guided LTX video model, and the GE-Act action expert optimize in
 the same distributed step. The run must preserve the existing video/planner
 recipe while adding a real action objective; merely constructing or logging the
@@ -62,8 +62,8 @@ metadata. A regression test must fail if the joint total omits action loss.
 
 - 8 GPUs, BF16, DeepSpeed ZeRO-2;
 - target global batch 128;
-- 30,000 optimizer steps with 1,000 warmup steps;
-- save only steps 20,000, 25,000, and 30,000;
+- 50,000 optimizer steps with 1,000 warmup steps;
+- save only steps 40,000, 45,000, and 50,000;
 - no LTX or Qwen gradient checkpointing in the preferred configuration;
 - preserve exact distributed sampler and resume state.
 
