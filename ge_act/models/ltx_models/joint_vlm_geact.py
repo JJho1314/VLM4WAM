@@ -324,6 +324,12 @@ def _named_trainable_parameters(
     ]
 
 
+def is_action_parameter_name(name: str) -> bool:
+    """Return whether a GE-Act LTX parameter belongs to the action branch."""
+
+    return name.startswith("action_") or ".action_" in name
+
+
 def build_joint_optimizer_parameter_groups(
     model: JointVLMGEActModel,
     ltx_lr: float,

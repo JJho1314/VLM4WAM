@@ -66,6 +66,7 @@ from models.ltx_models.vlm_semantic_planner import FrozenDualCameraVLMPlanner
 from models.ltx_models.joint_vlm_geact import (  # noqa: F401
     JointVLMGEActModel,
     build_joint_optimizer_parameter_groups,
+    is_action_parameter_name,
 )
 
 LOG_LEVEL = "INFO"
@@ -209,14 +210,21 @@ def encode_joint_planner_targets(
 
 def combine_joint_training_loss(
     loss_video: torch.Tensor,
+    loss_action: torch.Tensor,
     planner_losses: Dict[str, torch.Tensor],
     *,
+    action_loss_scale: float,
     planner_loss_weight: float,
 ) -> torch.Tensor:
     planner_loss = planner_losses.get("loss")
-    if not torch.is_tensor(loss_video) or not torch.is_tensor(planner_loss):
-        raise TypeError("joint video and planner losses must be tensors")
-    return loss_video + float(planner_loss_weight) * planner_loss
+    losses = (loss_video, loss_action, planner_loss)
+    if not all(torch.is_tensor(value) for value in losses):
+        raise TypeError("joint video, action, and planner losses must be tensors")
+    return (
+        loss_video
+        + float(action_loss_scale) * loss_action
+        + float(planner_loss_weight) * planner_loss
+    )
 
 
 def _configure_qwen_gradient_checkpointing(
@@ -1987,7 +1995,9 @@ class Trainer:
                     if joint_enabled:
                         loss = combine_joint_training_loss(
                             loss_video,
+                            loss_action,
                             planner_metrics,
+                            action_loss_scale=action_loss_scale,
                             planner_loss_weight=float(
                                 self.args.joint_training["planner_loss_weight"]
                             ),
@@ -1997,6 +2007,7 @@ class Trainer:
 
                     loss_components = {"loss_video": loss_video}
                     if joint_enabled:
+                        loss_components["loss_action"] = loss_action
                         loss_components["planner_loss"] = planner_metrics["loss"]
                     elif self.args.train_mode in (
                         "all",
@@ -2008,13 +2019,24 @@ class Trainer:
                     accelerator.backward(loss)
                     if accelerator.sync_gradients and joint_enabled:
                         unwrapped_joint = accelerator.unwrap_model(self.joint_model)
+                        action_parameters = []
+                        video_parameters = []
+                        for name, parameter in unwrapped_joint.ltx.named_parameters():
+                            if is_action_parameter_name(name):
+                                action_parameters.append(parameter)
+                            else:
+                                video_parameters.append(parameter)
                         joint_grad_metrics = {
                             "vlm_grad_norm": _global_gradient_norm(
                                 unwrapped_joint.planner.parameters(),
                                 accelerator=accelerator,
                             ),
                             "ltx_grad_norm": _global_gradient_norm(
-                                unwrapped_joint.ltx.parameters(),
+                                video_parameters,
+                                accelerator=accelerator,
+                            ),
+                            "action_grad_norm": _global_gradient_norm(
+                                action_parameters,
                                 accelerator=accelerator,
                             ),
                         }
@@ -2089,6 +2111,7 @@ class Trainer:
                         logs = {
                             "loss": loss.detach().item(),
                             "loss_video": loss_video.detach().item(),
+                            "loss_action": loss_action.detach().item(),
                             "planner_loss": planner_loss.detach().item(),
                             "planner_semantic_mse": planner_semantic_mse.detach().item(),
                             "planner_depth_wsa_loss": planner_depth_wsa_loss.detach().item(),
@@ -2107,6 +2130,7 @@ class Trainer:
                             logs["lm_plan_ce"] = lm_plan_ce_metric.item()
                         logs.setdefault("vlm_grad_norm", 0.0)
                         logs.setdefault("ltx_grad_norm", 0.0)
+                        logs.setdefault("action_grad_norm", 0.0)
                         lr_log_keys = {
                             "base_ltx": "lr/base_ltx",
                             "semantic_ltx": "lr/semantic_ltx",

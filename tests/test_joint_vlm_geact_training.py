@@ -32,6 +32,7 @@ from models.ltx_models.joint_vlm_geact import (  # noqa: E402
     _require_tensor_shape,
     build_joint_optimizer_parameter_groups,
 )
+from models.ltx_models import joint_vlm_geact as joint_vlm_geact_module  # noqa: E402
 
 
 NUM_KEYFRAMES = 4
@@ -739,6 +740,17 @@ def test_joint_optimizer_groups_are_disjoint_complete_and_ordered() -> None:
     assert id(joint.planner.private_query_bank) in ids_by_group["planner_heads"]
 
 
+def test_action_parameter_name_classifier_matches_geact_modules() -> None:
+    assert hasattr(joint_vlm_geact_module, "is_action_parameter_name")
+    classifier = joint_vlm_geact_module.is_action_parameter_name
+
+    assert classifier("action_proj_in.weight")
+    assert classifier("transformer_blocks.0.action_attn1.to_q.weight")
+    assert classifier("action_transformer_blocks.0.attn1.to_q.weight")
+    assert not classifier("transformer_blocks.0.attn1.to_q.weight")
+    assert not classifier("semantic_plan_proj.weight")
+
+
 def test_joint_optimizer_groups_reject_cross_group_parameter_aliases() -> None:
     joint = _make_tiny_joint_model()
     joint.planner.plan_head.weight = joint.planner.model.proj.weight
@@ -849,20 +861,24 @@ def test_joint_teacher_targets_are_encoded_under_no_grad() -> None:
     assert all(not value.requires_grad for value in targets.values())
 
 
-def test_joint_loss_uses_configured_planner_weight() -> None:
+def test_joint_loss_uses_action_and_configured_weights() -> None:
     contracts = _load_ge_trainer_symbols("combine_joint_training_loss")
     video_loss = torch.tensor(2.0, requires_grad=True)
+    action_loss = torch.tensor(4.0, requires_grad=True)
     planner_loss = torch.tensor(3.0, requires_grad=True)
 
     total = contracts.combine_joint_training_loss(
         video_loss,
+        action_loss,
         {"loss": planner_loss},
+        action_loss_scale=1.0,
         planner_loss_weight=0.1,
     )
 
-    torch.testing.assert_close(total, torch.tensor(2.3))
+    torch.testing.assert_close(total, torch.tensor(6.3))
     total.backward()
     torch.testing.assert_close(video_loss.grad, torch.tensor(1.0))
+    torch.testing.assert_close(action_loss.grad, torch.tensor(1.0))
     torch.testing.assert_close(planner_loss.grad, torch.tensor(0.1))
 
 
@@ -1792,11 +1808,13 @@ def test_joint_train_source_has_single_composite_and_required_logs() -> None:
     source = GE_TRAINER_PATH.read_text(encoding="utf-8")
     required_log_keys = (
         '"loss_video"',
+        '"loss_action"',
         '"planner_loss"',
         '"planner_semantic_mse"',
         '"planner_depth_wsa_loss"',
         '"vlm_grad_norm"',
         '"ltx_grad_norm"',
+        '"action_grad_norm"',
         '"lr/base_ltx"',
         '"lr/semantic_ltx"',
         '"lr/qwen"',
