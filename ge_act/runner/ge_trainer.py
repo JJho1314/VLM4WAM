@@ -248,6 +248,31 @@ def _configure_qwen_gradient_checkpointing(
         model.gradient_checkpointing_disable()
 
 
+def configure_joint_planner_trainability(
+    planner: torch.nn.Module,
+    *,
+    freeze_qwen_vision: bool,
+    freeze_qwen_lm_head: bool,
+) -> None:
+    """Enable joint planner training while preserving checkpoint freeze policy."""
+
+    planner.requires_grad_(True)
+    planner.train()
+    qwen = getattr(planner, "model", None)
+    if not isinstance(qwen, torch.nn.Module):
+        raise TypeError("joint planner must expose Qwen as planner.model")
+    for enabled, attribute in (
+        (freeze_qwen_vision, "visual"),
+        (freeze_qwen_lm_head, "lm_head"),
+    ):
+        module = getattr(qwen, attribute, None)
+        if enabled:
+            if not isinstance(module, torch.nn.Module):
+                raise ValueError(f"Qwen module is missing required {attribute}")
+            module.requires_grad_(False)
+            module.eval()
+
+
 def _configure_joint_lm_plan_objective(
     wrapper: torch.nn.Module,
     joint_config: Dict[str, Any],
@@ -1336,8 +1361,15 @@ class Trainer:
                         code_root=joint_config["da3_code_root"],
                     )
                     self.joint_target_encoder = encode_dual_camera_future_targets
-                    self.semantic_planner.wrapper.requires_grad_(True)
-                    self.semantic_planner.wrapper.train()
+                    configure_joint_planner_trainability(
+                        self.semantic_planner.wrapper,
+                        freeze_qwen_vision=bool(
+                            joint_config.get("freeze_qwen_vision", True)
+                        ),
+                        freeze_qwen_lm_head=bool(
+                            joint_config.get("freeze_qwen_lm_head", True)
+                        ),
+                    )
                     self.joint_model = JointVLMGEActModel(
                         self.semantic_planner.wrapper,
                         self.diffusion_model,
@@ -1384,8 +1416,16 @@ class Trainer:
         if joint_enabled:
             if self.joint_model is None or self.semantic_planner is None:
                 raise RuntimeError("joint models must be prepared before trainable parameters")
-            self.semantic_planner.wrapper.requires_grad_(True)
-            self.semantic_planner.wrapper.train()
+            joint_config = self.args.joint_training
+            configure_joint_planner_trainability(
+                self.semantic_planner.wrapper,
+                freeze_qwen_vision=bool(
+                    joint_config.get("freeze_qwen_vision", True)
+                ),
+                freeze_qwen_lm_head=bool(
+                    joint_config.get("freeze_qwen_lm_head", True)
+                ),
+            )
             _configure_qwen_gradient_checkpointing(
                 self.semantic_planner.wrapper.model,
                 enabled=bool(
@@ -1449,6 +1489,7 @@ class Trainer:
                 self.joint_model,
                 ltx_lr=float(self.args.lr) * lr_scale,
                 semantic_lr=float(self.args.semantic_lr) * lr_scale,
+                action_lr=float(joint_config["action_lr"]) * lr_scale,
                 qwen_lr=float(joint_config["qwen_lr"]) * lr_scale,
                 planner_head_lr=float(joint_config["planner_head_lr"]) * lr_scale,
             )
@@ -1674,6 +1715,15 @@ class Trainer:
 
             if joint_enabled:
                 self.joint_model.train()
+                configure_joint_planner_trainability(
+                    self.semantic_planner.wrapper,
+                    freeze_qwen_vision=bool(
+                        self.args.joint_training.get("freeze_qwen_vision", True)
+                    ),
+                    freeze_qwen_lm_head=bool(
+                        self.args.joint_training.get("freeze_qwen_lm_head", True)
+                    ),
+                )
             else:
                 self.diffusion_model.train()
 

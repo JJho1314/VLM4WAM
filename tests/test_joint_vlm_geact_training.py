@@ -352,8 +352,10 @@ class TinyGateOpenLTX(nn.Module):
         super().__init__()
         self.base_proj = nn.Linear(2, 2, bias=False)
         self.semantic_attn = nn.Linear(SEMANTIC_DIM, 2, bias=False)
+        self.action_proj = nn.Linear(2, 2, bias=False)
         nn.init.constant_(self.base_proj.weight, 0.25)
         nn.init.constant_(self.semantic_attn.weight, 0.01)
+        nn.init.constant_(self.action_proj.weight, 0.02)
         self.forward_calls = 0
 
     def forward(
@@ -700,22 +702,32 @@ def test_joint_rejects_inconsistent_ltx_latent_geometry_before_ltx() -> None:
 
 def test_joint_optimizer_groups_are_disjoint_complete_and_ordered() -> None:
     joint = _make_tiny_joint_model()
+    joint.planner.model.visual.requires_grad_(False)
+    joint.planner.model.lm_head.requires_grad_(False)
 
     groups = build_joint_optimizer_parameter_groups(
         joint,
         ltx_lr=2e-5,
         semantic_lr=1e-4,
-        qwen_lr=1e-6,
+        action_lr=5e-5,
+        qwen_lr=3e-6,
         planner_head_lr=3e-5,
     )
 
     assert [group["name"] for group in groups] == [
         "base_ltx",
         "semantic_ltx",
+        "action_ltx",
         "qwen",
         "planner_heads",
     ]
-    assert [group["lr"] for group in groups] == [2e-5, 1e-4, 1e-6, 3e-5]
+    assert [group["lr"] for group in groups] == [
+        2e-5,
+        1e-4,
+        5e-5,
+        3e-6,
+        3e-5,
+    ]
     parameter_ids = [id(parameter) for group in groups for parameter in group["params"]]
     assert len(parameter_ids) == len(set(parameter_ids))
     assert set(parameter_ids) == {
@@ -728,8 +740,10 @@ def test_joint_optimizer_groups_are_disjoint_complete_and_ordered() -> None:
     }
     assert id(joint.ltx.base_proj.weight) in ids_by_group["base_ltx"]
     assert id(joint.ltx.semantic_attn.weight) in ids_by_group["semantic_ltx"]
-    assert id(joint.planner.model.visual.weight) in ids_by_group["qwen"]
-    assert id(joint.planner.model.lm_head.weight) in ids_by_group["qwen"]
+    assert id(joint.ltx.action_proj.weight) in ids_by_group["action_ltx"]
+    assert id(joint.planner.model.proj.weight) in ids_by_group["qwen"]
+    assert id(joint.planner.model.visual.weight) not in parameter_ids
+    assert id(joint.planner.model.lm_head.weight) not in parameter_ids
     assert id(joint.planner.plan_head.weight) in ids_by_group["planner_heads"]
     assert id(joint.planner.depth_head.weight) in ids_by_group["planner_heads"]
     assert (
@@ -760,7 +774,8 @@ def test_joint_optimizer_groups_reject_cross_group_parameter_aliases() -> None:
             joint,
             ltx_lr=2e-5,
             semantic_lr=1e-4,
-            qwen_lr=1e-6,
+            action_lr=5e-5,
+            qwen_lr=3e-6,
             planner_head_lr=3e-5,
         )
 
@@ -774,7 +789,8 @@ def test_joint_optimizer_groups_reject_unclassified_parameters() -> None:
             joint,
             ltx_lr=2e-5,
             semantic_lr=1e-4,
-            qwen_lr=1e-6,
+            action_lr=5e-5,
+            qwen_lr=3e-6,
             planner_head_lr=3e-5,
         )
 
@@ -887,6 +903,7 @@ def test_joint_teacher_parameters_are_frozen_and_excluded() -> None:
         "State",
         "Trainer",
         "_configure_qwen_gradient_checkpointing",
+        "configure_joint_planner_trainability",
         "_joint_training_enabled",
         "compute_effective_video_fps",
         "freeze_conditioning_modules",
@@ -904,6 +921,11 @@ def test_joint_teacher_parameters_are_frozen_and_excluded() -> None:
         planner.model,
         "input_grads_enabled",
         True,
+    )
+    planner.model.gradient_checkpointing_disable = lambda: setattr(
+        planner.model,
+        "is_gradient_checkpointing",
+        False,
     )
     ltx = TinyGateOpenLTX()
     ltx.enable_gradient_checkpointing = lambda: setattr(
@@ -927,11 +949,14 @@ def test_joint_teacher_parameters_are_frozen_and_excluded() -> None:
     trainer.args = SimpleNamespace(
         joint_training={
             "enabled": True,
-            "qwen_gradient_checkpointing": True,
-            "qwen_lr": 1e-6,
+            "qwen_gradient_checkpointing": False,
+            "freeze_qwen_vision": True,
+            "freeze_qwen_lm_head": True,
+            "action_lr": 5e-5,
+            "qwen_lr": 3e-6,
             "planner_head_lr": 3e-5,
         },
-        gradient_checkpointing=True,
+        gradient_checkpointing=False,
         allow_tf32=False,
         train_epochs=1,
         train_steps=1,
@@ -983,18 +1008,29 @@ def test_joint_teacher_parameters_are_frozen_and_excluded() -> None:
     assert not trainer.semantic_teacher.training
     assert not trainer.depth_teacher.training
     assert planner.training
-    assert all(parameter.requires_grad for parameter in planner.parameters())
-    assert planner.model.is_gradient_checkpointing
-    assert planner.model.input_grads_enabled
-    assert ltx.gradient_checkpointing_enabled
+    assert planner.model.proj.weight.requires_grad
+    assert not planner.model.visual.weight.requires_grad
+    assert not planner.model.lm_head.weight.requires_grad
+    assert not planner.model.visual.training
+    assert not planner.model.lm_head.training
+    assert planner.model.is_gradient_checkpointing is False
+    assert not hasattr(planner.model, "input_grads_enabled")
+    assert not hasattr(ltx, "gradient_checkpointing_enabled")
     groups = captured["groups"]
     assert [group["name"] for group in groups] == [
         "base_ltx",
         "semantic_ltx",
+        "action_ltx",
         "qwen",
         "planner_heads",
     ]
-    assert [group["lr"] for group in groups] == [2e-5, 1e-4, 1e-6, 3e-5]
+    assert [group["lr"] for group in groups] == [
+        2e-5,
+        1e-4,
+        5e-5,
+        3e-6,
+        3e-5,
+    ]
     optimized_ids = {id(parameter) for group in groups for parameter in group["params"]}
     teacher_ids = {
         id(parameter)
@@ -1834,3 +1870,11 @@ def test_joint_train_source_has_single_composite_and_required_logs() -> None:
     assert "_configure_joint_lm_plan_objective(" in source
     for key in required_log_keys:
         assert key in source
+
+
+def test_joint_train_reapplies_qwen_freeze_after_composite_train_mode() -> None:
+    source = GE_TRAINER_PATH.read_text(encoding="utf-8")
+    after_composite_train = source.split("self.joint_model.train()", 1)[1]
+    joint_epoch_branch = after_composite_train.split("else:", 1)[0]
+
+    assert "configure_joint_planner_trainability(" in joint_epoch_branch

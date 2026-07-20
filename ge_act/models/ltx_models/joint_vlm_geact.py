@@ -334,6 +334,7 @@ def build_joint_optimizer_parameter_groups(
     model: JointVLMGEActModel,
     ltx_lr: float,
     semantic_lr: float,
+    action_lr: float,
     qwen_lr: float,
     planner_head_lr: float,
 ) -> list[dict[str, Any]]:
@@ -348,6 +349,7 @@ def build_joint_optimizer_parameter_groups(
     parameters_by_group: dict[str, list[nn.Parameter]] = {
         "base_ltx": [],
         "semantic_ltx": [],
+        "action_ltx": [],
         "qwen": [],
         "planner_heads": [],
     }
@@ -360,12 +362,23 @@ def build_joint_optimizer_parameter_groups(
             parameters_by_group[group_name].append(parameter)
 
     for name, parameter in _named_trainable_parameters(model.ltx):
-        add("semantic_ltx" if "semantic_" in name else "base_ltx", parameter)
+        if is_action_parameter_name(name):
+            add("action_ltx", parameter)
+        elif "semantic_" in name:
+            add("semantic_ltx", parameter)
+        else:
+            add("base_ltx", parameter)
 
     for name, parameter in _named_trainable_parameters(model.planner):
         add("qwen" if name.startswith("model.") else "planner_heads", parameter)
 
-    group_order = ("base_ltx", "semantic_ltx", "qwen", "planner_heads")
+    group_order = (
+        "base_ltx",
+        "semantic_ltx",
+        "action_ltx",
+        "qwen",
+        "planner_heads",
+    )
     owner_by_id: dict[int, str] = {}
     for group_name in group_order:
         for parameter in parameters_by_group[group_name]:
@@ -396,6 +409,7 @@ def build_joint_optimizer_parameter_groups(
     learning_rates = {
         "base_ltx": ltx_lr,
         "semantic_ltx": semantic_lr,
+        "action_ltx": action_lr,
         "qwen": qwen_lr,
         "planner_heads": planner_head_lr,
     }
