@@ -1862,8 +1862,10 @@ def test_joint_train_source_has_single_composite_and_required_logs() -> None:
         '"vlm_grad_norm"',
         '"ltx_grad_norm"',
         '"action_grad_norm"',
+        '"global_grad_norm"',
         '"lr/base_ltx"',
         '"lr/semantic_ltx"',
+        '"lr/action_ltx"',
         '"lr/qwen"',
         '"lr/planner_heads"',
         '"samples_per_second"',
@@ -1881,6 +1883,22 @@ def test_joint_train_source_has_single_composite_and_required_logs() -> None:
     assert "_configure_joint_lm_plan_objective(" in source
     for key in required_log_keys:
         assert key in source
+
+
+def test_deepspeed_gradient_norm_uses_engine_value_after_backward() -> None:
+    contracts = _load_ge_trainer_symbols("_deepspeed_global_gradient_norm")
+    accelerator = SimpleNamespace(device=torch.device("cpu"))
+
+    class FakeDeepSpeedEngine:
+        def get_global_grad_norm(self):
+            return 7.5
+
+    norm = contracts._deepspeed_global_gradient_norm(
+        FakeDeepSpeedEngine(),
+        accelerator=accelerator,
+    )
+
+    torch.testing.assert_close(norm, torch.tensor(7.5))
 
 
 def test_joint_train_reapplies_qwen_freeze_after_composite_train_mode() -> None:

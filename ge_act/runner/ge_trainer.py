@@ -306,6 +306,34 @@ def _global_gradient_norm(
     return global_squared_norm.clamp_min(0).sqrt()
 
 
+def _deepspeed_global_gradient_norm(
+    model: torch.nn.Module,
+    *,
+    accelerator: Accelerator,
+) -> torch.Tensor:
+    """Read the norm cached by DeepSpeed's step triggered inside backward()."""
+
+    getter = getattr(model, "get_global_grad_norm", None)
+    if not callable(getter):
+        raise RuntimeError("DeepSpeed engine does not expose get_global_grad_norm()")
+    value = getter()
+    if value is None:
+        raise RuntimeError("DeepSpeed did not cache a global gradient norm")
+    norm = torch.as_tensor(
+        value,
+        device=accelerator.device,
+        dtype=torch.float32,
+    )
+    if norm.numel() != 1:
+        raise RuntimeError("DeepSpeed global gradient norm must be scalar")
+    norm = norm.reshape(())
+    if not torch.isfinite(norm):
+        raise FloatingPointError(
+            f"DeepSpeed global gradient norm is non-finite: {norm.item()}"
+        )
+    return norm
+
+
 def _run_joint_validation(
     joint_model: torch.nn.Module,
     validation_call,
@@ -2076,29 +2104,39 @@ class Trainer:
                     require_finite_training_loss(loss, loss_components)
                     accelerator.backward(loss)
                     if accelerator.sync_gradients and joint_enabled:
-                        unwrapped_joint = accelerator.unwrap_model(self.joint_model)
-                        action_parameters = []
-                        video_parameters = []
-                        for name, parameter in unwrapped_joint.ltx.named_parameters():
-                            if is_action_parameter_name(name):
-                                action_parameters.append(parameter)
-                            else:
-                                video_parameters.append(parameter)
-                        joint_grad_metrics = {
-                            "vlm_grad_norm": _global_gradient_norm(
-                                unwrapped_joint.planner.parameters(),
-                                accelerator=accelerator,
-                            ),
-                            "ltx_grad_norm": _global_gradient_norm(
-                                video_parameters,
-                                accelerator=accelerator,
-                            ),
-                            "action_grad_norm": _global_gradient_norm(
-                                action_parameters,
-                                accelerator=accelerator,
-                            ),
-                        }
-                        if accelerator.distributed_type != DistributedType.DEEPSPEED:
+                        if (
+                            accelerator.distributed_type
+                            == DistributedType.DEEPSPEED
+                        ):
+                            joint_grad_metrics = {
+                                "global_grad_norm": _deepspeed_global_gradient_norm(
+                                    self.joint_model,
+                                    accelerator=accelerator,
+                                )
+                            }
+                        else:
+                            unwrapped_joint = accelerator.unwrap_model(self.joint_model)
+                            action_parameters = []
+                            video_parameters = []
+                            for name, parameter in unwrapped_joint.ltx.named_parameters():
+                                if is_action_parameter_name(name):
+                                    action_parameters.append(parameter)
+                                else:
+                                    video_parameters.append(parameter)
+                            joint_grad_metrics = {
+                                "vlm_grad_norm": _global_gradient_norm(
+                                    unwrapped_joint.planner.parameters(),
+                                    accelerator=accelerator,
+                                ),
+                                "ltx_grad_norm": _global_gradient_norm(
+                                    video_parameters,
+                                    accelerator=accelerator,
+                                ),
+                                "action_grad_norm": _global_gradient_norm(
+                                    action_parameters,
+                                    accelerator=accelerator,
+                                ),
+                            }
                             accelerator.clip_grad_norm_(
                                 self.joint_model.parameters(),
                                 self.args.max_grad_norm,
@@ -2186,12 +2224,10 @@ class Trainer:
                             logs[name] = value.item()
                         if lm_plan_ce_metric is not None:
                             logs["lm_plan_ce"] = lm_plan_ce_metric.item()
-                        logs.setdefault("vlm_grad_norm", 0.0)
-                        logs.setdefault("ltx_grad_norm", 0.0)
-                        logs.setdefault("action_grad_norm", 0.0)
                         lr_log_keys = {
                             "base_ltx": "lr/base_ltx",
                             "semantic_ltx": "lr/semantic_ltx",
+                            "action_ltx": "lr/action_ltx",
                             "qwen": "lr/qwen",
                             "planner_heads": "lr/planner_heads",
                         }
