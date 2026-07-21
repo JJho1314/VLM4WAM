@@ -38,6 +38,9 @@ JOINT_ACTION_HPC3_CONFIG_PATH = (
     GE_ACT_ROOT
     / "configs/ltx_model/libero/video_model_libero_joint_vlm_geact_action_k4_hpc3.yaml"
 )
+JOINT_ACTION_HPC3_SBATCH = (
+    GE_ACT_ROOT / "scripts/sbatch_train_joint_vlm_geact_action_hpc3.sh"
+)
 
 OLA_PLANNER_CHECKPOINT = (
     "/data/users/junjie/code/VLM4WAM_dual_camera_k4/outputs/"
@@ -710,6 +713,8 @@ def test_main_smoke_max_steps_is_a_constructor_override(
             "1",
             "--gradient_accumulation_steps_override",
             "1",
+            "--output_dir_override",
+            str(tmp_path / "smoke-output"),
             "--disable_deepspeed",
         ],
     )
@@ -720,6 +725,7 @@ def test_main_smoke_max_steps_is_a_constructor_override(
         "train_steps": 1,
         "batch_size": 1,
         "gradient_accumulation_steps": 1,
+        "output_dir": str(tmp_path / "smoke-output"),
         "use_deepspeed": False,
     }
     assert "runner.args.train_steps =" not in main_path.read_text()
@@ -765,6 +771,35 @@ def test_joint_ola_launcher_has_formal_and_bounded_smoke_modes() -> None:
         "PYTORCH_CUDA_ALLOC_CONF",
     ):
         assert f"export {variable}=" in launcher
+
+
+def test_joint_action_hpc3_launcher_is_isolated_and_bounded() -> None:
+    assert JOINT_ACTION_HPC3_SBATCH.is_file()
+    launcher = JOINT_ACTION_HPC3_SBATCH.read_text()
+
+    assert "#SBATCH --partition=acd_u" in launcher
+    assert "#SBATCH --gres=gpu:8" in launcher
+    assert "#SBATCH --cpus-per-task=64" in launcher
+    assert "/data/user/jhe724/.venvs/vlm4wam_joint/bin/python" in launcher
+    assert "/data/user/jhe724/.venvs/vlm4wam_joint/bin/torchrun" in launcher
+    assert "video_model_libero_joint_vlm_geact_action_k4_hpc3.yaml" in launcher
+    assert "RUN_KIND=${RUN_KIND:-formal}" in launcher
+    assert '"$RUN_KIND" == "smoke8"' in launcher
+    assert "--max_train_steps 2" in launcher
+    assert "--output_dir_override" in launcher
+    assert "smoke_joint_vlm_geact_action_" in launcher
+    assert "predecode_lerobot_videos.py" in launcher
+    assert "--verify-only" in launcher
+    assert "preflight_ltx_siglip2.py" in launcher
+    assert "--require-joint-formal" in launcher
+    assert "--nproc_per_node=8" in launcher
+    for variable in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        assert f"export {variable}=1" in launcher
 
 
 def test_runtime_preflight_requires_deepspeed_when_enabled(
