@@ -34,6 +34,10 @@ JOINT_CONFIG_PATH = (
     / "configs/ltx_model/libero/video_model_libero_joint_vlm_geact_k4_predecoded.yaml"
 )
 JOINT_TRAIN_LAUNCHER = GE_ACT_ROOT / "scripts/train_joint_vlm_geact_ola.sh"
+JOINT_ACTION_HPC3_CONFIG_PATH = (
+    GE_ACT_ROOT
+    / "configs/ltx_model/libero/video_model_libero_joint_vlm_geact_action_k4_hpc3.yaml"
+)
 
 OLA_PLANNER_CHECKPOINT = (
     "/data/users/junjie/code/VLM4WAM_dual_camera_k4/outputs/"
@@ -336,6 +340,139 @@ def test_joint_vlm_geact_config_matches_approved_recipe() -> None:
     assert config["use_deepspeed"] is True
     assert config["deepspeed"]["zero_optimization"]["stage"] == 2
     assert config["deepspeed"]["bf16"]["enabled"] is True
+
+
+def test_joint_action_hpc3_config_matches_approved_50k_recipe() -> None:
+    assert JOINT_ACTION_HPC3_CONFIG_PATH.is_file()
+    config = yaml.safe_load(JOINT_ACTION_HPC3_CONFIG_PATH.read_text())
+
+    assert config["return_video"] is True
+    assert config["return_action"] is True
+    assert config["train_mode"] == "all"
+    assert config["action_loss_scale"] == 1.0
+    assert config["add_state"] is True
+    assert config["rand_init_action"] is False
+    assert config["train_steps"] == 50_000
+    assert config["save_steps"] == [40_000, 45_000, 50_000]
+    assert config["batch_size"] == 4
+    assert config["gradient_accumulation_steps"] == 4
+    assert config["batch_size"] * config["gradient_accumulation_steps"] * 8 == 128
+    assert config["gradient_checkpointing"] is False
+    assert config["lr"] == 2e-5
+    assert config["semantic_lr"] == 1e-4
+
+    joint = config["joint_training"]
+    assert joint["enabled"] is True
+    assert joint["formal_recipe"] == "hpc3_action"
+    assert joint["planner_loss_weight"] == 0.1
+    assert joint["action_lr"] == 5e-5
+    assert joint["qwen_lr"] == 3e-6
+    assert joint["planner_head_lr"] == 3e-5
+    assert joint["freeze_qwen_vision"] is True
+    assert joint["freeze_qwen_lm_head"] is True
+    assert joint["qwen_gradient_checkpointing"] is False
+
+    model = config["diffusion_model"]["config"]
+    assert model["action_expert"] is True
+    assert model["action_in_channels"] == 15
+    assert model["action_out_channels"] == 15
+    assert model["action_num_attention_heads"] == 16
+    assert model["action_attention_head_dim"] == 32
+
+    assert config["pretrained_model_name_or_path"] == (
+        "/data/user/jhe724/junjie/weights/LTX-Video"
+    )
+    assert config["diffusion_model"]["model_path"] == (
+        "/data/user/jhe724/junjie/vlm4wam_joint_assets/ltx_step_50000"
+    )
+    assert config["semantic_plan"]["planner_checkpoint"] == (
+        "/data/user/jhe724/junjie/vlm4wam_joint_assets/planner_step_030000"
+    )
+    assert joint["siglip2_model_dir"] == (
+        "/data/user/jhe724/junjie/weights/siglip2-large-patch16-256"
+    )
+    assert joint["da3_ckpt_dir"] == (
+        "/data/user/jhe724/junjie/vlm4wam_joint_assets/DA3-LARGE-1.1"
+    )
+    assert joint["da3_code_root"] == (
+        "/data/user/jhe724/junjie/vlm4wam_joint_assets/Depth-Anything-3"
+    )
+    for split in ("train", "val"):
+        data = config["data"][split]
+        assert data["pack_action_state"] is True
+        assert data["require_predecoded"] is True
+        assert data["predecoded_video_root"] == (
+            "/data/user/jhe724/junjie/datasets/LIBERO-fastwam-predecoded-rgb"
+        )
+        assert data["action_chunk"] == 36
+        assert data["valid_cam"] == [
+            "observation.images.image",
+            "observation.images.wrist_image",
+        ]
+
+    assert collect_preflight_errors(
+        config,
+        world_size=8,
+        check_paths=False,
+        require_joint_formal=True,
+    ) == []
+
+
+def test_joint_action_hpc3_preflight_rejects_objective_and_geometry_drift() -> None:
+    config = copy.deepcopy(yaml.safe_load(JOINT_ACTION_HPC3_CONFIG_PATH.read_text()))
+    config["return_video"] = False
+    config["return_action"] = False
+    config["train_mode"] = "video_only"
+    config["action_loss_scale"] = 0.25
+    config["add_state"] = False
+    config["rand_init_action"] = True
+    config["noisy_video"] = True
+    config["train_steps"] = 30_000
+    config["save_steps"] = [20_000, 25_000, 30_000]
+    config["batch_size"] = 1
+    config["gradient_accumulation_steps"] = 16
+    joint = config["joint_training"]
+    joint["action_lr"] = 1e-5
+    joint["qwen_lr"] = 1e-6
+    joint["freeze_qwen_vision"] = False
+    model = config["diffusion_model"]["config"]
+    model["action_expert"] = False
+    model["action_in_channels"] = 7
+    model["action_out_channels"] = 7
+    for split in ("train", "val"):
+        config["data"][split]["pack_action_state"] = False
+        config["data"][split]["action_chunk"] = 8
+
+    errors = collect_preflight_errors(
+        config,
+        world_size=8,
+        check_paths=False,
+        require_joint_formal=True,
+    )
+
+    for expected in (
+        "train_steps must be 50000",
+        "joint action training requires batch/accumulation 4/4 or 2/8",
+        "joint Qwen lr must be 3e-6",
+        "joint save_steps must be [40000, 45000, 50000]",
+        "joint action training requires return_video=true",
+        "joint action training requires return_action=true",
+        "joint action training requires train_mode=all",
+        "joint action loss scale must be 1.0",
+        "joint action lr must be 5e-5",
+        "joint action training must freeze Qwen vision and LM head",
+        "joint action training requires add_state=true",
+        "joint action training must load checkpoint action weights",
+        "joint action training requires noisy_video=false",
+        "joint action model action_expert must be True",
+        "joint action model action_in_channels must be 15",
+        "joint action model action_out_channels must be 15",
+        "joint action training data requires pack_action_state=true",
+        "joint action validation data requires pack_action_state=true",
+        "joint action training data requires action_chunk=36",
+        "joint action validation data requires action_chunk=36",
+    ):
+        assert expected in errors
 
 
 def test_joint_vlm_geact_config_uses_verified_predecoded_ola_data() -> None:

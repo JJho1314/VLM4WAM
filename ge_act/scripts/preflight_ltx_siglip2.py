@@ -44,6 +44,34 @@ JOINT_FORMAL_RECIPE = {
         "libero_spatial_no_noops_lerobot",
     ],
 }
+HPC3_ACTION_FORMAL_RECIPE = {
+    "ltx_components": "/data/user/jhe724/junjie/weights/LTX-Video",
+    "ltx_checkpoint": (
+        "/data/user/jhe724/junjie/vlm4wam_joint_assets/ltx_step_50000"
+    ),
+    "planner_checkpoint": (
+        "/data/user/jhe724/junjie/vlm4wam_joint_assets/planner_step_030000"
+    ),
+    "siglip2_teacher": (
+        "/data/user/jhe724/junjie/weights/siglip2-large-patch16-256"
+    ),
+    "da3_checkpoint": (
+        "/data/user/jhe724/junjie/vlm4wam_joint_assets/DA3-LARGE-1.1"
+    ),
+    "da3_code_root": (
+        "/data/user/jhe724/junjie/vlm4wam_joint_assets/Depth-Anything-3"
+    ),
+    "data_root": "/data/user/jhe724/junjie/datasets/LIBERO-fastwam",
+    "predecoded_root": (
+        "/data/user/jhe724/junjie/datasets/LIBERO-fastwam-predecoded-rgb"
+    ),
+    "domains": [
+        "libero_10_no_noops_lerobot",
+        "libero_goal_no_noops_lerobot",
+        "libero_object_no_noops_lerobot",
+        "libero_spatial_no_noops_lerobot",
+    ],
+}
 
 
 def _nearest_existing_parent(path: Path) -> Path:
@@ -72,6 +100,13 @@ def collect_preflight_errors(
     semantic_source = semantic.get("source", "gt_siglip2")
     joint = config.get("joint_training", {})
     joint_enabled = isinstance(joint, dict) and bool(joint.get("enabled", False))
+    formal_recipe_name = joint.get("formal_recipe", "ola_video") if joint_enabled else None
+    action_profile = formal_recipe_name == "hpc3_action"
+    formal_recipe = (
+        HPC3_ACTION_FORMAL_RECIPE if action_profile else JOINT_FORMAL_RECIPE
+    )
+    if joint_enabled and formal_recipe_name not in ("ola_video", "hpc3_action"):
+        errors.append(f"unknown joint formal recipe: {formal_recipe_name}")
     if require_joint_formal and not joint_enabled:
         errors.append("formal joint preflight requires joint_training.enabled=true")
     hdf5_backend = config.get("train_data_class") == "LiberoFastWAMHDF5Dataset"
@@ -144,8 +179,9 @@ def collect_preflight_errors(
     )
     if global_batch != 128:
         errors.append(f"global batch must be 128, got {global_batch}")
-    if config.get("train_steps") != 30_000:
-        errors.append("train_steps must be 30000")
+    expected_train_steps = 50_000 if action_profile else 30_000
+    if config.get("train_steps") != expected_train_steps:
+        errors.append(f"train_steps must be {expected_train_steps}")
     if not joint_enabled and not config.get("gradient_checkpointing", False):
         errors.append("gradient checkpointing must be enabled for the initial run")
 
@@ -181,11 +217,22 @@ def collect_preflight_errors(
             errors.append("joint DA3 feature width must be 2048")
         if int(world_size) != 8:
             errors.append("joint formal training requires world size 8")
-        if (
-            config.get("batch_size") != 4
-            or config.get("gradient_accumulation_steps") != 4
-        ):
-            errors.append("joint training requires per-GPU batch 4 and accumulation 4")
+        batch_contract = (
+            ((4, 4), (2, 8)) if action_profile else ((4, 4),)
+        )
+        batch_shape = (
+            config.get("batch_size"),
+            config.get("gradient_accumulation_steps"),
+        )
+        if batch_shape not in batch_contract:
+            if action_profile:
+                errors.append(
+                    "joint action training requires batch/accumulation 4/4 or 2/8"
+                )
+            else:
+                errors.append(
+                    "joint training requires per-GPU batch 4 and accumulation 4"
+                )
         if bool(config.get("enable_slicing", True)):
             errors.append("joint training requires VAE slicing to be disabled")
         if (
@@ -198,8 +245,10 @@ def collect_preflight_errors(
             errors.append("joint LTX base lr must be 2e-5")
         if config.get("semantic_lr") != 1e-4:
             errors.append("joint LTX semantic lr must be 1e-4")
-        if joint.get("qwen_lr") != 1e-6:
-            errors.append("joint Qwen lr must be 1e-6")
+        expected_qwen_lr = 3e-6 if action_profile else 1e-6
+        if joint.get("qwen_lr") != expected_qwen_lr:
+            expected_qwen_lr_text = "3e-6" if action_profile else "1e-6"
+            errors.append(f"joint Qwen lr must be {expected_qwen_lr_text}")
         if joint.get("planner_head_lr") != 3e-5:
             errors.append("joint planner head lr must be 3e-5")
         if joint.get("planner_loss_weight") != 0.1:
@@ -227,8 +276,64 @@ def collect_preflight_errors(
             errors.append("joint DeepSpeed bf16 must be enabled")
         if config.get("lr_warmup_steps") != 1_000:
             errors.append("joint lr_warmup_steps must be 1000")
-        if config.get("save_steps") != [20_000, 25_000, 30_000]:
-            errors.append("joint save_steps must be [20000, 25000, 30000]")
+        expected_save_steps = (
+            [40_000, 45_000, 50_000]
+            if action_profile
+            else [20_000, 25_000, 30_000]
+        )
+        if config.get("save_steps") != expected_save_steps:
+            errors.append(f"joint save_steps must be {expected_save_steps}")
+        if action_profile:
+            if config.get("return_video") is not True:
+                errors.append("joint action training requires return_video=true")
+            if config.get("return_action") is not True:
+                errors.append("joint action training requires return_action=true")
+            if config.get("train_mode") != "all":
+                errors.append("joint action training requires train_mode=all")
+            if config.get("action_loss_scale") != 1.0:
+                errors.append("joint action loss scale must be 1.0")
+            if joint.get("action_lr") != 5e-5:
+                errors.append("joint action lr must be 5e-5")
+            if not joint.get("freeze_qwen_vision") or not joint.get(
+                "freeze_qwen_lm_head"
+            ):
+                errors.append(
+                    "joint action training must freeze Qwen vision and LM head"
+                )
+            if config.get("add_state") is not True:
+                errors.append("joint action training requires add_state=true")
+            if config.get("rand_init_action") is not False:
+                errors.append(
+                    "joint action training must load checkpoint action weights"
+                )
+            if config.get("noisy_video") is not False:
+                errors.append(
+                    "joint action training requires noisy_video=false"
+                )
+            expected_action_geometry = {
+                "action_expert": True,
+                "action_in_channels": 15,
+                "action_out_channels": 15,
+                "action_num_attention_heads": 16,
+                "action_attention_head_dim": 32,
+            }
+            for key, expected in expected_action_geometry.items():
+                if model_config.get(key) != expected:
+                    errors.append(
+                        f"joint action model {key} must be {expected}"
+                    )
+            for split, data_config in (
+                ("training", train_data),
+                ("validation", val_data),
+            ):
+                if data_config.get("pack_action_state") is not True:
+                    errors.append(
+                        f"joint action {split} data requires pack_action_state=true"
+                    )
+                if data_config.get("action_chunk") != 36:
+                    errors.append(
+                        f"joint action {split} data requires action_chunk=36"
+                    )
         if not joint.get("siglip2_model_dir"):
             errors.append("joint SigLIP2 teacher path is required")
         if not joint.get("da3_ckpt_dir"):
@@ -238,39 +343,39 @@ def collect_preflight_errors(
         formal_path_contract = (
             (
                 config.get("pretrained_model_name_or_path"),
-                JOINT_FORMAL_RECIPE["ltx_components"],
+                formal_recipe["ltx_components"],
                 "joint formal LTX components path does not match the approved recipe",
             ),
             (
                 config.get("diffusion_model", {}).get("model_path"),
-                JOINT_FORMAL_RECIPE["ltx_checkpoint"],
+                formal_recipe["ltx_checkpoint"],
                 "joint formal LTX checkpoint path does not match the approved recipe",
             ),
             (
                 semantic.get("planner_checkpoint"),
-                JOINT_FORMAL_RECIPE["planner_checkpoint"],
+                formal_recipe["planner_checkpoint"],
                 "joint formal planner checkpoint path does not match the approved recipe",
             ),
             (
                 joint.get("siglip2_model_dir"),
-                JOINT_FORMAL_RECIPE["siglip2_teacher"],
+                formal_recipe["siglip2_teacher"],
                 "joint formal SigLIP2 teacher path does not match the approved recipe",
             ),
             (
                 joint.get("da3_ckpt_dir"),
-                JOINT_FORMAL_RECIPE["da3_checkpoint"],
+                formal_recipe["da3_checkpoint"],
                 "joint formal DA3 checkpoint path does not match the approved recipe",
             ),
             (
                 joint.get("da3_code_root"),
-                JOINT_FORMAL_RECIPE["da3_code_root"],
+                formal_recipe["da3_code_root"],
                 "joint formal DA3 code root does not match the approved recipe",
             ),
         )
         for actual, expected, message in formal_path_contract:
             if actual != expected:
                 errors.append(message)
-        expected_data_roots = [JOINT_FORMAL_RECIPE["data_root"]] * 4
+        expected_data_roots = [formal_recipe["data_root"]] * 4
         if any(
             data_config.get("data_roots") != expected_data_roots
             for data_config in (train_data, val_data)
@@ -280,14 +385,14 @@ def collect_preflight_errors(
             )
         if any(
             data_config.get("predecoded_video_root")
-            != JOINT_FORMAL_RECIPE["predecoded_root"]
+            != formal_recipe["predecoded_root"]
             for data_config in (train_data, val_data)
         ):
             errors.append(
                 "joint formal predecoded root does not match the approved recipe"
             )
         if any(
-            data_config.get("domains") != JOINT_FORMAL_RECIPE["domains"]
+            data_config.get("domains") != formal_recipe["domains"]
             for data_config in (train_data, val_data)
         ):
             errors.append("joint formal domains do not match the approved recipe")
