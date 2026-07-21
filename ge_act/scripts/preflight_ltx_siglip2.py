@@ -420,6 +420,8 @@ def collect_preflight_errors(
     required_modules = list(REQUIRED_MODULES)
     if config.get("use_deepspeed", False):
         required_modules.append("deepspeed")
+    if joint_enabled:
+        required_modules.append("omegaconf")
     for module_name in dict.fromkeys(required_modules):
         if importlib.util.find_spec(module_name) is None:
             errors.append(f"missing Python module: {module_name}")

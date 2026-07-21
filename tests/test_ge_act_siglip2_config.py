@@ -826,6 +826,27 @@ def test_runtime_preflight_requires_deepspeed_when_enabled(
     assert "missing Python module: deepspeed" in errors
 
 
+def test_runtime_preflight_requires_omegaconf_for_joint_da3(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = copy.deepcopy(yaml.safe_load(JOINT_CONFIG_PATH.read_text()))
+    _redirect_formal_recipe_to_tmp_paths(config, tmp_path, monkeypatch)
+
+    monkeypatch.setattr(
+        preflight_module.importlib.util,
+        "find_spec",
+        lambda module_name: None if module_name == "omegaconf" else object(),
+    )
+    errors = collect_preflight_errors(
+        config,
+        world_size=8,
+        check_paths=True,
+        minimum_free_gb=0.0,
+    )
+
+    assert "missing Python module: omegaconf" in errors
+
+
 def test_required_joint_formal_mode_rejects_disabled_or_missing_joint_config() -> None:
     disabled = copy.deepcopy(yaml.safe_load(JOINT_CONFIG_PATH.read_text()))
     disabled["joint_training"]["enabled"] = False
