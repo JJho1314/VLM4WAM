@@ -22,6 +22,9 @@ from experiments.joint_libero_eval_contract import (
     validate_joint_evaluation_checkpoint,
 )
 
+EVAL_LIBERO_PATH = GE_ACT_ROOT / "experiments" / "eval_libero.py"
+JOINT_EVAL_PATH = GE_ACT_ROOT / "experiments" / "eval_libero_joint.py"
+
 
 def valid_k4_planner_metadata() -> dict[str, object]:
     return {
@@ -328,3 +331,29 @@ def test_pipeline_proxy_rejects_incomplete_or_duplicate_semantics() -> None:
             image=torch.zeros(1),
             semantic_plan=torch.zeros(1),
         )
+
+
+def test_joint_evaluator_loads_planner_and_uses_fail_closed_proxy() -> None:
+    source = JOINT_EVAL_PATH.read_text(encoding="utf-8")
+
+    assert "FrozenDualCameraVLMPlanner.from_checkpoint" in source
+    assert "normalize_joint_current_images(" in source
+    assert "build_joint_semantic_condition(" in source
+    assert "SemanticConditionedPipelineProxy(" in source
+    assert "return super().play(" in source
+    assert "return {}" not in source
+
+
+def test_joint_evaluator_has_no_semantic_disable_cli() -> None:
+    source = JOINT_EVAL_PATH.read_text(encoding="utf-8")
+
+    assert '"--joint_ckpt_dir"' in source
+    assert '"--disable_semantic"' not in source
+    assert '"--semantic_mode"' not in source
+
+
+def test_original_evaluator_is_not_modified_for_joint_conditioning() -> None:
+    source = EVAL_LIBERO_PATH.read_text(encoding="utf-8")
+
+    assert "joint_libero_eval_contract" not in source
+    assert "semantic_planner" not in source
