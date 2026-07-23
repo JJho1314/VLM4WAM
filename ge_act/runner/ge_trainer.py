@@ -248,11 +248,24 @@ def _configure_qwen_gradient_checkpointing(
         model.gradient_checkpointing_disable()
 
 
+def _resolve_qwen_language_model(qwen: torch.nn.Module) -> torch.nn.Module:
+    nested_model = getattr(qwen, "model", None)
+    for candidate in (
+        getattr(nested_model, "language_model", None),
+        getattr(qwen, "language_model", None),
+    ):
+        if isinstance(candidate, torch.nn.Module):
+            return candidate
+    raise ValueError("Qwen module is missing its language model")
+
+
 def configure_joint_planner_trainability(
     planner: torch.nn.Module,
     *,
     freeze_qwen_vision: bool,
     freeze_qwen_lm_head: bool,
+    freeze_qwen_embeddings: bool = False,
+    keep_qwen_first_n_layers: int = 0,
 ) -> None:
     """Enable joint planner training while preserving checkpoint freeze policy."""
 
@@ -261,16 +274,51 @@ def configure_joint_planner_trainability(
     qwen = getattr(planner, "model", None)
     if not isinstance(qwen, torch.nn.Module):
         raise TypeError("joint planner must expose Qwen as planner.model")
-    for enabled, attribute in (
-        (freeze_qwen_vision, "visual"),
-        (freeze_qwen_lm_head, "lm_head"),
-    ):
-        module = getattr(qwen, attribute, None)
-        if enabled:
-            if not isinstance(module, torch.nn.Module):
-                raise ValueError(f"Qwen module is missing required {attribute}")
-            module.requires_grad_(False)
-            module.eval()
+
+    if freeze_qwen_vision:
+        nested_model = getattr(qwen, "model", None)
+        visual = getattr(qwen, "visual", None)
+        if not isinstance(visual, torch.nn.Module):
+            visual = getattr(nested_model, "visual", None)
+        if not isinstance(visual, torch.nn.Module):
+            raise ValueError("Qwen module is missing required visual")
+        visual.requires_grad_(False)
+        visual.eval()
+
+    language_model = _resolve_qwen_language_model(qwen)
+    if freeze_qwen_embeddings:
+        embeddings = None
+        get_embeddings = getattr(qwen, "get_input_embeddings", None)
+        if callable(get_embeddings):
+            embeddings = get_embeddings()
+        if not isinstance(embeddings, torch.nn.Module):
+            embeddings = getattr(language_model, "embed_tokens", None)
+        if not isinstance(embeddings, torch.nn.Module):
+            raise ValueError("Qwen module is missing required input embeddings")
+        embeddings.requires_grad_(False)
+        embeddings.eval()
+
+    first_n_layers = int(keep_qwen_first_n_layers)
+    if first_n_layers < 0:
+        raise ValueError("keep_qwen_first_n_layers must be non-negative")
+    layers = getattr(language_model, "layers", None)
+    if first_n_layers:
+        if not isinstance(layers, (torch.nn.ModuleList, list, tuple)):
+            raise ValueError("Qwen language model is missing transformer layers")
+        if first_n_layers > len(layers):
+            raise ValueError(
+                "keep_qwen_first_n_layers exceeds the Qwen language layer count"
+            )
+        for layer in layers[:first_n_layers]:
+            layer.requires_grad_(False)
+            layer.eval()
+
+    if freeze_qwen_lm_head:
+        lm_head = getattr(qwen, "lm_head", None)
+        if not isinstance(lm_head, torch.nn.Module):
+            raise ValueError("Qwen module is missing required lm_head")
+        lm_head.requires_grad_(False)
+        lm_head.eval()
 
 
 def _configure_joint_lm_plan_objective(
@@ -1405,6 +1453,12 @@ class Trainer:
                         freeze_qwen_lm_head=bool(
                             joint_config.get("freeze_qwen_lm_head", True)
                         ),
+                        freeze_qwen_embeddings=bool(
+                            joint_config.get("freeze_qwen_embeddings", False)
+                        ),
+                        keep_qwen_first_n_layers=int(
+                            joint_config.get("keep_qwen_first_n_layers", 0)
+                        ),
                     )
                     self.joint_model = JointVLMGEActModel(
                         self.semantic_planner.wrapper,
@@ -1460,6 +1514,12 @@ class Trainer:
                 ),
                 freeze_qwen_lm_head=bool(
                     joint_config.get("freeze_qwen_lm_head", True)
+                ),
+                freeze_qwen_embeddings=bool(
+                    joint_config.get("freeze_qwen_embeddings", False)
+                ),
+                keep_qwen_first_n_layers=int(
+                    joint_config.get("keep_qwen_first_n_layers", 0)
                 ),
             )
             _configure_qwen_gradient_checkpointing(
@@ -1758,6 +1818,18 @@ class Trainer:
                     ),
                     freeze_qwen_lm_head=bool(
                         self.args.joint_training.get("freeze_qwen_lm_head", True)
+                    ),
+                    freeze_qwen_embeddings=bool(
+                        self.args.joint_training.get(
+                            "freeze_qwen_embeddings",
+                            False,
+                        )
+                    ),
+                    keep_qwen_first_n_layers=int(
+                        self.args.joint_training.get(
+                            "keep_qwen_first_n_layers",
+                            0,
+                        )
                     ),
                 )
             else:

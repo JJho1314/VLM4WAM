@@ -278,13 +278,32 @@ def test_offloaded_module_is_restored_only_for_bounded_validation() -> None:
     ]
 
 
+class TinyQwenLanguageModel(nn.Module):
+    def __init__(self, num_layers: int = 20) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(4, 1)
+        self.layers = nn.ModuleList(
+            nn.Linear(1, 1, bias=False) for _ in range(num_layers)
+        )
+
+
+class TinyQwenBackbone(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.language_model = TinyQwenLanguageModel()
+
+
 class TinyQwenModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
+        self.model = TinyQwenBackbone()
         self.proj = nn.Linear(1, 1, bias=False)
         self.visual = nn.Linear(1, 1, bias=False)
         self.lm_head = nn.Linear(1, 1, bias=False)
         nn.init.constant_(self.proj.weight, 0.5)
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.language_model.embed_tokens
 
 
 class TinyPlanner(nn.Module):
@@ -346,6 +365,45 @@ class TinyPlanner(nn.Module):
                 "depth_lnmse": depth_loss.detach(),
             },
         )
+
+
+def test_lawam_qwen_policy_trains_vision_and_freezes_lower_language() -> None:
+    symbols = _load_ge_trainer_symbols(
+        "_resolve_qwen_language_model",
+        "configure_joint_planner_trainability",
+    )
+    planner = TinyPlanner()
+
+    symbols.configure_joint_planner_trainability(
+        planner,
+        freeze_qwen_vision=False,
+        freeze_qwen_lm_head=True,
+        freeze_qwen_embeddings=True,
+        keep_qwen_first_n_layers=16,
+    )
+
+    language_model = planner.model.model.language_model
+    assert all(
+        parameter.requires_grad for parameter in planner.model.visual.parameters()
+    )
+    assert all(
+        not parameter.requires_grad
+        for parameter in language_model.embed_tokens.parameters()
+    )
+    assert all(
+        not parameter.requires_grad
+        for layer in language_model.layers[:16]
+        for parameter in layer.parameters()
+    )
+    assert all(
+        parameter.requires_grad
+        for layer in language_model.layers[16:]
+        for parameter in layer.parameters()
+    )
+    assert all(
+        not parameter.requires_grad
+        for parameter in planner.model.lm_head.parameters()
+    )
 
 
 class TinyGateOpenLTX(nn.Module):
@@ -904,6 +962,7 @@ def test_joint_teacher_parameters_are_frozen_and_excluded() -> None:
         "State",
         "Trainer",
         "_configure_qwen_gradient_checkpointing",
+        "_resolve_qwen_language_model",
         "configure_joint_planner_trainability",
         "_joint_training_enabled",
         "compute_effective_video_fps",
