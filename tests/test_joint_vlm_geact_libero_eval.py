@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 import torch
+import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +25,16 @@ from experiments.joint_libero_eval_contract import (
 
 EVAL_LIBERO_PATH = GE_ACT_ROOT / "experiments" / "eval_libero.py"
 JOINT_EVAL_PATH = GE_ACT_ROOT / "experiments" / "eval_libero_joint.py"
+EVAL_CONFIG_PATH = (
+    GE_ACT_ROOT
+    / "configs"
+    / "ltx_model"
+    / "libero"
+    / "action_model_libero_joint_step40000_eval.yaml"
+)
+EVAL_LAUNCHER_PATH = (
+    GE_ACT_ROOT / "scripts" / "eval_joint_vlm_geact_a6000.sh"
+)
 
 
 def valid_k4_planner_metadata() -> dict[str, object]:
@@ -357,3 +368,48 @@ def test_original_evaluator_is_not_modified_for_joint_conditioning() -> None:
 
     assert "joint_libero_eval_contract" not in source
     assert "semantic_planner" not in source
+
+
+def test_a6000_eval_config_matches_joint_training_geometry() -> None:
+    config = yaml.safe_load(EVAL_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    assert config["pretrained_model_name_or_path"] == (
+        "/data/LFT-W02_data/junjie/weights/LTX-Video"
+    )
+    assert config["diffusion_model"]["model_path"].endswith(
+        "joint_vlm_geact_action_k4_50k/step_40000/ltx"
+    )
+    assert config["return_action"] is True
+    assert config["return_video"] is False
+    assert config["add_state"] is True
+    assert config["data"]["train"]["sample_size"] == [256, 256]
+    assert config["data"]["train"]["n_previous"] == 4
+    assert config["data"]["train"]["chunk"] == 9
+    assert config["data"]["train"]["action_chunk"] == 36
+    model = config["diffusion_model"]["config"]
+    assert model["semantic_plan_context"] is True
+    assert model["semantic_plan_num_views"] == 2
+    assert model["semantic_plan_num_keyframes"] == 4
+    assert model["semantic_plan_in_dim"] == 1024
+    assert model["action_in_channels"] == 15
+    assert model["action_out_channels"] == 15
+
+
+def test_a6000_launcher_smoke_gates_full_evaluation() -> None:
+    source = EVAL_LAUNCHER_PATH.read_text(encoding="utf-8")
+
+    assert "CUDA_VISIBLE_DEVICES=1" in source
+    assert "SMOKE_MAX_TASKS=1" in source
+    assert "--num_trails_per_task 1" in source
+    assert "libero_spatial libero_object libero_goal libero_10" in source
+    assert "--num_trails_per_task 50" in source
+    assert "training_state" not in source
+
+
+def test_a6000_launcher_uses_local_joint_paths_and_ge_act_environment() -> None:
+    source = EVAL_LAUNCHER_PATH.read_text(encoding="utf-8")
+
+    assert "/data/LFT-W02_data/.conda/envs/ge-act/bin/python" in source
+    assert "/data/LFT-W02_data/junjie/VLA_RL/docker_libero/LIBERO" in source
+    assert "joint_vlm_geact_action_k4_50k/step_40000" in source
+    assert "eval_libero_joint.py" in source
