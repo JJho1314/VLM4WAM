@@ -202,6 +202,43 @@ def _metadata_value_matches(actual: Any, expected: Any) -> bool:
     return actual == expected
 
 
+def select_flat_keyframes(
+    plan: torch.Tensor,
+    *,
+    num_keyframes: int,
+    tokens_per_keyframe: int,
+    indices: Sequence[int],
+) -> torch.Tensor:
+    """Select ordered keyframes from a flattened ``[..., K*P, D]`` plan."""
+    if plan.ndim < 3:
+        raise ValueError("plan must have batch, token, and feature dimensions")
+    num_keyframes = int(num_keyframes)
+    tokens_per_keyframe = int(tokens_per_keyframe)
+    resolved = tuple(int(index) for index in indices)
+    if num_keyframes < 1 or tokens_per_keyframe < 1:
+        raise ValueError("planner keyframe and token counts must be positive")
+    if not resolved or len(set(resolved)) != len(resolved):
+        raise ValueError("selected keyframe indices must be unique and non-empty")
+    if min(resolved) < 0 or max(resolved) >= num_keyframes:
+        raise ValueError("selected keyframe index exceeds planner geometry")
+    expected_tokens = num_keyframes * tokens_per_keyframe
+    if plan.shape[-2] != expected_tokens:
+        raise ValueError(
+            f"planner token count must be {expected_tokens}, got {plan.shape[-2]}"
+        )
+    grouped = plan.reshape(
+        *plan.shape[:-2],
+        num_keyframes,
+        tokens_per_keyframe,
+        plan.shape[-1],
+    )
+    selected = grouped.index_select(
+        -3,
+        torch.as_tensor(resolved, device=plan.device),
+    )
+    return selected.flatten(-3, -2)
+
+
 def validate_dual_camera_export_metadata(
     metadata: dict[str, Any],
 ) -> dict[str, Any]:
@@ -2880,30 +2917,83 @@ class PlannerWrapper(nn.Module):
         return plans
 
     def predict_semantic_plan(self, **inputs: Any) -> torch.Tensor:
-        if self.plan_head_type == "lingbot_dino" and getattr(
-            self, "use_current_alignment", False
-        ):
-            return self.predict_current_future_plans(**inputs)["future_dino"]
-        if self.plan_head_type == "lingbot_dino" and self.depth_head is not None:
-            return self.predict_dino_depth_plan(**inputs)[0]
+        """Predict only future SigLIP2 features without executing any depth head."""
         image_hidden, plan_hidden = self._forward_hiddens(**inputs)
         head_dtype = next(self.plan_head.parameters()).dtype
-        if self.plan_head_type == "lingbot_dino":
-            num_views = getattr(self, "num_camera_views", 1)
-            image_hiddens = (
-                (image_hidden,)
-                if num_views == 1
-                else image_hidden.unbind(dim=1)
+        if self.plan_head_type != "lingbot_dino":
+            return self.plan_head(plan_hidden.to(dtype=head_dtype)).float()
+        if image_hidden is None:
+            raise RuntimeError("lingbot_dino semantic prediction requires image hidden")
+
+        if getattr(self, "use_current_alignment", False):
+            if self.independent_modality_task_tokens:
+                semantic_hidden = self.split_independent_current_future_task_hidden(
+                    plan_hidden
+                )["future_dino"]
+            else:
+                _, semantic_hidden = self.split_current_future_task_hidden(plan_hidden)
+        else:
+            semantic_hidden, _ = self.split_lingbot_query_hidden(plan_hidden)
+
+        num_views = getattr(self, "num_camera_views", 1)
+        if num_views == 1:
+            image_hiddens = (image_hidden,)
+        else:
+            if image_hidden.ndim != 4 or image_hidden.shape[1] != num_views:
+                raise RuntimeError(
+                    f"expected image hidden [B,{num_views},N,H], got "
+                    f"{tuple(image_hidden.shape)}"
+                )
+            image_hiddens = image_hidden.unbind(dim=1)
+        semantic_hidden = semantic_hidden.to(dtype=head_dtype)
+        plans = [
+            self.plan_head(
+                view_hidden.detach().to(dtype=head_dtype),
+                semantic_hidden,
+            ).float()
+            for view_hidden in image_hiddens
+        ]
+        return plans[0] if num_views == 1 else torch.stack(plans, dim=1)
+
+    def predict_semantic_plan_with_losses(
+        self,
+        semantic_plan_labels: torch.Tensor,
+        *,
+        selected_keyframe_indices: Sequence[int],
+        **inputs: Any,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Predict and supervise an ordered subset of a native planner sequence."""
+        semantic = self.predict_semantic_plan(**inputs)
+        if semantic.shape[-2] % self.num_keyframes:
+            raise RuntimeError(
+                "semantic planner tokens must divide evenly across native keyframes"
             )
-            plans = [
-                self.plan_head(
-                    view_hidden.detach().to(dtype=head_dtype),
-                    plan_hidden.to(dtype=head_dtype),
-                ).float()
-                for view_hidden in image_hiddens
-            ]
-            return plans[0] if num_views == 1 else torch.stack(plans, dim=1)
-        return self.plan_head(plan_hidden.to(dtype=head_dtype)).float()
+        semantic = select_flat_keyframes(
+            semantic,
+            num_keyframes=self.num_keyframes,
+            tokens_per_keyframe=semantic.shape[-2] // self.num_keyframes,
+            indices=selected_keyframe_indices,
+        )
+        semantic_target = semantic_plan_labels.to(
+            device=semantic.device,
+            dtype=torch.float32,
+        )
+        if semantic.shape != semantic_target.shape:
+            raise ValueError(
+                "semantic prediction/target shape mismatch: prediction "
+                f"{tuple(semantic.shape)} != target {tuple(semantic_target.shape)}"
+            )
+        losses = self.compute_plan_losses(semantic, semantic_target)
+        lm_plan_loss_weight = float(getattr(self, "lm_plan_loss_weight", 0.0))
+        if lm_plan_loss_weight > 0:
+            lm_plan_ce = getattr(self, "_last_lm_plan_ce", None)
+            if not isinstance(lm_plan_ce, torch.Tensor):
+                raise RuntimeError(
+                    "missing causal LM plan loss from the shared Qwen forward"
+                )
+            losses["loss"] = losses["loss"] + lm_plan_loss_weight * lm_plan_ce
+            losses["lm_plan_ce"] = lm_plan_ce.detach()
+        return semantic, losses
 
     def compute_plan_losses(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
         eps = 1e-6

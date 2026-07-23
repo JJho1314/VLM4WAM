@@ -149,6 +149,11 @@ class K4TaskAwareHead(nn.Module):
         )
 
 
+class FailIfCalledDepthHead(nn.Module):
+    def forward(self, *_args: Any, **_kwargs: Any) -> torch.Tensor:
+        raise AssertionError("semantic-only training must not execute the depth head")
+
+
 class TinyQwenBackbone(nn.Module):
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
@@ -850,6 +855,50 @@ def test_future_alignment_plan_tokens_keep_qwen_vision_gradient() -> None:
     assert grad is not None
     assert torch.isfinite(grad).all()
     assert torch.count_nonzero(grad) > 0
+
+
+def test_select_flat_keyframes_keeps_order_and_gradient() -> None:
+    plan = (
+        torch.arange(4.0)
+        .reshape(1, 1, 4, 1, 1)
+        .repeat(1, 2, 1, 2, 3)
+        .requires_grad_()
+    )
+
+    selected = planner.select_flat_keyframes(
+        plan.reshape(1, 2, 8, 3),
+        num_keyframes=4,
+        tokens_per_keyframe=2,
+        indices=(1, 3),
+    )
+
+    assert selected.shape == (1, 2, 4, 3)
+    torch.testing.assert_close(
+        selected.reshape(1, 2, 2, 2, 3)[:, :, :, 0, 0],
+        torch.tensor([[[1.0, 3.0], [1.0, 3.0]]]),
+    )
+    selected.sum().backward()
+    assert plan.grad is not None
+
+
+def test_semantic_only_k2_forward_never_calls_depth_head() -> None:
+    wrapper, model, input_ids = make_causal_lm_future_k4_loss_wrapper(
+        lm_plan_loss_weight=0.0,
+    )
+    wrapper.plan_head = K4TaskAwareHead(8)
+    wrapper.depth_head = FailIfCalledDepthHead()
+
+    semantic, losses = wrapper.predict_semantic_plan_with_losses(
+        semantic_plan_labels=torch.zeros(1, 2, 2 * 256, 8),
+        selected_keyframe_indices=(1, 3),
+        input_ids=input_ids,
+        pixel_values=torch.randn(1, 4),
+    )
+
+    assert semantic.shape == (1, 2, 2 * 256, 8)
+    assert losses["loss"].requires_grad
+    losses["loss"].backward()
+    assert torch.count_nonzero(model.model.visual.weight.grad) > 0
 
 
 def test_standalone_freeze_vision_supports_nested_qwen3vl_layout() -> None:
