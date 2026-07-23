@@ -1538,6 +1538,7 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
             {"name": "base_ltx", "lr": 4e-5},
             {"name": "semantic_ltx", "lr": 2e-4},
             {"name": "action_ltx", "lr": 5e-5},
+            {"name": "qwen_vision", "lr": 1e-4},
             {"name": "qwen", "lr": 3e-6},
             {"name": "planner_heads", "lr": 6e-5},
         ]
@@ -1578,9 +1579,10 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
     assert joint_meta["optimizer_group_lrs"] == {
         "action_ltx": 5e-5,
         "base_ltx": 4e-5,
-        "semantic_ltx": 2e-4,
-        "qwen": 3e-6,
-        "planner_heads": 6e-5,
+            "semantic_ltx": 2e-4,
+            "qwen_vision": 1e-4,
+            "qwen": 3e-6,
+            "planner_heads": 6e-5,
     }
     assert joint_meta["trainable_parameters"]["action_ltx"] == 1
     assert joint_meta["future_keyframe_offsets"] == [2, 4, 6, 8]
@@ -1949,6 +1951,7 @@ def test_joint_train_source_has_single_composite_and_required_logs() -> None:
         '"lr/base_ltx"',
         '"lr/semantic_ltx"',
         '"lr/action_ltx"',
+        '"lr/qwen_vision"',
         '"lr/qwen"',
         '"lr/planner_heads"',
         '"samples_per_second"',

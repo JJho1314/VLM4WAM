@@ -680,6 +680,7 @@ def save_joint_checkpoint(
             "action_ltx",
             "base_ltx",
             "semantic_ltx",
+            "qwen_vision",
             "qwen",
             "planner_heads",
         }
@@ -2301,6 +2302,7 @@ class Trainer:
                             "base_ltx": "lr/base_ltx",
                             "semantic_ltx": "lr/semantic_ltx",
                             "action_ltx": "lr/action_ltx",
+                            "qwen_vision": "lr/qwen_vision",
                             "qwen": "lr/qwen",
                             "planner_heads": "lr/planner_heads",
                         }
