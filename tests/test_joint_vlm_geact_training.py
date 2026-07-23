@@ -1676,6 +1676,11 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
         joint_training={
             "planner_loss_weight": 0.1,
             "lm_plan_loss_weight": 1e-3,
+            "semantic_only": True,
+            "planner_num_keyframes": 4,
+            "num_keyframes": 2,
+            "selected_planner_keyframe_indices": [1, 3],
+            "selected_future_keyframe_offsets": [4, 8],
             "action_lr": 5e-5,
             "qwen_lr": 3e-6,
             "planner_head_lr": 3e-5,
@@ -1740,7 +1745,11 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
             "planner_heads": 6e-5,
     }
     assert joint_meta["trainable_parameters"]["action_ltx"] == 1
-    assert joint_meta["future_keyframe_offsets"] == [2, 4, 6, 8]
+    assert joint_meta["future_keyframe_offsets"] == [4, 8]
+    assert joint_meta["num_keyframes"] == 2
+    assert joint_meta["planner_num_keyframes"] == 4
+    assert joint_meta["selected_planner_keyframe_indices"] == [1, 3]
+    assert joint_meta["semantic_only"] is True
     trainer_state = json.loads(
         (step_dir / "trainer_state.json").read_text(encoding="utf-8")
     )

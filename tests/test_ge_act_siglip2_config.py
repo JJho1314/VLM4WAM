@@ -41,6 +41,14 @@ JOINT_ACTION_HPC3_CONFIG_PATH = (
 JOINT_ACTION_HPC3_SBATCH = (
     GE_ACT_ROOT / "scripts/sbatch_train_joint_vlm_geact_action_hpc3.sh"
 )
+JOINT_ACTION_K2_HPC3_CONFIG_PATH = (
+    GE_ACT_ROOT
+    / "configs/ltx_model/libero/"
+    "video_model_libero_joint_vlm_geact_action_k2_semantic_only_hpc3.yaml"
+)
+JOINT_ACTION_K2_HPC3_SBATCH = (
+    GE_ACT_ROOT / "scripts/sbatch_train_joint_vlm_geact_action_k2_hpc3.sh"
+)
 
 OLA_PLANNER_CHECKPOINT = (
     "/data/users/junjie/code/VLM4WAM_dual_camera_k4/outputs/"
@@ -504,6 +512,58 @@ def test_joint_action_hpc3_preflight_rejects_objective_and_geometry_drift() -> N
         assert expected in errors
 
 
+def test_joint_action_k2_semantic_only_hpc3_config_is_fail_closed() -> None:
+    assert JOINT_ACTION_K2_HPC3_CONFIG_PATH.is_file()
+    config = yaml.safe_load(JOINT_ACTION_K2_HPC3_CONFIG_PATH.read_text())
+    joint = config["joint_training"]
+
+    assert config["tracker_name"] == "joint_vlm_geact_action_k2_semantic_only_25k"
+    assert config["train_steps"] == 25_000
+    assert config["save_steps"] == [5_000, 10_000, 15_000, 20_000, 25_000]
+    assert config["batch_size"] * config["gradient_accumulation_steps"] * 8 == 256
+    assert config["semantic_plan"]["keyframe_indices"] == [4, 8]
+    assert joint["formal_recipe"] == "hpc3_action_k2_semantic_only"
+    assert joint["semantic_only"] is True
+    assert joint["planner_num_keyframes"] == 4
+    assert joint["num_keyframes"] == 2
+    assert joint["selected_planner_keyframe_indices"] == [1, 3]
+    assert joint["selected_future_keyframe_offsets"] == [4, 8]
+    assert config["diffusion_model"]["config"]["semantic_plan_num_keyframes"] == 2
+    assert not any(key.startswith("da3_") for key in joint)
+    assert collect_preflight_errors(
+        config,
+        world_size=8,
+        check_paths=False,
+        require_joint_formal=True,
+    ) == []
+
+
+def test_joint_action_k2_semantic_only_preflight_rejects_depth_and_k2_drift() -> None:
+    config = copy.deepcopy(
+        yaml.safe_load(JOINT_ACTION_K2_HPC3_CONFIG_PATH.read_text())
+    )
+    joint = config["joint_training"]
+    joint["selected_planner_keyframe_indices"] = [0, 2]
+    joint["selected_future_keyframe_offsets"] = [2, 6]
+    joint["da3_ckpt_dir"] = "/tmp/forbidden"
+    config["diffusion_model"]["config"]["semantic_plan_num_keyframes"] = 4
+
+    errors = collect_preflight_errors(
+        config,
+        world_size=8,
+        check_paths=False,
+        require_joint_formal=True,
+    )
+
+    assert "semantic-only K2 planner indices must be [1, 3]" in errors
+    assert "semantic-only K2 future offsets must be [4, 8]" in errors
+    assert "semantic-only joint config must not contain DA3 fields" in errors
+    assert (
+        "LTX semantic keyframe count must match semantic_plan.keyframe_indices"
+        in errors
+    )
+
+
 def test_joint_vlm_geact_config_uses_verified_predecoded_ola_data() -> None:
     config = yaml.safe_load(JOINT_CONFIG_PATH.read_text())
 
@@ -826,6 +886,23 @@ def test_joint_action_hpc3_launcher_is_isolated_and_bounded() -> None:
         "NUMEXPR_NUM_THREADS",
     ):
         assert f"export {variable}=1" in launcher
+
+
+def test_joint_action_k2_hpc3_launcher_runs_one_step_eight_gpu_smoke() -> None:
+    assert JOINT_ACTION_K2_HPC3_SBATCH.is_file()
+    launcher = JOINT_ACTION_K2_HPC3_SBATCH.read_text()
+
+    assert "#SBATCH --partition=acd_u" in launcher
+    assert "#SBATCH --gres=gpu:8" in launcher
+    assert "video_model_libero_joint_vlm_geact_action_k2_semantic_only_hpc3.yaml" in launcher
+    assert "slurm-joint-vlm-geact-action-k2-%j.out" in launcher
+    assert '"$RUN_KIND" == "smoke8"' in launcher
+    assert "--max_train_steps 1" in launcher
+    assert "predecode_lerobot_videos.py" in launcher
+    assert "--verify-only" in launcher
+    assert "preflight_ltx_siglip2.py" in launcher
+    assert "--require-joint-formal" in launcher
+    assert "--nproc_per_node=8" in launcher
 
 
 def test_runtime_preflight_requires_deepspeed_when_enabled(

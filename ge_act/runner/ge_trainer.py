@@ -759,18 +759,40 @@ def save_joint_checkpoint(
             },
             "future_keyframe_offsets": [
                 int(value)
-                for value in getattr(
-                    planner_provider,
-                    "future_keyframe_offsets",
-                    source_planner_metadata["future_keyframe_offsets"],
+                for value in joint_config.get(
+                    "selected_future_keyframe_offsets",
+                    getattr(
+                        planner_provider,
+                        "future_keyframe_offsets",
+                        source_planner_metadata["future_keyframe_offsets"],
+                    ),
                 )
             ],
             "num_keyframes": int(
-                getattr(
-                    planner_provider,
+                joint_config.get(
                     "num_keyframes",
+                    getattr(
+                        planner_provider,
+                        "num_keyframes",
+                        source_planner_metadata["num_keyframes"],
+                    ),
+                )
+            ),
+            "planner_num_keyframes": int(
+                joint_config.get(
+                    "planner_num_keyframes",
                     source_planner_metadata["num_keyframes"],
                 )
+            ),
+            "selected_planner_keyframe_indices": [
+                int(value)
+                for value in joint_config.get(
+                    "selected_planner_keyframe_indices",
+                    range(source_planner_metadata["num_keyframes"]),
+                )
+            ],
+            "semantic_only": bool(
+                joint_config.get("semantic_only", False)
             ),
             "tokens_per_keyframe": int(
                 getattr(
@@ -2361,10 +2383,14 @@ class Trainer:
                         "semantic_mse",
                         planner_metrics.get("mse"),
                     )
-                    scalar_metrics["planner_depth_wsa_loss"] = planner_metrics.get(
+                    planner_depth_metric = planner_metrics.get(
                         "depth_wsa_loss",
                         planner_metrics.get("depth_smooth_l1"),
                     )
+                    if torch.is_tensor(planner_depth_metric):
+                        scalar_metrics["planner_depth_wsa_loss"] = (
+                            planner_depth_metric
+                        )
                     lm_plan_ce_metric = planner_metrics.get("lm_plan_ce")
                     if lm_plan_ce_metric is not None:
                         scalar_metrics["lm_plan_ce"] = lm_plan_ce_metric
@@ -2384,9 +2410,9 @@ class Trainer:
                         planner_semantic_mse = reduced_metrics[
                             "planner_semantic_mse"
                         ]
-                        planner_depth_wsa_loss = reduced_metrics[
+                        planner_depth_wsa_loss = reduced_metrics.get(
                             "planner_depth_wsa_loss"
-                        ]
+                        )
                         lm_plan_ce_metric = reduced_metrics.get("lm_plan_ce")
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
@@ -2404,7 +2430,6 @@ class Trainer:
                             "loss_action": loss_action.detach().item(),
                             "planner_loss": planner_loss.detach().item(),
                             "planner_semantic_mse": planner_semantic_mse.detach().item(),
-                            "planner_depth_wsa_loss": planner_depth_wsa_loss.detach().item(),
                             "samples_per_second": (
                                 session_samples_seen / elapsed
                             ),
@@ -2414,6 +2439,10 @@ class Trainer:
                                 else 0
                             ),
                         }
+                        if planner_depth_wsa_loss is not None:
+                            logs["planner_depth_wsa_loss"] = (
+                                planner_depth_wsa_loss.detach().item()
+                            )
                         for name, value in joint_grad_metrics.items():
                             logs[name] = value.item()
                         if lm_plan_ce_metric is not None:

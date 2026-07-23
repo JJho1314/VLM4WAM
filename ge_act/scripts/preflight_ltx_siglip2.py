@@ -101,11 +101,21 @@ def collect_preflight_errors(
     joint = config.get("joint_training", {})
     joint_enabled = isinstance(joint, dict) and bool(joint.get("enabled", False))
     formal_recipe_name = joint.get("formal_recipe", "ola_video") if joint_enabled else None
-    action_profile = formal_recipe_name == "hpc3_action"
+    semantic_only_k2_profile = (
+        formal_recipe_name == "hpc3_action_k2_semantic_only"
+    )
+    action_profile = formal_recipe_name in (
+        "hpc3_action",
+        "hpc3_action_k2_semantic_only",
+    )
     formal_recipe = (
         HPC3_ACTION_FORMAL_RECIPE if action_profile else JOINT_FORMAL_RECIPE
     )
-    if joint_enabled and formal_recipe_name not in ("ola_video", "hpc3_action"):
+    if joint_enabled and formal_recipe_name not in (
+        "ola_video",
+        "hpc3_action",
+        "hpc3_action_k2_semantic_only",
+    ):
         errors.append(f"unknown joint formal recipe: {formal_recipe_name}")
     if require_joint_formal and not joint_enabled:
         errors.append("formal joint preflight requires joint_training.enabled=true")
@@ -121,8 +131,14 @@ def collect_preflight_errors(
             errors.append("semantic_plan.model_name_or_path is required")
     elif semantic_source == "vlm_planner":
         if joint_enabled:
-            if keyframes != [2, 4, 6, 8]:
-                errors.append("joint VLM planner keyframe offsets must be [2, 4, 6, 8]")
+            expected_keyframes = (
+                [4, 8] if semantic_only_k2_profile else [2, 4, 6, 8]
+            )
+            if keyframes != expected_keyframes:
+                errors.append(
+                    "joint VLM planner keyframe offsets must be "
+                    f"{expected_keyframes}"
+                )
         elif keyframes != [8]:
             errors.append("VLM planner semantic keyframes must be [8]")
         if semantic.get("validation_mode") != "planner":
@@ -192,10 +208,28 @@ def collect_preflight_errors(
         expected_offsets = [2, 4, 6, 8]
         if semantic_source != "vlm_planner":
             errors.append("joint training requires semantic_plan.source=vlm_planner")
-        if joint.get("future_keyframe_offsets") != expected_offsets:
-            errors.append("joint planner future_keyframe_offsets must be [2, 4, 6, 8]")
-        if joint.get("num_keyframes") != 4:
-            errors.append("joint training requires four semantic keyframes")
+        if semantic_only_k2_profile:
+            if joint.get("semantic_only") is not True:
+                errors.append("semantic-only K2 profile requires semantic_only=true")
+            if joint.get("planner_num_keyframes") != 4:
+                errors.append("semantic-only K2 native planner must remain K4")
+            if joint.get("selected_planner_keyframe_indices") != [1, 3]:
+                errors.append("semantic-only K2 planner indices must be [1, 3]")
+            if joint.get("selected_future_keyframe_offsets") != [4, 8]:
+                errors.append("semantic-only K2 future offsets must be [4, 8]")
+            if joint.get("num_keyframes") != 2:
+                errors.append("semantic-only joint training requires two keyframes")
+            if any(str(key).startswith("da3_") for key in joint):
+                errors.append(
+                    "semantic-only joint config must not contain DA3 fields"
+                )
+        else:
+            if joint.get("future_keyframe_offsets") != expected_offsets:
+                errors.append(
+                    "joint planner future_keyframe_offsets must be [2, 4, 6, 8]"
+                )
+            if joint.get("num_keyframes") != 4:
+                errors.append("joint training requires four semantic keyframes")
         if (
             model_config.get("semantic_plan_num_views") != 2
             or joint.get("num_camera_views") != 2
@@ -212,12 +246,13 @@ def collect_preflight_errors(
             or joint.get("semantic_feature_dim") != 1024
         ):
             errors.append("joint semantic feature width must be 1024")
-        if joint.get("da3_align_strategy") != "wsa_multilayer":
-            errors.append("joint DA3 teacher must use four-layer WSA")
-        if joint.get("da3_teacher_layers") != [11, 15, 19, 23]:
-            errors.append("joint DA3 teacher layers must be [11, 15, 19, 23]")
-        if joint.get("da3_feature_dim") != 2048:
-            errors.append("joint DA3 feature width must be 2048")
+        if not semantic_only_k2_profile:
+            if joint.get("da3_align_strategy") != "wsa_multilayer":
+                errors.append("joint DA3 teacher must use four-layer WSA")
+            if joint.get("da3_teacher_layers") != [11, 15, 19, 23]:
+                errors.append("joint DA3 teacher layers must be [11, 15, 19, 23]")
+            if joint.get("da3_feature_dim") != 2048:
+                errors.append("joint DA3 feature width must be 2048")
         if int(world_size) != 8:
             errors.append("joint formal training requires world size 8")
         batch_contract = ((4, 8),) if action_profile else ((4, 4),)
@@ -366,11 +401,12 @@ def collect_preflight_errors(
                     )
         if not joint.get("siglip2_model_dir"):
             errors.append("joint SigLIP2 teacher path is required")
-        if not joint.get("da3_ckpt_dir"):
-            errors.append("joint DA3 teacher checkpoint is required")
-        if not joint.get("da3_code_root"):
-            errors.append("joint DA3 code root is required")
-        formal_path_contract = (
+        if not semantic_only_k2_profile:
+            if not joint.get("da3_ckpt_dir"):
+                errors.append("joint DA3 teacher checkpoint is required")
+            if not joint.get("da3_code_root"):
+                errors.append("joint DA3 code root is required")
+        formal_path_contract = [
             (
                 config.get("pretrained_model_name_or_path"),
                 formal_recipe["ltx_components"],
@@ -391,17 +427,22 @@ def collect_preflight_errors(
                 formal_recipe["siglip2_teacher"],
                 "joint formal SigLIP2 teacher path does not match the approved recipe",
             ),
-            (
-                joint.get("da3_ckpt_dir"),
-                formal_recipe["da3_checkpoint"],
-                "joint formal DA3 checkpoint path does not match the approved recipe",
-            ),
-            (
-                joint.get("da3_code_root"),
-                formal_recipe["da3_code_root"],
-                "joint formal DA3 code root does not match the approved recipe",
-            ),
-        )
+        ]
+        if not semantic_only_k2_profile:
+            formal_path_contract.extend(
+                [
+                    (
+                        joint.get("da3_ckpt_dir"),
+                        formal_recipe["da3_checkpoint"],
+                        "joint formal DA3 checkpoint path does not match the approved recipe",
+                    ),
+                    (
+                        joint.get("da3_code_root"),
+                        formal_recipe["da3_code_root"],
+                        "joint formal DA3 code root does not match the approved recipe",
+                    ),
+                ]
+            )
         for actual, expected, message in formal_path_contract:
             if actual != expected:
                 errors.append(message)
@@ -467,13 +508,16 @@ def collect_preflight_errors(
     elif semantic_source == "vlm_planner":
         required_paths["dual-camera VLM planner"] = semantic.get("planner_checkpoint")
     if joint_enabled:
-        required_paths.update(
-            {
-                "joint SigLIP2 teacher": joint.get("siglip2_model_dir"),
-                "joint DA3 teacher": joint.get("da3_ckpt_dir"),
-                "joint DA3 code root": joint.get("da3_code_root"),
-            }
+        required_paths["joint SigLIP2 teacher"] = joint.get(
+            "siglip2_model_dir"
         )
+        if not semantic_only_k2_profile:
+            required_paths.update(
+                {
+                    "joint DA3 teacher": joint.get("da3_ckpt_dir"),
+                    "joint DA3 code root": joint.get("da3_code_root"),
+                }
+            )
     for label, raw_path in required_paths.items():
         if not raw_path or not Path(raw_path).exists():
             errors.append(f"missing {label}: {raw_path}")
