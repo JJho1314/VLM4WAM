@@ -58,8 +58,9 @@ The additional worker evaluates only `libero_10` and then exits. The original
 launcher is expected to reach `libero_10` later. A lightweight guard process
 in a separate tmux session watches only for an evaluator whose parent is the
 original launcher and whose arguments select `libero_10`. If that duplicate
-appears, the guard terminates that child process; the original launcher then
-finishes its loop normally. The guard does not signal the parallel worker or
+appears, the guard terminates that child process. Because the launcher uses
+`set -e`, it then exits with a nonzero status after all three non-duplicated
+full suites have completed. The guard does not signal the parallel worker or
 any earlier suite.
 
 The parallel worker writes a completion marker only after exiting with status
