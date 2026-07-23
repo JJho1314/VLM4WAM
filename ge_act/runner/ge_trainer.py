@@ -243,15 +243,13 @@ def encode_joint_planner_targets(
     depth_teacher: Any,
     target_encoder: Callable[..., dict[str, torch.Tensor]],
 ) -> dict[str, torch.Tensor]:
-    """Run both online teachers with autograd disabled."""
+    """Run the configured online teacher(s) with autograd disabled."""
 
     with torch.no_grad():
-        targets = target_encoder(
-            current,
-            future,
-            appearance_encoder=semantic_teacher,
-            depth_encoder=depth_teacher,
-        )
+        target_kwargs = {"appearance_encoder": semantic_teacher}
+        if depth_teacher is not None:
+            target_kwargs["depth_encoder"] = depth_teacher
+        targets = target_encoder(current, future, **target_kwargs)
     return {name: value.detach() for name, value in targets.items()}
 
 
@@ -313,6 +311,7 @@ def configure_joint_planner_trainability(
     freeze_qwen_lm_head: bool,
     freeze_qwen_embeddings: bool = False,
     keep_qwen_first_n_layers: int = 0,
+    freeze_depth_head: bool = False,
 ) -> None:
     """Enable joint planner training while preserving checkpoint freeze policy."""
 
@@ -366,6 +365,13 @@ def configure_joint_planner_trainability(
             raise ValueError("Qwen module is missing required lm_head")
         lm_head.requires_grad_(False)
         lm_head.eval()
+
+    if freeze_depth_head:
+        for name in ("depth_head", "current_depth_head"):
+            depth_head = getattr(planner, name, None)
+            if isinstance(depth_head, torch.nn.Module):
+                depth_head.requires_grad_(False)
+                depth_head.eval()
 
 
 def _configure_joint_lm_plan_objective(
@@ -1460,6 +1466,9 @@ class Trainer:
                             "with offsets (2,4,6,8) and 256 tokens/keyframe"
                         )
                     joint_config = self.args.joint_training
+                    semantic_only = bool(
+                        joint_config.get("semantic_only", False)
+                    )
                     _configure_joint_lm_plan_objective(
                         self.semantic_planner.wrapper,
                         joint_config,
@@ -1467,11 +1476,9 @@ class Trainer:
                     from qwen3_vl_semantic_planner.dinov3_da3_2b.siglip2_target import (
                         Siglip2TargetEncoder,
                     )
-                    from qwen3_vl_semantic_planner.dinov3_da3_2b.depth_anything3_target import (
-                        DepthAnything3TargetEncoder,
-                    )
                     from qwen3_vl_semantic_planner.train_semantic_planner import (
                         encode_dual_camera_future_targets,
+                        encode_dual_camera_future_semantic_targets,
                     )
 
                     self.semantic_teacher = Siglip2TargetEncoder(
@@ -1481,18 +1488,32 @@ class Trainer:
                         device=device,
                         dtype=dtype,
                     )
-                    self.depth_teacher = DepthAnything3TargetEncoder(
-                        joint_config["da3_ckpt_dir"],
-                        process_res=int(joint_config.get("da3_process_res", 224)),
-                        feature_slice="full",
-                        align_strategy="wsa_multilayer",
-                        teacher_layers=(11, 15, 19, 23),
-                        layer_weights=(1.0, 1.2, 1.4, 1.6),
-                        device=device,
-                        dtype=dtype,
-                        code_root=joint_config["da3_code_root"],
-                    )
-                    self.joint_target_encoder = encode_dual_camera_future_targets
+                    if semantic_only:
+                        self.depth_teacher = None
+                        self.joint_target_encoder = (
+                            encode_dual_camera_future_semantic_targets
+                        )
+                    else:
+                        from qwen3_vl_semantic_planner.dinov3_da3_2b.depth_anything3_target import (
+                            DepthAnything3TargetEncoder,
+                        )
+
+                        self.depth_teacher = DepthAnything3TargetEncoder(
+                            joint_config["da3_ckpt_dir"],
+                            process_res=int(
+                                joint_config.get("da3_process_res", 224)
+                            ),
+                            feature_slice="full",
+                            align_strategy="wsa_multilayer",
+                            teacher_layers=(11, 15, 19, 23),
+                            layer_weights=(1.0, 1.2, 1.4, 1.6),
+                            device=device,
+                            dtype=dtype,
+                            code_root=joint_config["da3_code_root"],
+                        )
+                        self.joint_target_encoder = (
+                            encode_dual_camera_future_targets
+                        )
                     configure_joint_planner_trainability(
                         self.semantic_planner.wrapper,
                         freeze_qwen_vision=bool(
@@ -1507,12 +1528,25 @@ class Trainer:
                         keep_qwen_first_n_layers=int(
                             joint_config.get("keep_qwen_first_n_layers", 0)
                         ),
+                        freeze_depth_head=semantic_only,
                     )
                     self.joint_model = JointVLMGEActModel(
                         self.semantic_planner.wrapper,
                         self.diffusion_model,
-                        num_keyframes=4,
+                        num_keyframes=int(
+                            joint_config.get("num_keyframes", 4)
+                        ),
+                        planner_num_keyframes=(
+                            self.semantic_planner.num_keyframes
+                        ),
+                        selected_planner_keyframe_indices=tuple(
+                            joint_config.get(
+                                "selected_planner_keyframe_indices",
+                                (0, 1, 2, 3),
+                            )
+                        ),
                         tokens_per_keyframe=256,
+                        semantic_only=semantic_only,
                     )
             else:
                 raise ValueError(f"unknown semantic_plan.source: {semantic_source}")
@@ -1568,6 +1602,9 @@ class Trainer:
                 ),
                 keep_qwen_first_n_layers=int(
                     joint_config.get("keep_qwen_first_n_layers", 0)
+                ),
+                freeze_depth_head=bool(
+                    joint_config.get("semantic_only", False)
                 ),
             )
             _configure_qwen_gradient_checkpointing(
@@ -1893,6 +1930,12 @@ class Trainer:
                             0,
                         )
                     ),
+                    freeze_depth_head=bool(
+                        self.args.joint_training.get(
+                            "semantic_only",
+                            False,
+                        )
+                    ),
                 )
             else:
                 self.diffusion_model.train()
@@ -1945,10 +1988,17 @@ class Trainer:
                     joint_output = None
                     planner_metrics = None
                     if joint_enabled:
+                        joint_config = self.args.joint_training
+                        joint_offsets = tuple(
+                            joint_config.get(
+                                "selected_future_keyframe_offsets",
+                                self.semantic_planner.future_keyframe_offsets,
+                            )
+                        )
                         current_frames, future_frames = select_joint_planner_frames(
                             video,
                             n_previous=mem_size,
-                            offsets=self.semantic_planner.future_keyframe_offsets,
+                            offsets=joint_offsets,
                         )
                         planner_inputs = self.semantic_planner.prepare_inputs(
                             prepare_joint_planner_current_images(current_frames),
@@ -2027,14 +2077,22 @@ class Trainer:
                             dtype=torch.float32,
                         )
                     elif joint_enabled:
+                        joint_offsets = tuple(
+                            self.args.joint_training.get(
+                                "selected_future_keyframe_offsets",
+                                self.semantic_planner.future_keyframe_offsets,
+                            )
+                        )
                         semantic_plan_times = (
                             torch.tensor(
-                                self.semantic_planner.future_keyframe_offsets,
+                                joint_offsets,
                                 device=accelerator.device,
                                 dtype=torch.float32,
                             )
                             / float(self.semantic_planner.sequence_length - 1)
-                        ).reshape(1, 4).expand(batch_size * n_view, -1).clone()
+                        ).reshape(1, len(joint_offsets)).expand(
+                            batch_size * n_view, -1
+                        ).clone()
                     if semantic_plan is not None or joint_enabled:
                         semantic_condition_mask = sample_semantic_condition_mask(
                             batch_size=batch_size,
@@ -2180,7 +2238,9 @@ class Trainer:
                         joint_output = self.joint_model(
                             planner_inputs=planner_inputs,
                             semantic_labels=planner_targets["semantic_plan_labels"],
-                            depth_labels=planner_targets["depth_plan_labels"],
+                            depth_labels=planner_targets.get(
+                                "depth_plan_labels"
+                            ),
                             ltx_inputs=ltx_inputs,
                         )
                         pred_all = joint_output.ltx_predictions

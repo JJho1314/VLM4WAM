@@ -852,6 +852,95 @@ def encode_dual_camera_future_targets(
     }
 
 
+def encode_dual_camera_future_semantic_targets(
+    current_camera_images: torch.Tensor,
+    future_camera_images: torch.Tensor,
+    *,
+    appearance_encoder: Any,
+) -> dict[str, torch.Tensor]:
+    """Encode only future SigLIP2 targets, preserving sample/view/time order."""
+    if (
+        current_camera_images.ndim != 5
+        or current_camera_images.shape[1] != 2
+        or current_camera_images.shape[-1] != 3
+    ):
+        raise ValueError(
+            "current camera teacher frames must be [B,2,H,W,3], got "
+            f"{tuple(current_camera_images.shape)}"
+        )
+    if (
+        future_camera_images.ndim != 6
+        or future_camera_images.shape[1] != 2
+        or future_camera_images.shape[2] < 1
+        or future_camera_images.shape[-1] != 3
+    ):
+        raise ValueError(
+            "future camera teacher frames must be [B,2,K,H,W,3] with K>=1, got "
+            f"{tuple(future_camera_images.shape)}"
+        )
+    expected_current_shape = (
+        future_camera_images.shape[0],
+        future_camera_images.shape[1],
+        future_camera_images.shape[3],
+        future_camera_images.shape[4],
+        future_camera_images.shape[5],
+    )
+    if tuple(current_camera_images.shape) != tuple(expected_current_shape):
+        raise ValueError(
+            "current and future camera teacher frames must have the same shape "
+            "per frame, got "
+            f"{tuple(current_camera_images.shape)} and "
+            f"{tuple(future_camera_images.shape)}"
+        )
+    for name, frames in (
+        ("current", current_camera_images),
+        ("future", future_camera_images),
+    ):
+        if not torch.isfinite(frames).all():
+            raise ValueError(f"{name} camera teacher frames must be finite")
+        if frames.min() < -1.0001 or frames.max() > 1.0001:
+            raise ValueError(
+                f"{name} camera teacher frames must be normalized to [-1,1]"
+            )
+
+    batch_size, num_views, num_keyframes = future_camera_images.shape[:3]
+
+    def normalize(frames: torch.Tensor) -> torch.Tensor:
+        return (frames.float() + 1.0).mul_(0.5).clamp_(0.0, 1.0)
+
+    current_bv = normalize(flatten_camera_teacher_frames(current_camera_images))
+    keyframes_bv = [
+        normalize(flatten_camera_teacher_frames(future_camera_images[:, :, index]))
+        for index in range(num_keyframes)
+    ]
+    with torch.no_grad():
+        semantic = appearance_encoder.encode_future_keyframes(
+            current_bv,
+            keyframes_bv,
+            effective_fps=None,
+        )
+
+    expected_rows = batch_size * num_views
+    expected_tokens = num_keyframes * 256
+    if (
+        semantic.ndim != 3
+        or semantic.shape[0] != expected_rows
+        or semantic.shape[1] != expected_tokens
+    ):
+        raise ValueError(
+            "future appearance teacher features must be "
+            f"[B*V,{expected_tokens},D], got {tuple(semantic.shape)}"
+        )
+    return {
+        "semantic_plan_labels": semantic.reshape(
+            batch_size,
+            num_views,
+            expected_tokens,
+            semantic.shape[-1],
+        ).float()
+    }
+
+
 def configure_gradient_checkpointing(model: nn.Module, *, enabled: bool) -> None:
     if not enabled:
         if hasattr(model, "gradient_checkpointing_disable"):

@@ -22,7 +22,7 @@ _DEPTH_DIM = 2048
 class JointVLMGEActOutput:
     ltx_predictions: dict[str, torch.Tensor]
     semantic_plan: torch.Tensor
-    depth_plan: torch.Tensor
+    depth_plan: torch.Tensor | None
     planner_losses: dict[str, torch.Tensor]
 
 
@@ -39,7 +39,7 @@ def _require_tensor_shape(
 
 
 class JointVLMGEActModel(nn.Module):
-    """Run one planner pass and inject its differentiable K4 plan into LTX.
+    """Run one planner pass and inject its differentiable semantic plan into LTX.
 
     The GE-Act base checkpoint has no ``semantic_`` weights, so its semantic
     modules are newly constructed with zero-initialized semantic gates. On the
@@ -57,7 +57,10 @@ class JointVLMGEActModel(nn.Module):
         ltx: nn.Module,
         *,
         num_keyframes: int = 4,
+        planner_num_keyframes: int = 4,
+        selected_planner_keyframe_indices: tuple[int, ...] = (0, 1, 2, 3),
         tokens_per_keyframe: int = 256,
+        semantic_only: bool = False,
     ) -> None:
         super().__init__()
         if not isinstance(planner, nn.Module):
@@ -65,10 +68,32 @@ class JointVLMGEActModel(nn.Module):
         if not isinstance(ltx, nn.Module):
             raise TypeError("ltx must be an nn.Module")
         self.num_keyframes = int(num_keyframes)
+        self.planner_num_keyframes = int(planner_num_keyframes)
+        self.selected_planner_keyframe_indices = tuple(
+            int(index) for index in selected_planner_keyframe_indices
+        )
         self.tokens_per_keyframe = int(tokens_per_keyframe)
-        if self.num_keyframes != 4:
+        self.semantic_only = bool(semantic_only)
+        if self.num_keyframes < 1:
+            raise ValueError("num_keyframes must be positive")
+        if not self.semantic_only and self.num_keyframes != 4:
             raise ValueError(
                 f"joint VLM/GE-Act training requires K4, got K={self.num_keyframes}"
+            )
+        if self.planner_num_keyframes < self.num_keyframes:
+            raise ValueError(
+                "planner_num_keyframes must cover all injected keyframes"
+            )
+        if (
+            len(self.selected_planner_keyframe_indices) != self.num_keyframes
+            or len(set(self.selected_planner_keyframe_indices)) != self.num_keyframes
+            or min(self.selected_planner_keyframe_indices) < 0
+            or max(self.selected_planner_keyframe_indices)
+            >= self.planner_num_keyframes
+        ):
+            raise ValueError(
+                "selected_planner_keyframe_indices must contain one unique valid "
+                "native planner index per injected keyframe"
             )
         if self.tokens_per_keyframe <= 0:
             raise ValueError("tokens_per_keyframe must be positive")
@@ -78,7 +103,7 @@ class JointVLMGEActModel(nn.Module):
     def _validate_labels(
         self,
         semantic_labels: torch.Tensor,
-        depth_labels: torch.Tensor,
+        depth_labels: torch.Tensor | None,
     ) -> int:
         if not torch.is_tensor(semantic_labels) or semantic_labels.ndim != 4:
             shape = (
@@ -94,17 +119,21 @@ class JointVLMGEActModel(nn.Module):
             (batch_size, _NUM_CAMERA_VIEWS, flat_tokens, _SEMANTIC_DIM),
             name="semantic labels",
         )
-        _require_tensor_shape(
-            depth_labels,
-            (
-                batch_size,
-                _NUM_CAMERA_VIEWS,
-                _DEPTH_LAYERS,
-                flat_tokens,
-                _DEPTH_DIM,
-            ),
-            name="depth labels",
-        )
+        if self.semantic_only:
+            if depth_labels is not None:
+                raise ValueError("semantic-only joint training requires depth_labels=None")
+        else:
+            _require_tensor_shape(
+                depth_labels,
+                (
+                    batch_size,
+                    _NUM_CAMERA_VIEWS,
+                    _DEPTH_LAYERS,
+                    flat_tokens,
+                    _DEPTH_DIM,
+                ),
+                name="depth labels",
+            )
         return batch_size
 
     def _validate_ltx_inputs(
@@ -220,7 +249,7 @@ class JointVLMGEActModel(nn.Module):
         *,
         planner_inputs: Mapping[str, Any],
         semantic_labels: torch.Tensor,
-        depth_labels: torch.Tensor,
+        depth_labels: torch.Tensor | None,
         ltx_inputs: Mapping[str, Any],
     ) -> JointVLMGEActOutput:
         if not isinstance(planner_inputs, Mapping):
@@ -241,16 +270,31 @@ class JointVLMGEActModel(nn.Module):
             batch_size=batch_size,
         )
 
-        planner_result = self.planner.predict_dino_depth_plan_with_losses(
-            semantic_plan_labels=semantic_labels,
-            depth_plan_labels=depth_labels,
-            **dict(planner_inputs),
-        )
-        if not isinstance(planner_result, tuple) or len(planner_result) != 3:
-            raise TypeError(
-                "planner must return (semantic_plan, depth_plan, planner_losses)"
+        if self.semantic_only:
+            planner_result = self.planner.predict_semantic_plan_with_losses(
+                semantic_plan_labels=semantic_labels,
+                selected_keyframe_indices=self.selected_planner_keyframe_indices,
+                **dict(planner_inputs),
             )
-        semantic_plan, depth_plan, planner_losses = planner_result
+            if not isinstance(planner_result, tuple) or len(planner_result) != 2:
+                raise TypeError(
+                    "semantic-only planner must return "
+                    "(semantic_plan, planner_losses)"
+                )
+            semantic_plan, planner_losses = planner_result
+            depth_plan = None
+        else:
+            planner_result = self.planner.predict_dino_depth_plan_with_losses(
+                semantic_plan_labels=semantic_labels,
+                depth_plan_labels=depth_labels,
+                **dict(planner_inputs),
+            )
+            if not isinstance(planner_result, tuple) or len(planner_result) != 3:
+                raise TypeError(
+                    "planner must return "
+                    "(semantic_plan, depth_plan, planner_losses)"
+                )
+            semantic_plan, depth_plan, planner_losses = planner_result
         flat_tokens = self.num_keyframes * self.tokens_per_keyframe
         _require_tensor_shape(
             semantic_plan,
@@ -262,17 +306,18 @@ class JointVLMGEActModel(nn.Module):
             ),
             name="semantic prediction",
         )
-        _require_tensor_shape(
-            depth_plan,
-            (
-                batch_size,
-                _NUM_CAMERA_VIEWS,
-                flat_tokens,
-                _DEPTH_LAYERS,
-                _DEPTH_DIM,
-            ),
-            name="depth prediction",
-        )
+        if not self.semantic_only:
+            _require_tensor_shape(
+                depth_plan,
+                (
+                    batch_size,
+                    _NUM_CAMERA_VIEWS,
+                    flat_tokens,
+                    _DEPTH_LAYERS,
+                    _DEPTH_DIM,
+                ),
+                name="depth prediction",
+            )
         if not isinstance(planner_losses, Mapping):
             raise TypeError("planner_losses must be a mapping")
         if "loss" not in planner_losses or not torch.is_tensor(planner_losses["loss"]):

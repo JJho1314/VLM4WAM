@@ -398,6 +398,42 @@ class TinyPlanner(nn.Module):
         )
 
 
+class SemanticOnlyTinyPlanner(TinyPlanner):
+    def predict_semantic_plan_with_losses(
+        self,
+        *,
+        semantic_plan_labels: torch.Tensor,
+        selected_keyframe_indices: tuple[int, ...],
+        input_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        self.forward_calls += 1
+        assert selected_keyframe_indices == (1, 3)
+        batch_size = input_ids.shape[0]
+        qwen_hidden = self.model.proj(input_ids.float()).mean(dim=1)
+        plan_value = self.plan_head(qwen_hidden)
+        semantic_base = plan_value.new_zeros(SEMANTIC_DIM)
+        semantic_base[1] = 1.0
+        semantic_direction = plan_value.new_zeros(SEMANTIC_DIM)
+        semantic_direction[0] = 1.0
+        semantic_features = (
+            semantic_base.unsqueeze(0)
+            + plan_value * semantic_direction.unsqueeze(0)
+        )
+        semantic = semantic_features.reshape(
+            batch_size, 1, 1, SEMANTIC_DIM
+        ).expand(
+            batch_size,
+            2,
+            2 * self.tokens_per_keyframe,
+            SEMANTIC_DIM,
+        )
+        semantic_loss = (semantic - semantic_plan_labels).square().mean()
+        return semantic, {
+            "loss": semantic_loss,
+            "semantic_mse": semantic_loss.detach(),
+        }
+
+
 def test_lawam_qwen_policy_trains_vision_and_freezes_lower_language() -> None:
     symbols = _load_ge_trainer_symbols(
         "_resolve_qwen_language_model",
@@ -613,6 +649,50 @@ def test_gate_open_tiny_contract_reaches_qwen_and_semantic_parameters() -> None:
     assert output.planner_losses["loss"].requires_grad
     assert _finite_nonzero(joint.planner.model.proj.weight.grad)
     assert _finite_nonzero(joint.ltx.semantic_attn.weight.grad)
+
+
+def test_semantic_only_k2_joint_routes_gradients_without_depth() -> None:
+    planner = SemanticOnlyTinyPlanner()
+    joint = JointVLMGEActModel(
+        planner,
+        TinyGateOpenLTX(),
+        num_keyframes=2,
+        planner_num_keyframes=4,
+        selected_planner_keyframe_indices=(1, 3),
+        tokens_per_keyframe=TOKENS_PER_KEYFRAME,
+        semantic_only=True,
+    )
+    semantic_labels = torch.zeros(
+        1,
+        2,
+        2 * TOKENS_PER_KEYFRAME,
+        SEMANTIC_DIM,
+    )
+    ltx_inputs = _ltx_inputs()
+    ltx_inputs["semantic_plan_times"] = torch.tensor([[0.5, 1.0]]).repeat(2, 1)
+
+    output = joint(
+        planner_inputs={"input_ids": torch.ones(1, 1, dtype=torch.long)},
+        semantic_labels=semantic_labels,
+        depth_labels=None,
+        ltx_inputs=ltx_inputs,
+    )
+    (
+        output.ltx_predictions["video"].square().mean()
+        + 0.1 * output.planner_losses["loss"]
+    ).backward()
+
+    assert output.semantic_plan.shape == (
+        1,
+        2,
+        2,
+        TOKENS_PER_KEYFRAME,
+        SEMANTIC_DIM,
+    )
+    assert output.depth_plan is None
+    assert _finite_nonzero(planner.model.proj.weight.grad)
+    assert _finite_nonzero(joint.ltx.semantic_attn.weight.grad)
+    assert planner.depth_head.weight.grad is None
 
 
 def test_real_ltx_first_video_backward_only_opens_zero_gate(real_ltx_class) -> None:
@@ -850,6 +930,26 @@ def test_joint_optimizer_groups_are_disjoint_complete_and_ordered() -> None:
     assert id(joint.planner.private_query_bank) in ids_by_group["planner_heads"]
 
 
+def test_semantic_only_trainability_freezes_depth_head() -> None:
+    symbols = _load_ge_trainer_symbols(
+        "_resolve_qwen_language_model",
+        "configure_joint_planner_trainability",
+    )
+    planner = TinyPlanner()
+
+    symbols.configure_joint_planner_trainability(
+        planner,
+        freeze_qwen_vision=False,
+        freeze_qwen_lm_head=True,
+        freeze_depth_head=True,
+    )
+
+    assert all(
+        not parameter.requires_grad for parameter in planner.depth_head.parameters()
+    )
+    assert not planner.depth_head.training
+
+
 def test_action_parameter_name_classifier_matches_geact_modules() -> None:
     assert hasattr(joint_vlm_geact_module, "is_action_parameter_name")
     classifier = joint_vlm_geact_module.is_action_parameter_name
@@ -973,6 +1073,30 @@ def test_joint_teacher_targets_are_encoded_under_no_grad() -> None:
 
     assert grad_states == [False]
     assert all(not value.requires_grad for value in targets.values())
+
+
+def test_semantic_only_joint_targets_do_not_require_depth_teacher() -> None:
+    contracts = _load_ge_trainer_symbols("encode_joint_planner_targets")
+    grad_states: list[bool] = []
+
+    def target_encoder(current, future, *, appearance_encoder):
+        grad_states.append(torch.is_grad_enabled())
+        assert appearance_encoder == "siglip"
+        return {
+            "semantic_plan_labels": future.new_zeros(1, 2, 512, 1024),
+        }
+
+    targets = contracts.encode_joint_planner_targets(
+        torch.zeros(1, 2, 2, 2, 3, requires_grad=True),
+        torch.zeros(1, 2, 2, 2, 2, 3, requires_grad=True),
+        semantic_teacher="siglip",
+        depth_teacher=None,
+        target_encoder=target_encoder,
+    )
+
+    assert grad_states == [False]
+    assert set(targets) == {"semantic_plan_labels"}
+    assert not targets["semantic_plan_labels"].requires_grad
 
 
 def test_joint_loss_uses_action_and_configured_weights() -> None:

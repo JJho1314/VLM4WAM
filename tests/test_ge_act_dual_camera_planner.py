@@ -1393,6 +1393,31 @@ def test_encode_dual_camera_k4_future_targets_preserves_view_and_time() -> None:
     assert len(depth.keyframes) == 4
 
 
+def test_encode_dual_camera_future_semantic_targets_skips_depth() -> None:
+    current = torch.zeros(2, 2, 4, 4, 3)
+    future = torch.empty(2, 2, 2, 4, 4, 3)
+    for batch in range(2):
+        for view in range(2):
+            for keyframe in range(2):
+                future[batch, view, keyframe].fill_(
+                    -1.0 + 0.1 * (4 * batch + 2 * view + keyframe)
+                )
+    appearance = FutureAppearanceTeacher()
+
+    labels = planner.encode_dual_camera_future_semantic_targets(
+        current,
+        future,
+        appearance_encoder=appearance,
+    )
+
+    assert set(labels) == {"semantic_plan_labels"}
+    assert labels["semantic_plan_labels"].shape == (2, 2, 2 * 256, 1024)
+    torch.testing.assert_close(
+        labels["semantic_plan_labels"][0, :, ::256, 0],
+        torch.tensor([[0.0, 0.05], [0.1, 0.15]]),
+    )
+
+
 @pytest.mark.parametrize(
     ("current_shape", "future_shape"),
     [
