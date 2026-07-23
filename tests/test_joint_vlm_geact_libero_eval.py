@@ -411,5 +411,6 @@ def test_a6000_launcher_uses_local_joint_paths_and_ge_act_environment() -> None:
 
     assert "/data/LFT-W02_data/.conda/envs/ge-act/bin/python" in source
     assert "/data/LFT-W02_data/junjie/VLA_RL/docker_libero/LIBERO" in source
+    assert 'PYTHONPATH="$ROOT:$ROOT/ge_act:$LIBERO_ROOT' in source
     assert "joint_vlm_geact_action_k4_50k/step_40000" in source
     assert "eval_libero_joint.py" in source
