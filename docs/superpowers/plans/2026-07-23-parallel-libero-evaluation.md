@@ -27,7 +27,7 @@
 - Create on successful completion: `/data/LFT-W02_data/junjie/eval_results/joint_vlm_geact_action_k4_step40000/libero_10_parallel.complete`
 
 **Interfaces:**
-- Consumes: the existing step-40k checkpoint, joint evaluator, and original launcher PID `2743988`
+- Consumes: the project-local step-40k checkpoint, joint evaluator, and original launcher PID `2743988`
 - Produces: one isolated `libero_10` evaluation process plus a duplicate-prevention guard
 
 - [ ] **Step 1: Recheck the active process and GPU memory**
@@ -92,7 +92,7 @@ Run `/data/LFT-W02_data/.conda/envs/ge-act/bin/python` with:
 ```text
 ge_act/experiments/eval_libero_joint.py
 --config_file ge_act/configs/ltx_model/libero/action_model_libero_joint_step40000_eval.yaml
---joint_ckpt_dir /data/LFT-W02_data/junjie/weights/joint_vlm_geact_action_k4_50k/step_40000
+--joint_ckpt_dir /data/LFT-W02_data/junjie/VLA_WM/VLM4WAM/checkpoints/joint_vlm_geact_action_k4_50k/step_40000
 --output_dir /data/LFT-W02_data/junjie/eval_results/joint_vlm_geact_action_k4_step40000
 --device 0
 --exec_step 8
@@ -124,7 +124,7 @@ rm -f \"\$MARKER\"
 cd \"\$ROOT/ge_act\"
 \"\$PY\" \"\$ROOT/ge_act/experiments/eval_libero_joint.py\" \
   --config_file \"\$ROOT/ge_act/configs/ltx_model/libero/action_model_libero_joint_step40000_eval.yaml\" \
-  --joint_ckpt_dir /data/LFT-W02_data/junjie/weights/joint_vlm_geact_action_k4_50k/step_40000 \
+  --joint_ckpt_dir /data/LFT-W02_data/junjie/VLA_WM/VLM4WAM/checkpoints/joint_vlm_geact_action_k4_50k/step_40000 \
   --output_dir \"\$OUTPUT\" \
   --device 0 \
   --exec_step 8 \
