@@ -898,6 +898,7 @@ def test_joint_action_k2_hpc3_launcher_runs_one_step_eight_gpu_smoke() -> None:
     assert "slurm-joint-vlm-geact-action-k2-%j.out" in launcher
     assert '"$RUN_KIND" == "smoke8"' in launcher
     assert "--max_train_steps 1" in launcher
+    assert "--lr_warmup_steps_override 0" in launcher
     assert "predecode_lerobot_videos.py" in launcher
     assert "--verify-only" in launcher
     assert "preflight_ltx_siglip2.py" in launcher

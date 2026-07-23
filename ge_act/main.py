@@ -11,6 +11,13 @@ def positive_int(value):
     return parsed
 
 
+def nonnegative_int(value):
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be a non-negative integer")
+    return parsed
+
+
 def main():
 
     parser = argparse.ArgumentParser(
@@ -42,6 +49,12 @@ def main():
         type=positive_int,
         default=None,
         help='gradient-accumulation override for smoke tests',
+    )
+    parser.add_argument(
+        '--lr_warmup_steps_override',
+        type=nonnegative_int,
+        default=None,
+        help='warmup-step override for bounded smoke tests',
     )
     parser.add_argument(
         '--output_dir_override',
@@ -82,6 +95,10 @@ def main():
         if args.gradient_accumulation_steps_override is not None:
             config_overrides["gradient_accumulation_steps"] = (
                 args.gradient_accumulation_steps_override
+            )
+        if args.lr_warmup_steps_override is not None:
+            config_overrides["lr_warmup_steps"] = (
+                args.lr_warmup_steps_override
             )
         if args.output_dir_override is not None:
             config_overrides["output_dir"] = args.output_dir_override

@@ -48,6 +48,7 @@ if [[ "$RUN_KIND" == "smoke8" ]]; then
     SMOKE_OUTPUT_DIR=${SMOKE_OUTPUT_DIR:-/data/user/jhe724/junjie/outputs/smoke_joint_vlm_geact_action_k2_${SLURM_JOB_ID:-manual}}
     MAIN_ARGS+=(
         --max_train_steps 1
+        --lr_warmup_steps_override 0
         --output_dir_override "$SMOKE_OUTPUT_DIR"
     )
 elif [[ "$RUN_KIND" != "formal" ]]; then
