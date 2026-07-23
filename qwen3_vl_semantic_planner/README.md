@@ -28,7 +28,7 @@ Kept flat (not in a subdir) because it reuses the sibling shared infra (`qwen3vl
 Full lingbot-vla-v2 recipe: base = Qwen3-VL-4B **extracted from the open `robbyant/lingbot-vla-v2-6b`**;
 target = **DINO-video** (1024-d, 256 tokens/keyframe), not SigLIP; head = faithful `TaskTokenResampler`
 warm-started from lingbot's `future_video_align_head`; loss = plain MSE. Plan = 5 keyframes × 256 =
-[B, 1280, 1024]. Trainer `train_qwen3vl4b_lingbot_dino_planner.py` (flat, reuses the shared data infra);
+[B, 1280, 1024]. Trainer `train_semantic_planner.py` (flat, reuses the shared data infra);
 4B-specific modules + launcher live in `lingbot_dino_4b/`.
 ```bash
 DATASET_ROOT=<droid dataset> bash lingbot_dino_4b/train_lingbot_dino_4b.sh          # full (2 GPU)
@@ -53,7 +53,7 @@ See `lingbot_dino_4b/LINGBOT_DINO_SPEC.md` for the full spec + the 9-step traini
 qwen3_vl_semantic_planner/
 ├── train_qwen3vl_semantic_planner.py        # line 1 (CoVT/SigLIP 2B, baseline)
 ├── train_qwen3vl_tasktoken_planner.py       # line 2 (tasktoken/SigLIP 2B)
-├── train_qwen3vl4b_lingbot_dino_planner.py  # line 3 trainer (flat: reuses shared data infra)
+├── train_semantic_planner.py                 # shared LIBERO semantic planner trainer
 ├── qwen3vl_wrapper.py, build_siglip2_*.py    # shared infra
 ├── planner_plan_provider.py, STAGE2_PLAN.md  # stage-2 planner⊗WM
 ├── sbatch_train_qwen3vl2b_*.sh               # launchers (lines 1-2)

@@ -1,12 +1,12 @@
-# Full dual-camera K4 VLM + LTX video + GE-Act action training on HPC3.
+# LaWAM-aligned dual-camera K4 VLM + LTX video + GE-Act action training on HPC3.
 # RGB is loaded only from the verified predecoded cache.
 model_name: ltx_train
 is_i2v: true
 report_to: None
-tracker_name: joint_vlm_geact_action_k4_50k
+tracker_name: joint_vlm_geact_action_k4_lawam_25k
 
 logging_dir: logs
-output_dir: /data/user/jhe724/junjie/outputs/joint_vlm_geact_action_k4_50k
+output_dir: /data/user/jhe724/junjie/outputs/joint_vlm_geact_action_k4_lawam_25k
 pretrained_model_name_or_path: /data/user/jhe724/junjie/weights/LTX-Video
 
 train_data_class_path: data/lerobot_like_dataset.py
@@ -32,17 +32,17 @@ return_video: true
 train_mode: all
 action_loss_scale: 1.0
 
-train_steps: 50000
+train_steps: 25000
 train_epochs: 10000
 steps_to_save: 5000
-save_steps: [40000, 45000, 50000]
+save_steps: [5000, 10000, 15000, 20000, 25000]
 steps_to_log: 20
 steps_to_val: 2000
 
 mixed_precision: bf16
 allow_tf32: true
 nccl_timeout: 600
-seed: 42
+seed: 2026
 
 enable_slicing: false
 enable_tiling: true
@@ -50,9 +50,9 @@ add_state: true
 rand_init_action: false
 caption_dropout_p: 0.06
 
-# 4 samples/GPU * 8 GPUs * 4 accumulation = global batch 128.
+# 4 samples/GPU * 8 GPUs * 8 accumulation = global batch 256.
 batch_size: 4
-gradient_accumulation_steps: 4
+gradient_accumulation_steps: 8
 dataloader_num_workers: 8
 dataloader_prefetch_factor: 4
 pin_memory: true
@@ -66,14 +66,15 @@ beta1: 0.9
 beta2: 0.95
 beta3: 0.999
 epsilon: 1.0e-8
-weight_decay: 1.0e-5
+weight_decay: 1.0e-8
 optimizer_8bit: false
 optimizer_torchao: false
 scale_lr: false
 max_grad_norm: 1.0
 
-lr_scheduler: constant_with_warmup
-lr_warmup_steps: 1000
+lr_scheduler: cosine_with_min_lr
+lr_warmup_steps: 1500
+lr_min: 5.0e-7
 lr_num_cycles: 1
 lr_power: 1.0
 
@@ -99,9 +100,12 @@ joint_training:
   planner_loss_weight: 0.1
   lm_plan_loss_weight: 1.0e-3
   action_lr: 5.0e-5
-  qwen_lr: 3.0e-6
+  qwen_vision_lr: 1.0e-4
+  qwen_lr: 1.0e-4
   planner_head_lr: 3.0e-5
-  freeze_qwen_vision: true
+  freeze_qwen_vision: false
+  freeze_qwen_embeddings: true
+  keep_qwen_first_n_layers: 16
   freeze_qwen_lm_head: true
   qwen_gradient_checkpointing: false
   prewarm_text_condition_cache: true

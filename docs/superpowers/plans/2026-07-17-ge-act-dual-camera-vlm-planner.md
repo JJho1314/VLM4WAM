@@ -144,7 +144,7 @@ git commit -m "feat(planner): add independent GE-Act camera inputs"
 ### Task 2: Per-view VLM image-hidden routing with shared 256 query tokens
 
 **Files:**
-- Modify: `qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py:1176-2145`
+- Modify: `qwen3_vl_semantic_planner/train_semantic_planner.py:1176-2145`
 - Modify: `tests/test_ge_act_dual_camera_planner.py`
 
 **Interfaces:**
@@ -225,7 +225,7 @@ Expected: all tests pass; the legacy one-view API still returns `[B,256,D]`.
 - [ ] **Step 5: Commit per-view routing**
 
 ```bash
-git add qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py tests/test_ge_act_dual_camera_planner.py
+git add qwen3_vl_semantic_planner/train_semantic_planner.py tests/test_ge_act_dual_camera_planner.py
 git commit -m "feat(planner): predict aligned features for two cameras"
 ```
 
@@ -235,7 +235,7 @@ git commit -m "feat(planner): predict aligned features for two cameras"
 
 **Files:**
 - Modify: `qwen3_vl_semantic_planner/qwen3vl_wrapper.py:38-82`
-- Modify: `qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py:1528-1650,2244-2625`
+- Modify: `qwen3_vl_semantic_planner/train_semantic_planner.py:1528-1650,2244-2625`
 - Modify: `tests/test_ge_act_dual_camera_planner.py`
 
 **Interfaces:**
@@ -319,7 +319,7 @@ Expected: all tests pass, including strict rejection of composite inference meta
 - [ ] **Step 5: Commit checkpoint support**
 
 ```bash
-git add qwen3_vl_semantic_planner/qwen3vl_wrapper.py qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py tests/test_ge_act_dual_camera_planner.py
+git add qwen3_vl_semantic_planner/qwen3vl_wrapper.py qwen3_vl_semantic_planner/train_semantic_planner.py tests/test_ge_act_dual_camera_planner.py
 git commit -m "feat(planner): initialize and export dual-camera checkpoints"
 ```
 
@@ -328,7 +328,7 @@ git commit -m "feat(planner): initialize and export dual-camera checkpoints"
 ### Task 4: GE-Act-native planner training path and online two-view teachers
 
 **Files:**
-- Modify: `qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py:160-410,2630-3090`
+- Modify: `qwen3_vl_semantic_planner/train_semantic_planner.py:160-410,2630-3090`
 - Modify: `qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_4b.sh`
 - Create: `qwen3_vl_semantic_planner/dinov3_da3_2b/train_ge_act_dual_camera_siglip2da3.sh`
 - Modify: `tests/test_ge_act_dual_camera_planner.py`
@@ -399,7 +399,7 @@ Expected: tests pass and both shell scripts exit `0` from syntax checking.
 - [ ] **Step 5: Commit the train path**
 
 ```bash
-git add qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_4b.sh qwen3_vl_semantic_planner/dinov3_da3_2b/train_ge_act_dual_camera_siglip2da3.sh tests/test_ge_act_dual_camera_planner.py
+git add qwen3_vl_semantic_planner/train_semantic_planner.py qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_4b.sh qwen3_vl_semantic_planner/dinov3_da3_2b/train_ge_act_dual_camera_siglip2da3.sh tests/test_ge_act_dual_camera_planner.py
 git commit -m "feat(planner): train dual-camera targets from GE-Act data"
 ```
 
@@ -680,7 +680,7 @@ Run: `git diff --check`
 If smoke testing required tracked fixes, stage only the implementation and test files from this plan, then commit with:
 
 ```bash
-git add qwen3_vl_semantic_planner/ge_act_dual_camera.py qwen3_vl_semantic_planner/qwen3vl_wrapper.py qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_4b.sh qwen3_vl_semantic_planner/dinov3_da3_2b/train_ge_act_dual_camera_siglip2da3.sh ge_act/main.py ge_act/models/ltx_models/vlm_semantic_planner.py ge_act/runner/ge_trainer.py ge_act/scripts/preflight_ltx_siglip2.py ge_act/configs/ltx_model/libero/video_model_libero_vlm_planner.yaml ge_act/scripts/train_ltx_vlm_planner.sh ge_act/scripts/sbatch_train_ltx_vlm_planner_hpc3.sh tests/test_ge_act_dual_camera_planner.py tests/test_ge_act_vlm_semantic_planner.py tests/test_ge_act_siglip2_config.py tests/test_ge_act_semantic_training_contract.py
+git add qwen3_vl_semantic_planner/ge_act_dual_camera.py qwen3_vl_semantic_planner/qwen3vl_wrapper.py qwen3_vl_semantic_planner/train_semantic_planner.py qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_4b.sh qwen3_vl_semantic_planner/dinov3_da3_2b/train_ge_act_dual_camera_siglip2da3.sh ge_act/main.py ge_act/models/ltx_models/vlm_semantic_planner.py ge_act/runner/ge_trainer.py ge_act/scripts/preflight_ltx_siglip2.py ge_act/configs/ltx_model/libero/video_model_libero_vlm_planner.yaml ge_act/scripts/train_ltx_vlm_planner.sh ge_act/scripts/sbatch_train_ltx_vlm_planner_hpc3.sh tests/test_ge_act_dual_camera_planner.py tests/test_ge_act_vlm_semantic_planner.py tests/test_ge_act_siglip2_config.py tests/test_ge_act_semantic_training_contract.py
 git commit -m "fix: pass dual-camera planner smoke tests"
 ```
 

@@ -95,6 +95,37 @@ def _finite_nonzero(value: torch.Tensor | None) -> bool:
     )
 
 
+def test_cosine_with_min_lr_scheduler_respects_each_group_floor() -> None:
+    symbols = _load_ge_trainer_symbols("build_cosine_with_min_lr_scheduler")
+    first = nn.Parameter(torch.tensor(1.0))
+    second = nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [first], "lr": 1e-4},
+            {"params": [second], "lr": 2e-5},
+        ]
+    )
+    scheduler = symbols.build_cosine_with_min_lr_scheduler(
+        optimizer,
+        num_warmup_steps=2,
+        num_training_steps=6,
+        min_lr=5e-7,
+    )
+
+    assert scheduler.get_last_lr() == pytest.approx([0.0, 0.0])
+    optimizer.step()
+    scheduler.step()
+    assert scheduler.get_last_lr() == pytest.approx([5e-5, 1e-5])
+    optimizer.step()
+    scheduler.step()
+    assert scheduler.get_last_lr() == pytest.approx([1e-4, 2e-5])
+    for _ in range(4):
+        optimizer.step()
+        scheduler.step()
+
+    assert scheduler.get_last_lr() == pytest.approx([5e-7, 5e-7])
+
+
 def test_scalar_metric_reduction_skips_gradient_accumulation_microsteps() -> None:
     symbols = _load_ge_trainer_symbols(
         "reduce_scalar_metrics_at_accumulation_boundary"

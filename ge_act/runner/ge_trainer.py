@@ -75,6 +75,53 @@ logger = get_logger("wm_runner")
 logger.setLevel(LOG_LEVEL)
 
 
+def build_cosine_with_min_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    min_lr: float,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Warm up linearly, then cosine-decay every parameter group to `min_lr`."""
+
+    num_warmup_steps = int(num_warmup_steps)
+    num_training_steps = int(num_training_steps)
+    min_lr = float(min_lr)
+    if num_warmup_steps < 0:
+        raise ValueError("num_warmup_steps must be non-negative")
+    if num_training_steps <= num_warmup_steps:
+        raise ValueError("num_training_steps must exceed num_warmup_steps")
+    if min_lr < 0:
+        raise ValueError("min_lr must be non-negative")
+
+    lr_lambdas = []
+    for group in optimizer.param_groups:
+        base_lr = float(group["lr"])
+        if base_lr <= 0:
+            raise ValueError("optimizer parameter-group learning rates must be positive")
+        if min_lr > base_lr:
+            raise ValueError("min_lr cannot exceed a parameter-group learning rate")
+        min_ratio = min_lr / base_lr
+
+        def lr_lambda(
+            current_step: int,
+            *,
+            group_min_ratio: float = min_ratio,
+        ) -> float:
+            if current_step < num_warmup_steps:
+                return float(current_step) / float(max(1, num_warmup_steps))
+            progress = float(current_step - num_warmup_steps) / float(
+                max(1, num_training_steps - num_warmup_steps)
+            )
+            progress = min(max(progress, 0.0), 1.0)
+            cosine_ratio = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return group_min_ratio + (1.0 - group_min_ratio) * cosine_ratio
+
+        lr_lambdas.append(lr_lambda)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambdas)
+
+
 class EpochSeededRandomSampler(torch.utils.data.Sampler):
     """Rebuild the same shuffled `(sample_index, epoch)` stream on resume."""
 
@@ -1423,7 +1470,7 @@ class Trainer:
                     from qwen3_vl_semantic_planner.dinov3_da3_2b.depth_anything3_target import (
                         DepthAnything3TargetEncoder,
                     )
-                    from qwen3_vl_semantic_planner.train_qwen3vl4b_lingbot_dino_planner import (
+                    from qwen3_vl_semantic_planner.train_semantic_planner import (
                         encode_dual_camera_future_targets,
                     )
 
@@ -1587,7 +1634,10 @@ class Trainer:
                 ltx_lr=float(self.args.lr) * lr_scale,
                 semantic_lr=float(self.args.semantic_lr) * lr_scale,
                 action_lr=float(joint_config["action_lr"]) * lr_scale,
-                qwen_vision_lr=float(joint_config["qwen_vision_lr"]) * lr_scale,
+                qwen_vision_lr=float(
+                    joint_config.get("qwen_vision_lr", joint_config["qwen_lr"])
+                )
+                * lr_scale,
                 qwen_lr=float(joint_config["qwen_lr"]) * lr_scale,
                 planner_head_lr=float(joint_config["planner_head_lr"]) * lr_scale,
             )
@@ -1631,20 +1681,30 @@ class Trainer:
                     self.state.train_epochs * num_update_steps_per_epoch
                 )
                 self.state.overwrote_max_train_steps = True
-            self.lr_scheduler = get_scheduler(
-                name=self.args.lr_scheduler,
-                optimizer=self.optimizer,
-                num_warmup_steps=(
-                    self.args.lr_warmup_steps
-                    * self.state.accelerator.num_processes
-                ),
-                num_training_steps=(
-                    self.state.train_steps
-                    * self.state.accelerator.num_processes
-                ),
-                num_cycles=self.args.lr_num_cycles,
-                power=self.args.lr_power,
+            scheduler_warmup_steps = (
+                self.args.lr_warmup_steps
+                * self.state.accelerator.num_processes
             )
+            scheduler_training_steps = (
+                self.state.train_steps
+                * self.state.accelerator.num_processes
+            )
+            if self.args.lr_scheduler == "cosine_with_min_lr":
+                self.lr_scheduler = build_cosine_with_min_lr_scheduler(
+                    self.optimizer,
+                    num_warmup_steps=scheduler_warmup_steps,
+                    num_training_steps=scheduler_training_steps,
+                    min_lr=float(self.args.lr_min),
+                )
+            else:
+                self.lr_scheduler = get_scheduler(
+                    name=self.args.lr_scheduler,
+                    optimizer=self.optimizer,
+                    num_warmup_steps=scheduler_warmup_steps,
+                    num_training_steps=scheduler_training_steps,
+                    num_cycles=self.args.lr_num_cycles,
+                    power=self.args.lr_power,
+                )
             return
 
         train_mode = self.args.train_mode

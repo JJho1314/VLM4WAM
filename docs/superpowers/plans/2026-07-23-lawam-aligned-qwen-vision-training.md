@@ -258,14 +258,9 @@ assert joint["keep_qwen_first_n_layers"] == 16
 assert joint["freeze_qwen_lm_head"] is True
 ```
 
-Capture scheduler kwargs in the trainer test and assert:
-
-```python
-assert captured["scheduler_kwargs"]["name"] == "cosine_with_min_lr"
-assert captured["scheduler_kwargs"]["scheduler_specific_kwargs"] == {
-    "min_lr": 5e-7
-}
-```
+Add a scheduler unit test with two optimizer groups (`1e-4` and `2e-5`) and
+assert that both reach the same absolute `5e-7` floor after warmup and cosine
+decay.
 
 - [ ] **Step 2: Run focused config tests and verify RED**
 
@@ -303,15 +298,12 @@ joint_training:
   freeze_qwen_lm_head: true
 ```
 
-When constructing the scheduler, pass:
-
-```python
-scheduler_specific_kwargs=(
-    {"min_lr": float(self.args.lr_min)}
-    if self.args.lr_scheduler == "cosine_with_min_lr"
-    else None
-),
-```
+The installed Diffusers scheduler factory does not implement
+`cosine_with_min_lr`. Add a local `torch.optim.lr_scheduler.LambdaLR` helper
+that computes one lambda per optimizer group. Each group must decay to the
+same absolute floor, so the minimum ratio is `min_lr / group["lr"]`. Select
+this helper only for the joint `cosine_with_min_lr` recipe and preserve the
+existing Diffusers scheduler path for all other recipes.
 
 Update preflight to enforce the same values and precise error messages.
 
@@ -360,11 +352,23 @@ python -m compileall -q \
 pytest -q \
   tests/test_ge_act_siglip2_config.py \
   tests/test_joint_vlm_geact_training.py
-python ge_act/scripts/preflight_ltx_siglip2.py \
-  --config ge_act/configs/ltx_model/libero/video_model_libero_joint_vlm_geact_action_k4_hpc3.yaml \
-  --world-size 8 \
-  --skip-path-checks \
-  --require-joint-formal
+PYTHONPATH="$PWD:$PWD/ge_act" python - <<'PY'
+from pathlib import Path
+import yaml
+from ge_act.scripts.preflight_ltx_siglip2 import collect_preflight_errors
+
+path = Path(
+    "ge_act/configs/ltx_model/libero/"
+    "video_model_libero_joint_vlm_geact_action_k4_hpc3.yaml"
+)
+errors = collect_preflight_errors(
+    yaml.safe_load(path.read_text()),
+    world_size=8,
+    check_paths=False,
+    require_joint_formal=True,
+)
+assert not errors, errors
+PY
 git diff --check
 git status --short
 ```

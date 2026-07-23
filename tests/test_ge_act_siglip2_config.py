@@ -345,7 +345,7 @@ def test_joint_vlm_geact_config_matches_approved_recipe() -> None:
     assert config["deepspeed"]["bf16"]["enabled"] is True
 
 
-def test_joint_action_hpc3_config_matches_approved_50k_recipe() -> None:
+def test_joint_action_hpc3_config_matches_lawam_recipe() -> None:
     assert JOINT_ACTION_HPC3_CONFIG_PATH.is_file()
     config = yaml.safe_load(JOINT_ACTION_HPC3_CONFIG_PATH.read_text())
 
@@ -355,23 +355,31 @@ def test_joint_action_hpc3_config_matches_approved_50k_recipe() -> None:
     assert config["action_loss_scale"] == 1.0
     assert config["add_state"] is True
     assert config["rand_init_action"] is False
-    assert config["train_steps"] == 50_000
-    assert config["save_steps"] == [40_000, 45_000, 50_000]
+    assert config["seed"] == 2026
+    assert config["train_steps"] == 25_000
+    assert config["save_steps"] == [5_000, 10_000, 15_000, 20_000, 25_000]
     assert config["batch_size"] == 4
-    assert config["gradient_accumulation_steps"] == 4
-    assert config["batch_size"] * config["gradient_accumulation_steps"] * 8 == 128
+    assert config["gradient_accumulation_steps"] == 8
+    assert config["batch_size"] * config["gradient_accumulation_steps"] * 8 == 256
     assert config["gradient_checkpointing"] is False
     assert config["lr"] == 2e-5
     assert config["semantic_lr"] == 1e-4
+    assert config["lr_scheduler"] == "cosine_with_min_lr"
+    assert config["lr_warmup_steps"] == 1_500
+    assert config["lr_min"] == 5e-7
+    assert config["weight_decay"] == 1e-8
 
     joint = config["joint_training"]
     assert joint["enabled"] is True
     assert joint["formal_recipe"] == "hpc3_action"
     assert joint["planner_loss_weight"] == 0.1
     assert joint["action_lr"] == 5e-5
-    assert joint["qwen_lr"] == 3e-6
+    assert joint["qwen_vision_lr"] == 1e-4
+    assert joint["qwen_lr"] == 1e-4
     assert joint["planner_head_lr"] == 3e-5
-    assert joint["freeze_qwen_vision"] is True
+    assert joint["freeze_qwen_vision"] is False
+    assert joint["freeze_qwen_embeddings"] is True
+    assert joint["keep_qwen_first_n_layers"] == 16
     assert joint["freeze_qwen_lm_head"] is True
     assert joint["qwen_gradient_checkpointing"] is False
 
@@ -430,14 +438,23 @@ def test_joint_action_hpc3_preflight_rejects_objective_and_geometry_drift() -> N
     config["add_state"] = False
     config["rand_init_action"] = True
     config["noisy_video"] = True
+    config["seed"] = 42
     config["train_steps"] = 30_000
     config["save_steps"] = [20_000, 25_000, 30_000]
     config["batch_size"] = 1
     config["gradient_accumulation_steps"] = 16
+    config["weight_decay"] = 1e-5
+    config["lr_scheduler"] = "constant_with_warmup"
+    config["lr_warmup_steps"] = 1_000
+    config["lr_min"] = 0.0
     joint = config["joint_training"]
     joint["action_lr"] = 1e-5
+    joint["qwen_vision_lr"] = 3e-6
     joint["qwen_lr"] = 1e-6
-    joint["freeze_qwen_vision"] = False
+    joint["freeze_qwen_vision"] = True
+    joint["freeze_qwen_embeddings"] = False
+    joint["keep_qwen_first_n_layers"] = 0
+    joint["freeze_qwen_lm_head"] = False
     model = config["diffusion_model"]["config"]
     model["action_expert"] = False
     model["action_in_channels"] = 7
@@ -454,16 +471,25 @@ def test_joint_action_hpc3_preflight_rejects_objective_and_geometry_drift() -> N
     )
 
     for expected in (
-        "train_steps must be 50000",
-        "joint action training requires batch/accumulation 4/4 or 2/8",
-        "joint Qwen lr must be 3e-6",
-        "joint save_steps must be [40000, 45000, 50000]",
+        "global batch must be 256, got 128",
+        "train_steps must be 25000",
+        "joint action training requires batch/accumulation 4/8",
+        "joint Qwen vision lr must be 1e-4",
+        "joint Qwen lr must be 1e-4",
+        "joint save_steps must be [5000, 10000, 15000, 20000, 25000]",
+        "joint action training requires trainable Qwen vision",
+        "joint action training must freeze Qwen embeddings and LM head",
+        "joint action training must freeze the first 16 Qwen language layers",
+        "joint action training requires cosine_with_min_lr",
+        "joint action training requires lr_min=5e-7",
+        "joint action training requires lr_warmup_steps=1500",
+        "joint action training requires weight_decay=1e-8",
+        "joint action training requires seed=2026",
         "joint action training requires return_video=true",
         "joint action training requires return_action=true",
         "joint action training requires train_mode=all",
         "joint action loss scale must be 1.0",
         "joint action lr must be 5e-5",
-        "joint action training must freeze Qwen vision and LM head",
         "joint action training requires add_state=true",
         "joint action training must load checkpoint action weights",
         "joint action training requires noisy_video=false",

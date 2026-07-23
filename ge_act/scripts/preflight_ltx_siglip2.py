@@ -177,9 +177,12 @@ def collect_preflight_errors(
         * int(config.get("gradient_accumulation_steps", 0))
         * int(world_size)
     )
-    if global_batch != 128:
-        errors.append(f"global batch must be 128, got {global_batch}")
-    expected_train_steps = 50_000 if action_profile else 30_000
+    expected_global_batch = 256 if action_profile else 128
+    if global_batch != expected_global_batch:
+        errors.append(
+            f"global batch must be {expected_global_batch}, got {global_batch}"
+        )
+    expected_train_steps = 25_000 if action_profile else 30_000
     if config.get("train_steps") != expected_train_steps:
         errors.append(f"train_steps must be {expected_train_steps}")
     if not joint_enabled and not config.get("gradient_checkpointing", False):
@@ -217,9 +220,7 @@ def collect_preflight_errors(
             errors.append("joint DA3 feature width must be 2048")
         if int(world_size) != 8:
             errors.append("joint formal training requires world size 8")
-        batch_contract = (
-            ((4, 4), (2, 8)) if action_profile else ((4, 4),)
-        )
+        batch_contract = ((4, 8),) if action_profile else ((4, 4),)
         batch_shape = (
             config.get("batch_size"),
             config.get("gradient_accumulation_steps"),
@@ -227,7 +228,7 @@ def collect_preflight_errors(
         if batch_shape not in batch_contract:
             if action_profile:
                 errors.append(
-                    "joint action training requires batch/accumulation 4/4 or 2/8"
+                    "joint action training requires batch/accumulation 4/8"
                 )
             else:
                 errors.append(
@@ -245,10 +246,12 @@ def collect_preflight_errors(
             errors.append("joint LTX base lr must be 2e-5")
         if config.get("semantic_lr") != 1e-4:
             errors.append("joint LTX semantic lr must be 1e-4")
-        expected_qwen_lr = 3e-6 if action_profile else 1e-6
+        expected_qwen_lr = 1e-4 if action_profile else 1e-6
         if joint.get("qwen_lr") != expected_qwen_lr:
-            expected_qwen_lr_text = "3e-6" if action_profile else "1e-6"
+            expected_qwen_lr_text = "1e-4" if action_profile else "1e-6"
             errors.append(f"joint Qwen lr must be {expected_qwen_lr_text}")
+        if action_profile and joint.get("qwen_vision_lr") != 1e-4:
+            errors.append("joint Qwen vision lr must be 1e-4")
         if joint.get("planner_head_lr") != 3e-5:
             errors.append("joint planner head lr must be 3e-5")
         if joint.get("planner_loss_weight") != 0.1:
@@ -274,10 +277,16 @@ def collect_preflight_errors(
             errors.append("joint formal training requires DeepSpeed ZeRO-2")
         if not deepspeed.get("bf16", {}).get("enabled", False):
             errors.append("joint DeepSpeed bf16 must be enabled")
-        if config.get("lr_warmup_steps") != 1_000:
-            errors.append("joint lr_warmup_steps must be 1000")
+        expected_warmup_steps = 1_500 if action_profile else 1_000
+        if config.get("lr_warmup_steps") != expected_warmup_steps:
+            if action_profile:
+                errors.append(
+                    "joint action training requires lr_warmup_steps=1500"
+                )
+            else:
+                errors.append("joint lr_warmup_steps must be 1000")
         expected_save_steps = (
-            [40_000, 45_000, 50_000]
+            [5_000, 10_000, 15_000, 20_000, 25_000]
             if action_profile
             else [20_000, 25_000, 30_000]
         )
@@ -294,12 +303,33 @@ def collect_preflight_errors(
                 errors.append("joint action loss scale must be 1.0")
             if joint.get("action_lr") != 5e-5:
                 errors.append("joint action lr must be 5e-5")
-            if not joint.get("freeze_qwen_vision") or not joint.get(
-                "freeze_qwen_lm_head"
+            if joint.get("freeze_qwen_vision") is not False:
+                errors.append(
+                    "joint action training requires trainable Qwen vision"
+                )
+            if (
+                joint.get("freeze_qwen_embeddings") is not True
+                or joint.get("freeze_qwen_lm_head") is not True
             ):
                 errors.append(
-                    "joint action training must freeze Qwen vision and LM head"
+                    "joint action training must freeze Qwen embeddings and LM head"
                 )
+            if joint.get("keep_qwen_first_n_layers") != 16:
+                errors.append(
+                    "joint action training must freeze the first 16 Qwen language layers"
+                )
+            if config.get("lr_scheduler") != "cosine_with_min_lr":
+                errors.append(
+                    "joint action training requires cosine_with_min_lr"
+                )
+            if config.get("lr_min") != 5e-7:
+                errors.append("joint action training requires lr_min=5e-7")
+            if config.get("weight_decay") != 1e-8:
+                errors.append(
+                    "joint action training requires weight_decay=1e-8"
+                )
+            if config.get("seed") != 2026:
+                errors.append("joint action training requires seed=2026")
             if config.get("add_state") is not True:
                 errors.append("joint action training requires add_state=true")
             if config.get("rand_init_action") is not False:

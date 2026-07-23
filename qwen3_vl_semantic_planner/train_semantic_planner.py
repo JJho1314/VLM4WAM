@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
-"""Fine-tune Qwen3-VL-4B as a semantic planner — LINGBOT-DINO variant (full lingbot-vla-v2 recipe).
+"""Train the shared Qwen3-VL semantic planner.
 
-Independent 4B line (2B CoVT + tasktoken untouched). Differs from the SigLIP scripts:
-  * base VLM = Qwen3-VL-4B extracted from robbyant/lingbot-vla-v2-6b (--model-path → extracted dir);
-  * target  = DINO-video (1024-d, 256 tokens/keyframe) from lingbot's teacher, online, NOT SigLIP;
-  * head    = faithful TaskTokenResampler (LingbotDinoPlanHead), warm-startable from the 6b
-              future_video_align_head (--head-warmstart-ckpt);
-  * loss    = plain MSE (set via loss weights: mse=1, others=0).
-Plan = num_keyframes × 256 tokens (grid_size=16 ⇒ 16²=256), e.g. 5×256 = [B, 1280, 1024].
-
-NOTE: this plan lives in DINO-video space, so the Cosmos WM must be retrained to consume it — a
-separate downstream step (not covered here). See lingbot_dino_4b/LINGBOT_DINO_SPEC.md.
+The entry point supports the current LIBERO variants used by this repository:
+single- or dual-camera inputs, K1/K4 future plans, Qwen3-VL 2B/4B checkpoints,
+SigLIP2 semantic targets, and optional DA3 depth targets.  The
+``lingbot_dino`` head remains warm-start compatible with LingBot-VLA's
+``TaskTokenResampler``.
 """
 
 from __future__ import annotations
@@ -3064,15 +3059,37 @@ def apply_lora(model: nn.Module, args: argparse.Namespace) -> nn.Module:
     return get_peft_model(model, config)
 
 
+def resolve_qwen_visual_module(model: nn.Module) -> nn.Module:
+    nested_model = getattr(model, "model", None)
+    for candidate in (
+        getattr(model, "visual", None),
+        getattr(nested_model, "visual", None),
+    ):
+        if isinstance(candidate, nn.Module):
+            return candidate
+    candidates = [
+        module
+        for name, module in model.named_modules()
+        if name == "visual" or name.endswith(".visual")
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    raise ValueError(
+        "Qwen module must expose exactly one visual backbone; "
+        f"found {len(candidates)}"
+    )
+
+
 def set_trainable(model: nn.Module, *, freeze_vision: bool, freeze_lm_head: bool, full_finetune: bool) -> None:
     for p in model.parameters():
         p.requires_grad_(full_finetune)
-    if freeze_vision and hasattr(model, "visual"):
-        for p in model.visual.parameters():
-            p.requires_grad_(False)
+    if freeze_vision:
+        visual = resolve_qwen_visual_module(model)
+        visual.requires_grad_(False)
+        visual.eval()
     if freeze_lm_head and hasattr(model, "lm_head"):
-        for p in model.lm_head.parameters():
-            p.requires_grad_(False)
+        model.lm_head.requires_grad_(False)
+        model.lm_head.eval()
 
 
 def build_optimizer(wrapper: PlannerWrapper, args: argparse.Namespace) -> torch.optim.Optimizer:
@@ -3880,6 +3897,10 @@ def main() -> None:
                 print(json.dumps({"current_depth_head_warmstart": current_depth_report}), flush=True)
     wrapper.to(device)
     wrapper.train()
+    if args.freeze_vision:
+        # `wrapper.train()` recursively flips the frozen visual backbone back to
+        # training mode, so restore deterministic frozen-backbone behavior.
+        resolve_qwen_visual_module(wrapper.model).eval()
     if accelerator.is_main_process:
         trainable, total = count_trainable_parameters(wrapper)
         print(

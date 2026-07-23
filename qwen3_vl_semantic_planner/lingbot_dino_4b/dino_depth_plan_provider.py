@@ -346,7 +346,7 @@ class FrozenDinoDepthPlanProvider:
         trainer_dir = str(Path(__file__).resolve().parent.parent)
         if trainer_dir not in sys.path:
             sys.path.insert(0, trainer_dir)
-        from train_qwen3vl4b_lingbot_dino_planner import (
+        from train_semantic_planner import (
             PlannerWrapper,
             build_planner_inputs,
             move_qwen_inputs_to_device,
