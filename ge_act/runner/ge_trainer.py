@@ -1586,6 +1586,7 @@ class Trainer:
                 ltx_lr=float(self.args.lr) * lr_scale,
                 semantic_lr=float(self.args.semantic_lr) * lr_scale,
                 action_lr=float(joint_config["action_lr"]) * lr_scale,
+                qwen_vision_lr=float(joint_config["qwen_vision_lr"]) * lr_scale,
                 qwen_lr=float(joint_config["qwen_lr"]) * lr_scale,
                 planner_head_lr=float(joint_config["planner_head_lr"]) * lr_scale,
             )

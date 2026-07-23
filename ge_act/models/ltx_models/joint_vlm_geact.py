@@ -335,6 +335,7 @@ def build_joint_optimizer_parameter_groups(
     ltx_lr: float,
     semantic_lr: float,
     action_lr: float,
+    qwen_vision_lr: float,
     qwen_lr: float,
     planner_head_lr: float,
 ) -> list[dict[str, Any]]:
@@ -345,11 +346,21 @@ def build_joint_optimizer_parameter_groups(
     planner_model = getattr(model.planner, "model", None)
     if not isinstance(planner_model, nn.Module):
         raise ValueError("joint planner must expose its Qwen module as planner.model")
+    nested_planner_model = getattr(planner_model, "model", None)
+    qwen_visual = getattr(planner_model, "visual", None)
+    if not isinstance(qwen_visual, nn.Module):
+        qwen_visual = getattr(nested_planner_model, "visual", None)
+    if not isinstance(qwen_visual, nn.Module):
+        raise ValueError("joint planner Qwen module must expose its visual encoder")
+    qwen_vision_parameter_ids = {
+        id(parameter) for parameter in qwen_visual.parameters()
+    }
 
     parameters_by_group: dict[str, list[nn.Parameter]] = {
         "base_ltx": [],
         "semantic_ltx": [],
         "action_ltx": [],
+        "qwen_vision": [],
         "qwen": [],
         "planner_heads": [],
     }
@@ -370,12 +381,23 @@ def build_joint_optimizer_parameter_groups(
             add("base_ltx", parameter)
 
     for name, parameter in _named_trainable_parameters(model.planner):
-        add("qwen" if name.startswith("model.") else "planner_heads", parameter)
+        if name.startswith("model."):
+            add(
+                (
+                    "qwen_vision"
+                    if id(parameter) in qwen_vision_parameter_ids
+                    else "qwen"
+                ),
+                parameter,
+            )
+        else:
+            add("planner_heads", parameter)
 
     group_order = (
         "base_ltx",
         "semantic_ltx",
         "action_ltx",
+        "qwen_vision",
         "qwen",
         "planner_heads",
     )
@@ -410,6 +432,7 @@ def build_joint_optimizer_parameter_groups(
         "base_ltx": ltx_lr,
         "semantic_ltx": semantic_lr,
         "action_ltx": action_lr,
+        "qwen_vision": qwen_vision_lr,
         "qwen": qwen_lr,
         "planner_heads": planner_head_lr,
     }

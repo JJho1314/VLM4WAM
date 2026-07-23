@@ -761,7 +761,10 @@ def test_joint_rejects_inconsistent_ltx_latent_geometry_before_ltx() -> None:
 
 def test_joint_optimizer_groups_are_disjoint_complete_and_ordered() -> None:
     joint = _make_tiny_joint_model()
-    joint.planner.model.visual.requires_grad_(False)
+    language_model = joint.planner.model.model.language_model
+    language_model.embed_tokens.requires_grad_(False)
+    for layer in language_model.layers[:16]:
+        layer.requires_grad_(False)
     joint.planner.model.lm_head.requires_grad_(False)
 
     groups = build_joint_optimizer_parameter_groups(
@@ -769,7 +772,8 @@ def test_joint_optimizer_groups_are_disjoint_complete_and_ordered() -> None:
         ltx_lr=2e-5,
         semantic_lr=1e-4,
         action_lr=5e-5,
-        qwen_lr=3e-6,
+        qwen_vision_lr=1e-4,
+        qwen_lr=1e-4,
         planner_head_lr=3e-5,
     )
 
@@ -777,6 +781,7 @@ def test_joint_optimizer_groups_are_disjoint_complete_and_ordered() -> None:
         "base_ltx",
         "semantic_ltx",
         "action_ltx",
+        "qwen_vision",
         "qwen",
         "planner_heads",
     ]
@@ -784,7 +789,8 @@ def test_joint_optimizer_groups_are_disjoint_complete_and_ordered() -> None:
         2e-5,
         1e-4,
         5e-5,
-        3e-6,
+        1e-4,
+        1e-4,
         3e-5,
     ]
     parameter_ids = [id(parameter) for group in groups for parameter in group["params"]]
@@ -800,8 +806,8 @@ def test_joint_optimizer_groups_are_disjoint_complete_and_ordered() -> None:
     assert id(joint.ltx.base_proj.weight) in ids_by_group["base_ltx"]
     assert id(joint.ltx.semantic_attn.weight) in ids_by_group["semantic_ltx"]
     assert id(joint.ltx.action_proj.weight) in ids_by_group["action_ltx"]
+    assert id(joint.planner.model.visual.weight) in ids_by_group["qwen_vision"]
     assert id(joint.planner.model.proj.weight) in ids_by_group["qwen"]
-    assert id(joint.planner.model.visual.weight) not in parameter_ids
     assert id(joint.planner.model.lm_head.weight) not in parameter_ids
     assert id(joint.planner.plan_head.weight) in ids_by_group["planner_heads"]
     assert id(joint.planner.depth_head.weight) in ids_by_group["planner_heads"]
@@ -834,6 +840,7 @@ def test_joint_optimizer_groups_reject_cross_group_parameter_aliases() -> None:
             ltx_lr=2e-5,
             semantic_lr=1e-4,
             action_lr=5e-5,
+            qwen_vision_lr=1e-4,
             qwen_lr=3e-6,
             planner_head_lr=3e-5,
         )
@@ -849,6 +856,7 @@ def test_joint_optimizer_groups_reject_unclassified_parameters() -> None:
             ltx_lr=2e-5,
             semantic_lr=1e-4,
             action_lr=5e-5,
+            qwen_vision_lr=1e-4,
             qwen_lr=3e-6,
             planner_head_lr=3e-5,
         )
@@ -1008,13 +1016,16 @@ def test_joint_teacher_parameters_are_frozen_and_excluded() -> None:
     )
     trainer.args = SimpleNamespace(
         joint_training={
-            "enabled": True,
-            "qwen_gradient_checkpointing": False,
-            "freeze_qwen_vision": True,
-            "freeze_qwen_lm_head": True,
-            "action_lr": 5e-5,
-            "qwen_lr": 3e-6,
-            "planner_head_lr": 3e-5,
+                "enabled": True,
+                "qwen_gradient_checkpointing": False,
+                "freeze_qwen_vision": False,
+                "freeze_qwen_lm_head": True,
+                "freeze_qwen_embeddings": True,
+                "keep_qwen_first_n_layers": 16,
+                "action_lr": 5e-5,
+                "qwen_vision_lr": 1e-4,
+                "qwen_lr": 1e-4,
+                "planner_head_lr": 3e-5,
         },
         gradient_checkpointing=False,
         allow_tf32=False,
@@ -1069,10 +1080,21 @@ def test_joint_teacher_parameters_are_frozen_and_excluded() -> None:
     assert not trainer.depth_teacher.training
     assert planner.training
     assert planner.model.proj.weight.requires_grad
-    assert not planner.model.visual.weight.requires_grad
+    assert planner.model.visual.weight.requires_grad
     assert not planner.model.lm_head.weight.requires_grad
-    assert not planner.model.visual.training
+    assert planner.model.visual.training
     assert not planner.model.lm_head.training
+    assert not planner.model.model.language_model.embed_tokens.weight.requires_grad
+    assert all(
+        not parameter.requires_grad
+        for layer in planner.model.model.language_model.layers[:16]
+        for parameter in layer.parameters()
+    )
+    assert all(
+        parameter.requires_grad
+        for layer in planner.model.model.language_model.layers[16:]
+        for parameter in layer.parameters()
+    )
     assert planner.model.is_gradient_checkpointing is False
     assert not hasattr(planner.model, "input_grads_enabled")
     assert not hasattr(ltx, "gradient_checkpointing_enabled")
@@ -1081,6 +1103,7 @@ def test_joint_teacher_parameters_are_frozen_and_excluded() -> None:
         "base_ltx",
         "semantic_ltx",
         "action_ltx",
+        "qwen_vision",
         "qwen",
         "planner_heads",
     ]
@@ -1088,7 +1111,8 @@ def test_joint_teacher_parameters_are_frozen_and_excluded() -> None:
         2e-5,
         1e-4,
         5e-5,
-        3e-6,
+        1e-4,
+        1e-4,
         3e-5,
     ]
     optimized_ids = {id(parameter) for group in groups for parameter in group["params"]}
