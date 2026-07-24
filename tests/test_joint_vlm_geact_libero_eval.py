@@ -20,6 +20,7 @@ from experiments.joint_libero_eval_contract import (
     SemanticConditionedPipelineProxy,
     build_joint_semantic_condition,
     normalize_joint_current_images,
+    prepare_joint_inference_prompt,
     validate_joint_evaluation_checkpoint,
 )
 
@@ -55,6 +56,7 @@ def valid_k4_planner_metadata() -> dict[str, object]:
         "planner_token_count": 384,
         "video_target_type": "siglip2",
         "use_current_alignment": False,
+        "instruction_preprocessing": "libero_tgt_v1",
         "step": 40_000,
         "plan_token_strings": [
             f"<|sem_plan_{index}|>" for index in range(384)
@@ -77,6 +79,7 @@ def write_joint_export(tmp_path: Path, *, global_step: int = 40_000) -> Path:
                 "num_keyframes": 4,
                 "tokens_per_keyframe": 256,
                 "future_keyframe_offsets": [2, 4, 6, 8],
+                "instruction_preprocessing": "libero_tgt_v1",
             }
         ),
         encoding="utf-8",
@@ -150,6 +153,38 @@ def test_joint_checkpoint_contract_accepts_exact_step40000(tmp_path: Path) -> No
     assert checkpoint.ltx_dir == root / "ltx"
     assert checkpoint.planner_dir == root / "planner"
     assert checkpoint.metadata["future_keyframe_offsets"] == [2, 4, 6, 8]
+
+
+def test_joint_inference_prompt_marks_first_target() -> None:
+    assert prepare_joint_inference_prompt(
+        "turn on the stove and put the moka pot on it"
+    ) == "turn on the [TGT] stove and put the moka pot on it"
+
+
+def test_joint_checkpoint_rejects_legacy_prompt_contract(
+    tmp_path: Path,
+) -> None:
+    root = write_joint_export(tmp_path)
+    joint_path = root / "joint_meta.json"
+    joint = json.loads(joint_path.read_text(encoding="utf-8"))
+    joint.pop("instruction_preprocessing", None)
+    joint_path.write_text(json.dumps(joint), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="instruction_preprocessing"):
+        validate_joint_evaluation_checkpoint(root)
+
+
+def test_joint_checkpoint_rejects_legacy_planner_prompt_contract(
+    tmp_path: Path,
+) -> None:
+    root = write_joint_export(tmp_path)
+    planner_path = root / "planner" / "planner_meta.json"
+    planner = json.loads(planner_path.read_text(encoding="utf-8"))
+    planner.pop("instruction_preprocessing", None)
+    planner_path.write_text(json.dumps(planner), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="instruction_preprocessing"):
+        validate_joint_evaluation_checkpoint(root)
 
 
 @pytest.mark.parametrize(
@@ -274,6 +309,21 @@ def test_semantic_condition_preserves_main_wrist_order() -> None:
     assert mask.tolist() == [1.0, 1.0]
 
 
+def test_semantic_condition_receives_marked_prompt() -> None:
+    planner = RecordingPlanner()
+    current = torch.zeros(2, 3, 8, 8)
+
+    build_joint_semantic_condition(
+        planner,
+        current,
+        prepare_joint_inference_prompt("pick up the black bowl"),
+        device="cpu",
+        dtype=torch.bfloat16,
+    )
+
+    assert planner.instructions == ["pick up the [TGT] black bowl"]
+
+
 @pytest.mark.parametrize(
     ("planner", "message"),
     [
@@ -351,6 +401,12 @@ def test_joint_evaluator_loads_planner_and_uses_fail_closed_proxy() -> None:
     assert "normalize_joint_current_images(" in source
     assert "build_joint_semantic_condition(" in source
     assert "SemanticConditionedPipelineProxy(" in source
+    assert "marked_prompt = prepare_joint_inference_prompt(prompt)" in source
+    assert "current_images,\n                marked_prompt," in source
+    assert (
+        "current_images,\n                marked_prompt,\n"
+        "                excution_step="
+    ) in source
     assert "return super().play(" in source
     assert "return {}" not in source
 

@@ -14,10 +14,14 @@ from experiments.joint_libero_eval_contract import (
     SemanticConditionedPipelineProxy,
     build_joint_semantic_condition,
     normalize_joint_current_images,
+    prepare_joint_inference_prompt,
     validate_joint_evaluation_checkpoint,
 )
 from models.ltx_models.vlm_semantic_planner import (
     FrozenDualCameraVLMPlanner,
+)
+from qwen3_vl_semantic_planner.libero_target_text import (
+    LIBERO_TGT_PREPROCESSING,
 )
 
 
@@ -47,6 +51,7 @@ class JointInferenceLibero(InferenceLibero):
             self.joint_checkpoint.planner_dir,
             device=self.device,
             dtype=self.weight_dtype,
+            expected_instruction_preprocessing=LIBERO_TGT_PREPROCESSING,
         )
         self.pipeline = SemanticConditionedPipelineProxy(
             self.pipeline,
@@ -73,12 +78,13 @@ class JointInferenceLibero(InferenceLibero):
         if self._pending_conditioning:
             raise RuntimeError("stale semantic conditioning was not consumed")
 
+        marked_prompt = prepare_joint_inference_prompt(prompt)
         current_images = normalize_joint_current_images(obs)
         semantic_plan, semantic_plan_times, semantic_condition_mask = (
             build_joint_semantic_condition(
                 self.semantic_planner,
                 current_images,
-                prompt,
+                marked_prompt,
                 device=self.device,
                 dtype=self.weight_dtype,
             )
@@ -101,7 +107,7 @@ class JointInferenceLibero(InferenceLibero):
         try:
             return super().play(
                 current_images,
-                prompt,
+                marked_prompt,
                 excution_step=excution_step,
                 state=state,
             )

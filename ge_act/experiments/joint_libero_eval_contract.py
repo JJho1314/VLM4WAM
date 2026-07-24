@@ -13,6 +13,10 @@ import torch
 from models.ltx_models.vlm_semantic_planner import (
     validate_dual_camera_planner_metadata,
 )
+from qwen3_vl_semantic_planner.libero_target_text import (
+    LIBERO_TGT_PREPROCESSING,
+    preprocess_libero_instructions,
+)
 
 
 EXPECTED_CAMERA_VIEWS = 2
@@ -21,6 +25,15 @@ EXPECTED_TOKENS_PER_KEYFRAME = 256
 EXPECTED_FEATURE_DIM = 1024
 EXPECTED_KEYFRAME_OFFSETS = [2, 4, 6, 8]
 EXPECTED_KEYFRAME_TIMES = [0.25, 0.5, 0.75, 1.0]
+
+
+def prepare_joint_inference_prompt(prompt: str) -> str:
+    """Apply the target-aware instruction contract used by joint inference."""
+
+    return preprocess_libero_instructions(
+        [prompt],
+        preprocessing=LIBERO_TGT_PREPROCESSING,
+    )[0]
 
 
 @dataclass(frozen=True)
@@ -75,6 +88,7 @@ def validate_joint_evaluation_checkpoint(
         "num_keyframes": EXPECTED_KEYFRAMES,
         "tokens_per_keyframe": EXPECTED_TOKENS_PER_KEYFRAME,
         "future_keyframe_offsets": EXPECTED_KEYFRAME_OFFSETS,
+        "instruction_preprocessing": LIBERO_TGT_PREPROCESSING,
     }.items():
         _require_equal(joint, field, expected, source="joint metadata")
 
@@ -92,7 +106,10 @@ def validate_joint_evaluation_checkpoint(
         raise FileNotFoundError(f"missing LTX safetensors export in {ltx_dir}")
 
     planner_meta = _read_json(planner_dir / "planner_meta.json")
-    validate_dual_camera_planner_metadata(planner_meta)
+    validate_dual_camera_planner_metadata(
+        planner_meta,
+        expected_instruction_preprocessing=LIBERO_TGT_PREPROCESSING,
+    )
     _require_equal(
         planner_meta,
         "step",
