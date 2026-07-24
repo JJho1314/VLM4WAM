@@ -48,6 +48,21 @@ See `lingbot_dino_4b/LINGBOT_DINO_SPEC.md` for the full spec + the 9-step traini
   `SEMANTIC_PLAN_PLANNER_CKPT` is set)
 - `STAGE2_PLAN.md` — design doc
 
+### LIBERO target-aware text
+
+New dual-camera LIBERO planner runs must pass:
+
+```bash
+--instruction-preprocessing libero_tgt_v1
+```
+
+`[TGT]` is ordinary prompt text; do not add it as a tokenizer token. Before a
+long run, audit all four `meta/tasks.jsonl` files with
+`python -m qwen3_vl_semantic_planner.audit_libero_target_text ...`. A new
+target-aware GE-Act config must also set
+`semantic_plan.instruction_preprocessing: libero_tgt_v1`; this intentionally
+rejects the old unmarked planner checkpoint.
+
 ## Layout
 ```
 qwen3_vl_semantic_planner/

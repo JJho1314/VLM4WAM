@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from qwen3_vl_semantic_planner.libero_target_text import (
@@ -80,3 +83,41 @@ def test_batch_preprocessing_selects_target_or_legacy_contract() -> None:
     ) == raw
     with pytest.raises(ValueError, match="unsupported instruction preprocessing"):
         preprocess_libero_instructions(raw, preprocessing="libero_tgt_v2")
+
+
+def test_all_four_libero_suites_produce_exactly_one_marker() -> None:
+    fixture = Path(__file__).parent / "fixtures" / "libero_task_texts.json"
+    suites = json.loads(fixture.read_text())
+    assert {name: len(tasks) for name, tasks in suites.items()} == {
+        "libero_10": 10,
+        "libero_goal": 10,
+        "libero_object": 10,
+        "libero_spatial": 10,
+    }
+    marked = [
+        mark_libero_target(task)
+        for tasks in suites.values()
+        for task in tasks
+    ]
+    assert len(marked) == 40
+    assert all(value.count("[TGT]") == 1 for value in marked)
+
+
+def test_audit_task_files_reports_each_suite(tmp_path: Path) -> None:
+    from qwen3_vl_semantic_planner.audit_libero_target_text import (
+        audit_task_files,
+    )
+
+    paths = []
+    for suite in ("libero_10", "libero_goal"):
+        path = tmp_path / suite / "meta" / "tasks.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps({"task_index": 0, "task": "put the bowl on the plate"})
+            + "\n"
+        )
+        paths.append(path)
+    report = audit_task_files(paths)
+    assert report["total_tasks"] == 2
+    assert report["total_marked"] == 2
+    assert len(report["files"]) == 2
