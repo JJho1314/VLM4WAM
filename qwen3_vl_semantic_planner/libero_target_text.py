@@ -95,7 +95,9 @@ def mark_libero_target(instruction: str) -> str:
         object_end = stop_match.start() if stop_match is not None else len(text)
         phrase = text[object_start:object_end].strip(" ,.;")
         if not phrase or phrase.lower() in _BAD_OBJECTS:
-            continue
+            raise InstructionPreprocessingError(
+                f"LIBERO instruction has no target object: {instruction!r}"
+            )
         marked = text[:object_start] + _insert_marker(phrase) + text[object_end:]
         if marked.count(TGT_MARKER) != 1:
             raise InstructionPreprocessingError(

@@ -63,6 +63,11 @@ def test_mark_libero_target_rejects_non_string() -> None:
         mark_libero_target(7)  # type: ignore[arg-type]
 
 
+def test_mark_libero_target_rejects_pronominal_first_object() -> None:
+    with pytest.raises(InstructionPreprocessingError, match="no target object"):
+        mark_libero_target("put it on the shelf and pick up the bowl")
+
+
 def test_batch_preprocessing_selects_target_or_legacy_contract() -> None:
     raw = ["put the bowl on the plate"]
     assert preprocess_libero_instructions(
