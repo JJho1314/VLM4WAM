@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import train_qwen3vl4b_lingbot_dino_planner as T  # noqa: E402
+import train_semantic_planner as T  # noqa: E402
 from evaluate_qwen3vl4b_lingbot_dino_planner import load_planner  # noqa: E402
 
 

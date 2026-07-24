@@ -15,7 +15,7 @@ import numpy as np, torch, torch.nn.functional as F
 HERE = os.path.dirname(os.path.abspath(__file__))
 for p in (HERE, os.path.join(HERE,"dinov3_da3_2b"), os.path.join(HERE,"lingbot_dino_4b")):
     sys.path.insert(0, p)
-import train_qwen3vl4b_lingbot_dino_planner as T
+import train_semantic_planner as T
 from qwen3vl_wrapper import move_qwen_inputs_to_device, configure_qwen3vl_processor
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from train_feature_probes import ProbeDecoder, depth_to_disp

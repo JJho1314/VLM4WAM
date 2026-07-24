@@ -26,7 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))          # .../qwen3_vl_semant
 ROOT = os.path.dirname(HERE)                               # .../qwen3_vl_semantic_planner
 for p in (ROOT, HERE, os.path.join(ROOT, "lingbot_dino_4b")):
     sys.path.insert(0, p)
-import train_qwen3vl4b_lingbot_dino_planner as T
+import train_semantic_planner as T
 from qwen3vl_wrapper import move_qwen_inputs_to_device, configure_qwen3vl_processor
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from train_feature_probes import MiniDPTProbe

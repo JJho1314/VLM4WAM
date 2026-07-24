@@ -22,7 +22,7 @@ PLANNER_ROOT = Path(__file__).resolve().parents[1] / "qwen3_vl_semantic_planner"
 if str(PLANNER_ROOT) not in sys.path:
     sys.path.insert(0, str(PLANNER_ROOT))
 
-from qwen3_vl_semantic_planner import train_qwen3vl4b_lingbot_dino_planner as planner
+from qwen3_vl_semantic_planner import train_semantic_planner as planner
 from qwen3_vl_semantic_planner import qwen3vl_wrapper as qwen_helper
 from qwen3_vl_semantic_planner.dinov3_da3_2b.depth_anything3_target import (
     DepthAnything3TargetEncoder,
@@ -128,10 +128,43 @@ class K4ViewAwareHead(nn.Module):
         return self.scale * view_value.expand(batch, 4 * 256, self.feature_dim)
 
 
+class K4TaskAwareHead(nn.Module):
+    def __init__(self, feature_dim: int) -> None:
+        super().__init__()
+        self.feature_dim = int(feature_dim)
+        self.scale = nn.Parameter(torch.ones(()))
+
+    def forward(
+        self,
+        image_hidden: torch.Tensor,
+        task_hidden: torch.Tensor,
+    ) -> torch.Tensor:
+        assert task_hidden.shape[1] == 4 * 64
+        batch = image_hidden.shape[0]
+        value = image_hidden.mean(dim=(1, 2)) + task_hidden.mean(dim=(1, 2))
+        return self.scale * value.reshape(batch, 1, 1).expand(
+            batch,
+            4 * 256,
+            self.feature_dim,
+        )
+
+
+class FailIfCalledDepthHead(nn.Module):
+    def forward(self, *_args: Any, **_kwargs: Any) -> torch.Tensor:
+        raise AssertionError("semantic-only training must not execute the depth head")
+
+
+class TinyQwenBackbone(nn.Module):
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.visual = nn.Linear(hidden_size, hidden_size, bias=False)
+
+
 class TinyCausalQwen(nn.Module):
     def __init__(self, *, hidden_size: int = 4, vocab_size: int = 512) -> None:
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, hidden_size)
+        self.model = TinyQwenBackbone(hidden_size)
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         self.config = SimpleNamespace(image_token_id=2)
         self.forward_calls = 0
@@ -145,6 +178,7 @@ class TinyCausalQwen(nn.Module):
         input_ids: torch.Tensor,
         *,
         labels: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
         output_hidden_states: bool,
         use_cache: bool,
         **_kwargs: Any,
@@ -154,6 +188,11 @@ class TinyCausalQwen(nn.Module):
         self.forward_calls += 1
         self.received_labels.append(None if labels is None else labels.detach().clone())
         hidden = self.embedding(input_ids)
+        if pixel_values is not None:
+            visual_hidden = self.model.visual(
+                pixel_values.to(device=hidden.device, dtype=hidden.dtype)
+            )
+            hidden = hidden + visual_hidden.unsqueeze(1)
         logits = self.lm_head(hidden)
         loss = None
         if labels is not None:
@@ -797,6 +836,92 @@ def test_lm_plan_ce_uses_same_qwen_forward_and_trains_untied_lm_head() -> None:
     assert torch.count_nonzero(grad) > 0
 
 
+def test_future_alignment_plan_tokens_keep_qwen_vision_gradient() -> None:
+    wrapper, model, input_ids = make_causal_lm_future_k4_loss_wrapper(
+        lm_plan_loss_weight=0.0,
+    )
+    wrapper.plan_head = K4TaskAwareHead(8)
+    wrapper.depth_head = K4TaskAwareHead(4 * 8)
+
+    _, _, losses = wrapper.predict_dino_depth_plan_with_losses(
+        semantic_plan_labels=torch.zeros(1, 2, 4 * 256, 8),
+        depth_plan_labels=torch.ones(1, 2, 4, 4 * 256, 8),
+        input_ids=input_ids,
+        pixel_values=torch.randn(1, 4),
+    )
+    losses["loss"].backward()
+
+    grad = model.model.visual.weight.grad
+    assert grad is not None
+    assert torch.isfinite(grad).all()
+    assert torch.count_nonzero(grad) > 0
+
+
+def test_select_flat_keyframes_keeps_order_and_gradient() -> None:
+    plan = (
+        torch.arange(4.0)
+        .reshape(1, 1, 4, 1, 1)
+        .repeat(1, 2, 1, 2, 3)
+        .requires_grad_()
+    )
+
+    selected = planner.select_flat_keyframes(
+        plan.reshape(1, 2, 8, 3),
+        num_keyframes=4,
+        tokens_per_keyframe=2,
+        indices=(1, 3),
+    )
+
+    assert selected.shape == (1, 2, 4, 3)
+    torch.testing.assert_close(
+        selected.reshape(1, 2, 2, 2, 3)[:, :, :, 0, 0],
+        torch.tensor([[[1.0, 3.0], [1.0, 3.0]]]),
+    )
+    selected.sum().backward()
+    assert plan.grad is not None
+
+
+def test_semantic_only_k2_forward_never_calls_depth_head() -> None:
+    wrapper, model, input_ids = make_causal_lm_future_k4_loss_wrapper(
+        lm_plan_loss_weight=0.0,
+    )
+    wrapper.plan_head = K4TaskAwareHead(8)
+    wrapper.depth_head = FailIfCalledDepthHead()
+
+    semantic, losses = wrapper.predict_semantic_plan_with_losses(
+        semantic_plan_labels=torch.zeros(1, 2, 2 * 256, 8),
+        selected_keyframe_indices=(1, 3),
+        input_ids=input_ids,
+        pixel_values=torch.randn(1, 4),
+    )
+
+    assert semantic.shape == (1, 2, 2 * 256, 8)
+    assert losses["loss"].requires_grad
+    losses["loss"].backward()
+    assert torch.count_nonzero(model.model.visual.weight.grad) > 0
+
+
+def test_standalone_freeze_vision_supports_nested_qwen3vl_layout() -> None:
+    model = TinyCausalQwen()
+
+    planner.set_trainable(
+        model,
+        freeze_vision=True,
+        freeze_lm_head=True,
+        full_finetune=True,
+    )
+
+    assert all(
+        not parameter.requires_grad
+        for parameter in model.model.visual.parameters()
+    )
+    assert not model.model.visual.training
+    assert all(parameter.requires_grad for parameter in model.embedding.parameters())
+    assert all(
+        not parameter.requires_grad for parameter in model.lm_head.parameters()
+    )
+
+
 def test_zero_lm_plan_weight_preserves_hidden_only_qwen_path() -> None:
     wrapper, model, input_ids = make_causal_lm_future_k4_loss_wrapper(
         lm_plan_loss_weight=0.0,
@@ -1268,6 +1393,31 @@ def test_encode_dual_camera_k4_future_targets_preserves_view_and_time() -> None:
     assert len(depth.keyframes) == 4
 
 
+def test_encode_dual_camera_future_semantic_targets_skips_depth() -> None:
+    current = torch.zeros(2, 2, 4, 4, 3)
+    future = torch.empty(2, 2, 2, 4, 4, 3)
+    for batch in range(2):
+        for view in range(2):
+            for keyframe in range(2):
+                future[batch, view, keyframe].fill_(
+                    -1.0 + 0.1 * (4 * batch + 2 * view + keyframe)
+                )
+    appearance = FutureAppearanceTeacher()
+
+    labels = planner.encode_dual_camera_future_semantic_targets(
+        current,
+        future,
+        appearance_encoder=appearance,
+    )
+
+    assert set(labels) == {"semantic_plan_labels"}
+    assert labels["semantic_plan_labels"].shape == (2, 2, 2 * 256, 1024)
+    torch.testing.assert_close(
+        labels["semantic_plan_labels"][0, :, ::256, 0],
+        torch.tensor([[0.0, 0.05], [0.1, 0.15]]),
+    )
+
+
 @pytest.mark.parametrize(
     ("current_shape", "future_shape"),
     [
@@ -1346,7 +1496,7 @@ def test_ola_k4_config_and_launcher_are_fresh_and_fail_closed() -> None:
     train = config["data"]["train"]
     launcher = launcher_path.read_text(encoding="utf-8")
     trainer_source = (
-        PLANNER_ROOT / "train_qwen3vl4b_lingbot_dino_planner.py"
+        PLANNER_ROOT / "train_semantic_planner.py"
     ).read_text(encoding="utf-8")
 
     assert config["train_data_class"] == "CustomLeRobotDataset"

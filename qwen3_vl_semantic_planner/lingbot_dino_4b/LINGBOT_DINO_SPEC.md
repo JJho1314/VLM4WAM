@@ -2,7 +2,7 @@
 
 Source: verified read of `/data/LFT-W02_data/junjie/VLA_WM/lingbot-vla-v2` (file:line cited inline).
 All files for this 4B line live in this directory: `qwen3_vl_semantic_planner/lingbot_dino_4b/`.
-Target file to build (here): `train_qwen3vl4b_lingbot_dino_planner.py` (independent; 2B CoVT + tasktoken untouched).
+Target file to build (here): `train_semantic_planner.py` (independent; 2B CoVT + tasktoken untouched).
 
 ## Teacher (target encoder) — block C
 - `build_dino_video_teacher` → `DinoVideoTeacher.build()` (dino_video/teacher.py:132,15).
@@ -44,7 +44,7 @@ Target file to build (here): `train_qwen3vl4b_lingbot_dino_planner.py` (independ
 - This choice also sets the WM conditioning shape (block E): 1024-dim, 256 or 1280 tokens.
 - DECIDED (b): 5 keyframes, plan = [B, 1280, 1024]. Head/target already built for this.
 
-## Training-script glue — swap spec (copy PRISTINE train_qwen3vl_semantic_planner.py → train_qwen3vl4b_lingbot_dino_planner.py)
+## Training-script glue — swap spec (copy PRISTINE train_qwen3vl_semantic_planner.py → train_semantic_planner.py)
 All swaps verified against the existing script's line anchors:
 1. Dataset __getitem__ (~L302-323): add `current_image` = frames[0] (H,W,3 uint8) beside `keyframe_images`.
 2. Collator (~L339-363): stack + pass `current_image` through in online mode.

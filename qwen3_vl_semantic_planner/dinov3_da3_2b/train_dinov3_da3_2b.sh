@@ -117,7 +117,7 @@ TRAIN_ARGS=(
   --depth-loss-weight "$DEPTH_LOSS_WEIGHT"
 )
 
-TRAIN_SCRIPT="$PLANNER_DIR/train_qwen3vl4b_lingbot_dino_planner.py"
+TRAIN_SCRIPT="$PLANNER_DIR/train_semantic_planner.py"
 export PYTHONUNBUFFERED=1
 export XFORMERS_DISABLED=1
 export DINOV3_MODEL_DIR DA3_CKPT_DIR DA3_CODE_ROOT

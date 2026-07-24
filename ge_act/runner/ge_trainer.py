@@ -47,6 +47,7 @@ from utils.model_utils import load_condition_models, load_latent_models, load_va
 from utils.model_utils import forward_pass
 from utils.optimizer_utils import get_optimizer
 from utils.memory_utils import get_memory_statistics, free_memory
+from utils.profile_utils import should_save_final_checkpoint
 
 # ----------------------------------------------------
 from torch.utils.tensorboard import SummaryWriter
@@ -66,12 +67,125 @@ from models.ltx_models.vlm_semantic_planner import FrozenDualCameraVLMPlanner
 from models.ltx_models.joint_vlm_geact import (  # noqa: F401
     JointVLMGEActModel,
     build_joint_optimizer_parameter_groups,
+    is_action_parameter_name,
 )
 
 LOG_LEVEL = "INFO"
 # LOG_LEVEL = "DEBUG"
 logger = get_logger("wm_runner")
 logger.setLevel(LOG_LEVEL)
+
+_CUDA_PROFILE_COMMON_STAGES = (
+    "ltx_forward",
+    "backward",
+    "optimizer",
+    "total_gpu",
+)
+_CUDA_PROFILE_JOINT_STAGES = (
+    "siglip_target",
+    "qwen_planner",
+)
+
+
+def _make_cuda_profile_events(*, joint_enabled: bool):
+    stage_names = list(_CUDA_PROFILE_COMMON_STAGES)
+    if joint_enabled:
+        stage_names.extend(_CUDA_PROFILE_JOINT_STAGES)
+    return {
+        stage: {
+            "start": torch.cuda.Event(enable_timing=True),
+            "end": torch.cuda.Event(enable_timing=True),
+        }
+        for stage in stage_names
+    }
+
+
+def _record_cuda_profile_event(
+    events: Dict[str, Dict[str, torch.cuda.Event]] | None,
+    stage: str,
+    boundary: str,
+) -> None:
+    if events is not None:
+        events[stage][boundary].record()
+
+
+def _elapsed_cuda_profile_ms(
+    events: Dict[str, Dict[str, torch.cuda.Event]],
+) -> Dict[str, float]:
+    return {
+        stage: float(pair["start"].elapsed_time(pair["end"]))
+        for stage, pair in events.items()
+    }
+
+
+def _reduce_cuda_profile_across_ranks(
+    values: Dict[str, float],
+    *,
+    device: torch.device,
+) -> tuple[Dict[str, float], Dict[str, float]]:
+    names = sorted(values)
+    local = torch.tensor(
+        [values[name] for name in names],
+        device=device,
+        dtype=torch.float64,
+    )
+    mean = local.clone()
+    maximum = local.clone()
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(mean, op=dist.ReduceOp.SUM)
+        mean.div_(dist.get_world_size())
+        dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+    return (
+        {name: float(mean[index].item()) for index, name in enumerate(names)},
+        {name: float(maximum[index].item()) for index, name in enumerate(names)},
+    )
+
+
+def build_cosine_with_min_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    min_lr: float,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Warm up linearly, then cosine-decay every parameter group to `min_lr`."""
+
+    num_warmup_steps = int(num_warmup_steps)
+    num_training_steps = int(num_training_steps)
+    min_lr = float(min_lr)
+    if num_warmup_steps < 0:
+        raise ValueError("num_warmup_steps must be non-negative")
+    if num_training_steps <= num_warmup_steps:
+        raise ValueError("num_training_steps must exceed num_warmup_steps")
+    if min_lr < 0:
+        raise ValueError("min_lr must be non-negative")
+
+    lr_lambdas = []
+    for group in optimizer.param_groups:
+        base_lr = float(group["lr"])
+        if base_lr <= 0:
+            raise ValueError("optimizer parameter-group learning rates must be positive")
+        if min_lr > base_lr:
+            raise ValueError("min_lr cannot exceed a parameter-group learning rate")
+        min_ratio = min_lr / base_lr
+
+        def lr_lambda(
+            current_step: int,
+            *,
+            group_min_ratio: float = min_ratio,
+        ) -> float:
+            if current_step < num_warmup_steps:
+                return float(current_step) / float(max(1, num_warmup_steps))
+            progress = float(current_step - num_warmup_steps) / float(
+                max(1, num_training_steps - num_warmup_steps)
+            )
+            progress = min(max(progress, 0.0), 1.0)
+            cosine_ratio = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return group_min_ratio + (1.0 - group_min_ratio) * cosine_ratio
+
+        lr_lambdas.append(lr_lambda)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambdas)
 
 
 class EpochSeededRandomSampler(torch.utils.data.Sampler):
@@ -195,28 +309,33 @@ def encode_joint_planner_targets(
     depth_teacher: Any,
     target_encoder: Callable[..., dict[str, torch.Tensor]],
 ) -> dict[str, torch.Tensor]:
-    """Run both online teachers with autograd disabled."""
+    """Run the configured online teacher(s) with autograd disabled."""
 
     with torch.no_grad():
-        targets = target_encoder(
-            current,
-            future,
-            appearance_encoder=semantic_teacher,
-            depth_encoder=depth_teacher,
-        )
+        target_kwargs = {"appearance_encoder": semantic_teacher}
+        if depth_teacher is not None:
+            target_kwargs["depth_encoder"] = depth_teacher
+        targets = target_encoder(current, future, **target_kwargs)
     return {name: value.detach() for name, value in targets.items()}
 
 
 def combine_joint_training_loss(
     loss_video: torch.Tensor,
+    loss_action: torch.Tensor,
     planner_losses: Dict[str, torch.Tensor],
     *,
+    action_loss_scale: float,
     planner_loss_weight: float,
 ) -> torch.Tensor:
     planner_loss = planner_losses.get("loss")
-    if not torch.is_tensor(loss_video) or not torch.is_tensor(planner_loss):
-        raise TypeError("joint video and planner losses must be tensors")
-    return loss_video + float(planner_loss_weight) * planner_loss
+    losses = (loss_video, loss_action, planner_loss)
+    if not all(torch.is_tensor(value) for value in losses):
+        raise TypeError("joint video, action, and planner losses must be tensors")
+    return (
+        loss_video
+        + float(action_loss_scale) * loss_action
+        + float(planner_loss_weight) * planner_loss
+    )
 
 
 def _configure_qwen_gradient_checkpointing(
@@ -238,6 +357,87 @@ def _configure_qwen_gradient_checkpointing(
             config.use_cache = False
     elif not enabled and hasattr(model, "gradient_checkpointing_disable"):
         model.gradient_checkpointing_disable()
+
+
+def _resolve_qwen_language_model(qwen: torch.nn.Module) -> torch.nn.Module:
+    nested_model = getattr(qwen, "model", None)
+    for candidate in (
+        getattr(nested_model, "language_model", None),
+        getattr(qwen, "language_model", None),
+    ):
+        if isinstance(candidate, torch.nn.Module):
+            return candidate
+    raise ValueError("Qwen module is missing its language model")
+
+
+def configure_joint_planner_trainability(
+    planner: torch.nn.Module,
+    *,
+    freeze_qwen_vision: bool,
+    freeze_qwen_lm_head: bool,
+    freeze_qwen_embeddings: bool = False,
+    keep_qwen_first_n_layers: int = 0,
+    freeze_depth_head: bool = False,
+) -> None:
+    """Enable joint planner training while preserving checkpoint freeze policy."""
+
+    planner.requires_grad_(True)
+    planner.train()
+    qwen = getattr(planner, "model", None)
+    if not isinstance(qwen, torch.nn.Module):
+        raise TypeError("joint planner must expose Qwen as planner.model")
+
+    if freeze_qwen_vision:
+        nested_model = getattr(qwen, "model", None)
+        visual = getattr(qwen, "visual", None)
+        if not isinstance(visual, torch.nn.Module):
+            visual = getattr(nested_model, "visual", None)
+        if not isinstance(visual, torch.nn.Module):
+            raise ValueError("Qwen module is missing required visual")
+        visual.requires_grad_(False)
+        visual.eval()
+
+    language_model = _resolve_qwen_language_model(qwen)
+    if freeze_qwen_embeddings:
+        embeddings = None
+        get_embeddings = getattr(qwen, "get_input_embeddings", None)
+        if callable(get_embeddings):
+            embeddings = get_embeddings()
+        if not isinstance(embeddings, torch.nn.Module):
+            embeddings = getattr(language_model, "embed_tokens", None)
+        if not isinstance(embeddings, torch.nn.Module):
+            raise ValueError("Qwen module is missing required input embeddings")
+        embeddings.requires_grad_(False)
+        embeddings.eval()
+
+    first_n_layers = int(keep_qwen_first_n_layers)
+    if first_n_layers < 0:
+        raise ValueError("keep_qwen_first_n_layers must be non-negative")
+    layers = getattr(language_model, "layers", None)
+    if first_n_layers:
+        if not isinstance(layers, (torch.nn.ModuleList, list, tuple)):
+            raise ValueError("Qwen language model is missing transformer layers")
+        if first_n_layers > len(layers):
+            raise ValueError(
+                "keep_qwen_first_n_layers exceeds the Qwen language layer count"
+            )
+        for layer in layers[:first_n_layers]:
+            layer.requires_grad_(False)
+            layer.eval()
+
+    if freeze_qwen_lm_head:
+        lm_head = getattr(qwen, "lm_head", None)
+        if not isinstance(lm_head, torch.nn.Module):
+            raise ValueError("Qwen module is missing required lm_head")
+        lm_head.requires_grad_(False)
+        lm_head.eval()
+
+    if freeze_depth_head:
+        for name in ("depth_head", "current_depth_head"):
+            depth_head = getattr(planner, name, None)
+            if isinstance(depth_head, torch.nn.Module):
+                depth_head.requires_grad_(False)
+                depth_head.eval()
 
 
 def _configure_joint_lm_plan_objective(
@@ -271,6 +471,34 @@ def _global_gradient_norm(
             local_squared_norm = local_squared_norm + gradient.square().sum()
     global_squared_norm = accelerator.reduce(local_squared_norm, reduction="sum")
     return global_squared_norm.clamp_min(0).sqrt()
+
+
+def _deepspeed_global_gradient_norm(
+    model: torch.nn.Module,
+    *,
+    accelerator: Accelerator,
+) -> torch.Tensor:
+    """Read the norm cached by DeepSpeed's step triggered inside backward()."""
+
+    getter = getattr(model, "get_global_grad_norm", None)
+    if not callable(getter):
+        raise RuntimeError("DeepSpeed engine does not expose get_global_grad_norm()")
+    value = getter()
+    if value is None:
+        raise RuntimeError("DeepSpeed did not cache a global gradient norm")
+    norm = torch.as_tensor(
+        value,
+        device=accelerator.device,
+        dtype=torch.float32,
+    )
+    if norm.numel() != 1:
+        raise RuntimeError("DeepSpeed global gradient norm must be scalar")
+    norm = norm.reshape(())
+    if not torch.isfinite(norm):
+        raise FloatingPointError(
+            f"DeepSpeed global gradient norm is non-finite: {norm.item()}"
+        )
+    return norm
 
 
 def _run_joint_validation(
@@ -568,8 +796,10 @@ def save_joint_checkpoint(
             if group.get("name") is not None
         }
         required_optimizer_groups = {
+            "action_ltx",
             "base_ltx",
             "semantic_ltx",
+            "qwen_vision",
             "qwen",
             "planner_heads",
         }
@@ -586,6 +816,8 @@ def save_joint_checkpoint(
             "source_planner_checkpoint": str(planner_checkpoint),
             "source_ltx_checkpoint": str(args.diffusion_model["model_path"]),
             "planner_loss_weight": float(joint_config["planner_loss_weight"]),
+            "action_loss_scale": float(args.action_loss_scale),
+            "train_mode": str(args.train_mode),
             "lm_plan_loss_weight": float(model.planner.lm_plan_loss_weight),
             "optimizer_group_lrs": {
                 name: optimizer_group_lrs[name]
@@ -593,18 +825,40 @@ def save_joint_checkpoint(
             },
             "future_keyframe_offsets": [
                 int(value)
-                for value in getattr(
-                    planner_provider,
-                    "future_keyframe_offsets",
-                    source_planner_metadata["future_keyframe_offsets"],
+                for value in joint_config.get(
+                    "selected_future_keyframe_offsets",
+                    getattr(
+                        planner_provider,
+                        "future_keyframe_offsets",
+                        source_planner_metadata["future_keyframe_offsets"],
+                    ),
                 )
             ],
             "num_keyframes": int(
-                getattr(
-                    planner_provider,
+                joint_config.get(
                     "num_keyframes",
+                    getattr(
+                        planner_provider,
+                        "num_keyframes",
+                        source_planner_metadata["num_keyframes"],
+                    ),
+                )
+            ),
+            "planner_num_keyframes": int(
+                joint_config.get(
+                    "planner_num_keyframes",
                     source_planner_metadata["num_keyframes"],
                 )
+            ),
+            "selected_planner_keyframe_indices": [
+                int(value)
+                for value in joint_config.get(
+                    "selected_planner_keyframe_indices",
+                    range(source_planner_metadata["num_keyframes"]),
+                )
+            ],
+            "semantic_only": bool(
+                joint_config.get("semantic_only", False)
             ),
             "tokens_per_keyframe": int(
                 getattr(
@@ -622,6 +876,11 @@ def save_joint_checkpoint(
                     parameter.numel()
                     for parameter in model.ltx.parameters()
                     if parameter.requires_grad
+                ),
+                "action_ltx": sum(
+                    parameter.numel()
+                    for name, parameter in model.ltx.named_parameters()
+                    if parameter.requires_grad and is_action_parameter_name(name)
                 ),
                 "planner": sum(
                     parameter.numel()
@@ -1295,6 +1554,9 @@ class Trainer:
                             "with offsets (2,4,6,8) and 256 tokens/keyframe"
                         )
                     joint_config = self.args.joint_training
+                    semantic_only = bool(
+                        joint_config.get("semantic_only", False)
+                    )
                     _configure_joint_lm_plan_objective(
                         self.semantic_planner.wrapper,
                         joint_config,
@@ -1302,11 +1564,9 @@ class Trainer:
                     from qwen3_vl_semantic_planner.dinov3_da3_2b.siglip2_target import (
                         Siglip2TargetEncoder,
                     )
-                    from qwen3_vl_semantic_planner.dinov3_da3_2b.depth_anything3_target import (
-                        DepthAnything3TargetEncoder,
-                    )
-                    from qwen3_vl_semantic_planner.train_qwen3vl4b_lingbot_dino_planner import (
+                    from qwen3_vl_semantic_planner.train_semantic_planner import (
                         encode_dual_camera_future_targets,
+                        encode_dual_camera_future_semantic_targets,
                     )
 
                     self.semantic_teacher = Siglip2TargetEncoder(
@@ -1316,25 +1576,65 @@ class Trainer:
                         device=device,
                         dtype=dtype,
                     )
-                    self.depth_teacher = DepthAnything3TargetEncoder(
-                        joint_config["da3_ckpt_dir"],
-                        process_res=int(joint_config.get("da3_process_res", 224)),
-                        feature_slice="full",
-                        align_strategy="wsa_multilayer",
-                        teacher_layers=(11, 15, 19, 23),
-                        layer_weights=(1.0, 1.2, 1.4, 1.6),
-                        device=device,
-                        dtype=dtype,
-                        code_root=joint_config["da3_code_root"],
+                    if semantic_only:
+                        self.depth_teacher = None
+                        self.joint_target_encoder = (
+                            encode_dual_camera_future_semantic_targets
+                        )
+                    else:
+                        from qwen3_vl_semantic_planner.dinov3_da3_2b.depth_anything3_target import (
+                            DepthAnything3TargetEncoder,
+                        )
+
+                        self.depth_teacher = DepthAnything3TargetEncoder(
+                            joint_config["da3_ckpt_dir"],
+                            process_res=int(
+                                joint_config.get("da3_process_res", 224)
+                            ),
+                            feature_slice="full",
+                            align_strategy="wsa_multilayer",
+                            teacher_layers=(11, 15, 19, 23),
+                            layer_weights=(1.0, 1.2, 1.4, 1.6),
+                            device=device,
+                            dtype=dtype,
+                            code_root=joint_config["da3_code_root"],
+                        )
+                        self.joint_target_encoder = (
+                            encode_dual_camera_future_targets
+                        )
+                    configure_joint_planner_trainability(
+                        self.semantic_planner.wrapper,
+                        freeze_qwen_vision=bool(
+                            joint_config.get("freeze_qwen_vision", True)
+                        ),
+                        freeze_qwen_lm_head=bool(
+                            joint_config.get("freeze_qwen_lm_head", True)
+                        ),
+                        freeze_qwen_embeddings=bool(
+                            joint_config.get("freeze_qwen_embeddings", False)
+                        ),
+                        keep_qwen_first_n_layers=int(
+                            joint_config.get("keep_qwen_first_n_layers", 0)
+                        ),
+                        freeze_depth_head=semantic_only,
                     )
-                    self.joint_target_encoder = encode_dual_camera_future_targets
-                    self.semantic_planner.wrapper.requires_grad_(True)
-                    self.semantic_planner.wrapper.train()
                     self.joint_model = JointVLMGEActModel(
                         self.semantic_planner.wrapper,
                         self.diffusion_model,
-                        num_keyframes=4,
+                        num_keyframes=int(
+                            joint_config.get("num_keyframes", 4)
+                        ),
+                        planner_num_keyframes=(
+                            self.semantic_planner.num_keyframes
+                        ),
+                        selected_planner_keyframe_indices=tuple(
+                            joint_config.get(
+                                "selected_planner_keyframe_indices",
+                                (0, 1, 2, 3),
+                            )
+                        ),
                         tokens_per_keyframe=256,
+                        semantic_only=semantic_only,
                     )
             else:
                 raise ValueError(f"unknown semantic_plan.source: {semantic_source}")
@@ -1376,8 +1676,25 @@ class Trainer:
         if joint_enabled:
             if self.joint_model is None or self.semantic_planner is None:
                 raise RuntimeError("joint models must be prepared before trainable parameters")
-            self.semantic_planner.wrapper.requires_grad_(True)
-            self.semantic_planner.wrapper.train()
+            joint_config = self.args.joint_training
+            configure_joint_planner_trainability(
+                self.semantic_planner.wrapper,
+                freeze_qwen_vision=bool(
+                    joint_config.get("freeze_qwen_vision", True)
+                ),
+                freeze_qwen_lm_head=bool(
+                    joint_config.get("freeze_qwen_lm_head", True)
+                ),
+                freeze_qwen_embeddings=bool(
+                    joint_config.get("freeze_qwen_embeddings", False)
+                ),
+                keep_qwen_first_n_layers=int(
+                    joint_config.get("keep_qwen_first_n_layers", 0)
+                ),
+                freeze_depth_head=bool(
+                    joint_config.get("semantic_only", False)
+                ),
+            )
             _configure_qwen_gradient_checkpointing(
                 self.semantic_planner.wrapper.model,
                 enabled=bool(
@@ -1441,6 +1758,11 @@ class Trainer:
                 self.joint_model,
                 ltx_lr=float(self.args.lr) * lr_scale,
                 semantic_lr=float(self.args.semantic_lr) * lr_scale,
+                action_lr=float(joint_config["action_lr"]) * lr_scale,
+                qwen_vision_lr=float(
+                    joint_config.get("qwen_vision_lr", joint_config["qwen_lr"])
+                )
+                * lr_scale,
                 qwen_lr=float(joint_config["qwen_lr"]) * lr_scale,
                 planner_head_lr=float(joint_config["planner_head_lr"]) * lr_scale,
             )
@@ -1484,20 +1806,30 @@ class Trainer:
                     self.state.train_epochs * num_update_steps_per_epoch
                 )
                 self.state.overwrote_max_train_steps = True
-            self.lr_scheduler = get_scheduler(
-                name=self.args.lr_scheduler,
-                optimizer=self.optimizer,
-                num_warmup_steps=(
-                    self.args.lr_warmup_steps
-                    * self.state.accelerator.num_processes
-                ),
-                num_training_steps=(
-                    self.state.train_steps
-                    * self.state.accelerator.num_processes
-                ),
-                num_cycles=self.args.lr_num_cycles,
-                power=self.args.lr_power,
+            scheduler_warmup_steps = (
+                self.args.lr_warmup_steps
+                * self.state.accelerator.num_processes
             )
+            scheduler_training_steps = (
+                self.state.train_steps
+                * self.state.accelerator.num_processes
+            )
+            if self.args.lr_scheduler == "cosine_with_min_lr":
+                self.lr_scheduler = build_cosine_with_min_lr_scheduler(
+                    self.optimizer,
+                    num_warmup_steps=scheduler_warmup_steps,
+                    num_training_steps=scheduler_training_steps,
+                    min_lr=float(self.args.lr_min),
+                )
+            else:
+                self.lr_scheduler = get_scheduler(
+                    name=self.args.lr_scheduler,
+                    optimizer=self.optimizer,
+                    num_warmup_steps=scheduler_warmup_steps,
+                    num_training_steps=scheduler_training_steps,
+                    num_cycles=self.args.lr_num_cycles,
+                    power=self.args.lr_power,
+                )
             return
 
         train_mode = self.args.train_mode
@@ -1653,6 +1985,31 @@ class Trainer:
         # loss spikes
         anomalies = []
         joint_enabled = _joint_training_enabled(self.args)
+        cuda_profile_requested = os.environ.get(
+            "GEACT_CUDA_PROFILE",
+            "0",
+        ).lower() in {"1", "true", "yes"}
+        cuda_profile_enabled = bool(
+            cuda_profile_requested and torch.cuda.is_available()
+        )
+        cuda_profile_warmup_steps = int(
+            os.environ.get("GEACT_CUDA_PROFILE_WARMUP_STEPS", "2")
+        )
+        cuda_profile_max_steps = int(
+            os.environ.get("GEACT_CUDA_PROFILE_STEPS", "6")
+        )
+        cuda_profile_steps_logged = 0
+        cuda_profile_microsteps = 0
+        cuda_profile_window_ms: Dict[str, float] = {}
+        cuda_profile_window_wall_ms = 0.0
+        if cuda_profile_requested and not torch.cuda.is_available():
+            logger.warning("GEACT_CUDA_PROFILE requested without CUDA; profiling disabled")
+        elif cuda_profile_enabled and accelerator.is_main_process:
+            logger.info(
+                "CUDA component profiling enabled: warmup_steps=%d, profile_steps=%d",
+                cuda_profile_warmup_steps,
+                cuda_profile_max_steps,
+            )
         session_start_time = time.monotonic()
         session_samples_seen = 0
         last_epoch = first_epoch
@@ -1666,6 +2023,33 @@ class Trainer:
 
             if joint_enabled:
                 self.joint_model.train()
+                configure_joint_planner_trainability(
+                    self.semantic_planner.wrapper,
+                    freeze_qwen_vision=bool(
+                        self.args.joint_training.get("freeze_qwen_vision", True)
+                    ),
+                    freeze_qwen_lm_head=bool(
+                        self.args.joint_training.get("freeze_qwen_lm_head", True)
+                    ),
+                    freeze_qwen_embeddings=bool(
+                        self.args.joint_training.get(
+                            "freeze_qwen_embeddings",
+                            False,
+                        )
+                    ),
+                    keep_qwen_first_n_layers=int(
+                        self.args.joint_training.get(
+                            "keep_qwen_first_n_layers",
+                            0,
+                        )
+                    ),
+                    freeze_depth_head=bool(
+                        self.args.joint_training.get(
+                            "semantic_only",
+                            False,
+                        )
+                    ),
+                )
             else:
                 self.diffusion_model.train()
 
@@ -1691,12 +2075,30 @@ class Trainer:
                 logger.debug(f"Starting step {step + 1}")
                 logs = {}
                 joint_grad_metrics = {}
+                profile_this_microstep = bool(
+                    cuda_profile_enabled
+                    and global_step >= cuda_profile_warmup_steps
+                    and cuda_profile_steps_logged < cuda_profile_max_steps
+                )
+                cuda_profile_events = (
+                    _make_cuda_profile_events(joint_enabled=joint_enabled)
+                    if profile_this_microstep
+                    else None
+                )
+                cuda_profile_wall_start = (
+                    time.perf_counter() if profile_this_microstep else None
+                )
                 accumulation_context = (
                     accelerator.accumulate(self.joint_model)
                     if joint_enabled
                     else accelerator.accumulate([self.diffusion_model])
                 )
                 with accumulation_context:
+                    _record_cuda_profile_event(
+                        cuda_profile_events,
+                        "total_gpu",
+                        "start",
+                    )
                     
                     # shape: {b, c, v, t, h, w}; ranging from -1 to 1
                     video = batch['video'].to(
@@ -1717,14 +2119,26 @@ class Trainer:
                     joint_output = None
                     planner_metrics = None
                     if joint_enabled:
+                        joint_config = self.args.joint_training
+                        joint_offsets = tuple(
+                            joint_config.get(
+                                "selected_future_keyframe_offsets",
+                                self.semantic_planner.future_keyframe_offsets,
+                            )
+                        )
                         current_frames, future_frames = select_joint_planner_frames(
                             video,
                             n_previous=mem_size,
-                            offsets=self.semantic_planner.future_keyframe_offsets,
+                            offsets=joint_offsets,
                         )
                         planner_inputs = self.semantic_planner.prepare_inputs(
                             prepare_joint_planner_current_images(current_frames),
                             batch['caption'],
+                        )
+                        _record_cuda_profile_event(
+                            cuda_profile_events,
+                            "siglip_target",
+                            "start",
                         )
                         planner_targets = encode_joint_planner_targets(
                             current_frames,
@@ -1732,6 +2146,11 @@ class Trainer:
                             semantic_teacher=self.semantic_teacher,
                             depth_teacher=self.depth_teacher,
                             target_encoder=self.joint_target_encoder,
+                        )
+                        _record_cuda_profile_event(
+                            cuda_profile_events,
+                            "siglip_target",
+                            "end",
                         )
                     if self.semantic_encoder is not None:
                         semantic_config = self.args.semantic_plan
@@ -1799,14 +2218,22 @@ class Trainer:
                             dtype=torch.float32,
                         )
                     elif joint_enabled:
+                        joint_offsets = tuple(
+                            self.args.joint_training.get(
+                                "selected_future_keyframe_offsets",
+                                self.semantic_planner.future_keyframe_offsets,
+                            )
+                        )
                         semantic_plan_times = (
                             torch.tensor(
-                                self.semantic_planner.future_keyframe_offsets,
+                                joint_offsets,
                                 device=accelerator.device,
                                 dtype=torch.float32,
                             )
                             / float(self.semantic_planner.sequence_length - 1)
-                        ).reshape(1, 4).expand(batch_size * n_view, -1).clone()
+                        ).reshape(1, len(joint_offsets)).expand(
+                            batch_size * n_view, -1
+                        ).clone()
                     if semantic_plan is not None or joint_enabled:
                         semantic_condition_mask = sample_semantic_condition_mask(
                             batch_size=batch_size,
@@ -1952,17 +2379,30 @@ class Trainer:
                         joint_output = self.joint_model(
                             planner_inputs=planner_inputs,
                             semantic_labels=planner_targets["semantic_plan_labels"],
-                            depth_labels=planner_targets["depth_plan_labels"],
+                            depth_labels=planner_targets.get(
+                                "depth_plan_labels"
+                            ),
                             ltx_inputs=ltx_inputs,
+                            cuda_profile_events=cuda_profile_events,
                         )
                         pred_all = joint_output.ltx_predictions
                         planner_metrics = joint_output.planner_losses
                     else:
+                        _record_cuda_profile_event(
+                            cuda_profile_events,
+                            "ltx_forward",
+                            "start",
+                        )
                         pred_all = forward_pass(
                             model=self.diffusion_model,
                             semantic_plan=semantic_plan,
                             **ltx_inputs,
                         )["latents"]
+                        _record_cuda_profile_event(
+                            cuda_profile_events,
+                            "ltx_forward",
+                            "end",
+                        )
 
                     if self.args.train_mode == 'all' or self.args.train_mode == 'video_only':
                         pred = pred_all['video']
@@ -1987,7 +2427,9 @@ class Trainer:
                     if joint_enabled:
                         loss = combine_joint_training_loss(
                             loss_video,
+                            loss_action,
                             planner_metrics,
+                            action_loss_scale=action_loss_scale,
                             planner_loss_weight=float(
                                 self.args.joint_training["planner_loss_weight"]
                             ),
@@ -1997,6 +2439,7 @@ class Trainer:
 
                     loss_components = {"loss_video": loss_video}
                     if joint_enabled:
+                        loss_components["loss_action"] = loss_action
                         loss_components["planner_loss"] = planner_metrics["loss"]
                     elif self.args.train_mode in (
                         "all",
@@ -2005,20 +2448,51 @@ class Trainer:
                     ):
                         loss_components["loss_action"] = loss_action
                     require_finite_training_loss(loss, loss_components)
+                    _record_cuda_profile_event(
+                        cuda_profile_events,
+                        "backward",
+                        "start",
+                    )
                     accelerator.backward(loss)
+                    _record_cuda_profile_event(
+                        cuda_profile_events,
+                        "backward",
+                        "end",
+                    )
                     if accelerator.sync_gradients and joint_enabled:
-                        unwrapped_joint = accelerator.unwrap_model(self.joint_model)
-                        joint_grad_metrics = {
-                            "vlm_grad_norm": _global_gradient_norm(
-                                unwrapped_joint.planner.parameters(),
-                                accelerator=accelerator,
-                            ),
-                            "ltx_grad_norm": _global_gradient_norm(
-                                unwrapped_joint.ltx.parameters(),
-                                accelerator=accelerator,
-                            ),
-                        }
-                        if accelerator.distributed_type != DistributedType.DEEPSPEED:
+                        if (
+                            accelerator.distributed_type
+                            == DistributedType.DEEPSPEED
+                        ):
+                            joint_grad_metrics = {
+                                "global_grad_norm": _deepspeed_global_gradient_norm(
+                                    self.joint_model,
+                                    accelerator=accelerator,
+                                )
+                            }
+                        else:
+                            unwrapped_joint = accelerator.unwrap_model(self.joint_model)
+                            action_parameters = []
+                            video_parameters = []
+                            for name, parameter in unwrapped_joint.ltx.named_parameters():
+                                if is_action_parameter_name(name):
+                                    action_parameters.append(parameter)
+                                else:
+                                    video_parameters.append(parameter)
+                            joint_grad_metrics = {
+                                "vlm_grad_norm": _global_gradient_norm(
+                                    unwrapped_joint.planner.parameters(),
+                                    accelerator=accelerator,
+                                ),
+                                "ltx_grad_norm": _global_gradient_norm(
+                                    video_parameters,
+                                    accelerator=accelerator,
+                                ),
+                                "action_grad_norm": _global_gradient_norm(
+                                    action_parameters,
+                                    accelerator=accelerator,
+                                ),
+                            }
                             accelerator.clip_grad_norm_(
                                 self.joint_model.parameters(),
                                 self.args.max_grad_norm,
@@ -2032,9 +2506,80 @@ class Trainer:
                             self.args.max_grad_norm,
                         )
                         logs["grad_norm"] = grad_norm
+                    _record_cuda_profile_event(
+                        cuda_profile_events,
+                        "optimizer",
+                        "start",
+                    )
                     self.optimizer.step()
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad()
+                    _record_cuda_profile_event(
+                        cuda_profile_events,
+                        "optimizer",
+                        "end",
+                    )
+                    _record_cuda_profile_event(
+                        cuda_profile_events,
+                        "total_gpu",
+                        "end",
+                    )
+
+                    if cuda_profile_events is not None:
+                        torch.cuda.synchronize(accelerator.device)
+                        microstep_ms = _elapsed_cuda_profile_ms(
+                            cuda_profile_events
+                        )
+                        for name, value in microstep_ms.items():
+                            cuda_profile_window_ms[name] = (
+                                cuda_profile_window_ms.get(name, 0.0) + value
+                            )
+                        cuda_profile_window_wall_ms += (
+                            time.perf_counter() - cuda_profile_wall_start
+                        ) * 1000.0
+                        cuda_profile_microsteps += 1
+                        if accelerator.sync_gradients:
+                            profile_values = dict(cuda_profile_window_ms)
+                            profile_values["wall"] = cuda_profile_window_wall_ms
+                            mean_ms, max_rank_ms = (
+                                _reduce_cuda_profile_across_ranks(
+                                    profile_values,
+                                    device=accelerator.device,
+                                )
+                            )
+                            profiled_stages = (
+                                "siglip_target",
+                                "qwen_planner",
+                                "ltx_forward",
+                                "backward",
+                                "optimizer",
+                            )
+                            for reduced in (mean_ms, max_rank_ms):
+                                reduced["other_gpu"] = max(
+                                    0.0,
+                                    reduced["total_gpu"]
+                                    - sum(
+                                        reduced.get(name, 0.0)
+                                        for name in profiled_stages
+                                    ),
+                                )
+                            if accelerator.is_main_process:
+                                logger.info(
+                                    "CUDA_PROFILE %s",
+                                    json.dumps(
+                                        {
+                                            "optimizer_step": global_step + 1,
+                                            "microsteps": cuda_profile_microsteps,
+                                            "rank_mean_ms": mean_ms,
+                                            "rank_max_ms": max_rank_ms,
+                                        },
+                                        sort_keys=True,
+                                    ),
+                                )
+                            cuda_profile_steps_logged += 1
+                            cuda_profile_microsteps = 0
+                            cuda_profile_window_ms = {}
+                            cuda_profile_window_wall_ms = 0.0
                 
 
                 running_loss = running_loss + loss.detach().float()
@@ -2049,10 +2594,14 @@ class Trainer:
                         "semantic_mse",
                         planner_metrics.get("mse"),
                     )
-                    scalar_metrics["planner_depth_wsa_loss"] = planner_metrics.get(
+                    planner_depth_metric = planner_metrics.get(
                         "depth_wsa_loss",
                         planner_metrics.get("depth_smooth_l1"),
                     )
+                    if torch.is_tensor(planner_depth_metric):
+                        scalar_metrics["planner_depth_wsa_loss"] = (
+                            planner_depth_metric
+                        )
                     lm_plan_ce_metric = planner_metrics.get("lm_plan_ce")
                     if lm_plan_ce_metric is not None:
                         scalar_metrics["lm_plan_ce"] = lm_plan_ce_metric
@@ -2072,9 +2621,9 @@ class Trainer:
                         planner_semantic_mse = reduced_metrics[
                             "planner_semantic_mse"
                         ]
-                        planner_depth_wsa_loss = reduced_metrics[
+                        planner_depth_wsa_loss = reduced_metrics.get(
                             "planner_depth_wsa_loss"
-                        ]
+                        )
                         lm_plan_ce_metric = reduced_metrics.get("lm_plan_ce")
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
@@ -2089,9 +2638,9 @@ class Trainer:
                         logs = {
                             "loss": loss.detach().item(),
                             "loss_video": loss_video.detach().item(),
+                            "loss_action": loss_action.detach().item(),
                             "planner_loss": planner_loss.detach().item(),
                             "planner_semantic_mse": planner_semantic_mse.detach().item(),
-                            "planner_depth_wsa_loss": planner_depth_wsa_loss.detach().item(),
                             "samples_per_second": (
                                 session_samples_seen / elapsed
                             ),
@@ -2101,15 +2650,19 @@ class Trainer:
                                 else 0
                             ),
                         }
+                        if planner_depth_wsa_loss is not None:
+                            logs["planner_depth_wsa_loss"] = (
+                                planner_depth_wsa_loss.detach().item()
+                            )
                         for name, value in joint_grad_metrics.items():
                             logs[name] = value.item()
                         if lm_plan_ce_metric is not None:
                             logs["lm_plan_ce"] = lm_plan_ce_metric.item()
-                        logs.setdefault("vlm_grad_norm", 0.0)
-                        logs.setdefault("ltx_grad_norm", 0.0)
                         lr_log_keys = {
                             "base_ltx": "lr/base_ltx",
                             "semantic_ltx": "lr/semantic_ltx",
+                            "action_ltx": "lr/action_ltx",
+                            "qwen_vision": "lr/qwen_vision",
                             "qwen": "lr/qwen",
                             "planner_heads": "lr/planner_heads",
                         }
@@ -2213,7 +2766,14 @@ class Trainer:
                 self.writer.add_scalar("Average Training Loss", avg_loss, epoch)
 
         accelerator.wait_for_everyone()
-        if joint_enabled:
+        if not should_save_final_checkpoint(
+            cuda_profile_enabled=cuda_profile_enabled
+        ):
+            if accelerator.is_main_process:
+                logger.info(
+                    "Skipping final checkpoint because CUDA profiling is enabled"
+                )
+        elif joint_enabled:
             save_joint_checkpoint(
                 accelerator=accelerator,
                 joint_model=self.joint_model,

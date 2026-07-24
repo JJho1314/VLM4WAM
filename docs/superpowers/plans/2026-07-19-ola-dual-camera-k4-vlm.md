@@ -26,7 +26,7 @@
 
 **Files:**
 - Modify: `qwen3_vl_semantic_planner/ge_act_dual_camera.py`
-- Modify: `qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py`
+- Modify: `qwen3_vl_semantic_planner/train_semantic_planner.py`
 - Test: `tests/test_ge_act_dual_camera_planner.py`
 
 **Interfaces:**
@@ -116,7 +116,7 @@ Commit:
 
 ```bash
 git add qwen3_vl_semantic_planner/ge_act_dual_camera.py \
-  qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py \
+  qwen3_vl_semantic_planner/train_semantic_planner.py \
   tests/test_ge_act_dual_camera_planner.py
 git commit -m "feat(planner): load dual-camera K4 targets"
 ```
@@ -127,7 +127,7 @@ git commit -m "feat(planner): load dual-camera K4 targets"
 
 **Files:**
 - Modify: `qwen3_vl_semantic_planner/dinov3_da3_2b/depth_anything3_target.py`
-- Modify: `qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py`
+- Modify: `qwen3_vl_semantic_planner/train_semantic_planner.py`
 - Test: `tests/test_ge_act_dual_camera_planner.py`
 
 **Interfaces:**
@@ -213,7 +213,7 @@ Commit:
 
 ```bash
 git add qwen3_vl_semantic_planner/dinov3_da3_2b/depth_anything3_target.py \
-  qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py \
+  qwen3_vl_semantic_planner/train_semantic_planner.py \
   tests/test_ge_act_dual_camera_planner.py
 git commit -m "feat(planner): predict dual-camera K4 semantic plans"
 ```
@@ -394,7 +394,7 @@ Expected: zero failures.
 ```bash
 python -m py_compile \
   qwen3_vl_semantic_planner/ge_act_dual_camera.py \
-  qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py \
+  qwen3_vl_semantic_planner/train_semantic_planner.py \
   qwen3_vl_semantic_planner/dinov3_da3_2b/depth_anything3_target.py \
   qwen3_vl_semantic_planner/dinov3_da3_2b/preflight_dual_camera_k4.py \
   ge_act/models/ltx_models/vlm_semantic_planner.py

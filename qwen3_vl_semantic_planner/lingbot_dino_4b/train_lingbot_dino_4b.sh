@@ -221,7 +221,7 @@ fi
 )
 [[ "$BIDIRECTIONAL_PLAN_ATTN" == "1" ]] && TRAIN_ARGS+=(--bidirectional-plan-attn)
 
-TRAIN_SCRIPT="$PLANNER_DIR/train_qwen3vl4b_lingbot_dino_planner.py"
+TRAIN_SCRIPT="$PLANNER_DIR/train_semantic_planner.py"
 export PYTHONUNBUFFERED=1
 export XFORMERS_DISABLED=1   # MoGe/MoRGBD dinov2 -> F.scaled_dot_product_attention (unbuilt xformers op)
 export LINGBOT_SRC_ROOT UTILS3D_MOGE_PATH

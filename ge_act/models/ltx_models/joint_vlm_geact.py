@@ -22,7 +22,7 @@ _DEPTH_DIM = 2048
 class JointVLMGEActOutput:
     ltx_predictions: dict[str, torch.Tensor]
     semantic_plan: torch.Tensor
-    depth_plan: torch.Tensor
+    depth_plan: torch.Tensor | None
     planner_losses: dict[str, torch.Tensor]
 
 
@@ -39,7 +39,7 @@ def _require_tensor_shape(
 
 
 class JointVLMGEActModel(nn.Module):
-    """Run one planner pass and inject its differentiable K4 plan into LTX.
+    """Run one planner pass and inject its differentiable semantic plan into LTX.
 
     The GE-Act base checkpoint has no ``semantic_`` weights, so its semantic
     modules are newly constructed with zero-initialized semantic gates. On the
@@ -57,7 +57,10 @@ class JointVLMGEActModel(nn.Module):
         ltx: nn.Module,
         *,
         num_keyframes: int = 4,
+        planner_num_keyframes: int = 4,
+        selected_planner_keyframe_indices: tuple[int, ...] = (0, 1, 2, 3),
         tokens_per_keyframe: int = 256,
+        semantic_only: bool = False,
     ) -> None:
         super().__init__()
         if not isinstance(planner, nn.Module):
@@ -65,10 +68,32 @@ class JointVLMGEActModel(nn.Module):
         if not isinstance(ltx, nn.Module):
             raise TypeError("ltx must be an nn.Module")
         self.num_keyframes = int(num_keyframes)
+        self.planner_num_keyframes = int(planner_num_keyframes)
+        self.selected_planner_keyframe_indices = tuple(
+            int(index) for index in selected_planner_keyframe_indices
+        )
         self.tokens_per_keyframe = int(tokens_per_keyframe)
-        if self.num_keyframes != 4:
+        self.semantic_only = bool(semantic_only)
+        if self.num_keyframes < 1:
+            raise ValueError("num_keyframes must be positive")
+        if not self.semantic_only and self.num_keyframes != 4:
             raise ValueError(
                 f"joint VLM/GE-Act training requires K4, got K={self.num_keyframes}"
+            )
+        if self.planner_num_keyframes < self.num_keyframes:
+            raise ValueError(
+                "planner_num_keyframes must cover all injected keyframes"
+            )
+        if (
+            len(self.selected_planner_keyframe_indices) != self.num_keyframes
+            or len(set(self.selected_planner_keyframe_indices)) != self.num_keyframes
+            or min(self.selected_planner_keyframe_indices) < 0
+            or max(self.selected_planner_keyframe_indices)
+            >= self.planner_num_keyframes
+        ):
+            raise ValueError(
+                "selected_planner_keyframe_indices must contain one unique valid "
+                "native planner index per injected keyframe"
             )
         if self.tokens_per_keyframe <= 0:
             raise ValueError("tokens_per_keyframe must be positive")
@@ -78,7 +103,7 @@ class JointVLMGEActModel(nn.Module):
     def _validate_labels(
         self,
         semantic_labels: torch.Tensor,
-        depth_labels: torch.Tensor,
+        depth_labels: torch.Tensor | None,
     ) -> int:
         if not torch.is_tensor(semantic_labels) or semantic_labels.ndim != 4:
             shape = (
@@ -94,17 +119,21 @@ class JointVLMGEActModel(nn.Module):
             (batch_size, _NUM_CAMERA_VIEWS, flat_tokens, _SEMANTIC_DIM),
             name="semantic labels",
         )
-        _require_tensor_shape(
-            depth_labels,
-            (
-                batch_size,
-                _NUM_CAMERA_VIEWS,
-                _DEPTH_LAYERS,
-                flat_tokens,
-                _DEPTH_DIM,
-            ),
-            name="depth labels",
-        )
+        if self.semantic_only:
+            if depth_labels is not None:
+                raise ValueError("semantic-only joint training requires depth_labels=None")
+        else:
+            _require_tensor_shape(
+                depth_labels,
+                (
+                    batch_size,
+                    _NUM_CAMERA_VIEWS,
+                    _DEPTH_LAYERS,
+                    flat_tokens,
+                    _DEPTH_DIM,
+                ),
+                name="depth labels",
+            )
         return batch_size
 
     def _validate_ltx_inputs(
@@ -220,8 +249,9 @@ class JointVLMGEActModel(nn.Module):
         *,
         planner_inputs: Mapping[str, Any],
         semantic_labels: torch.Tensor,
-        depth_labels: torch.Tensor,
+        depth_labels: torch.Tensor | None,
         ltx_inputs: Mapping[str, Any],
+        cuda_profile_events: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> JointVLMGEActOutput:
         if not isinstance(planner_inputs, Mapping):
             raise TypeError("planner_inputs must be a mapping")
@@ -241,16 +271,35 @@ class JointVLMGEActModel(nn.Module):
             batch_size=batch_size,
         )
 
-        planner_result = self.planner.predict_dino_depth_plan_with_losses(
-            semantic_plan_labels=semantic_labels,
-            depth_plan_labels=depth_labels,
-            **dict(planner_inputs),
-        )
-        if not isinstance(planner_result, tuple) or len(planner_result) != 3:
-            raise TypeError(
-                "planner must return (semantic_plan, depth_plan, planner_losses)"
+        if cuda_profile_events is not None:
+            cuda_profile_events["qwen_planner"]["start"].record()
+        if self.semantic_only:
+            planner_result = self.planner.predict_semantic_plan_with_losses(
+                semantic_plan_labels=semantic_labels,
+                selected_keyframe_indices=self.selected_planner_keyframe_indices,
+                **dict(planner_inputs),
             )
-        semantic_plan, depth_plan, planner_losses = planner_result
+            if not isinstance(planner_result, tuple) or len(planner_result) != 2:
+                raise TypeError(
+                    "semantic-only planner must return "
+                    "(semantic_plan, planner_losses)"
+                )
+            semantic_plan, planner_losses = planner_result
+            depth_plan = None
+        else:
+            planner_result = self.planner.predict_dino_depth_plan_with_losses(
+                semantic_plan_labels=semantic_labels,
+                depth_plan_labels=depth_labels,
+                **dict(planner_inputs),
+            )
+            if not isinstance(planner_result, tuple) or len(planner_result) != 3:
+                raise TypeError(
+                    "planner must return "
+                    "(semantic_plan, depth_plan, planner_losses)"
+                )
+            semantic_plan, depth_plan, planner_losses = planner_result
+        if cuda_profile_events is not None:
+            cuda_profile_events["qwen_planner"]["end"].record()
         flat_tokens = self.num_keyframes * self.tokens_per_keyframe
         _require_tensor_shape(
             semantic_plan,
@@ -262,17 +311,18 @@ class JointVLMGEActModel(nn.Module):
             ),
             name="semantic prediction",
         )
-        _require_tensor_shape(
-            depth_plan,
-            (
-                batch_size,
-                _NUM_CAMERA_VIEWS,
-                flat_tokens,
-                _DEPTH_LAYERS,
-                _DEPTH_DIM,
-            ),
-            name="depth prediction",
-        )
+        if not self.semantic_only:
+            _require_tensor_shape(
+                depth_plan,
+                (
+                    batch_size,
+                    _NUM_CAMERA_VIEWS,
+                    flat_tokens,
+                    _DEPTH_LAYERS,
+                    _DEPTH_DIM,
+                ),
+                name="depth prediction",
+            )
         if not isinstance(planner_losses, Mapping):
             raise TypeError("planner_losses must be a mapping")
         if "loss" not in planner_losses or not torch.is_tensor(planner_losses["loss"]):
@@ -289,11 +339,15 @@ class JointVLMGEActModel(nn.Module):
             device=validated_ltx_inputs["noisy_latents"].device,
             dtype=validated_ltx_inputs["noisy_latents"].dtype,
         )
+        if cuda_profile_events is not None:
+            cuda_profile_events["ltx_forward"]["start"].record()
         forwarded = forward_pass(
             model=self.ltx,
             semantic_plan=semantic_plan,
             **validated_ltx_inputs,
         )
+        if cuda_profile_events is not None:
+            cuda_profile_events["ltx_forward"]["end"].record()
         if not isinstance(forwarded, Mapping) or "latents" not in forwarded:
             raise TypeError("forward_pass must return a mapping containing 'latents'")
         ltx_predictions = forwarded["latents"]
@@ -324,10 +378,18 @@ def _named_trainable_parameters(
     ]
 
 
+def is_action_parameter_name(name: str) -> bool:
+    """Return whether a GE-Act LTX parameter belongs to the action branch."""
+
+    return name.startswith("action_") or ".action_" in name
+
+
 def build_joint_optimizer_parameter_groups(
     model: JointVLMGEActModel,
     ltx_lr: float,
     semantic_lr: float,
+    action_lr: float,
+    qwen_vision_lr: float,
     qwen_lr: float,
     planner_head_lr: float,
 ) -> list[dict[str, Any]]:
@@ -338,10 +400,21 @@ def build_joint_optimizer_parameter_groups(
     planner_model = getattr(model.planner, "model", None)
     if not isinstance(planner_model, nn.Module):
         raise ValueError("joint planner must expose its Qwen module as planner.model")
+    nested_planner_model = getattr(planner_model, "model", None)
+    qwen_visual = getattr(planner_model, "visual", None)
+    if not isinstance(qwen_visual, nn.Module):
+        qwen_visual = getattr(nested_planner_model, "visual", None)
+    if not isinstance(qwen_visual, nn.Module):
+        raise ValueError("joint planner Qwen module must expose its visual encoder")
+    qwen_vision_parameter_ids = {
+        id(parameter) for parameter in qwen_visual.parameters()
+    }
 
     parameters_by_group: dict[str, list[nn.Parameter]] = {
         "base_ltx": [],
         "semantic_ltx": [],
+        "action_ltx": [],
+        "qwen_vision": [],
         "qwen": [],
         "planner_heads": [],
     }
@@ -354,12 +427,34 @@ def build_joint_optimizer_parameter_groups(
             parameters_by_group[group_name].append(parameter)
 
     for name, parameter in _named_trainable_parameters(model.ltx):
-        add("semantic_ltx" if "semantic_" in name else "base_ltx", parameter)
+        if is_action_parameter_name(name):
+            add("action_ltx", parameter)
+        elif "semantic_" in name:
+            add("semantic_ltx", parameter)
+        else:
+            add("base_ltx", parameter)
 
     for name, parameter in _named_trainable_parameters(model.planner):
-        add("qwen" if name.startswith("model.") else "planner_heads", parameter)
+        if name.startswith("model."):
+            add(
+                (
+                    "qwen_vision"
+                    if id(parameter) in qwen_vision_parameter_ids
+                    else "qwen"
+                ),
+                parameter,
+            )
+        else:
+            add("planner_heads", parameter)
 
-    group_order = ("base_ltx", "semantic_ltx", "qwen", "planner_heads")
+    group_order = (
+        "base_ltx",
+        "semantic_ltx",
+        "action_ltx",
+        "qwen_vision",
+        "qwen",
+        "planner_heads",
+    )
     owner_by_id: dict[int, str] = {}
     for group_name in group_order:
         for parameter in parameters_by_group[group_name]:
@@ -390,6 +485,8 @@ def build_joint_optimizer_parameter_groups(
     learning_rates = {
         "base_ltx": ltx_lr,
         "semantic_ltx": semantic_lr,
+        "action_ltx": action_lr,
+        "qwen_vision": qwen_vision_lr,
         "qwen": qwen_lr,
         "planner_heads": planner_head_lr,
     }

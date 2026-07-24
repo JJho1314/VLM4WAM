@@ -244,7 +244,7 @@ def main() -> None:
     _required_path(probe_path, f"{probe_kind} depth probe")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    import train_qwen3vl4b_lingbot_dino_planner as trainer
+    import train_semantic_planner as trainer
     import visualize_qwen3vl2b_siglip2_da3_split as legacy_visualizer
     from depth_anything3_target import DepthAnything3TargetEncoder, _import_da3
     from ge_act_dual_camera import DualCameraPlannerCollator
