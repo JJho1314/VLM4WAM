@@ -772,6 +772,24 @@ def save_joint_checkpoint(
     if next_batch_in_epoch == num_batches_per_epoch:
         epoch += 1
         next_batch_in_epoch = 0
+    planner_checkpoint = args.semantic_plan["planner_checkpoint"]
+    source_planner_metadata = json.loads(
+        (Path(planner_checkpoint) / "planner_meta.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    instruction_preprocessing = args.semantic_plan.get(
+        "instruction_preprocessing"
+    )
+    if (
+        source_planner_metadata.get("instruction_preprocessing")
+        != instruction_preprocessing
+    ):
+        raise ValueError(
+            "joint source planner instruction preprocessing mismatch: "
+            f"expected {instruction_preprocessing!r}, got "
+            f"{source_planner_metadata.get('instruction_preprocessing')!r}"
+        )
     if accelerator.is_main_process:
         step_dir.mkdir(parents=True, exist_ok=True)
         model = accelerator.unwrap_model(joint_model)
@@ -779,7 +797,6 @@ def save_joint_checkpoint(
             step_dir / "ltx",
             safe_serialization=True,
         )
-        planner_checkpoint = args.semantic_plan["planner_checkpoint"]
         _export_joint_planner(
             model.planner,
             planner_provider.processor,
@@ -788,23 +805,6 @@ def save_joint_checkpoint(
             global_step=global_step,
         )
         joint_config = args.joint_training
-        source_planner_metadata = json.loads(
-            (Path(planner_checkpoint) / "planner_meta.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        instruction_preprocessing = args.semantic_plan.get(
-            "instruction_preprocessing"
-        )
-        if (
-            source_planner_metadata.get("instruction_preprocessing")
-            != instruction_preprocessing
-        ):
-            raise ValueError(
-                "joint source planner instruction preprocessing mismatch: "
-                f"expected {instruction_preprocessing!r}, got "
-                f"{source_planner_metadata.get('instruction_preprocessing')!r}"
-            )
         optimizer_group_lrs = {
             str(group.get("name")): float(group["lr"])
             for group in optimizer.param_groups

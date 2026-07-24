@@ -353,6 +353,31 @@ def test_text_condition_cache_prewarm_uses_bounded_batches() -> None:
     assert set(cache) == {"pick", "place", "open"}
 
 
+def test_joint_text_cache_prewarm_marks_unique_captions_before_caching() -> None:
+    source = GE_TRAINER_PATH.read_text(encoding="utf-8")
+    prewarm = source[
+        source.index(
+            'if bool(joint_config.get("prewarm_text_condition_cache", False)):'
+        ) : source.index(
+            'logger.info(\n'
+            '                    "Prewarmed %d frozen text conditions",'
+        )
+    ]
+
+    assert (
+        "captions = prepare_joint_instruction_prompts(\n"
+        "                    tuple(caption_provider()),"
+    ) in prewarm
+    assert (
+        'self.args, "semantic_plan", {}\n'
+        '                    ).get("instruction_preprocessing"),'
+    ) in prewarm
+    assert (
+        "prewarm_text_condition_cache(\n"
+        "                    captions,"
+    ) in prewarm
+
+
 def test_offloaded_module_is_restored_only_for_bounded_validation() -> None:
     symbols = _load_ge_trainer_symbols("run_with_temporarily_restored_module")
 
@@ -1711,6 +1736,71 @@ class _SaveableModule(nn.Module):
         (path / f"{self.marker}.txt").write_text(self.marker, encoding="utf-8")
 
 
+@pytest.mark.parametrize("is_main_process", [True, False])
+def test_joint_checkpoint_preprocessing_mismatch_fails_before_artifacts(
+    tmp_path: Path,
+    is_main_process: bool,
+) -> None:
+    contracts = _load_ge_trainer_symbols("save_joint_checkpoint")
+    source_planner = tmp_path / "source_planner"
+    source_planner.mkdir()
+    (source_planner / "planner_meta.json").write_text(
+        json.dumps({"instruction_preprocessing": None}),
+        encoding="utf-8",
+    )
+    step_dir = tmp_path / "step_20000"
+
+    def export_planner(_planner, _processor, output_dir, **_kwargs) -> None:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True)
+        (output_dir / "unexpected.txt").write_text(
+            "unexpected",
+            encoding="utf-8",
+        )
+
+    contracts.save_joint_checkpoint.__globals__["_export_joint_planner"] = (
+        export_planner
+    )
+    accelerator = SimpleNamespace(
+        is_main_process=is_main_process,
+        unwrap_model=lambda model: model,
+        wait_for_everyone=lambda: None,
+        save_state=lambda _path: None,
+    )
+    args = SimpleNamespace(
+        semantic_plan={
+            "planner_checkpoint": str(source_planner),
+            "instruction_preprocessing": "libero_tgt_v1",
+        },
+        joint_training={},
+    )
+    joint_model = SimpleNamespace(
+        ltx=_SaveableModule("ltx"),
+        planner=SimpleNamespace(),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="joint source planner instruction preprocessing mismatch",
+    ):
+        contracts.save_joint_checkpoint(
+            accelerator=accelerator,
+            joint_model=joint_model,
+            planner_provider=SimpleNamespace(processor=None),
+            optimizer=SimpleNamespace(param_groups=[]),
+            step_dir=step_dir,
+            args=args,
+            global_step=20000,
+            epoch=3,
+            next_batch_in_epoch=17,
+            num_batches_per_epoch=100,
+            dataset_length=1712,
+            sampler_seed=42,
+        )
+
+    assert not step_dir.exists()
+
+
 def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
     tmp_path: Path,
 ) -> None:
@@ -1869,6 +1959,12 @@ def test_joint_checkpoint_calls_save_state_on_non_main_rank(tmp_path: Path) -> N
         "_export_joint_planner",
         "save_joint_checkpoint",
     )
+    source_planner = tmp_path / "source_planner"
+    source_planner.mkdir()
+    (source_planner / "planner_meta.json").write_text(
+        json.dumps({"instruction_preprocessing": None}),
+        encoding="utf-8",
+    )
     saved_states: list[Path] = []
     accelerator = SimpleNamespace(
         is_main_process=False,
@@ -1883,7 +1979,9 @@ def test_joint_checkpoint_calls_save_state_on_non_main_rank(tmp_path: Path) -> N
         planner_provider=object(),
         optimizer=object(),
         step_dir=tmp_path / "step_20000",
-        args=SimpleNamespace(),
+        args=SimpleNamespace(
+            semantic_plan={"planner_checkpoint": str(source_planner)}
+        ),
         global_step=20000,
         epoch=3,
         next_batch_in_epoch=17,
