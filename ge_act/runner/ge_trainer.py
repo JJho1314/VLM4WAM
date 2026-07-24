@@ -69,6 +69,9 @@ from models.ltx_models.joint_vlm_geact import (  # noqa: F401
     build_joint_optimizer_parameter_groups,
     is_action_parameter_name,
 )
+from qwen3_vl_semantic_planner.libero_target_text import (
+    preprocess_libero_instructions,
+)
 
 LOG_LEVEL = "INFO"
 # LOG_LEVEL = "DEBUG"
@@ -790,6 +793,18 @@ def save_joint_checkpoint(
                 encoding="utf-8"
             )
         )
+        instruction_preprocessing = args.semantic_plan.get(
+            "instruction_preprocessing"
+        )
+        if (
+            source_planner_metadata.get("instruction_preprocessing")
+            != instruction_preprocessing
+        ):
+            raise ValueError(
+                "joint source planner instruction preprocessing mismatch: "
+                f"expected {instruction_preprocessing!r}, got "
+                f"{source_planner_metadata.get('instruction_preprocessing')!r}"
+            )
         optimizer_group_lrs = {
             str(group.get("name")): float(group["lr"])
             for group in optimizer.param_groups
@@ -815,6 +830,7 @@ def save_joint_checkpoint(
             "global_step": int(global_step),
             "source_planner_checkpoint": str(planner_checkpoint),
             "source_ltx_checkpoint": str(args.diffusion_model["model_path"]),
+            "instruction_preprocessing": instruction_preprocessing,
             "planner_loss_weight": float(joint_config["planner_loss_weight"]),
             "action_loss_scale": float(args.action_loss_scale),
             "train_mode": str(args.train_mode),
@@ -1048,6 +1064,18 @@ def should_log_training_scalars(
         and global_step > 0
         and interval > 0
         and global_step % interval == 0
+    )
+
+
+def prepare_joint_instruction_prompts(
+    captions: Sequence[str],
+    *,
+    preprocessing: str | None,
+) -> list[str]:
+    """Return the one prompt list shared by planner and frozen T5."""
+    return preprocess_libero_instructions(
+        captions,
+        preprocessing=preprocessing,
     )
 
 
@@ -1451,7 +1479,12 @@ class Trainer:
                         "text-condition prewarm requires a dataset with "
                         "unique_captions()"
                     )
-                captions = tuple(caption_provider())
+                captions = prepare_joint_instruction_prompts(
+                    tuple(caption_provider()),
+                    preprocessing=getattr(
+                        self.args, "semantic_plan", {}
+                    ).get("instruction_preprocessing"),
+                )
                 prewarm_text_condition_cache(
                     captions,
                     cache=self.text_condition_cache,
@@ -1541,6 +1574,9 @@ class Trainer:
                     semantic_config["planner_checkpoint"],
                     device=device,
                     dtype=dtype,
+                    expected_instruction_preprocessing=semantic_config.get(
+                        "instruction_preprocessing"
+                    ),
                 )
                 if joint_enabled:
                     if (
@@ -2099,6 +2135,16 @@ class Trainer:
                         "total_gpu",
                         "start",
                     )
+                    captions = (
+                        prepare_joint_instruction_prompts(
+                            batch["caption"],
+                            preprocessing=self.args.semantic_plan.get(
+                                "instruction_preprocessing"
+                            ),
+                        )
+                        if joint_enabled
+                        else batch["caption"]
+                    )
                     
                     # shape: {b, c, v, t, h, w}; ranging from -1 to 1
                     video = batch['video'].to(
@@ -2133,7 +2179,7 @@ class Trainer:
                         )
                         planner_inputs = self.semantic_planner.prepare_inputs(
                             prepare_joint_planner_current_images(current_frames),
-                            batch['caption'],
+                            captions,
                         )
                         _record_cuda_profile_event(
                             cuda_profile_events,
@@ -2265,7 +2311,6 @@ class Trainer:
                     video_attention_mask = None
                     latents = rearrange(latents, 'bv c f h w -> bv (f h w) c')
 
-                    captions = batch['caption']
                     text_conds = get_cached_text_conditions(
                         captions,
                         cache=self.text_condition_cache,

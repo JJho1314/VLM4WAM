@@ -8,6 +8,7 @@ import math
 import os
 import random
 import sys
+from collections.abc import Sequence
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +34,9 @@ from models.ltx_models.joint_vlm_geact import (  # noqa: E402
     build_joint_optimizer_parameter_groups,
 )
 from models.ltx_models import joint_vlm_geact as joint_vlm_geact_module  # noqa: E402
+from qwen3_vl_semantic_planner.libero_target_text import (  # noqa: E402
+    preprocess_libero_instructions,
+)
 
 
 NUM_KEYFRAMES = 4
@@ -62,6 +66,7 @@ def _load_ge_trainer_symbols(*names: str) -> SimpleNamespace:
         "DistributedType": SimpleNamespace(DEEPSPEED="deepspeed"),
         "JointVLMGEActModel": JointVLMGEActModel,
         "Path": Path,
+        "Sequence": Sequence,
         "SummaryWriter": lambda *_args, **_kwargs: None,
         "argparse": argparse,
         "build_joint_optimizer_parameter_groups": (
@@ -77,6 +82,7 @@ def _load_ge_trainer_symbols(*names: str) -> SimpleNamespace:
         "logger": SimpleNamespace(info=lambda *_args, **_kwargs: None),
         "math": math,
         "os": os,
+        "preprocess_libero_instructions": preprocess_libero_instructions,
         "torch": torch,
         "init_logging": lambda *_args, **_kwargs: None,
     }
@@ -244,6 +250,79 @@ def test_frozen_text_conditions_are_cached_per_unique_instruction() -> None:
         first["prompt_attention_mask"],
         torch.ones(3, 1, dtype=torch.bool),
     )
+
+
+def test_joint_instruction_prompts_are_target_aware_and_idempotent() -> None:
+    symbols = _load_ge_trainer_symbols(
+        "prepare_joint_instruction_prompts"
+    )
+    marked = symbols.prepare_joint_instruction_prompts(
+        [
+            "put the bowl on the plate",
+            "open the [TGT] top drawer and put the bowl inside",
+        ],
+        preprocessing="libero_tgt_v1",
+    )
+    assert marked == [
+        "put the [TGT] bowl on the plate",
+        "open the [TGT] top drawer and put the bowl inside",
+    ]
+
+
+def test_joint_instruction_prompts_preserve_legacy_none_behavior() -> None:
+    symbols = _load_ge_trainer_symbols(
+        "prepare_joint_instruction_prompts"
+    )
+    captions = ["put the bowl on the plate"]
+
+    assert symbols.prepare_joint_instruction_prompts(
+        captions,
+        preprocessing=None,
+    ) == captions
+
+
+def test_target_aware_text_cache_is_keyed_by_marked_instruction() -> None:
+    symbols = _load_ge_trainer_symbols(
+        "prepare_joint_instruction_prompts",
+        "get_cached_text_conditions",
+    )
+    cache: dict[str, dict[str, torch.Tensor]] = {}
+    encoded_prompts: list[str] = []
+
+    def encode_missing(prompts: list[str]) -> dict[str, torch.Tensor]:
+        encoded_prompts.extend(prompts)
+        return {
+            "prompt_embeds": torch.zeros(len(prompts), 2, 3),
+            "prompt_attention_mask": torch.ones(len(prompts), 2),
+        }
+
+    prompts = symbols.prepare_joint_instruction_prompts(
+        ["turn on the stove"],
+        preprocessing="libero_tgt_v1",
+    )
+    symbols.get_cached_text_conditions(
+        prompts,
+        cache=cache,
+        encode_missing=encode_missing,
+    )
+    assert encoded_prompts == ["turn on the [TGT] stove"]
+    assert list(cache) == ["turn on the [TGT] stove"]
+
+
+def test_joint_loop_shares_one_marked_caption_variable() -> None:
+    source = GE_TRAINER_PATH.read_text(encoding="utf-8")
+    loop = source[source.index("for step, batch in enumerate(") :]
+    assert "prepare_joint_instruction_prompts(" in loop
+    assert "batch[\"caption\"]" in loop
+    assert (
+        "prepare_joint_planner_current_images(current_frames),\n"
+        "                            captions,"
+    ) in loop
+    assert (
+        "text_conds = get_cached_text_conditions(\n"
+        "                        captions,"
+    ) in loop
+    assert "captions = batch['caption']" not in loop
 
 
 def test_text_condition_cache_prewarm_uses_bounded_batches() -> None:
@@ -1647,6 +1726,7 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
                 "future_keyframe_offsets": [2, 4, 6, 8],
                 "num_keyframes": 4,
                 "target_tokens_per_keyframe": 256,
+                "instruction_preprocessing": "libero_tgt_v1",
             }
         ),
         encoding="utf-8",
@@ -1674,7 +1754,10 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
         save_state=lambda path: saved_states.append(Path(path)),
     )
     args = SimpleNamespace(
-        semantic_plan={"planner_checkpoint": str(source_planner)},
+        semantic_plan={
+            "planner_checkpoint": str(source_planner),
+            "instruction_preprocessing": "libero_tgt_v1",
+        },
         diffusion_model={"model_path": "/checkpoints/ltx_step_50000"},
         joint_training={
             "planner_loss_weight": 0.1,
@@ -1736,6 +1819,7 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
     joint_meta = json.loads((step_dir / "joint_meta.json").read_text(encoding="utf-8"))
     assert joint_meta["global_step"] == 20000
     assert joint_meta["source_planner_checkpoint"] == str(source_planner)
+    assert joint_meta["instruction_preprocessing"] == "libero_tgt_v1"
     assert joint_meta["lm_plan_loss_weight"] == 7e-4
     assert joint_meta["action_loss_scale"] == 1.0
     assert joint_meta["train_mode"] == "all"
@@ -1753,6 +1837,15 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
     assert joint_meta["planner_num_keyframes"] == 4
     assert joint_meta["selected_planner_keyframe_indices"] == [1, 3]
     assert joint_meta["semantic_only"] is True
+    exported_planner_meta = json.loads(
+        (step_dir / "planner" / "planner_meta.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert (
+        exported_planner_meta["instruction_preprocessing"]
+        == "libero_tgt_v1"
+    )
     trainer_state = json.loads(
         (step_dir / "trainer_state.json").read_text(encoding="utf-8")
     )
