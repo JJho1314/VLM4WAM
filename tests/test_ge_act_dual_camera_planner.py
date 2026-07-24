@@ -17,6 +17,9 @@ from qwen3_vl_semantic_planner.ge_act_dual_camera import (
     GEActDualCameraPlannerDataset,
     build_dual_camera_planner_inputs,
 )
+from qwen3_vl_semantic_planner.libero_target_text import (
+    LIBERO_TGT_PREPROCESSING,
+)
 
 PLANNER_ROOT = Path(__file__).resolve().parents[1] / "qwen3_vl_semantic_planner"
 if str(PLANNER_ROOT) not in sys.path:
@@ -652,12 +655,49 @@ def test_dual_camera_input_builder_flattens_images_main_then_wrist() -> None:
         [(main, wrist)],
         ["pick"],
         ["<|sem_plan_0|>"],
+        instruction_preprocessing=None,
     )
 
     assert processor.images == [main, wrist]
     assert processor.texts[0].count("<|image_pad|>") == 2
     assert "Main camera" in processor.rendered_conversations[0]
     assert "Wrist camera" in processor.rendered_conversations[0]
+
+
+def test_dual_camera_builder_marks_instruction_in_shared_user_turn() -> None:
+    processor = RecordingProcessor()
+
+    build_dual_camera_planner_inputs(
+        processor,
+        [(Image.new("RGB", (8, 8)), Image.new("RGB", (8, 8)))],
+        ["turn on the stove and put the moka pot on it"],
+        ["<|sem_plan_0|>"],
+        instruction_preprocessing=LIBERO_TGT_PREPROCESSING,
+    )
+
+    assert len(processor.rendered_conversations) == 1
+    user_text = processor.rendered_conversations[0]
+    assert (
+        "Instruction: turn on the [TGT] stove and put the moka pot on it"
+        in user_text
+    )
+    assert user_text.count("[TGT]") == 1
+
+
+def test_dual_camera_builder_preserves_legacy_no_marker_contract() -> None:
+    processor = RecordingProcessor()
+
+    build_dual_camera_planner_inputs(
+        processor,
+        [(Image.new("RGB", (8, 8)), Image.new("RGB", (8, 8)))],
+        ["turn on the stove"],
+        ["<|sem_plan_0|>"],
+        instruction_preprocessing=None,
+    )
+
+    user_text = processor.rendered_conversations[0]
+    assert "Instruction: turn on the stove" in user_text
+    assert "[TGT]" not in user_text
 
 
 def test_dual_camera_collator_stacks_targets_and_keeps_sample_major_image_order() -> None:
@@ -686,6 +726,7 @@ def test_dual_camera_collator_stacks_targets_and_keeps_sample_major_image_order(
     result = DualCameraPlannerCollator(
         processor=processor,
         plan_sequence=["<|sem_plan_0|>"],
+        instruction_preprocessing=None,
     )(batch)
 
     assert processor.images == [main_0, wrist_0, main_1, wrist_1]
@@ -1745,6 +1786,30 @@ def test_dual_camera_k4_metadata_is_geometry_derived_and_strict() -> None:
     corrupted["planner_token_count"] = 256
     with pytest.raises(ValueError, match="planner_token_count"):
         planner.validate_dual_camera_export_metadata(corrupted)
+
+
+def test_dual_camera_k4_metadata_records_target_text_contract() -> None:
+    metadata = planner.build_dual_camera_export_metadata(
+        future_keyframe_offsets=(2, 4, 6, 8),
+        num_keyframes=4,
+        target_tokens_per_keyframe=256,
+        planner_token_count=384,
+        instruction_preprocessing=LIBERO_TGT_PREPROCESSING,
+    )
+
+    assert metadata["instruction_preprocessing"] == LIBERO_TGT_PREPROCESSING
+    planner.validate_dual_camera_export_metadata(
+        metadata,
+        expected_instruction_preprocessing=LIBERO_TGT_PREPROCESSING,
+    )
+
+
+def test_dual_camera_metadata_rejects_missing_target_text_contract() -> None:
+    with pytest.raises(ValueError, match="instruction_preprocessing"):
+        planner.validate_dual_camera_export_metadata(
+            valid_dual_camera_metadata(),
+            expected_instruction_preprocessing=LIBERO_TGT_PREPROCESSING,
+        )
 
 
 def test_dual_camera_exported_checkpoint_rejects_composite_before_model_build(

@@ -8,6 +8,17 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+try:
+    from .libero_target_text import (
+        LIBERO_TGT_PREPROCESSING,
+        preprocess_libero_instructions,
+    )
+except ImportError:
+    from libero_target_text import (  # type: ignore[no-redef]
+        LIBERO_TGT_PREPROCESSING,
+        preprocess_libero_instructions,
+    )
+
 
 CAMERA_NAMES = ("main", "wrist")
 
@@ -93,15 +104,23 @@ def build_dual_camera_planner_inputs(
     image_pairs: list[tuple[Any, Any]],
     instructions: list[Any],
     plan_sequence: str | list[str],
+    *,
+    instruction_preprocessing: str | None = LIBERO_TGT_PREPROCESSING,
 ) -> Any:
     if len(image_pairs) != len(instructions):
         raise ValueError(
             f"images/instructions batch mismatch: {len(image_pairs)} != {len(instructions)}"
         )
+    marked_instructions = preprocess_libero_instructions(
+        instructions,
+        preprocessing=instruction_preprocessing,
+    )
     plan_text = plan_sequence if isinstance(plan_sequence, str) else "".join(plan_sequence)
     conversations = []
     flat_images = []
-    for image_pair, instruction in zip(image_pairs, instructions, strict=True):
+    for image_pair, instruction in zip(
+        image_pairs, marked_instructions, strict=True
+    ):
         if len(image_pair) != len(CAMERA_NAMES):
             raise ValueError(
                 f"each sample must contain {len(CAMERA_NAMES)} camera images, "
@@ -151,6 +170,7 @@ def build_dual_camera_planner_inputs(
 class DualCameraPlannerCollator:
     processor: Any
     plan_sequence: list[str]
+    instruction_preprocessing: str | None = LIBERO_TGT_PREPROCESSING
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         inputs = build_dual_camera_planner_inputs(
@@ -158,6 +178,7 @@ class DualCameraPlannerCollator:
             [item["images"] for item in batch],
             [item["prompt"] for item in batch],
             self.plan_sequence,
+            instruction_preprocessing=self.instruction_preprocessing,
         )
         inputs["current_camera_images"] = torch.stack(
             [item["current_camera_images"] for item in batch], dim=0

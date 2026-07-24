@@ -68,6 +68,16 @@ except ImportError:  # pragma: no cover - exercised by the production script ent
         DualCameraPlannerCollator,
         GEActDualCameraPlannerDataset,
     )
+try:  # package import in tests/libraries; flat fallback when launched as a script
+    from .libero_target_text import (  # type: ignore[import-not-found]
+        LIBERO_TGT_PREPROCESSING,
+        validate_instruction_preprocessing,
+    )
+except ImportError:  # pragma: no cover - exercised by the production script entry point
+    from libero_target_text import (  # noqa: E402
+        LIBERO_TGT_PREPROCESSING,
+        validate_instruction_preprocessing,
+    )
 try:  # package import for GE-Act provider; flat fallback for script entry point
     from .distributed_runtime import (  # type: ignore[import-not-found]
         accumulation_context,
@@ -116,8 +126,10 @@ def build_dual_camera_export_metadata(
     num_keyframes: int,
     target_tokens_per_keyframe: int,
     planner_token_count: int,
+    instruction_preprocessing: str | None = None,
 ) -> dict[str, Any]:
     """Build the camera/export contract from the trained planner geometry."""
+    validate_instruction_preprocessing(instruction_preprocessing)
     offsets = [int(offset) for offset in future_keyframe_offsets]
     keyframes = int(num_keyframes)
     tokens_per_keyframe = int(target_tokens_per_keyframe)
@@ -155,6 +167,8 @@ def build_dual_camera_export_metadata(
                 "planner_token_count": plan_tokens,
             }
         )
+    if instruction_preprocessing is not None:
+        metadata["instruction_preprocessing"] = instruction_preprocessing
     return metadata
 
 _INITIALIZATION_METADATA = {
@@ -241,8 +255,11 @@ def select_flat_keyframes(
 
 def validate_dual_camera_export_metadata(
     metadata: dict[str, Any],
+    *,
+    expected_instruction_preprocessing: str | None = None,
 ) -> dict[str, Any]:
     """Reject exports that cannot preserve separate main/wrist view context."""
+    validate_instruction_preprocessing(expected_instruction_preprocessing)
     if not isinstance(metadata, dict):
         raise ValueError("dual-camera planner metadata must be a dictionary")
     common = {
@@ -305,6 +322,18 @@ def validate_dual_camera_export_metadata(
             "incompatible dual-camera metadata field planner_input_frame: "
             "expected 'separate_camera_images', "
             f"got {legacy_input_frame!r}"
+        )
+    actual_preprocessing = metadata.get("instruction_preprocessing")
+    validate_instruction_preprocessing(actual_preprocessing)
+    if (
+        expected_instruction_preprocessing is not None
+        and actual_preprocessing != expected_instruction_preprocessing
+    ):
+        raise ValueError(
+            "incompatible dual-camera metadata field "
+            "instruction_preprocessing: expected "
+            f"{expected_instruction_preprocessing!r}, "
+            f"got {actual_preprocessing!r}"
         )
     return metadata
 
@@ -984,6 +1013,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-root", type=Path, default=None)
     parser.add_argument("--fastwam-data-config", type=Path, default=None)
     parser.add_argument("--ge-act-data-config", type=Path, default=None)
+    parser.add_argument(
+        "--instruction-preprocessing",
+        choices=[LIBERO_TGT_PREPROCESSING],
+        default=None,
+        help=(
+            "versioned instruction contract; use libero_tgt_v1 for new "
+            "target-aware LIBERO planner training"
+        ),
+    )
     parser.add_argument("--fastwam-dataset-dir", action="append", default=[])
     parser.add_argument(
         "--fastwam-text-embedding-cache-dir",
@@ -3732,9 +3770,17 @@ def save_checkpoint(
                     module.target_len // module.num_keyframes
                 ),
                 planner_token_count=module.latent_len,
+                instruction_preprocessing=getattr(
+                    args, "instruction_preprocessing", None
+                ),
             )
         )
-        validate_dual_camera_export_metadata(meta)
+        validate_dual_camera_export_metadata(
+            meta,
+            expected_instruction_preprocessing=getattr(
+                args, "instruction_preprocessing", None
+            ),
+        )
     (ckpt / "planner_meta.json").write_text(
         json.dumps(meta, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -4114,6 +4160,7 @@ def main() -> None:
         collator = DualCameraPlannerCollator(
             processor=processor,
             plan_sequence=plan_sequence,
+            instruction_preprocessing=args.instruction_preprocessing,
         )
         if accelerator.is_main_process:
             print(
