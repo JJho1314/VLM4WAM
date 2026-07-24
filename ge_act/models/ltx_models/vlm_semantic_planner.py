@@ -11,6 +11,10 @@ import torch
 from PIL import Image
 from torch import nn
 
+from qwen3_vl_semantic_planner.libero_target_text import (
+    validate_instruction_preprocessing,
+)
+
 
 _DUAL_CAMERA_COMMON_METADATA = {
     "planner_input_layout": "separate_camera_images",
@@ -76,8 +80,11 @@ def _metadata_matches(actual: Any, expected: Any) -> bool:
 
 def validate_dual_camera_planner_metadata(
     metadata: dict[str, Any],
+    *,
+    expected_instruction_preprocessing: str | None = None,
 ) -> dict[str, Any]:
     """Validate the exact independently trained main/wrist export geometry."""
+    validate_instruction_preprocessing(expected_instruction_preprocessing)
     if not isinstance(metadata, dict):
         raise ValueError("dual-camera planner metadata must be a dictionary")
     for field, expected in _DUAL_CAMERA_COMMON_METADATA.items():
@@ -119,6 +126,18 @@ def validate_dual_camera_planner_metadata(
         raise ValueError(
             "incompatible dual-camera planner metadata field plan_token_strings: "
             f"expected {planner_token_count} ordered planner tokens"
+        )
+    actual_preprocessing = metadata.get("instruction_preprocessing")
+    validate_instruction_preprocessing(actual_preprocessing)
+    if (
+        expected_instruction_preprocessing is not None
+        and actual_preprocessing != expected_instruction_preprocessing
+    ):
+        raise ValueError(
+            "incompatible dual-camera planner metadata field "
+            "instruction_preprocessing: expected "
+            f"{expected_instruction_preprocessing!r}, "
+            f"got {actual_preprocessing!r}"
         )
     return metadata
 
@@ -171,6 +190,7 @@ class FrozenDualCameraVLMPlanner:
         future_keyframe_offsets: Sequence[int],
         sequence_length: int,
         target_tokens_per_keyframe: int,
+        instruction_preprocessing: str | None,
     ) -> None:
         self.wrapper = wrapper
         self.processor = processor
@@ -184,6 +204,7 @@ class FrozenDualCameraVLMPlanner:
         )
         self.sequence_length = int(sequence_length)
         self.target_tokens_per_keyframe = int(target_tokens_per_keyframe)
+        self.instruction_preprocessing = instruction_preprocessing
 
     @classmethod
     def from_components(
@@ -196,9 +217,13 @@ class FrozenDualCameraVLMPlanner:
         device: torch.device | str,
         plan_tokens: Sequence[str] | None = None,
         metadata: dict[str, Any] | None = None,
+        expected_instruction_preprocessing: str | None = None,
     ) -> "FrozenDualCameraVLMPlanner":
         if metadata is not None:
-            validate_dual_camera_planner_metadata(metadata)
+            validate_dual_camera_planner_metadata(
+                metadata,
+                expected_instruction_preprocessing=expected_instruction_preprocessing,
+            )
             num_keyframes = int(metadata["num_keyframes"])
             offsets = tuple(int(value) for value in metadata["future_keyframe_offsets"])
             sequence_length = int(metadata.get("sequence_length", 9))
@@ -211,6 +236,7 @@ class FrozenDualCameraVLMPlanner:
             expected_plan_tokens = int(
                 metadata.get("planner_token_count", 256)
             )
+            instruction_preprocessing = metadata.get("instruction_preprocessing")
         else:
             num_keyframes = int(getattr(wrapper, "num_keyframes", 1))
             offsets = (8,) if num_keyframes == 1 else (2, 4, 6, 8)
@@ -222,6 +248,7 @@ class FrozenDualCameraVLMPlanner:
                 )
             tokens_per_keyframe = target_len // num_keyframes
             expected_plan_tokens = int(getattr(wrapper, "latent_len", 256))
+            instruction_preprocessing = None
         if plan_tokens is None:
             plan_tokens = [
                 f"<|sem_plan_{index}|>" for index in range(expected_plan_tokens)
@@ -245,6 +272,7 @@ class FrozenDualCameraVLMPlanner:
             future_keyframe_offsets=offsets,
             sequence_length=sequence_length,
             target_tokens_per_keyframe=tokens_per_keyframe,
+            instruction_preprocessing=instruction_preprocessing,
         )
 
     @staticmethod
@@ -305,6 +333,7 @@ class FrozenDualCameraVLMPlanner:
         *,
         device: torch.device | str,
         dtype: torch.dtype = torch.bfloat16,
+        expected_instruction_preprocessing: str | None = None,
     ) -> "FrozenDualCameraVLMPlanner":
         checkpoint_dir = Path(checkpoint_dir)
         metadata_path = checkpoint_dir / "planner_meta.json"
@@ -316,7 +345,10 @@ class FrozenDualCameraVLMPlanner:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as error:
             raise ValueError(f"invalid planner metadata: {metadata_path}") from error
-        validate_dual_camera_planner_metadata(metadata)
+        validate_dual_camera_planner_metadata(
+            metadata,
+            expected_instruction_preprocessing=expected_instruction_preprocessing,
+        )
 
         required_files = list(_CHECKPOINT_FILES)
         if bool(metadata.get("use_current_alignment", metadata["num_keyframes"] == 1)):
@@ -352,6 +384,7 @@ class FrozenDualCameraVLMPlanner:
             plan_tokens=metadata["plan_token_strings"],
             metadata=metadata,
             device=resolved_device,
+            expected_instruction_preprocessing=expected_instruction_preprocessing,
         )
 
     def prepare_inputs(
@@ -366,6 +399,7 @@ class FrozenDualCameraVLMPlanner:
                 image_pairs,
                 [str(value) for value in instructions],
                 self.plan_tokens,
+                instruction_preprocessing=self.instruction_preprocessing,
             )
         )
 

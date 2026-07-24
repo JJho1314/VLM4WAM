@@ -13,6 +13,9 @@ from ge_act.models.ltx_models.vlm_semantic_planner import (
     FrozenDualCameraVLMPlanner,
     validate_dual_camera_planner_metadata,
 )
+from qwen3_vl_semantic_planner.libero_target_text import (
+    LIBERO_TGT_PREPROCESSING,
+)
 
 
 class FakeDualWrapper(nn.Module):
@@ -107,10 +110,13 @@ def fake_input_builder(
     image_pairs: list[tuple[Image.Image, Image.Image]],
     instructions: list[str],
     plan_tokens: list[str],
+    *,
+    instruction_preprocessing: str | None = None,
 ) -> dict[str, Any]:
     assert len(image_pairs) == len(instructions)
     assert all(len(pair) == 2 for pair in image_pairs)
     assert len(plan_tokens) == 256
+    assert instruction_preprocessing in (None, LIBERO_TGT_PREPROCESSING)
     return {
         "input_ids": torch.arange(len(instructions)).reshape(-1, 1),
         "image_pairs": image_pairs,
@@ -122,10 +128,13 @@ def flexible_fake_input_builder(
     image_pairs: list[tuple[Image.Image, Image.Image]],
     instructions: list[str],
     plan_tokens: list[str],
+    *,
+    instruction_preprocessing: str | None = None,
 ) -> dict[str, Any]:
     assert len(image_pairs) == len(instructions)
     assert all(len(pair) == 2 for pair in image_pairs)
     assert len(plan_tokens) in (256, 384)
+    assert instruction_preprocessing in (None, LIBERO_TGT_PREPROCESSING)
     return {"input_ids": torch.arange(len(instructions)).reshape(-1, 1)}
 
 
@@ -212,6 +221,62 @@ def test_provider_prepare_inputs_does_not_run_qwen() -> None:
     assert model_inputs["input_ids"].shape == (2, 1)
     assert moved
     assert wrapper.received is None
+
+
+def test_frozen_provider_passes_metadata_selected_prompt_contract() -> None:
+    metadata = valid_k4_metadata()
+    metadata["instruction_preprocessing"] = LIBERO_TGT_PREPROCESSING
+    received: dict[str, str | None] = {}
+
+    def recording_builder(
+        processor: Any,
+        image_pairs: list[tuple[Image.Image, Image.Image]],
+        instructions: list[str],
+        plan_tokens: list[str],
+        *,
+        instruction_preprocessing: str | None,
+    ) -> dict[str, Any]:
+        received["instruction_preprocessing"] = instruction_preprocessing
+        return flexible_fake_input_builder(
+            processor,
+            image_pairs,
+            instructions,
+            plan_tokens,
+            instruction_preprocessing=instruction_preprocessing,
+        )
+
+    provider = FrozenDualCameraVLMPlanner.from_components(
+        wrapper=FakeK4DualWrapper(),
+        processor=FakeProcessor(),
+        input_builder=recording_builder,
+        input_mover=lambda value: value,
+        device="cpu",
+        plan_tokens=metadata["plan_token_strings"],
+        metadata=metadata,
+        expected_instruction_preprocessing=LIBERO_TGT_PREPROCESSING,
+    )
+    provider.prepare_inputs(
+        torch.zeros(1, 2, 3, 8, 8),
+        ["open the middle drawer of the cabinet"],
+    )
+    assert received == {
+        "instruction_preprocessing": LIBERO_TGT_PREPROCESSING
+    }
+
+
+def test_target_aware_provider_rejects_legacy_checkpoint_metadata() -> None:
+    metadata = valid_k4_metadata()
+    with pytest.raises(ValueError, match="instruction_preprocessing"):
+        validate_dual_camera_planner_metadata(
+            metadata,
+            expected_instruction_preprocessing=LIBERO_TGT_PREPROCESSING,
+        )
+
+
+def test_legacy_provider_keeps_unmarked_prompt() -> None:
+    metadata = valid_k4_metadata()
+    assert "instruction_preprocessing" not in metadata
+    assert validate_dual_camera_planner_metadata(metadata) is metadata
 
 
 @pytest.mark.parametrize(
