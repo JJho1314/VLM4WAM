@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import importlib
 
+import numpy as np
+import pytest
 import torch
+from PIL import Image
 
 from qwen3_vl_semantic_planner.lingbot_dino_4b.lingbot_resampler import (
     PerceiverAttention,
@@ -75,3 +78,77 @@ def test_capture_registers_temporarily_and_records_cpu_maps() -> None:
     assert len(capture.maps) == 1
     assert capture.maps[0].shape == (1, 6)
     assert capture.maps[0].device.type == "cpu"
+
+
+def test_merged_image_grid_matches_qwen_spatial_merge() -> None:
+    visualizer = _visualizer()
+
+    assert visualizer.merged_image_grid(
+        torch.tensor([1, 18, 18]),
+        spatial_merge_size=2,
+        expected_tokens=81,
+    ) == (9, 9)
+
+
+def test_merged_image_grid_rejects_token_mismatch() -> None:
+    visualizer = _visualizer()
+
+    with pytest.raises(ValueError, match="81"):
+        visualizer.merged_image_grid(
+            torch.tensor([1, 18, 18]),
+            spatial_merge_size=2,
+            expected_tokens=80,
+        )
+
+
+def test_joint_normalization_is_finite_and_shared_across_k4() -> None:
+    visualizer = _visualizer()
+    maps = torch.stack(
+        [torch.arange(81).reshape(9, 9).float() + 10 * index for index in range(4)]
+    )
+
+    normalized = visualizer.normalize_attention_stack(
+        maps,
+        lower_quantile=0.02,
+        upper_quantile=0.98,
+    )
+
+    assert normalized.shape == (4, 9, 9)
+    assert torch.isfinite(normalized).all()
+    assert normalized.min() >= 0
+    assert normalized.max() <= 1
+    assert normalized[0].mean() < normalized[-1].mean()
+
+
+def test_attention_products_and_composite_are_rgb(tmp_path) -> None:
+    visualizer = _visualizer()
+    rgb = np.full((40, 48, 3), 128, dtype=np.uint8)
+    heatmap, overlay = visualizer.attention_products(
+        rgb,
+        torch.linspace(0, 1, 9).reshape(3, 3),
+        alpha=0.55,
+    )
+
+    assert heatmap.shape == rgb.shape
+    assert overlay.shape == rgb.shape
+    assert heatmap.dtype == np.uint8
+    assert overlay.dtype == np.uint8
+
+    output_path = tmp_path / "composite.png"
+    observations = {"main": rgb, "wrist": rgb}
+    overlays = {
+        "main": [overlay.copy() for _ in range(4)],
+        "wrist": [overlay.copy() for _ in range(4)],
+    }
+    visualizer.render_composite(
+        output_path,
+        instruction="pick up the bowl",
+        observations=observations,
+        overlays=overlays,
+        offsets=[2, 4, 6, 8],
+    )
+
+    assert output_path.is_file()
+    with Image.open(output_path) as image:
+        assert image.mode == "RGB"
+        assert image.width > image.height
