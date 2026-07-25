@@ -152,3 +152,75 @@ def test_attention_products_and_composite_are_rgb(tmp_path) -> None:
     with Image.open(output_path) as image:
         assert image.mode == "RGB"
         assert image.width > image.height
+
+
+def test_validate_checkpoint_contract_accepts_dual_camera_k4() -> None:
+    visualizer = _visualizer()
+
+    visualizer.validate_checkpoint_contract(
+        {
+            "plan_head_type": "lingbot_dino",
+            "num_camera_views": 2,
+            "camera_names": ["main", "wrist"],
+            "num_keyframes": 4,
+            "future_keyframe_offsets": [2, 4, 6, 8],
+            "target_tokens_per_keyframe": 256,
+            "branch_latent_per_keyframe": 64,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("plan_head_type", "mlp"),
+        ("num_camera_views", 1),
+        ("camera_names", ["main", "main"]),
+        ("num_keyframes", 2),
+        ("future_keyframe_offsets", [2, 4]),
+    ],
+)
+def test_validate_checkpoint_contract_rejects_wrong_geometry(
+    field: str,
+    value: object,
+) -> None:
+    visualizer = _visualizer()
+    metadata = {
+        "plan_head_type": "lingbot_dino",
+        "num_camera_views": 2,
+        "camera_names": ["main", "wrist"],
+        "num_keyframes": 4,
+        "future_keyframe_offsets": [2, 4, 6, 8],
+        "target_tokens_per_keyframe": 256,
+        "branch_latent_per_keyframe": 64,
+    }
+    metadata[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        visualizer.validate_checkpoint_contract(metadata)
+
+
+def test_group_attention_captures_is_view_major_keyframe_major() -> None:
+    visualizer = _visualizer()
+    captures = [torch.full((1, 9), float(index)) for index in range(8)]
+
+    grouped = visualizer.group_attention_captures(
+        captures,
+        num_views=2,
+        num_keyframes=4,
+    )
+
+    assert grouped.shape == (2, 4, 9)
+    assert grouped[0, 3, 0] == 3
+    assert grouped[1, 0, 0] == 4
+
+
+def test_group_attention_captures_rejects_missing_call() -> None:
+    visualizer = _visualizer()
+
+    with pytest.raises(ValueError, match="8"):
+        visualizer.group_attention_captures(
+            [torch.zeros(1, 9) for _ in range(7)],
+            num_views=2,
+            num_keyframes=4,
+        )
