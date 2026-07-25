@@ -436,7 +436,7 @@ def _camera_rgb(frame: torch.Tensor) -> np.ndarray:
 
 def _save_rgb(path: Path, rgb: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(_validate_rgb(rgb), mode="RGB").save(path)
+    Image.fromarray(_validate_rgb(rgb)).save(path)
 
 
 def _write_manifest_atomic(path: Path, payload: Mapping[str, Any]) -> None:
