@@ -13,6 +13,7 @@ if str(GE_ACT_ROOT) not in sys.path:
 
 from models.ltx_models.ltx_attention_processor import Attention  # noqa: E402
 from models.ltx_models.semantic_conditioning import SemanticContextAdapter  # noqa: E402
+from models.ltx_models import transformer_ltx_multiview as transformer_module  # noqa: E402
 from models.ltx_models.transformer_ltx_multiview import (  # noqa: E402
     LTXVideoSemanticAttentionProcessor2_0,
     LTXVideoTransformer3DModel,
@@ -130,12 +131,27 @@ def test_adapter_rejects_invalid_grounding_fields(
         )
 
 
-def test_zero_bias_gate_matches_existing_semantic_attention_bitwise() -> None:
+def test_zero_bias_gate_uses_baseline_sdpa_and_matches_bitwise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     attention = _deterministic_semantic_attention()
     queries = torch.randn(2, 3, 2)
     context = torch.randn(2, 4, 2)
+    attention_masks: list[torch.Tensor | None] = []
+    scaled_dot_product_attention = transformer_module.F.scaled_dot_product_attention
+
+    def record_attention_mask(*args, **kwargs):
+        attention_masks.append(kwargs.get("attn_mask"))
+        return scaled_dot_product_attention(*args, **kwargs)
+
+    monkeypatch.setattr(
+        transformer_module.F,
+        "scaled_dot_product_attention",
+        record_attention_mask,
+    )
 
     expected = attention(queries, encoder_hidden_states=context)
+    attention_masks.clear()
     actual = attention(
         queries,
         encoder_hidden_states=context,
@@ -143,7 +159,42 @@ def test_zero_bias_gate_matches_existing_semantic_attention_bitwise() -> None:
     )
 
     assert attention.processor.raw_semantic_bias_gate.item() == 0.0
+    assert len(attention_masks) == 2
+    assert attention_masks[0] is None
+    assert attention_masks[1] is not None
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_zero_bias_gate_matches_cuda_mixed_precision_bitwise(
+    dtype: torch.dtype,
+) -> None:
+    if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        pytest.skip("CUDA device does not support bfloat16")
+    attention = _deterministic_semantic_attention().to(device="cuda", dtype=dtype)
+    queries = torch.randn(2, 7, 2, device="cuda", dtype=dtype)
+    context = torch.randn(2, 11, 2, device="cuda", dtype=dtype)
+    relevance = torch.linspace(
+        0.01,
+        1.0,
+        2 * 11,
+        device="cuda",
+        dtype=dtype,
+    ).reshape(2, 11)
+
+    expected = attention(queries, encoder_hidden_states=context)
+    actual = attention(
+        queries,
+        encoder_hidden_states=context,
+        relevance=relevance,
+    )
+
+    assert torch.equal(actual, expected)
+    actual.float().square().mean().backward()
+    gate_grad = attention.processor.raw_semantic_bias_gate.grad
+    assert gate_grad is not None
+    assert torch.count_nonzero(gate_grad) > 0
 
 
 def test_bias_is_bounded_and_prefers_the_more_relevant_key() -> None:
@@ -160,9 +211,12 @@ def test_bias_is_bounded_and_prefers_the_more_relevant_key() -> None:
     assert output[0, 0, 0] > output[0, 0, 1]
 
 
-def test_padding_mask_blocks_keys_and_all_masked_context_is_finite() -> None:
+@pytest.mark.parametrize("raw_gate", [0.0, 1.0])
+def test_padding_mask_blocks_keys_and_all_masked_context_is_finite(
+    raw_gate: float,
+) -> None:
     attention = _deterministic_semantic_attention()
-    attention.processor.raw_semantic_bias_gate.data.fill_(1.0)
+    attention.processor.raw_semantic_bias_gate.data.fill_(raw_gate)
     context = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
 
     output = attention(
@@ -246,6 +300,75 @@ def test_old_semantic_attention_state_dict_loads_with_zero_bias_gate() -> None:
     restored.load_state_dict(old_state_dict, strict=True)
 
     assert restored.semantic_attn.processor.raw_semantic_bias_gate.item() == 0.0
+
+
+@pytest.mark.parametrize("gradient_checkpointing", [False, True])
+def test_untouched_zero_residual_learns_bias_gate_on_first_backward(
+    gradient_checkpointing: bool,
+) -> None:
+    torch.manual_seed(29)
+    model = LTXVideoTransformer3DModel(
+        in_channels=4,
+        out_channels=4,
+        num_attention_heads=2,
+        attention_head_dim=6,
+        cross_attention_dim=12,
+        caption_channels=8,
+        num_layers=1,
+        semantic_plan_context=True,
+        semantic_plan_in_dim=8,
+        semantic_plan_coordinate_dim=4,
+        semantic_plan_num_keyframes=2,
+        semantic_plan_num_views=2,
+        semantic_plan_cross_attention_blocks=(0,),
+        semantic_plan_adaln_rank=4,
+    )
+    if gradient_checkpointing:
+        model.enable_gradient_checkpointing()
+    block = model.transformer_blocks[0]
+    assert torch.count_nonzero(block.semantic_modulation[-1].weight) == 0
+    assert block.semantic_attn.processor.raw_semantic_bias_gate.item() == 0.0
+
+    common_inputs = {
+        "hidden_states": torch.randn(2, 2, 4),
+        "encoder_hidden_states": torch.randn(1, 3, 8),
+        "timestep": torch.ones(2, 2),
+        "encoder_attention_mask": torch.ones(1, 3),
+        "n_view": 2,
+        "rope_interpolation_scale": (1.6, 32.0, 32.0),
+        "num_frames": 2,
+        "height": 1,
+        "width": 1,
+        "semantic_plan": torch.randn(1, 2, 2, 3, 8),
+        "semantic_plan_times": torch.tensor([[0.5, 1.0]]).repeat(2, 1),
+        "semantic_plan_positions": torch.rand(1, 2, 2, 3, 2),
+        "return_dict": False,
+    }
+    with torch.no_grad():
+        expected = model(**common_inputs)[0]["video"]
+
+    semantic_relevance = torch.tensor(
+        [[[[1.0, 0.4, 0.2], [0.8, 0.3, 0.1]]] * 2],
+        requires_grad=True,
+    )
+    actual = model(
+        **common_inputs,
+        semantic_plan_relevance=semantic_relevance,
+    )[0]["video"]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    actual.square().mean().backward()
+
+    gate_grad = block.semantic_attn.processor.raw_semantic_bias_gate.grad
+    assert gate_grad is not None
+    assert torch.count_nonzero(gate_grad) > 0
+    for projection in (
+        block.semantic_attn.to_q,
+        block.semantic_attn.to_k,
+        block.semantic_attn.to_v,
+        block.semantic_attn.to_out[0],
+    ):
+        projection_grad = projection.weight.grad
+        assert projection_grad is None or torch.count_nonzero(projection_grad) == 0
 
 
 @pytest.mark.parametrize("gradient_checkpointing", [False, True])

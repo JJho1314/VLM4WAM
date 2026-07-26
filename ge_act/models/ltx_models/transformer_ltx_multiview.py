@@ -42,6 +42,20 @@ from models.action_patches.patches import preprocessing_action_states, add_actio
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
+class _AttachZeroForwardSurrogate(torch.autograd.Function):
+    """Keep the primary forward value while routing backward through a surrogate."""
+
+    @staticmethod
+    def forward(ctx, primary: torch.Tensor, surrogate: torch.Tensor) -> torch.Tensor:
+        del ctx, surrogate
+        return primary
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        del ctx
+        return grad_output, grad_output
+
+
 
 class LTXVideoAttentionProcessor2_0:
     r"""
@@ -179,7 +193,8 @@ class LTXVideoSemanticAttentionProcessor2_0(nn.Module):
         query_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         key_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         relevance: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_zero_gate_surrogate: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, Optional[torch.Tensor]]:
         return super().__call__(
             attn,
             hidden_states,
@@ -188,7 +203,26 @@ class LTXVideoSemanticAttentionProcessor2_0(nn.Module):
             query_rotary_emb=query_rotary_emb,
             key_rotary_emb=key_rotary_emb,
             relevance=relevance,
+            return_zero_gate_surrogate=return_zero_gate_surrogate,
         )
+
+    @staticmethod
+    def _combine_padding_and_relevance_bias(
+        attention_mask: Optional[torch.Tensor],
+        log_bias: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        log_bias = log_bias.to(dtype=dtype)[:, None, None, :]
+        if attention_mask is None:
+            return log_bias
+        if attention_mask.dtype == torch.bool:
+            padding_bias = torch.zeros_like(
+                attention_mask,
+                dtype=dtype,
+            ).masked_fill(~attention_mask, float("-inf"))
+            return padding_bias + log_bias
+        return attention_mask.to(dtype=dtype) + log_bias
 
     def forward(
         self,
@@ -199,7 +233,8 @@ class LTXVideoSemanticAttentionProcessor2_0(nn.Module):
         query_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         key_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         relevance: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_zero_gate_surrogate: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, Optional[torch.Tensor]]:
         if encoder_hidden_states is None:
             raise ValueError("semantic cross-attention requires encoder_hidden_states")
         batch_size, query_length, _ = hidden_states.shape
@@ -247,6 +282,8 @@ class LTXVideoSemanticAttentionProcessor2_0(nn.Module):
         key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
         value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
 
+        log_relevance = None
+        bias_gate_is_zero = False
         if relevance is not None:
             expected_relevance = (batch_size, key_length)
             if tuple(relevance.shape) != expected_relevance:
@@ -262,20 +299,16 @@ class LTXVideoSemanticAttentionProcessor2_0(nn.Module):
             if bool((relevance < 0).any()):
                 raise ValueError("relevance must be non-negative")
 
-            log_bias = self.semantic_bias_gate * torch.log(
+            log_relevance = torch.log(
                 relevance.to(dtype=torch.float32).clamp_min(1e-6)
             )
-            log_bias = log_bias.to(dtype=query.dtype)[:, None, None, :]
-            if attention_mask is None:
-                attention_mask = log_bias
-            elif attention_mask.dtype == torch.bool:
-                padding_bias = torch.zeros_like(
+            bias_gate_is_zero = bool(self.raw_semantic_bias_gate.detach() == 0)
+            if not bias_gate_is_zero:
+                attention_mask = self._combine_padding_and_relevance_bias(
                     attention_mask,
+                    self.semantic_bias_gate * log_relevance,
                     dtype=query.dtype,
-                ).masked_fill(~attention_mask, float("-inf"))
-                attention_mask = padding_bias + log_bias
-            else:
-                attention_mask = attention_mask.to(dtype=query.dtype) + log_bias
+                )
 
         hidden_states = F.scaled_dot_product_attention(
             query,
@@ -287,6 +320,42 @@ class LTXVideoSemanticAttentionProcessor2_0(nn.Module):
         )
         if valid_key_rows is not None:
             hidden_states = torch.nan_to_num(hidden_states)
+
+        zero_gate_surrogate = None
+        if (
+            bias_gate_is_zero
+            and log_relevance is not None
+            and torch.is_grad_enabled()
+        ):
+            surrogate_mask = self._combine_padding_and_relevance_bias(
+                attention_mask,
+                self.semantic_bias_gate * log_relevance,
+                dtype=query.dtype,
+            )
+            surrogate_states = F.scaled_dot_product_attention(
+                query.detach(),
+                key.detach(),
+                value.detach(),
+                attn_mask=surrogate_mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+            if valid_key_rows is not None:
+                surrogate_states = torch.nan_to_num(surrogate_states)
+            surrogate_states = surrogate_states.transpose(1, 2).flatten(2, 3).to(query.dtype)
+            projected_surrogate = F.linear(
+                surrogate_states,
+                attn.to_out[0].weight.detach(),
+                bias=None,
+            )
+            zero_gate_surrogate = projected_surrogate - projected_surrogate.detach()
+            if valid_key_rows is not None:
+                zero_gate_surrogate = torch.where(
+                    valid_key_rows[:, None, None],
+                    zero_gate_surrogate,
+                    torch.zeros_like(zero_gate_surrogate),
+                )
+
         hidden_states = hidden_states.transpose(1, 2).flatten(2, 3).to(query.dtype)
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
@@ -298,6 +367,13 @@ class LTXVideoSemanticAttentionProcessor2_0(nn.Module):
             )
         if hidden_states.shape[:2] != (batch_size, query_length):
             raise RuntimeError("semantic attention changed the per-camera query layout")
+        if return_zero_gate_surrogate:
+            return hidden_states, zero_gate_surrogate
+        if zero_gate_surrogate is not None:
+            hidden_states = _AttachZeroForwardSurrogate.apply(
+                hidden_states,
+                zero_gate_surrogate,
+            )
         return hidden_states
 
 
@@ -532,14 +608,20 @@ class LTXVideoTransformerBlock(nn.Module):
             ).chunk(3, dim=-1)
             semantic_query = self.semantic_norm(hidden_states)
             semantic_query = semantic_query * (1 + semantic_scale) + semantic_shift
-            semantic_output = self.semantic_attn(
+            semantic_attention_result = self.semantic_attn(
                 semantic_query,
                 encoder_hidden_states=semantic_hidden_states,
                 attention_mask=semantic_attention_mask,
                 query_rotary_emb=semantic_query_rotary_emb,
                 key_rotary_emb=semantic_key_rotary_emb,
                 relevance=semantic_relevance,
+                return_zero_gate_surrogate=semantic_relevance is not None,
             )
+            if isinstance(semantic_attention_result, tuple):
+                semantic_output, semantic_bias_surrogate = semantic_attention_result
+            else:
+                semantic_output = semantic_attention_result
+                semantic_bias_surrogate = None
             if semantic_condition_mask is not None:
                 semantic_mask = semantic_condition_mask.to(
                     device=semantic_output.device,
@@ -550,7 +632,24 @@ class LTXVideoTransformerBlock(nn.Module):
                 elif semantic_mask.ndim == 2:
                     semantic_mask = semantic_mask[:, :, None]
                 semantic_output = semantic_output * semantic_mask
-            hidden_states = hidden_states + semantic_output * semantic_gate
+                if semantic_bias_surrogate is not None:
+                    semantic_bias_surrogate = semantic_bias_surrogate * semantic_mask
+            semantic_residual = semantic_output * semantic_gate
+            if semantic_bias_surrogate is not None:
+                residual_gate_is_initialized = bool(
+                    torch.count_nonzero(
+                        self.semantic_modulation[-1].weight.detach()
+                    )
+                )
+                if residual_gate_is_initialized:
+                    semantic_bias_surrogate = (
+                        semantic_bias_surrogate * semantic_gate.detach()
+                    )
+                semantic_residual = _AttachZeroForwardSurrogate.apply(
+                    semantic_residual,
+                    semantic_bias_surrogate,
+                )
+            hidden_states = hidden_states + semantic_residual
 
         norm_hidden_states = self.norm2(hidden_states) * (1 + scale_mlp) + shift_mlp
 
