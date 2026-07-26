@@ -24,6 +24,10 @@ _TEXT_ALIGN_DIM = 1152
 _FUTURE_FRAME_OFFSETS = (1, 4, 6, 9)
 _GE_ACT_FUTURE_INDICES = (0, 3, 5, 8)
 _GROUNDING_ROLES = ("source", "target", "action")
+_SUPERSEDED_QWEN_ANCHOR_FIELDS = (
+    "anchor_token_ids",
+    "anchor_embedding_hash",
+)
 
 
 def _require_equal(name: str, actual: Any, expected: Any) -> None:
@@ -35,6 +39,14 @@ def _require_keys(payload: Mapping[str, Any], required: tuple[str, ...]) -> None
     missing = sorted(set(required).difference(payload))
     if missing:
         raise ValueError(f"missing required metadata fields: {', '.join(missing)}")
+
+
+def _reject_superseded_fields(payload: Mapping[str, Any], fields: tuple[str, ...]) -> None:
+    present = sorted(set(fields).intersection(payload))
+    if present:
+        raise ValueError(
+            "superseded Qwen anchor fields are not permitted: " + ", ".join(present)
+        )
 
 
 def _require_hashes(instance: object, names: tuple[str, ...]) -> None:
@@ -163,6 +175,7 @@ class ReleasedTATokMetadata:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> ReleasedTATokMetadata:
         _require_keys(payload, cls._REQUIRED_FIELDS)
+        _reject_superseded_fields(payload, _SUPERSEDED_QWEN_ANCHOR_FIELDS)
         return cls(**{name: payload[name] for name in cls._REQUIRED_FIELDS})
 
 

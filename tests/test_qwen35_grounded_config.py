@@ -51,6 +51,17 @@ def test_released_ta_metadata_has_no_qwen_anchor_fields() -> None:
     assert ReleasedTATokMetadata.from_dict(json.loads(json.dumps(payload))) == metadata
 
 
+def test_released_ta_metadata_rejects_superseded_anchor_fields() -> None:
+    from qwen35_planx.config import ReleasedTATokMetadata
+
+    payload = ReleasedTATokMetadata.example().to_dict()
+    payload["anchor_token_ids"] = [0, 1]
+    payload["anchor_embedding_hash"] = "superseded-anchor-sha256"
+
+    with pytest.raises(ValueError, match="superseded.*anchor"):
+        ReleasedTATokMetadata.from_dict(payload)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
