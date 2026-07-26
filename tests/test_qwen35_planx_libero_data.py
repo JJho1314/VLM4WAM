@@ -4,6 +4,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pytest
 
@@ -211,3 +212,106 @@ def test_manifest_cli_writes_sorted_hash_bound_outputs(
 
     persisted = json.loads((output_dir / "manifest.json").read_text())
     assert persisted == manifest
+
+
+def test_hdf5_manifest_cli_writes_deterministic_explicit_windows(
+    tmp_path: Path,
+) -> None:
+    from qwen35_planx.cli.build_libero_manifests import build_hdf5_manifests
+
+    root = tmp_path / "hdf5"
+    root.mkdir()
+    shard_path = root / "shard_00000.h5"
+    key = "libero_goal:000000"
+    with h5py.File(shard_path, "w") as handle:
+        group = handle.create_group(f"episodes/{key}")
+        string_dtype = h5py.string_dtype(encoding="utf-8")
+        group.create_dataset("caption", data="pick up the mug", dtype=string_dtype)
+        group.create_dataset("domain", data="libero_goal", dtype=string_dtype)
+        group.create_dataset("episode_index", data=0, dtype=np.int64)
+        group.create_dataset("length", data=40, dtype=np.int64)
+        group.create_dataset("rgb_main", shape=(40, 256, 256, 3), dtype=np.uint8)
+        group.create_dataset("rgb_wrist", shape=(40, 256, 256, 3), dtype=np.uint8)
+        group.create_dataset("action", shape=(40, 7), dtype=np.float32)
+        group.create_dataset("state", shape=(40, 8), dtype=np.float32)
+    source_manifest = {
+        "schema_version": 1,
+        "camera_names": ["main", "wrist"],
+        "image_size": [256, 256],
+        "source_fps": 20,
+        "n_previous": 4,
+        "chunk": 9,
+        "action_chunk": 36,
+        "action_type": "absolute",
+        "action_space": "eef",
+        "compression": "none",
+        "source_roots": [str(root / "source")],
+        "datasets": {
+            "rgb_main": {"shape_tail": [256, 256, 3], "dtype": "uint8"},
+            "rgb_wrist": {"shape_tail": [256, 256, 3], "dtype": "uint8"},
+            "action": {"width": 7, "dtype": "float32"},
+            "state": {"width": 8, "dtype": "float32"},
+        },
+        "converter_fingerprint": "a" * 64,
+        "episodes": [
+            {
+                "key": key,
+                "shard": shard_path.name,
+                "group": f"episodes/{key}",
+                "caption": "pick up the mug",
+                "domain": "libero_goal",
+                "episode_index": 0,
+                "length": 40,
+            }
+        ],
+    }
+    source_path = root / "manifest.json"
+    source_path.write_text(json.dumps(source_manifest), encoding="utf-8")
+
+    first = build_hdf5_manifests(
+        hdf5_manifest=source_path,
+        output_dir=tmp_path / "first",
+        split_seed=42,
+        window_stride=36,
+        sample_n_frames=500,
+    )
+    second = build_hdf5_manifests(
+        hdf5_manifest=source_path,
+        output_dir=tmp_path / "second",
+        split_seed=42,
+        window_stride=36,
+        sample_n_frames=500,
+    )
+
+    assert first == second
+    assert set(first["files"]) == {
+        "hindsight_train.jsonl",
+        "hindsight_val.jsonl",
+    }
+    assert len(first["hdf5_manifest_hash"]) == 64
+    assert len(first["window_manifest_hash"]) == 64
+    split_file = next(
+        name for name, details in first["files"].items() if details["records"] == 2
+    )
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "first" / split_file).read_text().splitlines()
+    ]
+    assert [row["sample_id"] for row in rows] == sorted(
+        row["sample_id"] for row in rows
+    )
+    assert rows[0]["frame_indices"] == [
+        1,
+        1,
+        1,
+        1,
+        3,
+        7,
+        11,
+        15,
+        19,
+        23,
+        27,
+        31,
+        35,
+    ]
