@@ -378,7 +378,47 @@ def test_cache_hash_changes_when_finalized_array_content_changes(
         identities.append(manifest["cache_hash"])
 
     assert identities[0] != identities[1]
-    assert all(identity != metadata.cache_hash for identity in identities)
+    assert all(identity != metadata.provenance_hash for identity in identities)
+
+
+def test_planner_finalized_cache_hash_opens_cache_but_provenance_hash_does_not(
+    fake_hdf5_manifest: Path,
+    tmp_path: Path,
+) -> None:
+    from qwen35_planx.config import GroundedPlannerMetadata
+    from qwen35_planx.hindsight_schema import (
+        HindsightCache,
+        HindsightShardWriter,
+        finalize_hindsight_cache,
+    )
+
+    record = _two_windows(fake_hdf5_manifest)[0]
+    metadata = _metadata([record])
+    shard = tmp_path / "shard.npz"
+    HindsightShardWriter(shard, metadata=metadata).write([record], **_cache_arrays(1))
+    cache_dir = tmp_path / "cache"
+    manifest = finalize_hindsight_cache(
+        cache_dir,
+        shard_paths=[shard],
+        metadata=metadata,
+        expected_records=[record],
+    )
+    planner_metadata = replace(
+        GroundedPlannerMetadata.example(),
+        hindsight_cache_hash=manifest["cache_hash"],
+    )
+
+    with HindsightCache.open(
+        cache_dir,
+        expected_cache_hash=planner_metadata.hindsight_cache_hash,
+    ) as cache:
+        assert cache.cache_hash == planner_metadata.hindsight_cache_hash
+        assert cache.provenance_hash == metadata.provenance_hash
+    with pytest.raises(ValueError, match="cache hash"):
+        HindsightCache.open(
+            cache_dir,
+            expected_cache_hash=metadata.provenance_hash,
+        )
 
 
 def test_cache_open_binds_window_manifest_hash_to_index_records(
@@ -406,11 +446,19 @@ def test_cache_open_binds_window_manifest_hash_to_index_records(
     manifest_path.chmod(0o644)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["metadata"]["window_manifest_hash"] = "wrong-window-hash"
+    raw_metadata = {
+        name: value
+        for name, value in manifest["metadata"].items()
+        if name != "provenance_hash"
+    }
+    manifest["metadata"]["provenance_hash"] = sha256_json(raw_metadata)
+    manifest["provenance_hash"] = manifest["metadata"]["provenance_hash"]
     manifest["split_hash"] = "wrong-window-hash"
     manifest["cache_hash"] = sha256_json(
         {
             "format_version": 1,
             "metadata": manifest["metadata"],
+            "provenance_hash": manifest["provenance_hash"],
             "camera_names": manifest["camera_names"],
             "phrase_roles": manifest["phrase_roles"],
             "index": manifest["index"],

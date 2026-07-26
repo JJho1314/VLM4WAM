@@ -98,6 +98,37 @@ def test_hindsight_cache_rejects_missing_hashes() -> None:
         HindsightCacheMetadata.from_dict(payload)
 
 
+def test_hindsight_cache_metadata_exposes_only_provenance_identity() -> None:
+    from qwen35_planx.config import HindsightCacheMetadata
+
+    metadata = HindsightCacheMetadata.example()
+    payload = metadata.to_dict()
+
+    assert payload["provenance_hash"] == metadata.provenance_hash
+    assert not hasattr(metadata, "cache_hash")
+    assert HindsightCacheMetadata.from_dict(json.loads(json.dumps(payload))) == metadata
+
+
+def test_hindsight_cache_metadata_rejects_wrong_provenance_hash() -> None:
+    from qwen35_planx.config import HindsightCacheMetadata
+
+    payload = HindsightCacheMetadata.example().to_dict()
+    payload["provenance_hash"] = "wrong-provenance-hash"
+
+    with pytest.raises(ValueError, match="provenance_hash"):
+        HindsightCacheMetadata.from_dict(payload)
+
+
+def test_hindsight_cache_metadata_rejects_ambiguous_cache_hash_alias() -> None:
+    from qwen35_planx.config import HindsightCacheMetadata
+
+    payload = HindsightCacheMetadata.example().to_dict()
+    payload["cache_hash"] = payload["provenance_hash"]
+
+    with pytest.raises(ValueError, match="ambiguous.*cache_hash"):
+        HindsightCacheMetadata.from_dict(payload)
+
+
 def test_grounded_planner_rejects_camera_reordering() -> None:
     from qwen35_planx.config import GroundedPlannerMetadata
 

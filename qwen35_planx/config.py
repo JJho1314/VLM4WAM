@@ -181,7 +181,7 @@ class ReleasedTATokMetadata:
 
 @dataclass(frozen=True)
 class HindsightCacheMetadata:
-    """Hashes needed to reproduce a video-hindsight cache exactly."""
+    """Provenance needed to reproduce a video-hindsight cache exactly."""
 
     FORMAT_VERSION: ClassVar[int] = 1
 
@@ -204,16 +204,17 @@ class HindsightCacheMetadata:
         "preprocessing_hash",
     )
     _REQUIRED_FIELDS: ClassVar[tuple[str, ...]] = ("format_version",) + _HASH_FIELDS
+    _PROVENANCE_FIELD: ClassVar[str] = "provenance_hash"
 
     def __post_init__(self) -> None:
         _require_equal("format_version", self.format_version, self.FORMAT_VERSION)
         _require_hashes(self, self._HASH_FIELDS)
 
     @property
-    def cache_hash(self) -> str:
-        """Content hash used by planner checkpoints to identify this cache."""
+    def provenance_hash(self) -> str:
+        """Hash of inputs/configuration, excluding finalized cache contents."""
 
-        return sha256_json(self.to_dict())
+        return sha256_json(asdict(self))
 
     @classmethod
     def example(cls) -> HindsightCacheMetadata:
@@ -229,12 +230,26 @@ class HindsightCacheMetadata:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            **asdict(self),
+            self._PROVENANCE_FIELD: self.provenance_hash,
+        }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> HindsightCacheMetadata:
-        _require_keys(payload, cls._REQUIRED_FIELDS)
-        return cls(**{name: payload[name] for name in cls._REQUIRED_FIELDS})
+        _require_keys(payload, cls._REQUIRED_FIELDS + (cls._PROVENANCE_FIELD,))
+        if "cache_hash" in payload:
+            raise ValueError(
+                "ambiguous metadata-only cache_hash is not permitted; "
+                "use provenance_hash"
+            )
+        metadata = cls(**{name: payload[name] for name in cls._REQUIRED_FIELDS})
+        _require_equal(
+            cls._PROVENANCE_FIELD,
+            payload[cls._PROVENANCE_FIELD],
+            metadata.provenance_hash,
+        )
+        return metadata
 
 
 @dataclass(frozen=True)
@@ -389,7 +404,7 @@ class GroundedPlannerMetadata:
             tokenizer_hash="example-tokenizer-sha256",
             ta_tok_hash="example-ta-tok-sha256",
             base_model_hash="example-base-model-sha256",
-            hindsight_cache_hash=HindsightCacheMetadata.example().cache_hash,
+            hindsight_cache_hash="example-finalized-hindsight-cache-sha256",
         )
 
     def to_dict(self) -> dict[str, Any]:

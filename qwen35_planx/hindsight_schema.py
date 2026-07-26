@@ -42,6 +42,7 @@ _SHARD_FIELDS = set(_ARRAY_SPECS) | {
 _MANIFEST_FIELDS = {
     "format_version",
     "metadata",
+    "provenance_hash",
     "cache_hash",
     "split_hash",
     "teacher_hash",
@@ -100,6 +101,7 @@ def _cache_content_hash(
         {
             "format_version": _FORMAT_VERSION,
             "metadata": metadata.to_dict(),
+            "provenance_hash": metadata.provenance_hash,
             "camera_names": list(CAMERA_NAMES),
             "phrase_roles": list(PHRASE_ROLES),
             "index": dict(index_manifest),
@@ -491,6 +493,7 @@ def finalize_hindsight_cache(
         manifest: dict[str, Any] = {
             "format_version": _FORMAT_VERSION,
             "metadata": metadata.to_dict(),
+            "provenance_hash": metadata.provenance_hash,
             "cache_hash": _cache_content_hash(
                 metadata=metadata,
                 index_manifest=index_manifest,
@@ -563,6 +566,18 @@ class HindsightCache:
     def codes(self) -> np.ndarray:
         return self._arrays["codes"]
 
+    @property
+    def cache_hash(self) -> str:
+        """Finalized content identity used by planner checkpoints."""
+
+        return str(self.manifest["cache_hash"])
+
+    @property
+    def provenance_hash(self) -> str:
+        """Identity of the inputs/configuration used to build this cache."""
+
+        return self.metadata.provenance_hash
+
     @classmethod
     def open(
         cls,
@@ -592,6 +607,8 @@ class HindsightCache:
             raise ValueError("cache camera order must be canonical main/wrist")
         _validate_phrase_roles(manifest["phrase_roles"])
         metadata = HindsightCacheMetadata.from_dict(manifest["metadata"])
+        if manifest["provenance_hash"] != metadata.provenance_hash:
+            raise ValueError("cache provenance_hash does not match metadata")
         if manifest["split_hash"] != metadata.window_manifest_hash:
             raise ValueError("cache split hash does not match metadata")
         if manifest["teacher_hash"] != _teacher_hash(metadata):
