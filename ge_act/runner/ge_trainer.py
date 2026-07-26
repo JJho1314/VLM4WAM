@@ -1,19 +1,18 @@
-import os, random, math
+import math
+import os
+import random
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping
 
 from datetime import datetime, timedelta
 import argparse
 import json
-import importlib
-# ----------------------------------------------------
-import matplotlib.pyplot as plt
-import matplotlib
+import shutil
 
-from yaml import load, dump, Loader, Dumper
-import numpy as np
+from yaml import Loader, load
 from tqdm import tqdm
 import torch
 from torch import distributed as dist
@@ -62,7 +61,11 @@ from models.ltx_models.semantic_conditioning import (
     build_semantic_plan_times,
     select_future_keyframes,
 )
-from models.ltx_models.vlm_semantic_planner import FrozenDualCameraVLMPlanner
+from models.ltx_models.vlm_semantic_planner import (
+    FrozenDualCameraVLMPlanner,
+    configure_qwen_top_layers_for_joint_training,
+    load_qwen35_grounded_provider,
+)
 
 LOG_LEVEL = "INFO"
 # LOG_LEVEL = "DEBUG"
@@ -108,6 +111,24 @@ def compute_ltx_latent_frames(
     if raw_future_frames < 1:
         raise ValueError("at least one future frame is required")
     return (raw_future_frames - 1) // temporal_compression_ratio + 1 + n_previous
+
+
+def select_training_future_video(
+    video: torch.Tensor,
+    *,
+    n_previous: int,
+    chunk: int,
+    return_action: bool,
+    return_video: bool,
+) -> torch.Tensor:
+    """Keep real future RGB for joint training; synthesize length only for action-only."""
+
+    future_video = video[:, :, n_previous:]
+    if return_action and not return_video:
+        repeats = [1] * future_video.ndim
+        repeats[2] = chunk
+        future_video = future_video[:, :, :1].repeat(*repeats)
+    return future_video
 
 
 def sample_semantic_condition_mask(
@@ -181,10 +202,50 @@ def build_optimizer_parameter_groups(
     train_mode: str,
     base_lr: float,
     semantic_lr: float,
+    *,
+    action_lr: float | None = None,
+    provider: torch.nn.Module | None = None,
+    qwen_top_lr: float | None = None,
+    qwen_vision_lr: float | None = None,
+    qwen_ownership: Any | None = None,
 ) -> List[Dict[str, Any]]:
     """Apply GE-Act train-mode filtering and split semantic parameters by LR."""
 
+    if provider is None:
+        base_parameters = []
+        semantic_parameters = []
+        for name, parameter in model.named_parameters():
+            is_action = "action_" in name
+            if train_mode == "action_only":
+                trainable = is_action
+            elif train_mode == "video_only":
+                trainable = not is_action
+            elif train_mode in ("all", "action_full"):
+                trainable = True
+            else:
+                raise NotImplementedError(f"unknown train mode: {train_mode}")
+            parameter.requires_grad_(trainable)
+            if not trainable:
+                continue
+            if _is_semantic_parameter(name):
+                semantic_parameters.append(parameter)
+            else:
+                base_parameters.append(parameter)
+
+        groups = []
+        if base_parameters:
+            groups.append({"name": "base_ltx", "params": base_parameters, "lr": base_lr})
+        if semantic_parameters:
+            groups.append({"name": "semantic", "params": semantic_parameters, "lr": semantic_lr})
+        return groups
+
+    if qwen_ownership is None:
+        raise ValueError("grounded provider requires explicit Qwen module ownership")
+    if action_lr is None or qwen_top_lr is None or qwen_vision_lr is None:
+        raise ValueError("all five grounded optimizer learning rates are required")
+
     base_parameters = []
+    action_parameters = []
     semantic_parameters = []
     for name, parameter in model.named_parameters():
         is_action = "action_" in name
@@ -199,17 +260,341 @@ def build_optimizer_parameter_groups(
         parameter.requires_grad_(trainable)
         if not trainable:
             continue
-        if _is_semantic_parameter(name):
+        if is_action:
+            action_parameters.append(parameter)
+        elif _is_semantic_parameter(name):
             semantic_parameters.append(parameter)
         else:
             base_parameters.append(parameter)
 
-    groups = []
-    if base_parameters:
-        groups.append({"name": "base_ltx", "params": base_parameters, "lr": base_lr})
-    if semantic_parameters:
-        groups.append({"name": "semantic", "params": semantic_parameters, "lr": semantic_lr})
-    return groups
+    def owned_parameter_ids(modules: Any, *, label: str) -> set[int]:
+        if not isinstance(modules, tuple) or not modules:
+            raise ValueError(f"{label} ownership must contain explicit modules")
+        identifiers: set[int] = set()
+        for module in modules:
+            if not isinstance(module, torch.nn.Module):
+                raise TypeError(f"{label} ownership must contain torch modules")
+            identifiers.update(id(parameter) for parameter in module.parameters())
+        return identifiers
+
+    top_ids = owned_parameter_ids(
+        getattr(qwen_ownership, "top_language_layers", None),
+        label="qwen_top8",
+    )
+    vision_ids = owned_parameter_ids(
+        getattr(qwen_ownership, "vision_modules", None),
+        label="qwen_vision",
+    )
+    semantic_ids = owned_parameter_ids(
+        getattr(qwen_ownership, "semantic_modules", None),
+        label="semantic_adapter",
+    )
+    ownership_sets = (top_ids, vision_ids, semantic_ids)
+    if any(
+        left.intersection(right)
+        for index, left in enumerate(ownership_sets)
+        for right in ownership_sets[index + 1 :]
+    ):
+        raise RuntimeError("explicit Qwen module ownership overlaps")
+
+    qwen_top_parameters = []
+    qwen_vision_parameters = []
+    provider_semantic_parameters = []
+    unowned_provider_parameters = []
+    for name, parameter in provider.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        identifier = id(parameter)
+        if identifier in top_ids:
+            qwen_top_parameters.append(parameter)
+        elif identifier in vision_ids:
+            qwen_vision_parameters.append(parameter)
+        elif identifier in semantic_ids:
+            provider_semantic_parameters.append(parameter)
+        else:
+            unowned_provider_parameters.append(name)
+    if unowned_provider_parameters:
+        raise ValueError(
+            "unowned trainable grounded provider parameters: "
+            + ", ".join(unowned_provider_parameters)
+        )
+    semantic_parameters.extend(provider_semantic_parameters)
+
+    grouped = (
+        ("ltx_video", base_parameters, float(base_lr)),
+        ("action_expert", action_parameters, float(action_lr)),
+        ("semantic_adapter", semantic_parameters, float(semantic_lr)),
+        ("qwen_top8", qwen_top_parameters, float(qwen_top_lr)),
+        ("qwen_vision", qwen_vision_parameters, float(qwen_vision_lr)),
+    )
+    empty = [name for name, parameters, _ in grouped if not parameters]
+    if empty:
+        raise ValueError(
+            "grounded optimizer groups must all be nonempty: "
+            + ", ".join(empty)
+        )
+    parameter_ids = [
+        id(parameter)
+        for _, parameters, _ in grouped
+        for parameter in parameters
+    ]
+    trainable_ids = {
+        id(parameter)
+        for module in (model, provider)
+        for parameter in module.parameters()
+        if parameter.requires_grad
+    }
+    if len(parameter_ids) != len(set(parameter_ids)):
+        raise RuntimeError("grounded optimizer parameter groups contain duplicates")
+    if set(parameter_ids) != trainable_ids:
+        raise RuntimeError(
+            "grounded optimizer groups do not exhaust trainable parameters"
+        )
+    return [
+        {"name": name, "params": parameters, "lr": learning_rate}
+        for name, parameters, learning_rate in grouped
+    ]
+
+
+def compute_joint_loss(
+    *,
+    loss_video,
+    loss_action,
+    planner_loss,
+    action_loss_scale: float,
+    planner_aux_weight: float,
+):
+    """Combine video, action, and unscaled planner auxiliary objectives."""
+
+    return (
+        loss_video
+        + float(action_loss_scale) * loss_action
+        + float(planner_aux_weight) * planner_loss
+    )
+
+
+def build_grounded_semantic_condition(
+    provider: torch.nn.Module,
+    batch: Mapping[str, Any],
+    *,
+    training: bool,
+    qwen_gradient_scale: float,
+):
+    """Teacher-force cached targets for training, generate otherwise, then compress."""
+
+    from qwen35_planx.compression import compress_grounded_plan
+    from qwen35_planx.planner_dataset import CachedPlannerTargets
+    from qwen35_planx.provider import scale_gradient
+
+    current_images = batch.get("current_images")
+    captions = batch.get("caption")
+    if not isinstance(current_images, torch.Tensor):
+        raise TypeError("grounded batch current_images must be a tensor")
+    if not isinstance(captions, (list, tuple)):
+        raise TypeError("grounded batch caption must be a sequence")
+    instructions = [str(caption) for caption in captions]
+    if training:
+        required = {
+            "target_codes",
+            "target_relevance",
+            "target_relevance_confidence",
+            "target_flow",
+            "target_phrase_embeddings",
+        }
+        missing = sorted(required.difference(batch))
+        if missing:
+            raise ValueError(
+                "grounded training batch is missing cached targets: "
+                + ", ".join(missing)
+            )
+        targets = CachedPlannerTargets(
+            codes=batch["target_codes"].long(),
+            relevance=batch["target_relevance"],
+            relevance_confidence=batch["target_relevance_confidence"],
+            flow=batch["target_flow"],
+            phrase_embeddings=batch["target_phrase_embeddings"],
+        )
+        planner_output = provider.teacher_force(
+            current_images,
+            instructions,
+            targets=targets,
+        )
+        boundary_scale = float(qwen_gradient_scale)
+        planner_loss = planner_output.loss
+    else:
+        planner_output = provider.generate(current_images, instructions)
+        boundary_scale = 1.0
+        planner_loss = None
+    fused = provider.fuse(
+        planner_output,
+        qwen_gradient_scale=boundary_scale,
+    )
+    relevance = scale_gradient(
+        planner_output.relevance,
+        boundary_scale,
+    )
+    return compress_grounded_plan(fused, relevance), planner_loss
+
+
+class JointGroundedTrainingModel(torch.nn.Module):
+    """One registered module for DeepSpeed containing both trainable models."""
+
+    def __init__(
+        self,
+        *,
+        diffusion_model: torch.nn.Module,
+        semantic_provider: torch.nn.Module,
+    ) -> None:
+        super().__init__()
+        if not isinstance(diffusion_model, torch.nn.Module):
+            raise TypeError("diffusion_model must be a torch module")
+        if not isinstance(semantic_provider, torch.nn.Module):
+            raise TypeError("semantic_provider must be a torch module")
+        self.diffusion_model = diffusion_model
+        self.semantic_provider = semantic_provider
+
+    def forward(self, *args, **kwargs):
+        return self.diffusion_model(*args, **kwargs)
+
+
+def prepare_joint_training_components(
+    accelerator,
+    joint_model: JointGroundedTrainingModel,
+    optimizer,
+    dataloader,
+    scheduler,
+):
+    """Prepare one DeepSpeed-compatible model plus all mutable training state."""
+
+    return accelerator.prepare(
+        joint_model,
+        optimizer,
+        dataloader,
+        scheduler,
+    )
+
+
+def _joint_model_topology(model: JointGroundedTrainingModel) -> list[dict[str, Any]]:
+    if not isinstance(model, JointGroundedTrainingModel):
+        raise TypeError("joint_model must be a JointGroundedTrainingModel")
+    state = model.state_dict()
+    names = tuple(state)
+    if not any(name.startswith("diffusion_model.") for name in names):
+        raise ValueError("joint model has no diffusion state")
+    if not any(name.startswith("semantic_provider.") for name in names):
+        raise ValueError("joint model has no semantic provider state")
+    return [
+        {
+            "name": name,
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+        }
+        for name, value in state.items()
+    ]
+
+
+def _joint_topology_hash(model: JointGroundedTrainingModel) -> str:
+    from qwen35_planx.hashing import sha256_json
+
+    return sha256_json(_joint_model_topology(model))
+
+
+def save_joint_training_checkpoint(
+    accelerator,
+    output_dir: str | Path,
+    *,
+    step: int,
+    joint_model: JointGroundedTrainingModel,
+) -> Path:
+    """Atomically publish Accelerate state containing diffusion and provider."""
+
+    if type(step) is not int or step < 0:
+        raise ValueError("joint checkpoint step must be a non-negative integer")
+    root = Path(output_dir)
+    destination = root / f"step_{step:06d}"
+    staging = root / f".{destination.name}.incomplete"
+    if getattr(accelerator, "is_main_process", True):
+        root.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
+    if destination.exists():
+        raise FileExistsError(f"joint checkpoint already exists: {destination}")
+    if staging.exists():
+        raise FileExistsError(
+            f"incomplete joint checkpoint already exists: {staging}"
+        )
+    if getattr(accelerator, "is_main_process", True):
+        staging.mkdir()
+    try:
+        accelerator.wait_for_everyone()
+        accelerator.save_state(str(staging))
+        accelerator.wait_for_everyone()
+        if getattr(accelerator, "is_main_process", True):
+            metadata = {
+                "format_version": 1,
+                "step": step,
+                "model_children": [
+                    "diffusion_model",
+                    "semantic_provider",
+                ],
+                "topology_hash": _joint_topology_hash(joint_model),
+            }
+            (staging / "joint_state.json").write_text(
+                json.dumps(
+                    metadata,
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.replace(staging, destination)
+        accelerator.wait_for_everyone()
+    except Exception:
+        if getattr(accelerator, "is_main_process", True):
+            shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return destination
+
+
+def load_joint_training_checkpoint(
+    accelerator,
+    checkpoint_dir: str | Path,
+    *,
+    joint_model: JointGroundedTrainingModel,
+) -> int:
+    """Validate both child topologies before restoring Accelerate state."""
+
+    checkpoint = Path(checkpoint_dir)
+    metadata_path = checkpoint / "joint_state.json"
+    if not metadata_path.is_file():
+        raise ValueError(
+            f"joint checkpoint is incomplete: missing {metadata_path}"
+        )
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("joint checkpoint metadata is invalid") from error
+    expected_fields = {
+        "format_version",
+        "step",
+        "model_children",
+        "topology_hash",
+    }
+    if not isinstance(metadata, dict) or set(metadata) != expected_fields:
+        raise ValueError("joint checkpoint metadata fields are invalid")
+    if (
+        metadata["format_version"] != 1
+        or type(metadata["step"]) is not int
+        or metadata["step"] < 0
+        or metadata["model_children"]
+        != ["diffusion_model", "semantic_provider"]
+        or metadata["topology_hash"] != _joint_topology_hash(joint_model)
+    ):
+        raise ValueError("joint checkpoint is incompatible with runtime models")
+    accelerator.load_state(str(checkpoint))
+    accelerator.wait_for_everyone()
+    return int(metadata["step"])
 
 
 def should_save_checkpoint(global_step: int, args: argparse.Namespace) -> bool:
@@ -248,6 +633,15 @@ class Trainer:
         args = argparse.Namespace(**cd)
         args.lr = float(args.lr)
         args.semantic_lr = float(getattr(args, "semantic_lr", args.lr))
+        args.action_lr = float(getattr(args, "action_lr", args.lr))
+        args.qwen_top_lr = float(getattr(args, "qwen_top_lr", 1e-6))
+        args.qwen_vision_lr = float(getattr(args, "qwen_vision_lr", 5e-7))
+        args.planner_aux_weight = float(
+            getattr(args, "planner_aux_weight", 0.25)
+        )
+        args.qwen_ge_gradient_scale = float(
+            getattr(args, "qwen_ge_gradient_scale", 0.1)
+        )
         args.epsilon = float(args.epsilon)
         args.weight_decay = float(args.weight_decay)
 
@@ -256,7 +650,7 @@ class Trainer:
         if output_dir is not None:
             self.args.output_dir = output_dir
 
-        if self.args.load_weights == False:
+        if not self.args.load_weights:
             print('You are not loading the pretrained weights, please check the code.')
         self.state = State()
 
@@ -268,6 +662,10 @@ class Trainer:
         self.scheduler = None
         self.semantic_encoder = None
         self.semantic_planner = None
+        self.grounded_provider = None
+        self.qwen_ownership = None
+        self.joint_model = None
+        self.resume_global_step = 0
         self.video_frame_rate = compute_effective_video_fps(self.args.data["train"])
 
         self._init_distributed()
@@ -524,6 +922,32 @@ class Trainer:
                     device=device,
                     dtype=dtype,
                 )
+            elif semantic_source == "qwen35_grounded":
+                cache = getattr(self.train_dataset, "cache", None)
+                cache_hash = getattr(cache, "cache_hash", None)
+                cache_dir = getattr(self.train_dataset, "hindsight_cache", None)
+                if not isinstance(cache_hash, str) or not cache_hash:
+                    raise ValueError(
+                        "qwen35_grounded requires a validated hindsight dataset"
+                    )
+                if cache_dir is None:
+                    raise ValueError(
+                        "qwen35_grounded dataset must expose hindsight_cache"
+                    )
+                condition_dim = int(
+                    self.args.diffusion_model["config"][
+                        "semantic_plan_in_dim"
+                    ]
+                )
+                self.grounded_provider = load_qwen35_grounded_provider(
+                    semantic_config["planner_checkpoint"],
+                    hindsight_cache_hash=cache_hash,
+                    cache_dir=cache_dir,
+                    dataset=self.train_dataset,
+                    condition_dim=condition_dim,
+                    device=device,
+                    dtype=dtype,
+                )
             else:
                 raise ValueError(f"unknown semantic_plan.source: {semantic_source}")
 
@@ -561,6 +985,26 @@ class Trainer:
 
         if self.args.gradient_checkpointing:
             self.diffusion_model.enable_gradient_checkpointing()
+            if self.grounded_provider is not None:
+                backbone = self.grounded_provider.planner.backbone
+                enable = getattr(backbone, "gradient_checkpointing_enable", None)
+                if callable(enable):
+                    try:
+                        enable(
+                            gradient_checkpointing_kwargs={
+                                "use_reentrant": False,
+                            }
+                        )
+                    except TypeError:
+                        enable()
+
+        if self.grounded_provider is not None:
+            self.qwen_ownership = (
+                configure_qwen_top_layers_for_joint_training(
+                    self.grounded_provider,
+                    top_language_layers=8,
+                )
+            )
 
         # Enable TF32 for faster training on Ampere GPUs: https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
         if self.args.allow_tf32 and torch.cuda.is_available():
@@ -577,10 +1021,16 @@ class Trainer:
 
         # Make sure the trainable params are in float32
         if self.args.mixed_precision == "fp16":
-            cast_training_params([self.diffusion_model], dtype=torch.float32)
+            models = [self.diffusion_model]
+            if self.grounded_provider is not None:
+                models.append(self.grounded_provider)
+            cast_training_params(models, dtype=torch.float32)
 
         self.state.learning_rate = self.args.lr
         semantic_learning_rate = self.args.semantic_lr
+        action_learning_rate = self.args.action_lr
+        qwen_top_learning_rate = self.args.qwen_top_lr
+        qwen_vision_learning_rate = self.args.qwen_vision_lr
         if self.args.scale_lr:
             lr_scale = (
                 self.args.gradient_accumulation_steps
@@ -589,23 +1039,31 @@ class Trainer:
             )
             self.state.learning_rate *= lr_scale
             semantic_learning_rate *= lr_scale
+            action_learning_rate *= lr_scale
+            qwen_top_learning_rate *= lr_scale
+            qwen_vision_learning_rate *= lr_scale
 
         params_to_optimize = build_optimizer_parameter_groups(
             self.diffusion_model,
             train_mode=train_mode,
             base_lr=self.state.learning_rate,
             semantic_lr=semantic_learning_rate,
+            action_lr=action_learning_rate,
+            provider=self.grounded_provider,
+            qwen_top_lr=qwen_top_learning_rate,
+            qwen_vision_lr=qwen_vision_learning_rate,
+            qwen_ownership=self.qwen_ownership,
         )
-        diffusion_model_trainable_params = [
+        trainable_params = [
             parameter for group in params_to_optimize for parameter in group["params"]
         ]
-        num_trainable_params = sum(parameter.numel() for parameter in diffusion_model_trainable_params)
+        num_trainable_params = sum(parameter.numel() for parameter in trainable_params)
         logger.info(f'Total trainable parameters: {num_trainable_params}')
         logger.info(
             "Optimizer groups: %s",
             {group["name"]: {"lr": group["lr"], "params": sum(p.numel() for p in group["params"])} for group in params_to_optimize},
         )
-        self.state.num_trainable_parameters = sum(p.numel() for p in diffusion_model_trainable_params)
+        self.state.num_trainable_parameters = sum(p.numel() for p in trainable_params)
 
         optimizer = get_optimizer(
             params_to_optimize=params_to_optimize,
@@ -639,9 +1097,45 @@ class Trainer:
         
 
     def prepare_for_training(self):
-        self.diffusion_model, self.optimizer, self.train_dataloader, self.lr_scheduler = self.state.accelerator.prepare(
-            self.diffusion_model, self.optimizer, self.train_dataloader, self.lr_scheduler
+        if self.grounded_provider is None:
+            self.diffusion_model, self.optimizer, self.train_dataloader, self.lr_scheduler = self.state.accelerator.prepare(
+                self.diffusion_model, self.optimizer, self.train_dataloader, self.lr_scheduler
+            )
+            return
+        self.joint_model = JointGroundedTrainingModel(
+            diffusion_model=self.diffusion_model,
+            semantic_provider=self.grounded_provider,
         )
+        (
+            self.joint_model,
+            self.optimizer,
+            self.train_dataloader,
+            self.lr_scheduler,
+        ) = prepare_joint_training_components(
+            self.state.accelerator,
+            self.joint_model,
+            self.optimizer,
+            self.train_dataloader,
+            self.lr_scheduler,
+        )
+        self.diffusion_model = self.joint_model
+        resume_from = getattr(self.args, "resume_from_checkpoint", None)
+        if resume_from:
+            unwrapped = unwrap_model(
+                self.state.accelerator,
+                self.joint_model,
+            )
+            self.resume_global_step = load_joint_training_checkpoint(
+                self.state.accelerator,
+                resume_from,
+                joint_model=unwrapped,
+            )
+
+    def _unwrapped_diffusion_model(self, accelerator):
+        model = unwrap_model(accelerator, self.diffusion_model)
+        if isinstance(model, JointGroundedTrainingModel):
+            return model.diffusion_model
+        return model
 
 
     def prepare_trackers(self):
@@ -670,9 +1164,9 @@ class Trainer:
         }
         logger.info(f"Training configuration: {json.dumps(info, indent=4)}")
         
-        global_step = 0
+        global_step = int(self.resume_global_step)
         first_epoch = 0
-        initial_global_step = 0
+        initial_global_step = global_step
         progress_bar = tqdm(
             range(0, self.state.train_steps),
             initial=initial_global_step,
@@ -688,9 +1182,6 @@ class Trainer:
             generator = generator.manual_seed(self.args.seed)
         self.state.generator = generator
 
-        # loss spikes
-        anomalies = []
-
         for epoch in range(first_epoch, self.state.train_epochs):
             if global_step >= self.state.train_steps:
                 break
@@ -703,7 +1194,7 @@ class Trainer:
             for step, batch in enumerate(self.train_dataloader):
                 logger.debug(f"Starting step {step + 1}")
                 logs = {}
-                with accelerator.accumulate([ self.diffusion_model ]):
+                with accelerator.accumulate(self.diffusion_model):
                     
                     video = batch['video']
 
@@ -714,6 +1205,8 @@ class Trainer:
                     semantic_keyframes = None
                     planner_semantic_plan = None
                     planner_semantic_times = None
+                    grounded_condition = None
+                    planner_aux_loss = None
                     if self.semantic_encoder is not None:
                         semantic_config = self.args.semantic_plan
                         semantic_future = rearrange(
@@ -733,6 +1226,16 @@ class Trainer:
                                 n_previous=mem_size,
                             )
                         )
+                    elif self.grounded_provider is not None:
+                        (
+                            grounded_condition,
+                            planner_aux_loss,
+                        ) = build_grounded_semantic_condition(
+                            self.grounded_provider,
+                            batch,
+                            training=True,
+                            qwen_gradient_scale=self.args.qwen_ge_gradient_scale,
+                        )
                     video = rearrange(video, 'b c v t h w -> (b v) c t h w')
 
                     # here we use color jitter to the video, with different views or different batches different jitter
@@ -740,10 +1243,13 @@ class Trainer:
                         video = apply_color_jitter_to_video(video)
 
                     mem = video[:,:,:mem_size]
-                    future_video = video[:,:,mem_size:]
-
-                    if self.args.return_action:
-                        future_video = future_video[:,:,:1].repeat(1,1,self.args.data['train']['chunk'],1,1)
+                    future_video = select_training_future_video(
+                        video,
+                        n_previous=mem_size,
+                        chunk=self.args.data["train"]["chunk"],
+                        return_action=self.args.return_action,
+                        return_video=self.args.return_video,
+                    )
 
                     # get the shape params
                     _, _, raw_frames, raw_height, raw_width = future_video.shape
@@ -758,6 +1264,9 @@ class Trainer:
 
                     semantic_plan = None
                     semantic_plan_times = None
+                    semantic_plan_positions = None
+                    semantic_plan_mask = None
+                    semantic_plan_relevance = None
                     semantic_condition_mask = None
                     if self.semantic_encoder is not None:
                         semantic_plan = self.semantic_encoder.encode(semantic_keyframes)
@@ -778,6 +1287,36 @@ class Trainer:
                         semantic_plan_times = planner_semantic_times.to(
                             device=accelerator.device,
                             dtype=torch.float32,
+                        )
+                    elif grounded_condition is not None:
+                        semantic_plan = grounded_condition.tokens.to(
+                            device=accelerator.device,
+                            dtype=weight_dtype,
+                        )
+                        semantic_plan_positions = grounded_condition.positions.to(
+                            device=accelerator.device,
+                            dtype=torch.float32,
+                        )
+                        semantic_plan_mask = grounded_condition.mask.to(
+                            device=accelerator.device,
+                        )
+                        semantic_plan_relevance = grounded_condition.relevance.to(
+                            device=accelerator.device,
+                            dtype=weight_dtype,
+                        )
+                        semantic_plan_times = build_semantic_plan_times(
+                            batch_size=batch_size,
+                            n_view=n_view,
+                            n_previous=mem_size,
+                            num_future_frames=raw_frames,
+                            num_latent_frames=latent_frames,
+                            indices=tuple(
+                                self.args.semantic_plan.get(
+                                    "keyframe_indices",
+                                    (0, 3, 5, 8),
+                                )
+                            ),
+                            device=accelerator.device,
                         )
                     if semantic_plan is not None:
                         semantic_condition_mask = sample_semantic_condition_mask(
@@ -852,8 +1391,6 @@ class Trainer:
                             
 
                         actions = batch['actions'][:, -self.args.data['train']['action_chunk']:].to(accelerator.device, dtype=weight_dtype).contiguous()   # shape b,t,c
-                        action_dim = actions.shape[-1]
-
                         noise_actions = randn_tensor(actions.shape, device=accelerator.device, dtype=weight_dtype)
 
                         # here we get action_timesteps, shape (b,) originally, target shape (b, l) 
@@ -916,6 +1453,9 @@ class Trainer:
                         spatial_compression_ratio=self.SPATIAL_DOWN_RATIO,
                         semantic_plan=semantic_plan,
                         semantic_plan_times=semantic_plan_times,
+                        semantic_plan_positions=semantic_plan_positions,
+                        semantic_plan_mask=semantic_plan_mask,
+                        semantic_plan_relevance=semantic_plan_relevance,
                         semantic_condition_mask=semantic_condition_mask,
                     )['latents']
 
@@ -939,9 +1479,18 @@ class Trainer:
                         loss_action = 0.
                     action_loss_scale = getattr(self.args, "action_loss_scale", 1.0)
 
-                    loss = loss_video + action_loss_scale * loss_action
+                    if planner_aux_loss is None:
+                        loss = loss_video + action_loss_scale * loss_action
+                    else:
+                        loss = compute_joint_loss(
+                            loss_video=loss_video,
+                            loss_action=loss_action,
+                            planner_loss=planner_aux_loss,
+                            action_loss_scale=action_loss_scale,
+                            planner_aux_weight=self.args.planner_aux_weight,
+                        )
 
-                    assert torch.isnan(loss) == False, "NaN loss detected"
+                    assert not torch.isnan(loss), "NaN loss detected"
                     accelerator.backward(loss)
                     if accelerator.sync_gradients and accelerator.distributed_type != DistributedType.DEEPSPEED:
                         grad_norm = accelerator.clip_grad_norm_(self.diffusion_model.parameters(), self.args.max_grad_norm)
@@ -991,15 +1540,18 @@ class Trainer:
                 
                 if accelerator.sync_gradients and should_save_checkpoint(global_step, self.args):
                     accelerator.wait_for_everyone()
-                    if accelerator.is_main_process:
-                        model_to_save = unwrap_model(accelerator, self.diffusion_model)
-                        dtype = (
-                            torch.float16
-                            if self.args.mixed_precision == "fp16"
-                            else torch.bfloat16
-                            if self.args.mixed_precision == "bf16"
-                            else torch.float32
+                    if self.grounded_provider is not None:
+                        save_joint_training_checkpoint(
+                            accelerator,
+                            self.save_folder,
+                            step=global_step,
+                            joint_model=unwrap_model(
+                                accelerator,
+                                self.diffusion_model,
+                            ),
                         )
+                    elif accelerator.is_main_process:
+                        model_to_save = unwrap_model(accelerator, self.diffusion_model)
 
                         model_save_dir = os.path.join(self.save_folder,f'step_{global_step}')
                         model_to_save.save_pretrained(model_save_dir, safe_serialization=True)
@@ -1013,15 +1565,20 @@ class Trainer:
                 self.writer.add_scalar("Average Training Loss", avg_loss, epoch)
 
         accelerator.wait_for_everyone()
-        if accelerator.is_main_process:
+        if self.grounded_provider is not None:
+            final_checkpoint = Path(self.save_folder) / f"step_{global_step:06d}"
+            if not final_checkpoint.exists():
+                save_joint_training_checkpoint(
+                    accelerator,
+                    self.save_folder,
+                    step=global_step,
+                    joint_model=unwrap_model(
+                        accelerator,
+                        self.diffusion_model,
+                    ),
+                )
+        elif accelerator.is_main_process:
             self.diffusion_model = unwrap_model(accelerator, self.diffusion_model)
-            dtype = (
-                torch.float16
-                if self.args.mixed_precision == "fp16"
-                else torch.bfloat16
-                if self.args.mixed_precision == "bf16"
-                else torch.float32
-            )
 
             model_save_dir = os.path.join(self.save_folder,f'step_{global_step}')
             self.diffusion_model.save_pretrained(model_save_dir, safe_serialization=True)
@@ -1049,6 +1606,9 @@ class Trainer:
         to_log=True,
         semantic_plan=None,
         semantic_plan_times=None,
+        semantic_plan_positions=None,
+        semantic_plan_mask=None,
+        semantic_plan_relevance=None,
         semantic_condition_mask=None,
         semantic_mode=None,
     ):
@@ -1057,7 +1617,7 @@ class Trainer:
 
         pipe = self.pipeline_class(
             self.scheduler, self.vae, self.text_encoder, self.tokenizer,
-            unwrap_model(accelerator, self.diffusion_model) if accelerator is not None else self.diffusion_model
+            self._unwrapped_diffusion_model(accelerator) if accelerator is not None else self.diffusion_model
         )
 
         batch = next(iter(self.val_dataloader))
@@ -1071,7 +1631,11 @@ class Trainer:
 
         image = image[:batch_size]
 
-        if self.semantic_encoder is not None or self.semantic_planner is not None:
+        if (
+            self.semantic_encoder is not None
+            or self.semantic_planner is not None
+            or self.grounded_provider is not None
+        ):
             semantic_mode = semantic_mode or self.args.semantic_plan.get("validation_mode", "gt")
             if semantic_mode == "gt":
                 if self.semantic_encoder is None:
@@ -1110,24 +1674,82 @@ class Trainer:
                     dtype=self.state.weight_dtype,
                 )
             elif semantic_mode == "planner":
-                if self.semantic_planner is None:
+                if (
+                    self.semantic_planner is None
+                    and self.grounded_provider is None
+                ):
                     raise ValueError(
-                        "planner semantic validation requires semantic_plan.source=vlm_planner"
+                        "planner semantic validation requires a planner source"
                     )
-                semantic_plan, semantic_plan_times = build_vlm_semantic_condition(
-                    self.semantic_planner,
-                    gt_video[:batch_size],
-                    prompt[:batch_size],
-                    n_previous=self.args.data['train']['n_previous'],
-                )
-                semantic_plan = semantic_plan.to(
-                    device=accelerator.device,
-                    dtype=self.state.weight_dtype,
-                )
-                semantic_plan_times = semantic_plan_times.to(
-                    device=accelerator.device,
-                    dtype=torch.float32,
-                )
+                if self.grounded_provider is not None:
+                    grounded_condition, _ = (
+                        build_grounded_semantic_condition(
+                            self.grounded_provider,
+                            {
+                                "current_images": batch["current_images"][
+                                    :batch_size
+                                ],
+                                "caption": prompt[:batch_size],
+                            },
+                            training=False,
+                            qwen_gradient_scale=self.args.qwen_ge_gradient_scale,
+                        )
+                    )
+                    semantic_plan = grounded_condition.tokens.to(
+                        device=accelerator.device,
+                        dtype=self.state.weight_dtype,
+                    )
+                    semantic_plan_positions = (
+                        grounded_condition.positions.to(
+                            device=accelerator.device,
+                            dtype=torch.float32,
+                        )
+                    )
+                    semantic_plan_mask = grounded_condition.mask.to(
+                        device=accelerator.device,
+                    )
+                    semantic_plan_relevance = (
+                        grounded_condition.relevance.to(
+                            device=accelerator.device,
+                            dtype=self.state.weight_dtype,
+                        )
+                    )
+                    mem_size = self.args.data['train']['n_previous']
+                    raw_future_frames = self.args.data['train']['chunk']
+                    latent_num_frames = compute_ltx_latent_frames(
+                        raw_future_frames,
+                        temporal_compression_ratio=self.TEMPORAL_DOWN_RATIO,
+                        n_previous=mem_size,
+                    )
+                    semantic_plan_times = build_semantic_plan_times(
+                        batch_size=batch_size,
+                        n_view=v,
+                        n_previous=mem_size,
+                        num_future_frames=raw_future_frames,
+                        num_latent_frames=latent_num_frames,
+                        indices=tuple(
+                            self.args.semantic_plan.get(
+                                "keyframe_indices",
+                                (0, 3, 5, 8),
+                            )
+                        ),
+                        device=accelerator.device,
+                    )
+                else:
+                    semantic_plan, semantic_plan_times = build_vlm_semantic_condition(
+                        self.semantic_planner,
+                        gt_video[:batch_size],
+                        prompt[:batch_size],
+                        n_previous=self.args.data['train']['n_previous'],
+                    )
+                    semantic_plan = semantic_plan.to(
+                        device=accelerator.device,
+                        dtype=self.state.weight_dtype,
+                    )
+                    semantic_plan_times = semantic_plan_times.to(
+                        device=accelerator.device,
+                        dtype=torch.float32,
+                    )
                 semantic_condition_mask = torch.ones(
                     batch_size * v,
                     device=accelerator.device,
@@ -1139,6 +1761,9 @@ class Trainer:
             elif semantic_mode == "none":
                 semantic_plan = None
                 semantic_plan_times = None
+                semantic_plan_positions = None
+                semantic_plan_mask = None
+                semantic_plan_relevance = None
                 semantic_condition_mask = None
             else:
                 raise ValueError(f"unknown semantic validation mode: {semantic_mode}")
@@ -1180,6 +1805,9 @@ class Trainer:
             frame_rate=self.video_frame_rate,
             semantic_plan=semantic_plan,
             semantic_plan_times=semantic_plan_times,
+            semantic_plan_positions=semantic_plan_positions,
+            semantic_plan_mask=semantic_plan_mask,
+            semantic_plan_relevance=semantic_plan_relevance,
             semantic_condition_mask=semantic_condition_mask,
         )[0]
 

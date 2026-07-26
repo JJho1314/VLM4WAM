@@ -114,6 +114,288 @@ class DualCameraSemanticPlan:
     times: torch.Tensor
 
 
+@dataclass(frozen=True)
+class QwenJointTrainingOwnership:
+    """Explicit module ownership for the joint-stage Qwen optimizer groups."""
+
+    top_language_layers: tuple[nn.Module, ...]
+    vision_modules: tuple[nn.Module, ...]
+    semantic_modules: tuple[nn.Module, ...]
+
+
+def _resolve_module_path(root: nn.Module, path: str) -> nn.Module | None:
+    value: Any = root
+    for part in path.split("."):
+        value = getattr(value, part, None)
+        if value is None:
+            return None
+    return value if isinstance(value, nn.Module) else None
+
+
+def _resolve_language_layers(planner: nn.Module) -> tuple[nn.Module, ...]:
+    backbone = getattr(planner, "backbone", None)
+    if not isinstance(backbone, nn.Module):
+        raise ValueError("grounded planner is missing its Qwen backbone")
+    for path in (
+        "model.language_model.layers",
+        "model.language_model.model.layers",
+        "language_model.layers",
+        "language_model.model.layers",
+        "model.layers",
+        "layers",
+    ):
+        module = _resolve_module_path(backbone, path)
+        if isinstance(module, nn.ModuleList):
+            layers = tuple(module)
+            if layers and all(isinstance(layer, nn.Module) for layer in layers):
+                return layers
+    raise ValueError(
+        "Qwen language layers are not exposed through a supported explicit path"
+    )
+
+
+def _resolve_vision_module(planner: nn.Module) -> nn.Module:
+    backbone = getattr(planner, "backbone", None)
+    if not isinstance(backbone, nn.Module):
+        raise ValueError("grounded planner is missing its Qwen backbone")
+    for path in (
+        "model.visual",
+        "model.vision_model",
+        "model.vision_tower",
+        "visual",
+        "vision_model",
+        "vision_tower",
+    ):
+        module = _resolve_module_path(backbone, path)
+        if module is not None:
+            return module
+    raise ValueError(
+        "Qwen vision tower is not exposed through a supported explicit path"
+    )
+
+
+def configure_qwen_top_layers_for_joint_training(
+    provider: nn.Module,
+    *,
+    top_language_layers: int = 8,
+) -> QwenJointTrainingOwnership:
+    """Freeze Qwen except its explicit top language layers and vision tower."""
+
+    if not isinstance(provider, nn.Module):
+        raise TypeError("provider must be a torch module")
+    if type(top_language_layers) is not int or top_language_layers <= 0:
+        raise ValueError("top_language_layers must be a positive integer")
+    planner = getattr(provider, "planner", None)
+    if not isinstance(planner, nn.Module):
+        raise ValueError("provider must expose a grounded planner module")
+    language_layers = _resolve_language_layers(planner)
+    if len(language_layers) < top_language_layers:
+        raise ValueError(
+            f"Qwen exposes only {len(language_layers)} language layers, "
+            f"cannot train top {top_language_layers}"
+        )
+    vision = _resolve_vision_module(planner)
+    semantic_modules: list[nn.Module] = []
+    for owner, names in (
+        (
+            planner,
+            (
+                "visual_regression",
+                "semantic_projection",
+                "phrase_projection",
+                "grounding_query",
+                "fusion_gate",
+            ),
+        ),
+        (
+            provider,
+            (
+                "visual_adapter",
+                "hidden_adapter",
+                "position_encoder",
+                "output_norm",
+            ),
+        ),
+    ):
+        for name in names:
+            module = getattr(owner, name, None)
+            if not isinstance(module, nn.Module):
+                raise ValueError(
+                    f"grounded provider is missing joint semantic module: {name}"
+                )
+            semantic_modules.append(module)
+
+    provider.requires_grad_(False)
+    top_layers = language_layers[-top_language_layers:]
+    for module in (*top_layers, vision, *semantic_modules):
+        module.requires_grad_(True)
+    return QwenJointTrainingOwnership(
+        top_language_layers=top_layers,
+        vision_modules=(vision,),
+        semantic_modules=tuple(semantic_modules),
+    )
+
+
+def _validate_grounded_checkpoint_contract(
+    checkpoint_dir: Path,
+    *,
+    hindsight_cache_hash: str,
+):
+    """Validate every persisted artifact and cache binding without Qwen allocation."""
+
+    from qwen35_planx.cli.train_semantic_planner import (
+        validate_planner_checkpoint,
+    )
+    from qwen35_planx.config import GroundedPlannerMetadata
+
+    metadata_payload, _ = validate_planner_checkpoint(checkpoint_dir)
+    metadata = GroundedPlannerMetadata.from_dict(metadata_payload)
+    metadata.validate_runtime(
+        hindsight_cache_hash=hindsight_cache_hash,
+    )
+    return metadata
+
+
+def _load_grounded_checkpoint_components(
+    checkpoint_dir: Path,
+    *,
+    metadata,
+    cache_dir: Path,
+    dataset: Any,
+    condition_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+):
+    """Allocate Qwen only after the complete joint-stage contract is validated."""
+
+    from safetensors.torch import load_file, load_model
+    from transformers import (
+        AutoConfig,
+        AutoModelForImageTextToText,
+        AutoProcessor,
+        AutoTokenizer,
+    )
+
+    from qwen35_planx.hashing import sha256_json
+    from qwen35_planx.planner import GroundedQwen35Planner
+    from qwen35_planx.planner_dataset import GroundedPlannerCollator
+    from qwen35_planx.provider import Qwen35GroundedPlanProvider
+    from qwen35_planx.vocabulary import VisualVocabularyLayout
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        checkpoint_dir / "tokenizer",
+        local_files_only=True,
+    )
+    processor = AutoProcessor.from_pretrained(
+        checkpoint_dir / "processor",
+        local_files_only=True,
+    )
+    config = AutoConfig.from_pretrained(
+        checkpoint_dir / "model_config",
+        local_files_only=True,
+    )
+    backbone = AutoModelForImageTextToText.from_config(
+        config,
+        torch_dtype=dtype,
+    )
+    input_embeddings = backbone.get_input_embeddings()
+    if input_embeddings is None:
+        raise ValueError("Qwen checkpoint does not expose input embeddings")
+    if input_embeddings.weight.shape[0] != len(tokenizer):
+        raise ValueError(
+            "Qwen checkpoint tokenizer and input embeddings differ in size"
+        )
+    if hasattr(processor, "tokenizer"):
+        processor.tokenizer = tokenizer
+
+    structure_ids = tuple(metadata.structure_token_ids)
+    original_vocab_size = min(token_id for _, token_id in structure_ids)
+    layout = VisualVocabularyLayout(
+        original_vocab_size=original_vocab_size,
+        visual_start_id=metadata.visual_token_start_id,
+        visual_end_id=metadata.visual_token_end_id,
+        structure_token_ids=structure_ids,
+        tokenizer_hash=metadata.tokenizer_hash,
+        base_embedding_hash=metadata.base_model_hash,
+        expanded_embedding_hash=sha256_json(
+            {
+                "tokenizer_hash": metadata.tokenizer_hash,
+                "visual_start_id": metadata.visual_token_start_id,
+                "visual_end_id": metadata.visual_token_end_id,
+            }
+        ),
+        save_directory=str((checkpoint_dir / "tokenizer").resolve()),
+        _tokenizer=tokenizer,
+    )
+    actual_tokenizer_hash = sha256_json(
+        sorted(
+            (str(token), int(token_id))
+            for token, token_id in tokenizer.get_vocab().items()
+        )
+    )
+    if actual_tokenizer_hash != metadata.tokenizer_hash:
+        raise ValueError("checkpoint tokenizer hash differs from planner metadata")
+    codebook = load_file(
+        checkpoint_dir / "ta_codebook.safetensors",
+        device="cpu",
+    )["codebook"]
+    visual_weight = input_embeddings.weight[
+        layout.visual_start_id : layout.visual_end_id
+    ]
+    planner = GroundedQwen35Planner.from_components(
+        backbone=backbone,
+        visual_embedding_weight=visual_weight,
+        codebook=codebook,
+    )
+    load_model(
+        planner,
+        checkpoint_dir / "planner.safetensors",
+        strict=True,
+    )
+    collator = GroundedPlannerCollator(
+        processor,
+        layout,
+        cache_dir=cache_dir,
+        dataset=dataset,
+        metadata=metadata,
+    )
+    provider = Qwen35GroundedPlanProvider(
+        planner=planner,
+        collator=collator,
+        layout=layout,
+        condition_dim=condition_dim,
+    )
+    return provider.to(device=device, dtype=dtype)
+
+
+def load_qwen35_grounded_provider(
+    checkpoint_dir: str | Path,
+    *,
+    hindsight_cache_hash: str,
+    cache_dir: str | Path,
+    dataset: Any,
+    condition_dim: int,
+    device: torch.device | str,
+    dtype: torch.dtype,
+):
+    """Validate cache/checkpoint provenance before allocating the 4B provider."""
+
+    checkpoint = Path(checkpoint_dir)
+    metadata = _validate_grounded_checkpoint_contract(
+        checkpoint,
+        hindsight_cache_hash=hindsight_cache_hash,
+    )
+    return _load_grounded_checkpoint_components(
+        checkpoint,
+        metadata=metadata,
+        cache_dir=Path(cache_dir),
+        dataset=dataset,
+        condition_dim=condition_dim,
+        device=torch.device(device),
+        dtype=dtype,
+    )
+
+
 class FrozenDualCameraVLMPlanner:
     """Own a frozen planner and expose only its future SigLIP2 view grids."""
 

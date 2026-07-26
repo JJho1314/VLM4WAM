@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,14 @@ import torch
 from PIL import Image
 from torch import nn
 
-from ge_act.models.ltx_models.vlm_semantic_planner import (
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+GE_ACT_ROOT = REPOSITORY_ROOT / "ge_act"
+for path in (REPOSITORY_ROOT, GE_ACT_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
+from ge_act.models.ltx_models import vlm_semantic_planner as planner_module  # noqa: E402
+from ge_act.models.ltx_models.vlm_semantic_planner import (  # noqa: E402
     FrozenDualCameraVLMPlanner,
     validate_dual_camera_planner_metadata,
 )
@@ -167,3 +175,43 @@ def test_provider_rejects_invalid_input_and_output_shapes() -> None:
         provider.predict(torch.zeros(1, 1, 3, 8, 8), ["pick"])
     with pytest.raises(RuntimeError, match="future_siglip"):
         provider.predict(torch.zeros(1, 2, 3, 8, 8), ["pick"])
+
+
+def test_grounded_provider_validates_checkpoint_and_cache_before_qwen_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allocation_called = False
+
+    def reject_cache(*_args: Any, **_kwargs: Any) -> None:
+        raise ValueError("planner/cache hash mismatch")
+
+    def record_allocation(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal allocation_called
+        allocation_called = True
+
+    monkeypatch.setattr(
+        planner_module,
+        "_validate_grounded_checkpoint_contract",
+        reject_cache,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        planner_module,
+        "_load_grounded_checkpoint_components",
+        record_allocation,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="planner/cache hash mismatch"):
+        planner_module.load_qwen35_grounded_provider(
+            tmp_path,
+            hindsight_cache_hash="cache-hash",
+            cache_dir=tmp_path / "cache",
+            dataset=object(),
+            condition_dim=8,
+            device="cpu",
+            dtype=torch.float32,
+        )
+
+    assert not allocation_called

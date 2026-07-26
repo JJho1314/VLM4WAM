@@ -106,11 +106,29 @@ def _append_exact_error(
 def _validate_dataset_config(
     config: dict[str, Any], errors: list[str]
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    semantic = _mapping(config.get("semantic_plan"))
+    grounded = semantic.get("source") == "qwen35_grounded"
     expected_classes = {
-        "train_data_class_path": DATASET_CLASS_PATH,
-        "train_data_class": DATASET_CLASS,
-        "val_data_class_path": DATASET_CLASS_PATH,
-        "val_data_class": DATASET_CLASS,
+        "train_data_class_path": (
+            "data/libero_hindsight_hdf5_dataset.py"
+            if grounded
+            else DATASET_CLASS_PATH
+        ),
+        "train_data_class": (
+            "LiberoHindsightHDF5Dataset"
+            if grounded
+            else DATASET_CLASS
+        ),
+        "val_data_class_path": (
+            "data/libero_hindsight_hdf5_dataset.py"
+            if grounded
+            else DATASET_CLASS_PATH
+        ),
+        "val_data_class": (
+            "LiberoHindsightHDF5Dataset"
+            if grounded
+            else DATASET_CLASS
+        ),
     }
     for field, expected in expected_classes.items():
         _append_exact_error(errors, field, config.get(field), expected)
@@ -122,7 +140,10 @@ def _validate_dataset_config(
         ("train", train_data, True),
         ("val", val_data, False),
     ):
-        for field, expected in FIXED_DATA_FIELDS.items():
+        fixed_fields = dict(FIXED_DATA_FIELDS)
+        if grounded:
+            fixed_fields["previous_pick_mode"] = "uniform"
+        for field, expected in fixed_fields.items():
             _append_exact_error(
                 errors,
                 f"{split} {field}",
@@ -137,6 +158,12 @@ def _validate_dataset_config(
         )
         for forbidden in sorted(OLD_LOADER_KEYS & set(split_data)):
             errors.append(f"{split} data must not contain old-loader key {forbidden}")
+        if grounded:
+            cache = split_data.get("hindsight_cache")
+            if type(cache) is not str or not cache:
+                errors.append(
+                    f"{split} hindsight_cache must be a non-empty path"
+                )
 
     train_manifest = train_data.get("manifest_path")
     val_manifest = val_data.get("manifest_path")
@@ -146,6 +173,10 @@ def _validate_dataset_config(
         errors.append("val manifest_path must be a non-empty path")
     if train_manifest != val_manifest:
         errors.append("train and validation must use the same manifest")
+    if grounded and train_data.get("hindsight_cache") != val_data.get(
+        "hindsight_cache"
+    ):
+        errors.append("train and validation must use the same hindsight cache")
     for split, split_data in (("train", train_data), ("val", val_data)):
         stat_file = split_data.get("stat_file")
         if type(stat_file) is not str or not stat_file:
@@ -160,6 +191,17 @@ def _validate_training_config(config: dict[str, Any], world_size: int) -> list[s
     semantic = _mapping(config.get("semantic_plan"))
     diffusion = _mapping(config.get("diffusion_model"))
     model_config = _mapping(diffusion.get("config"))
+    if semantic.get("source") == "qwen35_grounded":
+        _validate_grounded_training_config(
+            config,
+            semantic=semantic,
+            model_config=model_config,
+            train_data=train_data,
+            val_data=val_data,
+            world_size=world_size,
+            errors=errors,
+        )
+        return errors
     _append_exact_error(errors, "semantic_plan.enabled", semantic.get("enabled"), True)
     _append_exact_error(
         errors,
@@ -279,6 +321,123 @@ def _validate_training_config(config: dict[str, Any], world_size: int) -> list[s
     return errors
 
 
+def _validate_grounded_training_config(
+    config: dict[str, Any],
+    *,
+    semantic: dict[str, Any],
+    model_config: dict[str, Any],
+    train_data: dict[str, Any],
+    val_data: dict[str, Any],
+    world_size: int,
+    errors: list[str],
+) -> None:
+    """Validate the Task-12 joint contract without weakening old preflight."""
+
+    expected_top_level = {
+        "model_name": "ltx_train",
+        "is_i2v": True,
+        "return_action": True,
+        "return_video": True,
+        "train_mode": "all",
+        "train_steps": 30_000,
+        "steps_to_save": 5_000,
+        "mixed_precision": "bf16",
+        "allow_tf32": True,
+        "gradient_checkpointing": True,
+        "add_state": False,
+        "noisy_video": False,
+        "load_weights": True,
+        "use_deepspeed": True,
+        "lr": 2e-5,
+        "action_lr": 1e-4,
+        "semantic_lr": 5e-5,
+        "qwen_top_lr": 1e-6,
+        "qwen_vision_lr": 5e-7,
+        "planner_aux_weight": 0.25,
+        "qwen_ge_gradient_scale": 0.1,
+    }
+    for field, expected in expected_top_level.items():
+        _append_exact_error(errors, field, config.get(field), expected)
+    for field, expected in {
+        "enabled": True,
+        "source": "qwen35_grounded",
+        "num_keyframes": 4,
+        "tokens_per_frame": 96,
+        "keyframe_indices": [0, 3, 5, 8],
+        "dropout": 0.15,
+        "validation_mode": "planner",
+    }.items():
+        _append_exact_error(
+            errors,
+            f"semantic_plan.{field}",
+            semantic.get(field),
+            expected,
+        )
+    planner_checkpoint = semantic.get("planner_checkpoint")
+    if type(planner_checkpoint) is not str or not planner_checkpoint:
+        errors.append("semantic_plan.planner_checkpoint must be a non-empty path")
+
+    model_contract = {
+        "action_expert": True,
+        "action_in_channels": 7,
+        "action_out_channels": 7,
+        "semantic_plan_context": True,
+        "semantic_plan_in_dim": 2048,
+        "semantic_plan_num_keyframes": 4,
+        "semantic_plan_num_views": 2,
+        "semantic_plan_cross_attention_blocks": list(range(28)),
+        "num_layers": 28,
+    }
+    for field, expected in model_contract.items():
+        _append_exact_error(
+            errors,
+            f"diffusion {field}",
+            model_config.get(field),
+            expected,
+        )
+
+    if type(world_size) is not int or type(world_size) is bool or world_size != 8:
+        errors.append(f"grounded training world_size must be 8, got {world_size!r}")
+    batch_size = config.get("batch_size")
+    accumulation = config.get("gradient_accumulation_steps")
+    if (
+        type(batch_size) is int
+        and type(batch_size) is not bool
+        and type(accumulation) is int
+        and type(accumulation) is not bool
+        and batch_size > 0
+        and accumulation > 0
+        and type(world_size) is int
+    ):
+        global_batch = batch_size * accumulation * world_size
+        if global_batch != 128:
+            errors.append(f"global batch must be 128, got {global_batch}")
+    else:
+        errors.append(
+            "batch_size and gradient_accumulation_steps must be positive integers"
+        )
+
+    deepspeed = _mapping(config.get("deepspeed"))
+    zero = _mapping(deepspeed.get("zero_optimization"))
+    _append_exact_error(errors, "DeepSpeed ZeRO stage", zero.get("stage"), 2)
+    _append_exact_error(
+        errors,
+        "DeepSpeed bf16.enabled",
+        _mapping(deepspeed.get("bf16")).get("enabled"),
+        True,
+    )
+    _append_exact_error(
+        errors,
+        "DeepSpeed fp16.enabled",
+        _mapping(deepspeed.get("fp16")).get("enabled"),
+        False,
+    )
+    if train_data.get("stat_file") != val_data.get("stat_file"):
+        errors.append(
+            "train and validation must use the same normalization statistics"
+        )
+
+
 def _resolve_ge_act_path(raw_path: str, ge_act_root: Path) -> Path:
     path = Path(raw_path)
     return path if path.is_absolute() else ge_act_root / path
@@ -340,15 +499,44 @@ def _collect_path_errors(
         errors.append(f"missing base diffusion checkpoint: {raw_diffusion}")
 
     semantic = _mapping(config.get("semantic_plan"))
-    raw_siglip = semantic.get("model_name_or_path")
-    siglip_path = Path(raw_siglip) if type(raw_siglip) is str and raw_siglip else None
-    if siglip_path is None or not siglip_path.exists():
-        errors.append(f"missing SigLIP2 checkpoint: {raw_siglip}")
-    elif siglip_path.is_dir() and not (
-        list(siglip_path.glob("*.safetensors"))
-        or (siglip_path / "pytorch_model.bin").is_file()
-    ):
-        errors.append(f"SigLIP2 checkpoint directory has no weights: {siglip_path}")
+    if semantic.get("source") == "qwen35_grounded":
+        raw_cache = train_data.get("hindsight_cache")
+        raw_planner = semantic.get("planner_checkpoint")
+        cache = None
+        try:
+            from qwen35_planx.hashing import sha256_file
+            from qwen35_planx.hindsight_schema import HindsightCache
+
+            cache = HindsightCache.open(Path(str(raw_cache)))
+            if (
+                type(manifest_path) is str
+                and cache.metadata.hdf5_manifest_hash
+                != sha256_file(Path(manifest_path))
+            ):
+                errors.append("hindsight cache differs from HDF5 manifest")
+            from ge_act.models.ltx_models.vlm_semantic_planner import (
+                _validate_grounded_checkpoint_contract,
+            )
+
+            _validate_grounded_checkpoint_contract(
+                Path(str(raw_planner)),
+                hindsight_cache_hash=cache.cache_hash,
+            )
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            errors.append(f"invalid grounded planner/cache: {error}")
+        finally:
+            if cache is not None:
+                cache.close()
+    else:
+        raw_siglip = semantic.get("model_name_or_path")
+        siglip_path = Path(raw_siglip) if type(raw_siglip) is str and raw_siglip else None
+        if siglip_path is None or not siglip_path.exists():
+            errors.append(f"missing SigLIP2 checkpoint: {raw_siglip}")
+        elif siglip_path.is_dir() and not (
+            list(siglip_path.glob("*.safetensors"))
+            or (siglip_path / "pytorch_model.bin").is_file()
+        ):
+            errors.append(f"SigLIP2 checkpoint directory has no weights: {siglip_path}")
 
     raw_output = config.get("output_dir")
     if type(raw_output) is not str or not raw_output:
