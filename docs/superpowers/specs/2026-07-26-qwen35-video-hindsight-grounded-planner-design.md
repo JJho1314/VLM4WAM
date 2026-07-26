@@ -2,7 +2,7 @@
 
 Date: 2026-07-26
 
-Status: Design approved in conversation; written review pending
+Status: Approved
 
 ## Objective
 
@@ -102,10 +102,23 @@ replacing it. Parsing failures retain the full instruction, mark the missing
 field, and reduce the confidence of losses that require that field. They do
 not discard an otherwise valid planner sample.
 
-The frozen SigLIP2 text tower encodes the full instruction and the three
-phrases into normalized 1,152-dimensional embeddings. These embeddings define
-the common space used for direct text/feature cosine similarity. Qwen3.5 hidden
-states are not assumed to be isotropic or directly cosine-comparable with text.
+Every stored or predicted three-role axis uses the canonical order
+`(source, target, action)`, even though the human-readable prompt prints
+`ACT`, `SRC`, and `TGT`.
+
+After the unchanged original instruction, the planner prompt appends three
+learned structural query tokens in canonical order:
+`<SRC_QUERY><TGT_QUERY><ACT_QUERY>`. Their causal states have consumed the
+current image, every structured field, and the full original instruction.
+
+During target-cache construction, the frozen SigLIP2 text tower encodes the
+full instruction and the three phrases into normalized 1,152-dimensional
+teacher embeddings. These embeddings define the common space used for direct
+text/feature cosine similarity. They supervise a Qwen phrase-anchor head at
+the three role-query positions; planner inference predicts the anchors from
+Qwen prompt states and never loads SigLIP2. Qwen3.5
+hidden states are not assumed to be isotropic or directly cosine-comparable
+with text.
 
 ## Video-Hindsight Grounding Teacher
 
@@ -313,9 +326,12 @@ For each future position:
    TA-Tok embedding of the target code.
 2. `semantic_projection(h_post) -> R^1152` predicts a normalized feature in
    the frozen SigLIP2 text space.
-3. `grounding_head(h_post, phrase_embeddings) -> R^3` predicts source,
-   target, and action relevance logits.
-4. `fusion_gate(h_post, grounding_logits)` predicts a bounded semantic
+3. `phrase_projection(h_SRC_QUERY, h_TGT_QUERY, h_ACT_QUERY) -> R^(3x1152)`
+   predicts normalized source, target, and action anchors from the three
+   learned role-query states after the full instruction has been consumed.
+4. `grounding_head(h_post, predicted_phrase_anchors) -> R^3` predicts source,
+   target, and action relevance logits without an inference-time text teacher.
+5. `fusion_gate(h_post, grounding_logits)` predicts a bounded semantic
    residual strength through a sigmoid in `[0, 1]`.
 
 No head changes the released TA-Tok codebook.
@@ -340,7 +356,9 @@ Where:
   - cosine regression from `visual_regression(h_pre)` to the frozen TA
     codebook vector of the target code;
   - confidence-weighted cosine regression from
-    `semantic_projection(h_post)` to `S_target`.
+    `semantic_projection(h_post)` to `S_target`;
+  - field-mask-weighted cosine regression from the three predicted phrase
+    anchors to the cached SigLIP2 phrase embeddings.
 - `L_grounding` is confidence-weighted Jensen-Shannon divergence between the
   predicted and hindsight source/target/action distributions.
 - `L_counterfactual` is an InfoNCE/ranking objective requiring correct
@@ -457,8 +475,8 @@ Initial optimizer groups:
 |---|---:|
 | Qwen3.5 language | `1e-5` |
 | Qwen3.5 vision | `5e-6` |
-| New vocabulary and semantic/grounding heads | `1e-4` |
-| Fusion adapters | `1e-4` |
+| New visual vocabulary and visual prediction head | `1e-4` |
+| Semantic, phrase-anchor, grounding, and fusion-gate heads | `1e-4` |
 
 Use:
 
@@ -579,6 +597,8 @@ Unit coverage must include:
 - Qwen vocabulary expansion without a 1,536-to-2,048 initialization
   projection;
 - correct `h_pre`/`h_post` causal alignment, including the final code token;
+- prompt field-position alignment and phrase-anchor prediction without
+  importing SigLIP2 at inference;
 - independent main/wrist causal state;
 - phrase parsing and missing-field confidence behavior;
 - target-cache quantization round trip and hash rejection;
