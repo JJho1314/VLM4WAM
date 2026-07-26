@@ -622,6 +622,7 @@ def export_codebook_safetensors(
         if not bool(torch.isfinite(codebook).all()):
             raise ValueError("released codebook contains non-finite values")
         save_file({"codebook": codebook}, tensor_temporary)
+        metadata["artifact_sha256"] = sha256_file(tensor_temporary)
         metadata_temporary.write_text(
             json.dumps(metadata, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",

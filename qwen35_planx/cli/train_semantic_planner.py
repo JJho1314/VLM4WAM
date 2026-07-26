@@ -274,6 +274,21 @@ def build_optimizer_groups(
 
     if not isinstance(planner, nn.Module):
         raise TypeError("planner must be a torch module")
+    backbone = getattr(planner, "backbone", None)
+    input_embedding = _input_embedding_parameter(planner)
+    input_id = id(input_embedding) if input_embedding is not None else None
+    if isinstance(backbone, nn.Module):
+        forwarded_base = getattr(backbone, "model", None)
+        forwarded_ids = _module_parameter_ids(forwarded_base)
+        for name, parameter in backbone.named_parameters():
+            bypassed_by_forward = (
+                bool(forwarded_ids) and id(parameter) not in forwarded_ids
+            )
+            if (
+                ("lm_head" in name or bypassed_by_forward)
+                and id(parameter) != input_id
+            ):
+                parameter.requires_grad_(False)
     learning_rates = {
         "qwen_language": float(qwen_language_lr),
         "qwen_vision": float(qwen_vision_lr),
@@ -544,6 +559,88 @@ def _restore_rng_state(state: Mapping[str, Any]) -> None:
     )
 
 
+def _validate_rng_state(state: Mapping[str, Any]) -> None:
+    required = {
+        "torch_cpu", "torch_cuda", "python_version", "python_state",
+        "python_gauss", "numpy_bit_generator", "numpy_state",
+        "numpy_position", "numpy_has_gauss", "numpy_cached_gaussian",
+    }
+    if not isinstance(state, Mapping) or set(state) != required:
+        raise ValueError("checkpoint RNG state fields are invalid")
+    torch_cpu = state["torch_cpu"]
+    torch_cuda = state["torch_cuda"]
+    python_state = state["python_state"]
+    numpy_state = state["numpy_state"]
+    if (
+        not isinstance(torch_cpu, torch.Tensor)
+        or torch_cpu.dtype != torch.uint8
+        or torch_cpu.ndim != 1
+        or torch_cpu.numel() == 0
+        or not isinstance(torch_cuda, list)
+        or any(
+            not isinstance(value, torch.Tensor)
+            or value.dtype != torch.uint8
+            or value.ndim != 1
+            or value.numel() == 0
+            for value in torch_cuda
+        )
+        or type(state["python_version"]) is not int
+        or not isinstance(python_state, torch.Tensor)
+        or python_state.dtype != torch.int64
+        or python_state.ndim != 1
+        or python_state.numel() == 0
+        or (
+            state["python_gauss"] is not None
+            and (
+                not isinstance(state["python_gauss"], (int, float))
+                or not math.isfinite(float(state["python_gauss"]))
+            )
+        )
+        or not isinstance(state["numpy_bit_generator"], str)
+        or not state["numpy_bit_generator"]
+        or not isinstance(numpy_state, torch.Tensor)
+        or numpy_state.dtype != torch.uint32
+        or numpy_state.ndim != 1
+        or numpy_state.numel() == 0
+        or type(state["numpy_position"]) is not int
+        or type(state["numpy_has_gauss"]) is not int
+        or state["numpy_has_gauss"] not in (0, 1)
+        or not isinstance(state["numpy_cached_gaussian"], (int, float))
+        or not math.isfinite(float(state["numpy_cached_gaussian"]))
+    ):
+        raise ValueError("checkpoint torch RNG state is invalid")
+
+
+def _rng_state_to_wire(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Make RNG state safe for all_gather_object across PyTorch versions."""
+
+    _validate_rng_state(state)
+    return {
+        **dict(state),
+        "torch_cpu": state["torch_cpu"].tolist(),
+        "torch_cuda": [value.tolist() for value in state["torch_cuda"]],
+        "python_state": state["python_state"].tolist(),
+        "numpy_state": state["numpy_state"].tolist(),
+    }
+
+
+def _rng_state_from_wire(state: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(state, Mapping):
+        raise ValueError("gathered RNG state is invalid")
+    restored = {
+        **dict(state),
+        "torch_cpu": torch.tensor(state["torch_cpu"], dtype=torch.uint8),
+        "torch_cuda": [
+            torch.tensor(value, dtype=torch.uint8)
+            for value in state["torch_cuda"]
+        ],
+        "python_state": torch.tensor(state["python_state"], dtype=torch.int64),
+        "numpy_state": torch.tensor(state["numpy_state"], dtype=torch.uint32),
+    }
+    _validate_rng_state(restored)
+    return restored
+
+
 def _optimizer_step(state_dict: Mapping[str, Any]) -> int:
     steps = []
     for state in state_dict.get("state", {}).values():
@@ -553,6 +650,46 @@ def _optimizer_step(state_dict: Mapping[str, Any]) -> int:
         elif isinstance(value, (int, float)):
             steps.append(int(value))
     return max(steps, default=0)
+
+
+def _validate_state_topology(
+    saved: Any,
+    runtime: Any,
+    *,
+    label: str,
+) -> None:
+    if isinstance(runtime, Mapping):
+        if not isinstance(saved, Mapping) or set(saved) != set(runtime):
+            raise ValueError(f"{label} state topology mismatch")
+        for name in runtime:
+            _validate_state_topology(
+                saved[name],
+                runtime[name],
+                label=f"{label}.{name}",
+            )
+        return
+    if isinstance(runtime, (list, tuple)):
+        if not isinstance(saved, type(runtime)) or len(saved) != len(runtime):
+            raise ValueError(f"{label} state topology mismatch")
+        for index, (saved_value, runtime_value) in enumerate(
+            zip(saved, runtime)
+        ):
+            _validate_state_topology(
+                saved_value,
+                runtime_value,
+                label=f"{label}[{index}]",
+            )
+        return
+    if isinstance(runtime, torch.Tensor):
+        if (
+            not isinstance(saved, torch.Tensor)
+            or saved.dtype != runtime.dtype
+            or tuple(saved.shape) != tuple(runtime.shape)
+        ):
+            raise ValueError(f"{label} state topology mismatch")
+        return
+    if type(saved) is not type(runtime):
+        raise ValueError(f"{label} state topology mismatch")
 
 
 def _validate_metadata_payload(
@@ -615,6 +752,7 @@ def save_planner_checkpoint(
     base_model_dir: Path | str | None = None,
     released_ta_dir: Path | str | None = None,
     allow_test_artifacts: bool = False,
+    rng_states_by_rank: Sequence[Mapping[str, Any]] | None = None,
 ) -> Path:
     """Atomically publish one complete, resumable planner checkpoint."""
 
@@ -650,6 +788,15 @@ def save_planner_checkpoint(
         raise ValueError("checkpoint codebook is non-finite or has incompatible shape")
     if not allow_test_artifacts and tuple(codebook.shape) != (65_536, 1_536):
         raise ValueError("released checkpoint codebook must have shape [65536,1536]")
+
+    optimizer_state = optimizer.state_dict()
+    scheduler_state = scheduler.state_dict()
+    optimizer_step = _optimizer_step(optimizer_state)
+    scheduler_step = int(scheduler_state.get("last_epoch", -1))
+    if step != optimizer_step or step != scheduler_step:
+        raise ValueError(
+            "current step, optimizer step, and scheduler step must match"
+        )
 
     root = Path(output_dir)
     _assert_safe_output(
@@ -692,8 +839,8 @@ def save_planner_checkpoint(
         tokenizer.save_pretrained(staging / "tokenizer")
         _save_model_config(planner, staging / "model_config")
         _json_dump(staging / "planner_meta.json", metadata_payload)
-        torch.save(optimizer.state_dict(), staging / "optimizer.pt")
-        torch.save(scheduler.state_dict(), staging / "scheduler.pt")
+        torch.save(optimizer_state, staging / "optimizer.pt")
+        torch.save(scheduler_state, staging / "scheduler.pt")
         torch.save(
             {
                 "enabled": scaler is not None,
@@ -701,7 +848,17 @@ def save_planner_checkpoint(
             },
             staging / "scaler.pt",
         )
-        torch.save(_capture_rng_state(), staging / "rng_state.pt")
+        rng_states = (
+            list(rng_states_by_rank)
+            if rng_states_by_rank is not None
+            else [_capture_rng_state()]
+        )
+        for state in rng_states:
+            _validate_rng_state(state)
+        torch.save(
+            {"world_size": len(rng_states), "states": rng_states},
+            staging / "rng_state.pt",
+        )
         hash_names = tuple(
             name
             for name in REQUIRED_CHECKPOINT_ENTRIES
@@ -711,15 +868,13 @@ def save_planner_checkpoint(
             name: _artifact_hash(staging / name)
             for name in hash_names
         }
-        optimizer_state = optimizer.state_dict()
-        scheduler_state = scheduler.state_dict()
         _json_dump(
             staging / "trainer_state.json",
             {
                 "format_version": 1,
                 "current_step": step,
-                "optimizer_step": _optimizer_step(optimizer_state),
-                "scheduler_step": int(scheduler_state.get("last_epoch", step)),
+                "optimizer_step": optimizer_step,
+                "scheduler_step": scheduler_step,
                 "optimizer_groups": {
                     name: optimizer_initial_lrs[name]
                     for name in _GROUP_LRS
@@ -812,6 +967,14 @@ def validate_planner_checkpoint(
         raise ValueError(
             "planner optimizer group learning rates differ from Task 8"
         )
+    if not (
+        trainer_state["current_step"]
+        == trainer_state.get("optimizer_step")
+        == trainer_state.get("scheduler_step")
+    ):
+        raise ValueError(
+            "current step, optimizer step, and scheduler step must match"
+        )
     artifact_hashes = trainer_state.get("artifact_hashes")
     expected_hash_names = set(REQUIRED_CHECKPOINT_ENTRIES) - {"trainer_state.json"}
     if not isinstance(artifact_hashes, Mapping) or set(artifact_hashes) != expected_hash_names:
@@ -862,6 +1025,8 @@ def load_planner_checkpoint(
     scaler: Any,
     expected_metadata: GroundedPlannerMetadata | Mapping[str, Any],
     allow_test_artifacts: bool = False,
+    process_index: int = 0,
+    world_size: int = 1,
 ) -> int:
     """Resume only after the complete checkpoint has passed every validation."""
 
@@ -891,6 +1056,89 @@ def load_planner_checkpoint(
         weights_only=True,
         map_location="cpu",
     )
+    if (
+        not isinstance(rng_state, Mapping)
+        or rng_state.get("world_size") != world_size
+        or not isinstance(rng_state.get("states"), list)
+        or len(rng_state["states"]) != world_size
+        or not 0 <= process_index < world_size
+    ):
+        raise ValueError("checkpoint RNG world-size/rank coverage mismatch")
+    for state in rng_state["states"]:
+        _validate_rng_state(state)
+    runtime_state = planner.state_dict()
+    with safe_open(
+        checkpoint / "planner.safetensors", framework="pt", device="cpu"
+    ) as handle:
+        file_shapes = {
+            name: tuple(handle.get_slice(name).get_shape())
+            for name in handle.keys()
+        }
+        aliases = dict(handle.metadata() or {})
+    for name, shape in file_shapes.items():
+        if name not in runtime_state or tuple(runtime_state[name].shape) != shape:
+            raise ValueError(f"planner state topology mismatch at {name}")
+    missing = set(runtime_state).difference(file_shapes)
+    alias_names = {
+        name for name, target in aliases.items() if target in file_shapes
+    }
+    if missing.difference(alias_names):
+        raise ValueError("planner state keys differ from checkpoint")
+
+    runtime_groups = optimizer.param_groups
+    if not isinstance(optimizer_state, Mapping):
+        raise ValueError("optimizer state topology mismatch")
+    saved_groups = optimizer_state.get("param_groups")
+    if (
+        not isinstance(saved_groups, list)
+        or len(saved_groups) != len(runtime_groups)
+    ):
+        raise ValueError("optimizer group topology mismatch")
+    saved_param_map: dict[int, nn.Parameter] = {}
+    for saved_group, runtime_group in zip(saved_groups, runtime_groups):
+        if not isinstance(saved_group, Mapping):
+            raise ValueError("optimizer group topology mismatch")
+        saved_params = saved_group.get("params", [])
+        runtime_params = runtime_group.get("params", [])
+        if (
+            saved_group.get("name") != runtime_group.get("name")
+            or set(saved_group) != set(runtime_group)
+            or len(saved_params) != len(runtime_params)
+        ):
+            raise ValueError("optimizer group topology mismatch")
+        for name in set(runtime_group).difference({"params"}):
+            _validate_state_topology(
+                saved_group[name],
+                runtime_group[name],
+                label=f"optimizer group {saved_group.get('name')}.{name}",
+            )
+        saved_param_map.update(zip(saved_params, runtime_params))
+    saved_optimizer_slots = optimizer_state.get("state")
+    if not isinstance(saved_optimizer_slots, Mapping):
+        raise ValueError("optimizer state topology mismatch")
+    for identifier, state in saved_optimizer_slots.items():
+        parameter = saved_param_map.get(identifier)
+        if parameter is None or not isinstance(state, Mapping):
+            raise ValueError("optimizer state topology mismatch")
+        for value in state.values():
+            if (
+                isinstance(value, torch.Tensor)
+                and value.numel() != 1
+                and tuple(value.shape) != tuple(parameter.shape)
+            ):
+                raise ValueError("optimizer state tensor shape mismatch")
+    runtime_scheduler = scheduler.state_dict()
+    _validate_state_topology(
+        scheduler_state,
+        runtime_scheduler,
+        label="scheduler",
+    )
+    if len(scheduler_state.get("base_lrs", [])) != len(runtime_groups):
+        raise ValueError("scheduler group topology mismatch")
+    if not isinstance(scaler_state, Mapping) or set(scaler_state) != {
+        "enabled", "state_dict"
+    }:
+        raise ValueError("checkpoint scaler payload is invalid")
     if _optimizer_step(optimizer_state) != int(trainer_state["optimizer_step"]):
         raise ValueError("optimizer step differs from trainer_state")
     if int(scheduler_state.get("last_epoch", -1)) != int(
@@ -899,13 +1147,19 @@ def load_planner_checkpoint(
         raise ValueError("scheduler step differs from trainer_state")
     if bool(scaler_state.get("enabled")) != (scaler is not None):
         raise ValueError("checkpoint scaler mode differs from runtime")
+    if scaler is not None:
+        _validate_state_topology(
+            scaler_state["state_dict"],
+            scaler.state_dict(),
+            label="scaler",
+        )
 
     load_model(planner, checkpoint / "planner.safetensors", strict=True)
     optimizer.load_state_dict(optimizer_state)
     scheduler.load_state_dict(scheduler_state)
     if scaler is not None:
         scaler.load_state_dict(scaler_state["state_dict"])
-    _restore_rng_state(rng_state)
+    _restore_rng_state(rng_state["states"][process_index])
     return int(trainer_state["current_step"])
 
 
@@ -954,11 +1208,9 @@ class _TinyBackbone(nn.Module):
         return self.embed_tokens
 
     def forward(self, input_ids: torch.Tensor, **_kwargs: Any) -> Mapping[str, torch.Tensor]:
-        return {
-            "last_hidden_state": self.language_model(
-                self.embed_tokens(input_ids)
-            )
-        }
+        hidden = self.embed_tokens(input_ids)
+        hidden = hidden + 0.01 * self.vision_model(hidden)
+        return {"last_hidden_state": self.language_model(hidden)}
 
 
 class _TinySavedArtifact:
@@ -1169,6 +1421,10 @@ def _save_from_training(
     step: int,
 ) -> Path | None:
     accelerator.wait_for_everyone()
+    from accelerate.utils import gather_object
+
+    wire_states = gather_object([_rng_state_to_wire(_capture_rng_state())])
+    rng_states = [_rng_state_from_wire(state) for state in wire_states]
     checkpoint = None
     if accelerator.is_main_process:
         checkpoint = save_planner_checkpoint(
@@ -1186,6 +1442,7 @@ def _save_from_training(
             base_model_dir=artifacts.base_model_dir,
             released_ta_dir=artifacts.released_ta_dir,
             allow_test_artifacts=artifacts.allow_test_artifacts,
+            rng_states_by_rank=rng_states,
         )
     accelerator.wait_for_everyone()
     return checkpoint
@@ -1195,11 +1452,15 @@ def run_training(config: PlannerTrainingConfig) -> Path | None:
     """Run the bounded Accelerate optimizer-step loop."""
 
     from accelerate import Accelerator
-    from accelerate.utils import set_seed
+    from accelerate.utils import GradientAccumulationPlugin, set_seed
 
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        step_scheduler_with_optimizer=False,
+        gradient_accumulation_plugin=GradientAccumulationPlugin(
+            num_steps=config.gradient_accumulation_steps,
+            sync_with_dataloader=False,
+        ),
     )
     validate_effective_global_batch(
         per_device_batch=config.per_device_batch,
@@ -1229,6 +1490,8 @@ def run_training(config: PlannerTrainingConfig) -> Path | None:
             scaler=getattr(accelerator, "scaler", None),
             expected_metadata=artifacts.metadata,
             allow_test_artifacts=artifacts.allow_test_artifacts,
+            process_index=accelerator.process_index,
+            world_size=accelerator.num_processes,
         )
         if current_step >= config.max_steps:
             raise ValueError(
@@ -1266,9 +1529,9 @@ def run_training(config: PlannerTrainingConfig) -> Path | None:
                     artifacts.planner.parameters(),
                     config.gradient_clip_norm,
                 )
-            artifacts.optimizer.step()
-            artifacts.scheduler.step()
-            artifacts.optimizer.zero_grad(set_to_none=True)
+                artifacts.optimizer.step()
+                artifacts.scheduler.step()
+                artifacts.optimizer.zero_grad(set_to_none=True)
         if not accelerator.sync_gradients:
             continue
         current_step += 1

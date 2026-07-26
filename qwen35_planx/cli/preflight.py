@@ -13,7 +13,13 @@ from typing import Sequence
 
 import torch
 from safetensors import safe_open
-from transformers import AutoConfig, AutoImageProcessor, AutoModel, AutoProcessor
+from transformers import (
+    AutoConfig,
+    AutoImageProcessor,
+    AutoModel,
+    AutoModelForImageTextToText,
+    AutoProcessor,
+)
 
 from qwen35_planx.official_ta_tok import inspect_released_checkpoint
 from qwen35_planx.hashing import sha256_file, sha256_json
@@ -345,6 +351,38 @@ def _validate_local_dinov3_model(model_path: Path) -> list[str]:
     )
 
 
+def _validate_local_qwen_model(model_path: Path) -> list[str]:
+    try:
+        config = AutoConfig.from_pretrained(model_path, local_files_only=True)
+        with torch.device("meta"):
+            model = AutoModelForImageTextToText.from_config(config)
+        expected = {
+            name: tuple(tensor.shape)
+            for name, tensor in model.state_dict().items()
+        }
+        index_paths = [
+            model_path / name
+            for name in _WEIGHT_INDEX_NAMES
+            if (model_path / name).is_file()
+        ]
+        weight_paths = [
+            model_path / name
+            for name in _WEIGHT_FILE_NAMES
+            if (model_path / name).is_file()
+        ]
+        if len(index_paths) + len(weight_paths) != 1:
+            return ["local Qwen weights must contain exactly one indexed or single artifact"]
+        inventory = (
+            _inventory_indexed_weights(model_path, index_paths[0])
+            if index_paths
+            else _inventory_weight_file(weight_paths[0])
+        )
+    except Exception as error:
+        return [f"local Qwen weights are invalid: {error}"]
+    errors = _validate_weight_inventory(inventory, expected)
+    return [error.replace("local SigLIP2", "local Qwen") for error in errors]
+
+
 def _existing_ancestor(path: Path) -> Path | None:
     candidate = path
     while not candidate.exists() and candidate != candidate.parent:
@@ -553,6 +591,7 @@ def _load_codebook_export_metadata(path: Path) -> dict[str, object]:
         "format_version",
         "checkpoint_sha256",
         "state_sha256",
+        "artifact_sha256",
         "geometry",
         "teacher",
     }
@@ -572,7 +611,7 @@ def _load_codebook_export_metadata(path: Path) -> dict[str, object]:
         or teacher.get("grid_size") != 27
     ):
         raise ValueError("TA codebook metadata geometry/hash contract is invalid")
-    for name in ("checkpoint_sha256", "state_sha256"):
+    for name in ("checkpoint_sha256", "state_sha256", "artifact_sha256"):
         if not isinstance(payload[name], str) or not payload[name]:
             raise ValueError(f"TA codebook metadata {name} must be nonempty")
     return payload
@@ -587,10 +626,15 @@ def _validate_codebook_export(
         raise FileNotFoundError(f"TA codebook safetensors does not exist: {tensor_path}")
     if tensor_path.stat().st_size == 0:
         raise ValueError("TA codebook safetensors is zero-byte")
+    if sha256_file(tensor_path) != metadata["artifact_sha256"]:
+        raise ValueError("TA codebook artifact SHA-256 mismatch")
     with safe_open(tensor_path, framework="pt", device="cpu") as handle:
         if list(handle.keys()) != ["codebook"]:
             raise ValueError("TA codebook safetensors must contain only codebook")
-        shape = tuple(handle.get_slice("codebook").get_shape())
+        codebook = handle.get_tensor("codebook")
+        shape = tuple(codebook.shape)
+    if not bool(torch.isfinite(codebook).all()):
+        raise ValueError("TA codebook contains non-finite values")
     if shape != (65_536, 1_536):
         raise ValueError(
             f"TA codebook shape must be (65536, 1536), got {shape}"
@@ -656,8 +700,15 @@ def planner_training_preflight_report(
     from qwen35_planx.hindsight_schema import HindsightCache
     from qwen35_planx.planner_dataset import (
         CachedPlannerTargets,
+        GroundedPlannerBatch,
+        GroundedPlannerCollator,
         HindsightPlannerDataset,
     )
+    from qwen35_planx.vocabulary import (
+        STRUCTURE_TOKENS,
+        VisualVocabularyLayout,
+    )
+    from transformers import AutoProcessor, AutoTokenizer
 
     base_model = Path(str(config.base_model)).resolve()
     if not base_model.is_dir():
@@ -674,6 +725,9 @@ def planner_training_preflight_report(
         or base_config.get("model_type") != "qwen3_5"
     ):
         raise ValueError("base Qwen config model_type must be 'qwen3_5'")
+    qwen_errors = _validate_local_qwen_model(base_model)
+    if qwen_errors:
+        raise ValueError("; ".join(qwen_errors))
     processor_errors = _validate_processor_artifacts(
         base_model,
         label="Qwen3.5",
@@ -721,6 +775,61 @@ def planner_training_preflight_report(
             "flow": tuple(targets.flow.shape),
             "phrase_embeddings": tuple(targets.phrase_embeddings.shape),
         }
+        tokenizer = AutoTokenizer.from_pretrained(
+            base_model, local_files_only=True
+        )
+        processor = AutoProcessor.from_pretrained(
+            base_model, local_files_only=True
+        )
+        original_vocab_size = len(tokenizer)
+        visual_tokens = [
+            f"<|ta_{index:05d}|>" for index in range(65_536)
+        ]
+        added = tokenizer.add_special_tokens(
+            {
+                "additional_special_tokens": [
+                    *STRUCTURE_TOKENS,
+                    *visual_tokens,
+                ]
+            }
+        )
+        if added != len(STRUCTURE_TOKENS) + 65_536:
+            raise ValueError("Qwen tokenizer visual expansion is not exact")
+        structure_ids = tuple(
+            (token, int(tokenizer.convert_tokens_to_ids(token)))
+            for token in STRUCTURE_TOKENS
+        )
+        visual_start = int(tokenizer.convert_tokens_to_ids(visual_tokens[0]))
+        layout = VisualVocabularyLayout(
+            original_vocab_size=original_vocab_size,
+            visual_start_id=visual_start,
+            visual_end_id=visual_start + 65_536,
+            structure_token_ids=structure_ids,
+            tokenizer_hash=sha256_json(
+                sorted(
+                    (str(token), int(token_id))
+                    for token, token_id in tokenizer.get_vocab().items()
+                )
+            ),
+            base_embedding_hash="preflight-shape-only",
+            expanded_embedding_hash="preflight-shape-only",
+        )
+        processor.tokenizer = tokenizer
+        collator = GroundedPlannerCollator(
+            processor,
+            layout,
+            cache_dir=cache_dir,
+            dataset=dataset,
+        )
+        cpu_batch = collator([sample])
+        if not isinstance(cpu_batch, GroundedPlannerBatch) or any(
+            tensor.device.type != "cpu"
+            for tensor in cpu_batch.qwen_inputs.values()
+        ):
+            raise ValueError("preflight collator did not produce a CPU planner batch")
+        sample_shapes["qwen_input_ids"] = tuple(
+            cpu_batch.qwen_inputs["input_ids"].shape
+        )
         cache_hash = cache.cache_hash
         cache_ta_hash = cache.metadata.ta_tok_hash
     if cache_ta_hash != codebook_report["checkpoint_hash"]:

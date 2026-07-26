@@ -21,6 +21,7 @@ from transformers import (
     SiglipVisionConfig,
     SiglipVisionModel,
 )
+from qwen35_planx.hashing import sha256_file
 
 
 class _FakeEncoder(nn.Module):
@@ -375,6 +376,7 @@ def test_lookup_decode_and_atomic_codebook_export(
     metadata = json.loads(metadata_path.read_text())
     assert metadata["checkpoint_sha256"] == tokenizer.checkpoint_hash
     assert metadata["state_sha256"] == tokenizer.state_hash
+    assert metadata["artifact_sha256"] == sha256_file(tensor_path)
     assert metadata["geometry"]["tokens_per_frame"] == 729
     assert metadata["teacher"]["selected_layer"] == -2
     assert not list(tmp_path.glob("*.tmp"))

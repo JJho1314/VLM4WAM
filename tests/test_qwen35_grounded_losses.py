@@ -38,6 +38,35 @@ def test_chunked_visual_ce_matches_dense_reference_and_gradients() -> None:
     torch.testing.assert_close(actual_weight_grad, weight.grad)
 
 
+def test_chunked_visual_ce_bf16_matches_fp32_reference_and_gradients() -> None:
+    from qwen35_planx.losses import chunked_visual_cross_entropy
+
+    torch.manual_seed(91)
+    hidden_fp32 = torch.randn(2, 33, 256, requires_grad=True)
+    weight_fp32 = torch.randn(4096, 256, requires_grad=True)
+    targets = torch.randint(0, 4096, (2, 33))
+    reference = F.cross_entropy(
+        hidden_fp32.reshape(-1, 256) @ weight_fp32.T,
+        targets.reshape(-1),
+    )
+    reference.backward()
+    expected_hidden_grad = hidden_fp32.grad.detach().clone()
+    expected_weight_grad = weight_fp32.grad.detach().clone()
+
+    hidden = hidden_fp32.detach().to(torch.bfloat16).requires_grad_(True)
+    weight = weight_fp32.detach().to(torch.bfloat16).requires_grad_(True)
+    actual = chunked_visual_cross_entropy(hidden, weight, targets, chunk_size=7)
+    actual.backward()
+
+    torch.testing.assert_close(actual.float(), reference, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(
+        hidden.grad.float(), expected_hidden_grad, atol=3e-3, rtol=3e-2
+    )
+    torch.testing.assert_close(
+        weight.grad.float(), expected_weight_grad, atol=3e-3, rtol=3e-2
+    )
+
+
 def test_chunked_visual_ce_never_materializes_more_than_requested_positions(
     monkeypatch,
 ) -> None:

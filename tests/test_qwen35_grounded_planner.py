@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -464,6 +467,7 @@ class _GroupedBackbone(nn.Module):
         self.vision_model = nn.Linear(5, 5)
         self.language_model = _CheckpointableLanguage()
         self.embed_tokens = nn.Embedding(20, 5)
+        self.lm_head = nn.Linear(5, 20, bias=False)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -490,6 +494,22 @@ class _SaveableArtifact:
             json.dumps({"kind": self.kind}),
             encoding="utf-8",
         )
+
+
+class _FakeScaler:
+    def __init__(self) -> None:
+        self.scale = torch.tensor(1024.0)
+        self.growth_tracker = torch.tensor(7, dtype=torch.int32)
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return {
+            "scale": self.scale.clone(),
+            "growth_tracker": self.growth_tracker.clone(),
+        }
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        self.scale.copy_(state["scale"])
+        self.growth_tracker.copy_(state["growth_tracker"])
 
 
 def _tiny_checkpoint_metadata() -> dict[str, object]:
@@ -552,6 +572,7 @@ def test_optimizer_groups_are_exact_exhaustive_and_duplicate_free() -> None:
     assert "backbone.embed_tokens.weight" in grouped_names[
         "visual_vocab_and_prediction_head"
     ]
+    assert planner.backbone.lm_head.weight.requires_grad is False
     assert {
         name
         for name in grouped_names["visual_vocab_and_prediction_head"]
@@ -600,6 +621,7 @@ def test_selective_checkpointing_and_effective_batch_contract() -> None:
 def test_atomic_checkpoint_resume_restores_all_training_state(tmp_path: Path) -> None:
     from qwen35_planx.cli.train_semantic_planner import (
         REQUIRED_CHECKPOINT_ENTRIES,
+        _capture_rng_state,
         build_optimizer_groups,
         load_planner_checkpoint,
         save_planner_checkpoint,
@@ -635,9 +657,12 @@ def test_atomic_checkpoint_resume_restores_all_training_state(tmp_path: Path) ->
     released_ta_dir = tmp_path / "released-ta"
     base_dir.mkdir()
     released_ta_dir.mkdir()
+    rank_zero_rng = _capture_rng_state()
+    torch.manual_seed(902)
+    rank_one_rng = _capture_rng_state()
     checkpoint = save_planner_checkpoint(
         output_dir=tmp_path / "runs",
-        step=3,
+        step=1,
         planner=planner,
         optimizer=optimizer,
         scheduler=scheduler,
@@ -652,9 +677,10 @@ def test_atomic_checkpoint_resume_restores_all_training_state(tmp_path: Path) ->
         base_model_dir=base_dir,
         released_ta_dir=released_ta_dir,
         allow_test_artifacts=True,
+        rng_states_by_rank=(rank_zero_rng, rank_one_rng),
     )
 
-    assert checkpoint.name == "step_000003"
+    assert checkpoint.name == "step_000001"
     assert all((checkpoint / name).exists() for name in REQUIRED_CHECKPOINT_ENTRIES)
     assert (checkpoint / "scaler.pt").is_file()
     assert (checkpoint / "rng_state.pt").is_file()
@@ -675,9 +701,11 @@ def test_atomic_checkpoint_resume_restores_all_training_state(tmp_path: Path) ->
         scaler=None,
         expected_metadata=_tiny_checkpoint_metadata(),
         allow_test_artifacts=True,
+        process_index=1,
+        world_size=2,
     )
 
-    assert resumed_step == 3
+    assert resumed_step == 1
     for name, value in planner.state_dict().items():
         torch.testing.assert_close(value, expected_model[name])
     actual_optimizer = optimizer.state_dict()
@@ -692,12 +720,15 @@ def test_atomic_checkpoint_resume_restores_all_training_state(tmp_path: Path) ->
             else:
                 assert value == expected
     assert scheduler.state_dict() == expected_scheduler
+    torch.testing.assert_close(torch.random.get_rng_state(), rank_one_rng["torch_cpu"])
 
 
 def test_resume_fails_closed_before_mutation_on_missing_or_mismatch(
     tmp_path: Path,
 ) -> None:
     from qwen35_planx.cli.train_semantic_planner import (
+        _artifact_hash,
+        _capture_rng_state,
         build_optimizer_groups,
         load_planner_checkpoint,
         save_planner_checkpoint,
@@ -707,6 +738,28 @@ def test_resume_fails_closed_before_mutation_on_missing_or_mismatch(
     groups = build_optimizer_groups(planner, visual_token_start_id=7)
     optimizer = torch.optim.AdamW(groups)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    scaler = _FakeScaler()
+    with pytest.raises(ValueError, match="current.*optimizer.*scheduler"):
+        save_planner_checkpoint(
+            output_dir=tmp_path / "bad-step",
+            step=3,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            processor=_SaveableArtifact("processor"),
+            tokenizer=_SaveableArtifact("tokenizer"),
+            metadata=_tiny_checkpoint_metadata(),
+            codebook=torch.randn(13, 3),
+            scaler=scaler,
+            optimizer_group_lrs={
+                group["name"]: group["lr"] for group in groups
+            },
+            allow_test_artifacts=True,
+        )
+    sum(parameter.square().sum() for parameter in planner.parameters()).backward()
+    optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad(set_to_none=True)
     checkpoint = save_planner_checkpoint(
         output_dir=tmp_path / "runs",
         step=1,
@@ -717,7 +770,7 @@ def test_resume_fails_closed_before_mutation_on_missing_or_mismatch(
         tokenizer=_SaveableArtifact("tokenizer"),
         metadata=_tiny_checkpoint_metadata(),
         codebook=torch.randn(13, 3),
-        scaler=None,
+        scaler=scaler,
         optimizer_group_lrs={
             group["name"]: group["lr"] for group in groups
         },
@@ -736,7 +789,7 @@ def test_resume_fails_closed_before_mutation_on_missing_or_mismatch(
             planner=planner,
             optimizer=optimizer,
             scheduler=scheduler,
-            scaler=None,
+            scaler=scaler,
             expected_metadata=mismatched,
             allow_test_artifacts=True,
         )
@@ -757,11 +810,77 @@ def test_resume_fails_closed_before_mutation_on_missing_or_mismatch(
             planner=planner,
             optimizer=optimizer,
             scheduler=scheduler,
-            scaler=None,
+            scaler=scaler,
             expected_metadata=_tiny_checkpoint_metadata(),
             allow_test_artifacts=True,
         )
     trainer_state_path.write_text(original_trainer_state, encoding="utf-8")
+
+    # A topology failure discovered after the checkpoint's artifact manifest
+    # has passed must still leave every runtime object untouched.
+    for parameter in planner.parameters():
+        parameter.data.zero_()
+    sentinel_model = {
+        name: value.detach().clone()
+        for name, value in planner.state_dict().items()
+    }
+    sentinel_optimizer = copy.deepcopy(optimizer.state_dict())
+    sentinel_scheduler = copy.deepcopy(scheduler.state_dict())
+    sentinel_scaler = copy.deepcopy(scaler.state_dict())
+    sentinel_rng = _capture_rng_state()
+    optimizer_path = checkpoint / "optimizer.pt"
+    corrupted_optimizer = torch.load(
+        optimizer_path,
+        weights_only=True,
+        map_location="cpu",
+    )
+    corrupted_optimizer["param_groups"][0]["params"].pop()
+    torch.save(corrupted_optimizer, optimizer_path)
+    trainer_state = json.loads(original_trainer_state)
+    trainer_state["artifact_hashes"]["optimizer.pt"] = _artifact_hash(
+        optimizer_path
+    )
+    trainer_state_path.write_text(json.dumps(trainer_state), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="optimizer group topology mismatch"):
+        load_planner_checkpoint(
+            checkpoint,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            expected_metadata=_tiny_checkpoint_metadata(),
+            allow_test_artifacts=True,
+        )
+    for name, value in planner.state_dict().items():
+        torch.testing.assert_close(value, sentinel_model[name])
+    actual_optimizer = optimizer.state_dict()
+    assert actual_optimizer["param_groups"] == sentinel_optimizer["param_groups"]
+    assert actual_optimizer["state"].keys() == sentinel_optimizer["state"].keys()
+    for key, state in actual_optimizer["state"].items():
+        for name, value in state.items():
+            expected = sentinel_optimizer["state"][key][name]
+            if isinstance(value, torch.Tensor):
+                torch.testing.assert_close(value, expected)
+            else:
+                assert value == expected
+    assert scheduler.state_dict() == sentinel_scheduler
+    actual_scaler = scaler.state_dict()
+    assert actual_scaler.keys() == sentinel_scaler.keys()
+    for name, value in actual_scaler.items():
+        torch.testing.assert_close(value, sentinel_scaler[name])
+    actual_rng = _capture_rng_state()
+    for name in sentinel_rng:
+        expected = sentinel_rng[name]
+        actual = actual_rng[name]
+        if isinstance(expected, torch.Tensor):
+            torch.testing.assert_close(actual, expected)
+        elif isinstance(expected, list):
+            assert len(actual) == len(expected)
+            for actual_item, expected_item in zip(actual, expected):
+                torch.testing.assert_close(actual_item, expected_item)
+        else:
+            assert actual == expected
 
     (checkpoint / "rng_state.pt").unlink()
     with pytest.raises(FileNotFoundError, match="incomplete planner checkpoint"):
@@ -770,7 +889,7 @@ def test_resume_fails_closed_before_mutation_on_missing_or_mismatch(
             planner=planner,
             optimizer=optimizer,
             scheduler=scheduler,
-            scaler=None,
+            scaler=scaler,
             expected_metadata=_tiny_checkpoint_metadata(),
             allow_test_artifacts=True,
         )
@@ -857,6 +976,81 @@ def test_tiny_accelerate_training_writes_reloadable_one_step_checkpoint(
     assert trainer_state["current_step"] == 1
     assert trainer_state["optimizer_step"] == 1
     assert trainer_state["scheduler_step"] == 1
+
+
+def test_two_process_short_loader_accumulates_and_saves_rank_rng(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "tiny-two-process.json"
+    output_dir = tmp_path / "run"
+    config_path.write_text(
+        json.dumps(
+            {
+                "tiny_smoke": True,
+                "output_dir": str(output_dir),
+                "per_device_batch": 64,
+                "gradient_accumulation_steps": 2,
+                "max_steps": 2,
+                "warmup_steps": 0,
+                "save_every": 2,
+                "validate_every": 2,
+                "log_every": 1,
+                "num_workers": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["CUDA_VISIBLE_DEVICES"] = ""
+    environment["PYTHONPATH"] = os.pathsep.join(
+        filter(
+            None,
+            (
+                str(Path.cwd()),
+                str(Path.cwd() / "ge_act"),
+                environment.get("PYTHONPATH"),
+            ),
+        )
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc_per_node=2",
+            "--module",
+            "qwen35_planx.cli.train_semantic_planner",
+            "--config",
+            str(config_path),
+        ],
+        cwd=Path.cwd(),
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + "\n" + result.stderr
+
+    checkpoint = output_dir / "step_000002"
+    trainer_state = json.loads(
+        (checkpoint / "trainer_state.json").read_text(encoding="utf-8")
+    )
+    assert trainer_state["current_step"] == 2
+    assert trainer_state["optimizer_step"] == 2
+    assert trainer_state["scheduler_step"] == 2
+    rank_rng = torch.load(
+        checkpoint / "rng_state.pt",
+        weights_only=True,
+        map_location="cpu",
+    )
+    assert rank_rng["world_size"] == 2
+    assert len(rank_rng["states"]) == 2
+    assert not torch.equal(
+        rank_rng["states"][0]["torch_cpu"],
+        rank_rng["states"][1]["torch_cpu"],
+    )
 
 
 def test_training_preflight_refuses_incomplete_resume(tmp_path: Path) -> None:

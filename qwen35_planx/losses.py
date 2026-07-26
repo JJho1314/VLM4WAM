@@ -36,11 +36,14 @@ class _MemoryBoundedVisualCrossEntropy(torch.autograd.Function):
     ) -> tuple[Tensor, Tensor]:
         flat_hidden = hidden.reshape(-1, hidden.shape[-1])
         flat_targets = targets.reshape(-1)
-        loss_sum = hidden.new_zeros(())
+        loss_sum = torch.zeros((), device=hidden.device, dtype=torch.float32)
         predictions = torch.empty_like(flat_targets)
         for start in range(0, flat_hidden.shape[0], chunk_size):
             stop = min(start + chunk_size, flat_hidden.shape[0])
-            logits = F.linear(flat_hidden[start:stop], visual_weight)
+            logits = F.linear(
+                flat_hidden[start:stop].float(),
+                visual_weight.float(),
+            )
             loss_sum.add_(
                 F.cross_entropy(
                     logits,
@@ -69,14 +72,20 @@ class _MemoryBoundedVisualCrossEntropy(torch.autograd.Function):
 
         flat_hidden = hidden.reshape(-1, hidden.shape[-1])
         flat_targets = targets.reshape(-1)
-        grad_hidden = torch.zeros_like(flat_hidden) if needs_hidden else None
-        grad_weight = torch.zeros_like(visual_weight) if needs_weight else None
-        scale = grad_loss / flat_hidden.shape[0]
+        flat_hidden_fp32 = flat_hidden.float()
+        visual_weight_fp32 = visual_weight.float()
+        grad_hidden = (
+            torch.zeros_like(flat_hidden_fp32) if needs_hidden else None
+        )
+        grad_weight = (
+            torch.zeros_like(visual_weight_fp32) if needs_weight else None
+        )
+        scale = grad_loss.float() / flat_hidden.shape[0]
 
         for start in range(0, flat_hidden.shape[0], ctx.chunk_size):
             stop = min(start + ctx.chunk_size, flat_hidden.shape[0])
-            hidden_chunk = flat_hidden[start:stop]
-            logits = F.linear(hidden_chunk, visual_weight)
+            hidden_chunk = flat_hidden_fp32[start:stop]
+            logits = F.linear(hidden_chunk, visual_weight_fp32)
             grad_logits = logits.softmax(dim=-1)
             target_column = flat_targets[start:stop].unsqueeze(-1)
             grad_logits.scatter_add_(
@@ -86,14 +95,19 @@ class _MemoryBoundedVisualCrossEntropy(torch.autograd.Function):
             )
             grad_logits.mul_(scale)
             if grad_hidden is not None:
-                grad_hidden[start:stop] = grad_logits.matmul(visual_weight)
+                grad_hidden[start:stop] = grad_logits.matmul(visual_weight_fp32)
             if grad_weight is not None:
                 grad_weight.addmm_(grad_logits.transpose(0, 1), hidden_chunk)
 
         hidden_gradient = (
-            None if grad_hidden is None else grad_hidden.reshape(hidden.shape)
+            None
+            if grad_hidden is None
+            else grad_hidden.reshape(hidden.shape).to(hidden.dtype)
         )
-        return hidden_gradient, grad_weight, None, None
+        weight_gradient = (
+            None if grad_weight is None else grad_weight.to(visual_weight.dtype)
+        )
+        return hidden_gradient, weight_gradient, None, None
 
 
 def _chunked_visual_objective(
