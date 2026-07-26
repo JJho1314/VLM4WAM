@@ -317,6 +317,10 @@ class HindsightTargetBuilder:
         if not isinstance(window, HindsightWindowRecord):
             raise TypeError("window must be HindsightWindowRecord")
         self._validate_bounds(trajectory, window)
+        if not np.isfinite(trajectory.actions).all():
+            raise ValueError("trajectory actions must contain only finite values")
+        if not np.isfinite(trajectory.states).all():
+            raise ValueError("trajectory states must contain only finite values")
 
         fields = self.instruction_parser(window.caption)
         negatives = _negative_phrases(fields, self.vocabulary)

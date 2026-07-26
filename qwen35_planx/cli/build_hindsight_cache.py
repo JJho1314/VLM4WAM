@@ -11,7 +11,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
-from typing import Any, Mapping, Sequence
+from typing import Any, Sequence
 
 import numpy as np
 from safetensors.torch import load_file, save_file
@@ -39,6 +39,27 @@ from qwen35_planx.instruction import parse_libero_instruction
 
 
 _FORMAT_VERSION = 1
+_WINDOW_FILES = ("hindsight_train.jsonl", "hindsight_val.jsonl")
+_WINDOW_CONTRACT_FIELDS = (
+    "format_version",
+    "camera_names",
+    "num_keyframes",
+    "ge_act_future_indices",
+    "action_chunk",
+    "chunk",
+    "n_previous",
+    "video_temporal_stride",
+    "split_seed",
+    "window_stride",
+    "sample_n_frames",
+)
+_WINDOW_ENVELOPE_FIELDS = set(_WINDOW_CONTRACT_FIELDS) | {
+    "contract_hash",
+    "hdf5_manifest",
+    "hdf5_manifest_hash",
+    "window_manifest_hash",
+    "files",
+}
 
 
 def _canonical_json(value: Any) -> str:
@@ -77,54 +98,116 @@ def _parse_jsonl(path: Path) -> list[HindsightWindowRecord]:
     return records
 
 
-def load_window_records(path: Path | str) -> list[HindsightWindowRecord]:
-    """Load canonical windows from JSONL or the HDF5-window manifest JSON."""
-
+def _load_window_manifest_envelope(
+    path: Path | str,
+    *,
+    expected_hdf5_manifest: Path | str | None = None,
+) -> tuple[dict[str, Any], list[HindsightWindowRecord]]:
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"window manifest does not exist: {path}")
-    if path.suffix == ".jsonl":
-        records = _parse_jsonl(path)
-    else:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as error:
-            raise ValueError(f"invalid window manifest JSON: {error}") from error
-        if isinstance(payload, list):
-            records = [HindsightWindowRecord.from_dict(item) for item in payload]
-        elif isinstance(payload, Mapping) and isinstance(payload.get("files"), Mapping):
-            names = sorted(
-                name
-                for name in payload["files"]
-                if isinstance(name, str)
-                and name.startswith("hindsight_")
-                and name.endswith(".jsonl")
+    if path.suffix != ".json":
+        raise ValueError(
+            "window manifest must be the canonical Task-3 JSON envelope, "
+            "not standalone JSONL"
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid window manifest JSON: {error}") from error
+    if not isinstance(payload, dict) or set(payload) != _WINDOW_ENVELOPE_FIELDS:
+        raise ValueError("window manifest is not the canonical Task-3 envelope")
+
+    contract = {name: payload[name] for name in _WINDOW_CONTRACT_FIELDS}
+    expected_fixed = {
+        "format_version": 1,
+        "camera_names": ["main", "wrist"],
+        "num_keyframes": 4,
+        "ge_act_future_indices": [0, 3, 5, 8],
+        "action_chunk": 36,
+        "chunk": 9,
+        "n_previous": 4,
+        "video_temporal_stride": 4,
+    }
+    for name, expected in expected_fixed.items():
+        if contract[name] != expected:
+            raise ValueError(
+                f"window manifest contract {name} must be {expected!r}"
             )
-            if not names:
-                raise ValueError(
-                    "window manifest JSON does not reference hindsight JSONL files"
-                )
-            records = []
-            root = path.parent.resolve()
-            for name in names:
-                child = (root / name).resolve()
-                try:
-                    child.relative_to(root)
-                except ValueError as error:
-                    raise ValueError(
-                        f"unsafe window manifest child path: {name}"
-                    ) from error
-                records.extend(_parse_jsonl(child))
-        elif isinstance(payload, Mapping):
-            records = [HindsightWindowRecord.from_dict(payload)]
-        else:
-            raise ValueError("window manifest JSON must contain records or files")
+    for name in ("split_seed", "window_stride", "sample_n_frames"):
+        if type(contract[name]) is not int:
+            raise ValueError(f"window manifest contract {name} must be an integer")
+    if contract["window_stride"] <= 0 or contract["sample_n_frames"] <= 36:
+        raise ValueError("window manifest stride/sample length contract is invalid")
+    if payload["contract_hash"] != sha256_json(contract):
+        raise ValueError("window manifest contract_hash mismatch")
+
+    referenced_hdf5 = Path(payload["hdf5_manifest"])
+    if not referenced_hdf5.is_absolute() or not referenced_hdf5.is_file():
+        raise ValueError(
+            "window manifest hdf5_manifest must be an existing absolute path"
+        )
+    if expected_hdf5_manifest is not None and (
+        referenced_hdf5.resolve() != Path(expected_hdf5_manifest).resolve()
+    ):
+        raise ValueError("window manifest references a different HDF5 manifest")
+    if payload["hdf5_manifest_hash"] != sha256_file(referenced_hdf5):
+        raise ValueError("window manifest hdf5_manifest_hash mismatch")
+
+    files = payload["files"]
+    if not isinstance(files, dict) or set(files) != set(_WINDOW_FILES):
+        raise ValueError(
+            "window manifest files must reference exactly the train/val JSONL files"
+        )
+    records = []
+    root = path.parent.resolve()
+    for name in _WINDOW_FILES:
+        description = files[name]
+        if (
+            not isinstance(description, dict)
+            or set(description) != {"records", "sha256"}
+            or type(description["records"]) is not int
+            or description["records"] < 0
+        ):
+            raise ValueError(f"window manifest file metadata is invalid for {name}")
+        child = (root / name).resolve()
+        if child.parent != root or not child.is_file():
+            raise ValueError(f"window manifest referenced file is missing: {name}")
+        if description["sha256"] != sha256_file(child):
+            raise ValueError(f"window manifest referenced SHA-256 mismatch: {name}")
+        split_records = _parse_jsonl(child)
+        if len(split_records) != description["records"]:
+            raise ValueError(f"window manifest referenced record count mismatch: {name}")
+        expected_split = name.removeprefix("hindsight_").removesuffix(".jsonl")
+        if any(record.split != expected_split for record in split_records):
+            raise ValueError(
+                f"window record split does not match referenced filename: {name}"
+            )
+        records.extend(split_records)
     if not records:
         raise ValueError("window manifest must contain at least one record")
     records.sort(key=lambda record: record.sample_id)
     sample_ids = [record.sample_id for record in records]
     if len(sample_ids) != len(set(sample_ids)):
         raise ValueError("window manifest contains duplicate sample IDs")
+    if payload["window_manifest_hash"] != sha256_json(
+        [record.to_dict() for record in records]
+    ):
+        raise ValueError("window manifest canonical window_manifest_hash mismatch")
+    return payload, records
+
+
+def load_window_records(
+    path: Path | str,
+    *,
+    expected_hdf5_manifest: Path | str | None = None,
+) -> list[HindsightWindowRecord]:
+    """Load only the hash-bound canonical Task-3 window-manifest envelope."""
+
+    _, records = _load_window_manifest_envelope(
+        path,
+        expected_hdf5_manifest=expected_hdf5_manifest,
+    )
     return records
 
 
@@ -153,6 +236,7 @@ def _artifact_hash(path: Path) -> str:
 def build_cache_metadata(
     *,
     hdf5_manifest: Path | str,
+    window_manifest: Path | str,
     records: Sequence[HindsightWindowRecord],
     ta_checkpoint: Path | str,
     siglip_model: Path | str,
@@ -174,12 +258,16 @@ def build_cache_metadata(
             )
         },
     }
+    envelope, authoritative_records = _load_window_manifest_envelope(
+        window_manifest,
+        expected_hdf5_manifest=hdf5_manifest,
+    )
+    if list(records) != authoritative_records:
+        raise ValueError("records differ from authoritative window manifest")
     return HindsightCacheMetadata(
         format_version=HindsightCacheMetadata.FORMAT_VERSION,
-        hdf5_manifest_hash=sha256_file(Path(hdf5_manifest)),
-        window_manifest_hash=sha256_json(
-            [record.to_dict() for record in records]
-        ),
+        hdf5_manifest_hash=envelope["hdf5_manifest_hash"],
+        window_manifest_hash=envelope["window_manifest_hash"],
         instruction_parser_hash=sha256_file(package_root / "instruction.py"),
         ta_tok_hash=_artifact_hash(Path(ta_checkpoint)),
         siglip2_hash=_artifact_hash(Path(siglip_model)),
@@ -281,9 +369,13 @@ def build_shards(
         raise TypeError("shard_index and num_shards must be integers")
     if num_shards <= 0 or not 0 <= shard_index < num_shards:
         raise ValueError("shard assignment must satisfy 0 <= index < num_shards")
-    records = load_window_records(window_manifest)
-    expected_hash = sha256_json([record.to_dict() for record in records])
-    if metadata.window_manifest_hash != expected_hash:
+    envelope, records = _load_window_manifest_envelope(
+        window_manifest,
+        expected_hdf5_manifest=hdf5_manifest,
+    )
+    if metadata.hdf5_manifest_hash != envelope["hdf5_manifest_hash"]:
+        raise ValueError("metadata does not bind the authoritative HDF5 manifest hash")
+    if metadata.window_manifest_hash != envelope["window_manifest_hash"]:
         raise ValueError("metadata does not bind the supplied window manifest")
     _, episodes = load_manifest(Path(hdf5_manifest))
     episode_lookup = {episode.key: episode for episode in episodes}
@@ -366,7 +458,11 @@ def _derive_phrase_table(
             if not embeddings:
                 raise ValueError(f"missing train embedding for {role} phrase {phrase!r}")
             rows.append(F.normalize(torch.stack(embeddings).mean(dim=0), dim=-1))
-        tensors[role] = torch.stack(rows).to(torch.float16).contiguous()
+        tensors[role] = (
+            torch.stack(rows).to(torch.float16).contiguous()
+            if rows
+            else torch.empty((0, 1152), dtype=torch.float16)
+        )
     return vocabulary_by_role, tensors
 
 
@@ -485,6 +581,74 @@ def load_phrase_embedding_table(
     return expected_vocabulary, tensors
 
 
+def _write_build_diagnostics(cache_dir: Path) -> None:
+    with HindsightCache.open(cache_dir) as cache:
+        body = {
+            "format_version": _FORMAT_VERSION,
+            "policy": "fail_closed_no_discard",
+            "cache_hash": cache.cache_hash,
+            "index_sha256": cache.manifest["index"]["sha256"],
+            "validated_trajectory_ids": sorted(
+                {record.episode_key for record in cache.records}
+            ),
+            "discarded_trajectory_ids": [],
+            "non_finite_trajectory_ids": [],
+        }
+    payload = {**body, "diagnostics_hash": sha256_json(body)}
+    path = cache_dir / "build_diagnostics.json"
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    path.chmod(0o444)
+
+
+def _load_build_diagnostics(cache_dir: Path) -> dict[str, Any]:
+    path = cache_dir / "build_diagnostics.json"
+    if not path.is_file():
+        raise ValueError("cache build diagnostics are missing")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cache build diagnostics are invalid: {error}") from error
+    fields = {
+        "format_version",
+        "policy",
+        "cache_hash",
+        "index_sha256",
+        "validated_trajectory_ids",
+        "discarded_trajectory_ids",
+        "non_finite_trajectory_ids",
+        "diagnostics_hash",
+    }
+    if not isinstance(payload, dict) or set(payload) != fields:
+        raise ValueError("cache build diagnostics fields are invalid")
+    body = {
+        name: payload[name]
+        for name in fields
+        if name != "diagnostics_hash"
+    }
+    if payload["diagnostics_hash"] != sha256_json(body):
+        raise ValueError("cache build diagnostics hash mismatch")
+    with HindsightCache.open(cache_dir) as cache:
+        expected_ids = sorted({record.episode_key for record in cache.records})
+        valid = (
+            payload["format_version"] == _FORMAT_VERSION
+            and payload["policy"] == "fail_closed_no_discard"
+            and payload["cache_hash"] == cache.cache_hash
+            and payload["index_sha256"] == cache.manifest["index"]["sha256"]
+            and payload["validated_trajectory_ids"] == expected_ids
+            and payload["discarded_trajectory_ids"] == []
+            and payload["non_finite_trajectory_ids"] == []
+        )
+    if not valid:
+        raise ValueError(
+            "cache build diagnostics violate the successful-cache invariant"
+        )
+    return payload
+
+
 def finalize_cache(
     *,
     window_manifest: Path | str,
@@ -518,6 +682,7 @@ def finalize_cache(
             expected_records=records,
         )
         _phrase_table(stage, records)
+        _write_build_diagnostics(stage)
         _fsync_path(stage)
         os.replace(stage, output)
         _fsync_path(output.parent)
@@ -553,6 +718,7 @@ def audit_cache(
         raise ValueError("samples must be a positive integer")
     cache = Path(cache)
     margins = _counterfactual_margins(cache)
+    diagnostics = _load_build_diagnostics(cache)
     with HindsightCache.open(cache) as opened:
         count = min(samples, len(opened))
         indices = np.linspace(0, len(opened) - 1, count, dtype=np.int64)
@@ -623,8 +789,11 @@ def audit_cache(
             "samples_audited": count,
             "per_camera_phrase": per_camera_phrase,
             "per_camera": per_camera,
-            "discarded_trajectory_ids": [],
-            "non_finite_trajectory_ids": [],
+            "validated_trajectory_ids": diagnostics["validated_trajectory_ids"],
+            "discarded_trajectory_ids": diagnostics["discarded_trajectory_ids"],
+            "non_finite_trajectory_ids": diagnostics[
+                "non_finite_trajectory_ids"
+            ],
         }
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -640,7 +809,10 @@ def _load_production_builder(arguments: argparse.Namespace) -> HindsightTargetBu
     from qwen35_planx.siglip_relevance import SiglipRelevanceTeacher
     from qwen35_planx.temporal_grounding import DinoTemporalTeacher
 
-    records = load_window_records(arguments.window_manifest)
+    records = load_window_records(
+        arguments.window_manifest,
+        expected_hdf5_manifest=arguments.hdf5_manifest,
+    )
     vocabulary = build_counterfactual_vocabulary(records)
     device = torch.device(
         f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}"
@@ -690,7 +862,10 @@ def _build_command(arguments: argparse.Namespace) -> int:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
         return 2
-    records = load_window_records(arguments.window_manifest)
+    records = load_window_records(
+        arguments.window_manifest,
+        expected_hdf5_manifest=arguments.hdf5_manifest,
+    )
     shard_index = arguments.shard_index
     if shard_index is None:
         shard_index = int(os.environ.get("RANK", "0"))
@@ -706,6 +881,7 @@ def _build_command(arguments: argparse.Namespace) -> int:
         return 2
     metadata = build_cache_metadata(
         hdf5_manifest=arguments.hdf5_manifest,
+        window_manifest=arguments.window_manifest,
         records=records,
         ta_checkpoint=arguments.ta_checkpoint,
         siglip_model=arguments.siglip_model,

@@ -431,7 +431,10 @@ def collect_hindsight_cache_preflight_errors(
         try:
             from qwen35_planx.cli.build_hindsight_cache import load_window_records
 
-            windows = load_window_records(windows_path)
+            windows = load_window_records(
+                windows_path,
+                expected_hdf5_manifest=hdf5_path,
+            )
             if episode_lookup:
                 for window in windows:
                     episode = episode_lookup.get(window.episode_key)
@@ -471,6 +474,17 @@ def collect_hindsight_cache_preflight_errors(
                     )
         except Exception as error:
             errors.append(f"window manifest failed safe validation: {error}")
+
+    if episode_lookup:
+        from qwen35_planx.hindsight_data import read_full_trajectory
+
+        for episode_key in sorted(episode_lookup):
+            try:
+                read_full_trajectory(episode_lookup[episode_key])
+            except Exception as error:
+                errors.append(
+                    f"HDF5 episode {episode_key} failed complete validation: {error}"
+                )
 
     if not checkpoint_path.is_file():
         errors.append(f"released TA-Tok checkpoint does not exist: {checkpoint_path}")

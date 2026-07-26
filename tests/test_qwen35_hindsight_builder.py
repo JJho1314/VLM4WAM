@@ -317,10 +317,69 @@ def _write_fake_hdf5_manifest(root: Path) -> Path:
     return path
 
 
-def _metadata(records: list[HindsightWindowRecord]) -> HindsightCacheMetadata:
+def _write_window_manifest_envelope(
+    root: Path,
+    *,
+    hdf5_manifest: Path,
+    records: list[HindsightWindowRecord],
+) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    ordered = sorted(records, key=lambda record: record.sample_id)
+    files = {}
+    for split in ("train", "val"):
+        path = root / f"hindsight_{split}.jsonl"
+        split_records = [record for record in ordered if record.split == split]
+        path.write_text(
+            "".join(
+                json.dumps(record.to_dict(), sort_keys=True) + "\n"
+                for record in split_records
+            ),
+            encoding="utf-8",
+        )
+        files[path.name] = {
+            "records": len(split_records),
+            "sha256": sha256_file(path),
+        }
+    contract = {
+        "format_version": 1,
+        "camera_names": ["main", "wrist"],
+        "num_keyframes": 4,
+        "ge_act_future_indices": [0, 3, 5, 8],
+        "action_chunk": 36,
+        "chunk": 9,
+        "n_previous": 4,
+        "video_temporal_stride": 4,
+        "split_seed": 42,
+        "window_stride": 36,
+        "sample_n_frames": 500,
+    }
+    envelope = {
+        **contract,
+        "contract_hash": sha256_json(contract),
+        "hdf5_manifest": str(hdf5_manifest.resolve()),
+        "hdf5_manifest_hash": sha256_file(hdf5_manifest),
+        "window_manifest_hash": sha256_json(
+            [record.to_dict() for record in ordered]
+        ),
+        "files": files,
+    }
+    path = root / "manifest.json"
+    path.write_text(json.dumps(envelope), encoding="utf-8")
+    return path
+
+
+def _metadata(
+    records: list[HindsightWindowRecord],
+    *,
+    hdf5_manifest: Path | None = None,
+) -> HindsightCacheMetadata:
     return HindsightCacheMetadata(
         format_version=1,
-        hdf5_manifest_hash="hdf5-hash",
+        hdf5_manifest_hash=(
+            "hdf5-hash"
+            if hdf5_manifest is None
+            else sha256_file(hdf5_manifest)
+        ),
         window_manifest_hash=sha256_json([record.to_dict() for record in records]),
         instruction_parser_hash="parser-hash",
         ta_tok_hash="ta-hash",
@@ -347,16 +406,26 @@ def test_fake_teacher_build_finalize_audit_smoke(
 
     hdf5_manifest = _write_fake_hdf5_manifest(tmp_path / "hdf5")
     record = fake_builder_inputs.window
-    window_manifest = tmp_path / "windows.jsonl"
-    window_manifest.write_text(
-        json.dumps(record.to_dict(), sort_keys=True) + "\n",
-        encoding="utf-8",
+    window_manifest = _write_window_manifest_envelope(
+        tmp_path / "windows",
+        hdf5_manifest=hdf5_manifest,
+        records=[record],
     )
     source_mtime = (tmp_path / "hdf5" / "episodes.hdf5").stat().st_mtime_ns
     builder = HindsightTargetBuilder.from_components(
         **fake_builder_inputs.components
     )
     shard_root = tmp_path / "shards"
+    with pytest.raises(ValueError, match="authoritative HDF5 manifest hash"):
+        build_shards(
+            hdf5_manifest=hdf5_manifest,
+            window_manifest=window_manifest,
+            output=tmp_path / "bad-shards",
+            shard_index=0,
+            num_shards=1,
+            builder=builder,
+            metadata=_metadata([record]),
+        )
     build_shards(
         hdf5_manifest=hdf5_manifest,
         window_manifest=window_manifest,
@@ -364,7 +433,7 @@ def test_fake_teacher_build_finalize_audit_smoke(
         shard_index=0,
         num_shards=1,
         builder=builder,
-        metadata=_metadata([record]),
+        metadata=_metadata([record], hdf5_manifest=hdf5_manifest),
     )
     from qwen35_planx.cli import build_hindsight_cache as cache_cli
 
@@ -396,6 +465,7 @@ def test_fake_teacher_build_finalize_audit_smoke(
         assert cache.codes.flags.writeable is False
     assert metrics_path.is_file()
     assert metrics["samples_audited"] == 1
+    assert metrics["validated_trajectory_ids"] == ["libero_goal:000000"]
     assert set(metrics["per_camera_phrase"]["main"]) == {
         "source",
         "target",
@@ -411,6 +481,12 @@ def test_fake_teacher_build_finalize_audit_smoke(
     )
     assert vocabulary["split"] == "train"
     assert "forbidden validation drawer" not in json.dumps(vocabulary)
+    diagnostics = json.loads(
+        (cache_dir / "build_diagnostics.json").read_text(encoding="utf-8")
+    )
+    assert diagnostics["validated_trajectory_ids"] == ["libero_goal:000000"]
+    assert diagnostics["discarded_trajectory_ids"] == []
+    assert diagnostics["non_finite_trajectory_ids"] == []
     assert (tmp_path / "hdf5" / "episodes.hdf5").stat().st_mtime_ns == source_mtime
     assert any(
         path.endswith("phrase_embeddings.safetensors") for path in fsynced
@@ -496,8 +572,11 @@ def test_hindsight_preflight_rejects_window_mismatch_bounds_and_existing_output(
         frame_indices=frames,
         action_indices=actions,
     )
-    windows = tmp_path / "windows.jsonl"
-    windows.write_text(json.dumps(invalid.to_dict()) + "\n", encoding="utf-8")
+    windows = _write_window_manifest_envelope(
+        tmp_path / "windows",
+        hdf5_manifest=hdf5_manifest,
+        records=[invalid],
+    )
     output = tmp_path / "existing-output"
     output.mkdir()
 
@@ -514,6 +593,200 @@ def test_hindsight_preflight_rejects_window_mismatch_bounds_and_existing_output(
     assert any("caption" in error for error in errors)
     assert any("trajectory bounds" in error for error in errors)
     assert any("already exists" in error for error in errors)
+
+
+def test_window_loader_requires_hash_bound_task3_envelope(tmp_path: Path) -> None:
+    from qwen35_planx.cli.build_hindsight_cache import load_window_records
+
+    hdf5_manifest = _write_fake_hdf5_manifest(tmp_path / "hdf5")
+    envelope = _write_window_manifest_envelope(
+        tmp_path / "windows",
+        hdf5_manifest=hdf5_manifest,
+        records=[_window()],
+    )
+    standalone = envelope.parent / "hindsight_train.jsonl"
+
+    with pytest.raises(ValueError, match="canonical Task-3.*envelope"):
+        load_window_records(standalone)
+
+    standalone.write_text("", encoding="utf-8")
+    with pytest.raises(ValueError, match="SHA-256|record count"):
+        load_window_records(envelope)
+
+
+def test_window_loader_rejects_self_consistent_split_label_edit(
+    tmp_path: Path,
+) -> None:
+    from qwen35_planx.cli.build_hindsight_cache import load_window_records
+
+    hdf5_manifest = _write_fake_hdf5_manifest(tmp_path / "hdf5")
+    envelope_path = _write_window_manifest_envelope(
+        tmp_path / "windows",
+        hdf5_manifest=hdf5_manifest,
+        records=[_window()],
+    )
+    envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+    train_path = envelope_path.parent / "hindsight_train.jsonl"
+    row = _window().to_dict()
+    row["split"] = "val"
+    train_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    envelope["files"]["hindsight_train.jsonl"] = {
+        "records": 1,
+        "sha256": sha256_file(train_path),
+    }
+    envelope["window_manifest_hash"] = sha256_json([row])
+    envelope_path.write_text(json.dumps(envelope), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="split.*filename"):
+        load_window_records(envelope_path)
+
+
+def test_hdf5_trajectory_rejects_nonfinite_actions_and_states() -> None:
+    trajectory = _trajectory()
+    for field in ("actions", "states"):
+        values = np.array(getattr(trajectory, field), copy=True)
+        values[0, 0] = np.nan
+        arguments = {
+            "rgb": trajectory.rgb,
+            "actions": trajectory.actions,
+            "states": trajectory.states,
+            field: values,
+        }
+        with pytest.raises(ValueError, match=rf"{field}.*finite"):
+            HDF5Trajectory(**arguments)
+
+
+def test_builder_rechecks_finite_trajectory_before_any_teacher(
+    fake_builder_inputs,
+) -> None:
+    from qwen35_planx.hindsight_builder import HindsightTargetBuilder
+
+    fake_builder_inputs.trajectory.actions[0, 0] = np.nan
+    builder = HindsightTargetBuilder.from_components(
+        **fake_builder_inputs.components
+    )
+
+    with pytest.raises(ValueError, match="actions.*finite"):
+        builder.build_window(
+            fake_builder_inputs.trajectory,
+            fake_builder_inputs.window,
+        )
+    assert fake_builder_inputs.dino.frames_seen == 0
+
+
+@pytest.mark.parametrize("corruption", ["signature", "missing_group", "nonfinite"])
+def test_preflight_reads_every_hdf5_episode_before_teacher_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    corruption: str,
+) -> None:
+    from qwen35_planx.cli import build_hindsight_cache as cache_cli
+
+    hdf5_manifest = _write_fake_hdf5_manifest(tmp_path / "hdf5")
+    windows = _write_window_manifest_envelope(
+        tmp_path / "windows",
+        hdf5_manifest=hdf5_manifest,
+        records=[_window()],
+    )
+    shard = tmp_path / "hdf5" / "episodes.hdf5"
+    if corruption == "signature":
+        shard.write_bytes(b"not an HDF5 file")
+    elif corruption == "missing_group":
+        with h5py.File(shard, "a") as handle:
+            del handle["episodes/libero_goal:000000"]
+    else:
+        with h5py.File(shard, "a") as handle:
+            handle["episodes/libero_goal:000000/action"][0, 0] = np.nan
+
+    monkeypatch.setattr(
+        cache_cli,
+        "_load_production_builder",
+        lambda _arguments: pytest.fail("teachers allocated before HDF5 validation"),
+    )
+    result = cache_cli.main(
+        [
+            "build",
+            "--hdf5-manifest",
+            str(hdf5_manifest),
+            "--window-manifest",
+            str(windows),
+            "--ta-checkpoint",
+            str(tmp_path / "missing-ta.pt"),
+            "--siglip-model",
+            str(tmp_path / "missing-siglip"),
+            "--dinov3-model",
+            str(tmp_path / "missing-dino"),
+            "--output",
+            str(tmp_path / "shards"),
+            "--shard-index",
+            "0",
+            "--num-shards",
+            "1",
+        ]
+    )
+
+    assert result == 2
+    assert not (tmp_path / "shards").exists()
+    assert "HDF5 episode libero_goal:000000 failed complete validation" in (
+        capsys.readouterr().err
+    )
+
+
+def test_finalize_supports_empty_train_role_vocabulary(
+    fake_builder_inputs,
+    tmp_path: Path,
+) -> None:
+    from qwen35_planx.cli.build_hindsight_cache import (
+        build_shards,
+        finalize_cache,
+        load_phrase_embedding_table,
+    )
+    from qwen35_planx.hindsight_builder import HindsightTargetBuilder
+
+    record = replace(fake_builder_inputs.window, caption="open the wooden drawer")
+    hdf5_manifest = _write_fake_hdf5_manifest(tmp_path / "hdf5")
+    shard = tmp_path / "hdf5" / "episodes.hdf5"
+    with h5py.File(shard, "a") as handle:
+        group = handle["episodes/libero_goal:000000"]
+        del group["caption"]
+        group.create_dataset(
+            "caption",
+            data=record.caption,
+            dtype=h5py.string_dtype("utf-8"),
+        )
+    payload = json.loads(hdf5_manifest.read_text(encoding="utf-8"))
+    payload["episodes"][0]["caption"] = record.caption
+    hdf5_manifest.write_text(json.dumps(payload), encoding="utf-8")
+    windows = _write_window_manifest_envelope(
+        tmp_path / "windows",
+        hdf5_manifest=hdf5_manifest,
+        records=[record],
+    )
+    builder = HindsightTargetBuilder.from_components(
+        **fake_builder_inputs.components
+    )
+    shard_root = tmp_path / "shards"
+    build_shards(
+        hdf5_manifest=hdf5_manifest,
+        window_manifest=windows,
+        output=shard_root,
+        shard_index=0,
+        num_shards=1,
+        builder=builder,
+        metadata=_metadata([record], hdf5_manifest=hdf5_manifest),
+    )
+
+    cache_dir = tmp_path / "cache"
+    finalize_cache(
+        window_manifest=windows,
+        shard_root=shard_root,
+        output=cache_dir,
+    )
+    vocabulary, tensors = load_phrase_embedding_table(cache_dir)
+
+    assert vocabulary["target"] == []
+    assert tensors["target"].shape == (0, 1152)
 
 
 def test_ola_launcher_runs_preflight_before_workers(tmp_path: Path) -> None:

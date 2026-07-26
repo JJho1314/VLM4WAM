@@ -132,6 +132,10 @@ class HDF5Trajectory:
             raise ValueError("actions must have shape [T,7] and dtype float32")
         if self.states.shape != (length, 8) or self.states.dtype != np.float32:
             raise ValueError("states must have shape [T,8] and dtype float32")
+        if not np.isfinite(self.actions).all():
+            raise ValueError("actions must contain only finite values")
+        if not np.isfinite(self.states).all():
+            raise ValueError("states must contain only finite values")
 
 
 def _uniform_window_indices(
