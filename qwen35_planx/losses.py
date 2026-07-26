@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import math
 
 import torch
@@ -23,6 +24,12 @@ def _weighted_mean(value: Tensor, weight: Tensor) -> Tensor:
     return (finite_value * finite_weight).sum() / finite_weight.sum().clamp_min(1e-12)
 
 
+def _autocast_disabled(device_type: str):
+    if device_type == "meta":
+        return nullcontext()
+    return torch.autocast(device_type=device_type, enabled=False)
+
+
 class _MemoryBoundedVisualCrossEntropy(torch.autograd.Function):
     """Recompute each visual-logit chunk instead of saving logits for backward."""
 
@@ -38,20 +45,23 @@ class _MemoryBoundedVisualCrossEntropy(torch.autograd.Function):
         flat_targets = targets.reshape(-1)
         loss_sum = torch.zeros((), device=hidden.device, dtype=torch.float32)
         predictions = torch.empty_like(flat_targets)
-        for start in range(0, flat_hidden.shape[0], chunk_size):
-            stop = min(start + chunk_size, flat_hidden.shape[0])
-            logits = F.linear(
-                flat_hidden[start:stop].float(),
-                visual_weight.float(),
-            )
-            loss_sum.add_(
-                F.cross_entropy(
-                    logits,
-                    flat_targets[start:stop],
-                    reduction="sum",
+        with _autocast_disabled(hidden.device.type):
+            flat_hidden_fp32 = flat_hidden.float()
+            visual_weight_fp32 = visual_weight.float()
+            for start in range(0, flat_hidden.shape[0], chunk_size):
+                stop = min(start + chunk_size, flat_hidden.shape[0])
+                logits = F.linear(
+                    flat_hidden_fp32[start:stop],
+                    visual_weight_fp32,
                 )
-            )
-            predictions[start:stop] = logits.argmax(dim=-1)
+                loss_sum.add_(
+                    F.cross_entropy(
+                        logits,
+                        flat_targets[start:stop],
+                        reduction="sum",
+                    )
+                )
+                predictions[start:stop] = logits.argmax(dim=-1)
 
         predictions = predictions.reshape(targets.shape)
         ctx.save_for_backward(hidden, visual_weight, targets)
@@ -72,32 +82,41 @@ class _MemoryBoundedVisualCrossEntropy(torch.autograd.Function):
 
         flat_hidden = hidden.reshape(-1, hidden.shape[-1])
         flat_targets = targets.reshape(-1)
-        flat_hidden_fp32 = flat_hidden.float()
-        visual_weight_fp32 = visual_weight.float()
-        grad_hidden = (
-            torch.zeros_like(flat_hidden_fp32) if needs_hidden else None
-        )
-        grad_weight = (
-            torch.zeros_like(visual_weight_fp32) if needs_weight else None
-        )
-        scale = grad_loss.float() / flat_hidden.shape[0]
-
-        for start in range(0, flat_hidden.shape[0], ctx.chunk_size):
-            stop = min(start + ctx.chunk_size, flat_hidden.shape[0])
-            hidden_chunk = flat_hidden_fp32[start:stop]
-            logits = F.linear(hidden_chunk, visual_weight_fp32)
-            grad_logits = logits.softmax(dim=-1)
-            target_column = flat_targets[start:stop].unsqueeze(-1)
-            grad_logits.scatter_add_(
-                dim=1,
-                index=target_column,
-                src=-torch.ones_like(target_column, dtype=grad_logits.dtype),
+        with _autocast_disabled(hidden.device.type):
+            flat_hidden_fp32 = flat_hidden.float()
+            visual_weight_fp32 = visual_weight.float()
+            grad_hidden = (
+                torch.zeros_like(flat_hidden_fp32) if needs_hidden else None
             )
-            grad_logits.mul_(scale)
-            if grad_hidden is not None:
-                grad_hidden[start:stop] = grad_logits.matmul(visual_weight_fp32)
-            if grad_weight is not None:
-                grad_weight.addmm_(grad_logits.transpose(0, 1), hidden_chunk)
+            grad_weight = (
+                torch.zeros_like(visual_weight_fp32) if needs_weight else None
+            )
+            scale = grad_loss.float() / flat_hidden.shape[0]
+
+            for start in range(0, flat_hidden.shape[0], ctx.chunk_size):
+                stop = min(start + ctx.chunk_size, flat_hidden.shape[0])
+                hidden_chunk = flat_hidden_fp32[start:stop]
+                logits = F.linear(hidden_chunk, visual_weight_fp32)
+                grad_logits = logits.softmax(dim=-1)
+                target_column = flat_targets[start:stop].unsqueeze(-1)
+                grad_logits.scatter_add_(
+                    dim=1,
+                    index=target_column,
+                    src=-torch.ones_like(
+                        target_column,
+                        dtype=grad_logits.dtype,
+                    ),
+                )
+                grad_logits.mul_(scale)
+                if grad_hidden is not None:
+                    grad_hidden[start:stop] = grad_logits.matmul(
+                        visual_weight_fp32
+                    )
+                if grad_weight is not None:
+                    grad_weight.addmm_(
+                        grad_logits.transpose(0, 1),
+                        hidden_chunk,
+                    )
 
         hidden_gradient = (
             None

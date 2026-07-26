@@ -484,6 +484,17 @@ class _GroupedPlanner(nn.Module):
         self.fusion_gate = nn.Sequential(nn.Linear(8, 2), nn.SiLU(), nn.Linear(2, 1))
 
 
+class _QwenLikeInventoryModel(nn.Module):
+    def __init__(self, *, tied: bool) -> None:
+        super().__init__()
+        self.model = nn.Module()
+        self.model.language_model = nn.Module()
+        self.model.language_model.embed_tokens = nn.Embedding(11, 5)
+        self.lm_head = nn.Linear(5, 11, bias=False)
+        if tied:
+            self.lm_head.weight = self.model.language_model.embed_tokens.weight
+
+
 class _SaveableArtifact:
     def __init__(self, kind: str) -> None:
         self.kind = kind
@@ -524,6 +535,69 @@ def _tiny_checkpoint_metadata() -> dict[str, object]:
         "tokenizer_hash": "tokenizer-sha256",
         "base_model_hash": "base-model-sha256",
     }
+
+
+def _make_one_step_checkpoint(
+    output_dir: Path,
+    *,
+    scaler=None,
+):
+    from qwen35_planx.cli.train_semantic_planner import (
+        build_optimizer_groups,
+        save_planner_checkpoint,
+    )
+
+    planner = _GroupedPlanner()
+    groups = build_optimizer_groups(planner, visual_token_start_id=7)
+    optimizer = torch.optim.AdamW(groups)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    sum(parameter.square().sum() for parameter in planner.parameters()).backward()
+    optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad(set_to_none=True)
+    checkpoint = save_planner_checkpoint(
+        output_dir=output_dir,
+        step=1,
+        planner=planner,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        processor=_SaveableArtifact("processor"),
+        tokenizer=_SaveableArtifact("tokenizer"),
+        metadata=_tiny_checkpoint_metadata(),
+        codebook=torch.randn(13, 3),
+        scaler=scaler,
+        optimizer_group_lrs={
+            group["name"]: group["lr"] for group in groups
+        },
+        allow_test_artifacts=True,
+    )
+    return checkpoint, planner, optimizer, scheduler
+
+
+def _refresh_checkpoint_hash(checkpoint: Path, name: str) -> None:
+    from qwen35_planx.cli.train_semantic_planner import _artifact_hash
+
+    trainer_path = checkpoint / "trainer_state.json"
+    trainer_state = json.loads(trainer_path.read_text(encoding="utf-8"))
+    trainer_state["artifact_hashes"][name] = _artifact_hash(checkpoint / name)
+    trainer_path.write_text(json.dumps(trainer_state), encoding="utf-8")
+
+
+def _assert_rng_states_equal(
+    actual: dict[str, object],
+    expected: dict[str, object],
+) -> None:
+    assert actual.keys() == expected.keys()
+    for name, expected_value in expected.items():
+        actual_value = actual[name]
+        if isinstance(expected_value, torch.Tensor):
+            torch.testing.assert_close(actual_value, expected_value)
+        elif isinstance(expected_value, list):
+            assert len(actual_value) == len(expected_value)
+            for actual_item, expected_item in zip(actual_value, expected_value):
+                torch.testing.assert_close(actual_item, expected_item)
+        else:
+            assert actual_value == expected_value
 
 
 def test_optimizer_groups_are_exact_exhaustive_and_duplicate_free() -> None:
@@ -589,6 +663,38 @@ def test_optimizer_groups_are_exact_exhaustive_and_duplicate_free() -> None:
         "fusion_gate.2.weight",
         "fusion_gate.2.bias",
     }
+
+
+def test_qwen_inventory_accepts_canonical_tied_weight_and_rejects_untied_gap() -> None:
+    from qwen35_planx.cli.preflight import (
+        _canonical_weight_shapes,
+        _validate_weight_inventory,
+    )
+
+    tied_expected = _canonical_weight_shapes(
+        _QwenLikeInventoryModel(tied=True)
+    )
+    assert tied_expected == {
+        "model.language_model.embed_tokens.weight": (11, 5),
+    }
+    assert _validate_weight_inventory(
+        {
+            "model.language_model.embed_tokens.weight": (11, 5),
+        },
+        tied_expected,
+    ) == []
+
+    untied_expected = _canonical_weight_shapes(
+        _QwenLikeInventoryModel(tied=False)
+    )
+    errors = _validate_weight_inventory(
+        {
+            "model.language_model.embed_tokens.weight": (11, 5),
+        },
+        untied_expected,
+    )
+    assert len(errors) == 1
+    assert "missing keys: lm_head.weight" in errors[0]
 
 
 def test_selective_checkpointing_and_effective_batch_contract() -> None:
@@ -721,6 +827,139 @@ def test_atomic_checkpoint_resume_restores_all_training_state(tmp_path: Path) ->
                 assert value == expected
     assert scheduler.state_dict() == expected_scheduler
     torch.testing.assert_close(torch.random.get_rng_state(), rank_one_rng["torch_cpu"])
+
+
+def test_directory_validation_reads_persisted_scheduler_step(
+    tmp_path: Path,
+) -> None:
+    from qwen35_planx.cli.train_semantic_planner import validate_planner_checkpoint
+
+    checkpoint, _, _, _ = _make_one_step_checkpoint(tmp_path / "run")
+    scheduler_path = checkpoint / "scheduler.pt"
+    scheduler_state = torch.load(
+        scheduler_path,
+        weights_only=True,
+        map_location="cpu",
+    )
+    scheduler_state["last_epoch"] = 2
+    torch.save(scheduler_state, scheduler_path)
+    _refresh_checkpoint_hash(checkpoint, "scheduler.pt")
+
+    with pytest.raises(ValueError, match="scheduler step differs"):
+        validate_planner_checkpoint(
+            checkpoint,
+            expected_metadata=_tiny_checkpoint_metadata(),
+            allow_test_artifacts=True,
+        )
+
+
+def test_directory_validation_rejects_mixed_adamw_slot_steps(
+    tmp_path: Path,
+) -> None:
+    from qwen35_planx.cli.train_semantic_planner import validate_planner_checkpoint
+
+    checkpoint, _, _, _ = _make_one_step_checkpoint(tmp_path / "run")
+    optimizer_path = checkpoint / "optimizer.pt"
+    optimizer_state = torch.load(
+        optimizer_path,
+        weights_only=True,
+        map_location="cpu",
+    )
+    first_slot = next(iter(optimizer_state["state"].values()))
+    first_slot["step"] = torch.zeros_like(first_slot["step"])
+    torch.save(optimizer_state, optimizer_path)
+    _refresh_checkpoint_hash(checkpoint, "optimizer.pt")
+
+    with pytest.raises(ValueError, match="AdamW slot step"):
+        validate_planner_checkpoint(
+            checkpoint,
+            expected_metadata=_tiny_checkpoint_metadata(),
+            allow_test_artifacts=True,
+        )
+
+
+def test_resume_prevalidates_adamw_slots_and_rng_before_mutation(
+    tmp_path: Path,
+) -> None:
+    from qwen35_planx.cli.train_semantic_planner import (
+        _capture_rng_state,
+        load_planner_checkpoint,
+    )
+
+    scaler = _FakeScaler()
+    checkpoint, planner, optimizer, scheduler = _make_one_step_checkpoint(
+        tmp_path / "run",
+        scaler=scaler,
+    )
+    for parameter in planner.parameters():
+        parameter.data.zero_()
+    sentinel_model = {
+        name: value.detach().clone()
+        for name, value in planner.state_dict().items()
+    }
+    sentinel_optimizer = copy.deepcopy(optimizer.state_dict())
+    sentinel_scheduler = copy.deepcopy(scheduler.state_dict())
+    sentinel_scaler = copy.deepcopy(scaler.state_dict())
+    sentinel_rng = _capture_rng_state()
+
+    def assert_unchanged() -> None:
+        for name, value in planner.state_dict().items():
+            torch.testing.assert_close(value, sentinel_model[name])
+        actual_optimizer = optimizer.state_dict()
+        assert actual_optimizer["param_groups"] == sentinel_optimizer["param_groups"]
+        assert actual_optimizer["state"].keys() == sentinel_optimizer["state"].keys()
+        for key, state in actual_optimizer["state"].items():
+            for name, value in state.items():
+                expected = sentinel_optimizer["state"][key][name]
+                if isinstance(value, torch.Tensor):
+                    torch.testing.assert_close(value, expected)
+                else:
+                    assert value == expected
+        assert scheduler.state_dict() == sentinel_scheduler
+        for name, value in scaler.state_dict().items():
+            torch.testing.assert_close(value, sentinel_scaler[name])
+        _assert_rng_states_equal(_capture_rng_state(), sentinel_rng)
+
+    optimizer_path = checkpoint / "optimizer.pt"
+    original_optimizer = torch.load(
+        optimizer_path,
+        weights_only=True,
+        map_location="cpu",
+    )
+    missing_slot = copy.deepcopy(original_optimizer)
+    next(iter(missing_slot["state"].values())).pop("exp_avg_sq")
+    torch.save(missing_slot, optimizer_path)
+    _refresh_checkpoint_hash(checkpoint, "optimizer.pt")
+    with pytest.raises(ValueError, match="AdamW slot"):
+        load_planner_checkpoint(
+            checkpoint,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            expected_metadata=_tiny_checkpoint_metadata(),
+            allow_test_artifacts=True,
+        )
+    assert_unchanged()
+
+    torch.save(original_optimizer, optimizer_path)
+    _refresh_checkpoint_hash(checkpoint, "optimizer.pt")
+    rng_path = checkpoint / "rng_state.pt"
+    rng_payload = torch.load(rng_path, weights_only=True, map_location="cpu")
+    rng_payload["states"][0]["python_version"] = 999
+    torch.save(rng_payload, rng_path)
+    _refresh_checkpoint_hash(checkpoint, "rng_state.pt")
+    with pytest.raises(ValueError, match="RNG state"):
+        load_planner_checkpoint(
+            checkpoint,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            expected_metadata=_tiny_checkpoint_metadata(),
+            allow_test_artifacts=True,
+        )
+    assert_unchanged()
 
 
 def test_resume_fails_closed_before_mutation_on_missing_or_mismatch(

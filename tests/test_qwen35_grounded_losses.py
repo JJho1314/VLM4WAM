@@ -67,6 +67,57 @@ def test_chunked_visual_ce_bf16_matches_fp32_reference_and_gradients() -> None:
     )
 
 
+def test_chunked_visual_ce_disables_outer_autocast_for_fp32_math(
+    monkeypatch,
+) -> None:
+    import qwen35_planx.losses as losses
+
+    torch.manual_seed(92)
+    hidden_fp32 = torch.randn(2, 19, 64, requires_grad=True)
+    weight_fp32 = torch.randn(1024, 64, requires_grad=True)
+    targets = torch.randint(0, 1024, (2, 19))
+    reference = F.cross_entropy(
+        hidden_fp32.reshape(-1, 64) @ weight_fp32.T,
+        targets.reshape(-1),
+    )
+    reference.backward()
+    expected_hidden_grad = hidden_fp32.grad.detach().clone()
+    expected_weight_grad = weight_fp32.grad.detach().clone()
+
+    linear_dtypes: list[torch.dtype] = []
+    original_linear = losses.F.linear
+
+    def recording_linear(
+        input: torch.Tensor,
+        rows: torch.Tensor,
+    ) -> torch.Tensor:
+        result = original_linear(input, rows)
+        linear_dtypes.append(result.dtype)
+        return result
+
+    monkeypatch.setattr(losses.F, "linear", recording_linear)
+    hidden = hidden_fp32.detach().to(torch.bfloat16).requires_grad_(True)
+    weight = weight_fp32.detach().to(torch.bfloat16).requires_grad_(True)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        actual = losses.chunked_visual_cross_entropy(
+            hidden,
+            weight,
+            targets,
+            chunk_size=5,
+        )
+
+    assert actual.dtype == torch.float32
+    assert linear_dtypes and set(linear_dtypes) == {torch.float32}
+    actual.backward()
+    torch.testing.assert_close(actual, reference, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(
+        hidden.grad.float(), expected_hidden_grad, atol=3e-3, rtol=3e-2
+    )
+    torch.testing.assert_close(
+        weight.grad.float(), expected_weight_grad, atol=3e-3, rtol=3e-2
+    )
+
+
 def test_chunked_visual_ce_never_materializes_more_than_requested_positions(
     monkeypatch,
 ) -> None:

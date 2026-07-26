@@ -101,6 +101,20 @@ def _expected_weight_shapes(config: object) -> dict[str, tuple[int, ...]]:
     return {name: tuple(tensor.shape) for name, tensor in model.state_dict().items()}
 
 
+def _canonical_weight_shapes(model: torch.nn.Module) -> dict[str, tuple[int, ...]]:
+    """Return persistent state shapes with tied tensor aliases de-duplicated."""
+
+    expected: dict[str, tuple[int, ...]] = {}
+    seen: set[int] = set()
+    for name, tensor in model.state_dict(keep_vars=True).items():
+        identifier = id(tensor)
+        if identifier in seen:
+            continue
+        seen.add(identifier)
+        expected[name] = tuple(tensor.shape)
+    return expected
+
+
 def _inventory_safetensors(path: Path) -> dict[str, tuple[int, ...]]:
     with safe_open(path, framework="pt", device="cpu") as handle:
         return {
@@ -356,10 +370,7 @@ def _validate_local_qwen_model(model_path: Path) -> list[str]:
         config = AutoConfig.from_pretrained(model_path, local_files_only=True)
         with torch.device("meta"):
             model = AutoModelForImageTextToText.from_config(config)
-        expected = {
-            name: tuple(tensor.shape)
-            for name, tensor in model.state_dict().items()
-        }
+        expected = _canonical_weight_shapes(model)
         index_paths = [
             model_path / name
             for name in _WEIGHT_INDEX_NAMES

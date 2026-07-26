@@ -574,12 +574,14 @@ def _validate_rng_state(state: Mapping[str, Any]) -> None:
     if (
         not isinstance(torch_cpu, torch.Tensor)
         or torch_cpu.dtype != torch.uint8
+        or torch_cpu.device.type != "cpu"
         or torch_cpu.ndim != 1
         or torch_cpu.numel() == 0
         or not isinstance(torch_cuda, list)
         or any(
             not isinstance(value, torch.Tensor)
             or value.dtype != torch.uint8
+            or value.device.type != "cpu"
             or value.ndim != 1
             or value.numel() == 0
             for value in torch_cuda
@@ -608,7 +610,38 @@ def _validate_rng_state(state: Mapping[str, Any]) -> None:
         or not isinstance(state["numpy_cached_gaussian"], (int, float))
         or not math.isfinite(float(state["numpy_cached_gaussian"]))
     ):
-        raise ValueError("checkpoint torch RNG state is invalid")
+        raise ValueError("checkpoint RNG state representation is invalid")
+    python_tuple = (
+        state["python_version"],
+        tuple(int(value) for value in python_state.tolist()),
+        state["python_gauss"],
+    )
+    numpy_tuple = (
+        state["numpy_bit_generator"],
+        numpy_state.numpy().astype(np.uint32, copy=False),
+        state["numpy_position"],
+        state["numpy_has_gauss"],
+        float(state["numpy_cached_gaussian"]),
+    )
+    try:
+        if state["python_version"] != random.Random().getstate()[0]:
+            raise ValueError("unsupported Python RNG state version")
+        private_python = random.Random()
+        private_python.setstate(python_tuple)
+        private_numpy = np.random.RandomState()
+        private_numpy.set_state(numpy_tuple)
+        private_torch = torch.Generator(device="cpu")
+        private_torch.set_state(torch_cpu)
+        expected_cuda_states = (
+            torch.cuda.device_count() if torch.cuda.is_available() else 0
+        )
+        if len(torch_cuda) != expected_cuda_states:
+            raise ValueError("CUDA RNG device coverage differs")
+        for index, cuda_state in enumerate(torch_cuda):
+            private_cuda = torch.Generator(device=f"cuda:{index}")
+            private_cuda.set_state(cuda_state)
+    except Exception as error:
+        raise ValueError(f"checkpoint RNG state is invalid: {error}") from error
 
 
 def _rng_state_to_wire(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -641,15 +674,115 @@ def _rng_state_from_wire(state: Mapping[str, Any]) -> dict[str, Any]:
     return restored
 
 
-def _optimizer_step(state_dict: Mapping[str, Any]) -> int:
-    steps = []
-    for state in state_dict.get("state", {}).values():
-        value = state.get("step") if isinstance(state, Mapping) else None
-        if isinstance(value, torch.Tensor) and value.numel() == 1:
-            steps.append(int(value.item()))
-        elif isinstance(value, (int, float)):
-            steps.append(int(value))
-    return max(steps, default=0)
+def _adamw_step_value(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        if (
+            value.numel() != 1
+            or value.dtype == torch.bool
+            or not (
+                value.dtype.is_floating_point
+                or value.dtype
+                in {
+                    torch.uint8,
+                    torch.int8,
+                    torch.int16,
+                    torch.int32,
+                    torch.int64,
+                }
+            )
+            or not bool(torch.isfinite(value).all())
+        ):
+            raise ValueError("AdamW slot step is invalid")
+        scalar = float(value.item())
+    elif type(value) in (int, float) and math.isfinite(float(value)):
+        scalar = float(value)
+    else:
+        raise ValueError("AdamW slot step is invalid")
+    if scalar < 0 or not scalar.is_integer():
+        raise ValueError("AdamW slot step is invalid")
+    return int(scalar)
+
+
+def _validate_adamw_state(
+    state_dict: Any,
+    *,
+    expected_step: int,
+    runtime_parameters: Mapping[int, nn.Parameter] | None = None,
+) -> None:
+    if (
+        not isinstance(state_dict, Mapping)
+        or set(state_dict) != {"state", "param_groups"}
+        or not isinstance(state_dict["state"], Mapping)
+        or not isinstance(state_dict["param_groups"], list)
+    ):
+        raise ValueError("AdamW state topology mismatch")
+    parameter_options: dict[int, bool] = {}
+    for group in state_dict["param_groups"]:
+        if (
+            not isinstance(group, Mapping)
+            or not isinstance(group.get("params"), list)
+            or type(group.get("amsgrad")) is not bool
+        ):
+            raise ValueError("AdamW parameter group is invalid")
+        for identifier in group["params"]:
+            if type(identifier) is not int or identifier in parameter_options:
+                raise ValueError("AdamW parameter coverage is invalid")
+            parameter_options[identifier] = group["amsgrad"]
+    slots = state_dict["state"]
+    if set(slots) != set(parameter_options):
+        raise ValueError(
+            "optimizer group topology mismatch: "
+            "AdamW slot coverage is incomplete"
+        )
+    if runtime_parameters is not None and set(runtime_parameters) != set(
+        parameter_options
+    ):
+        raise ValueError("AdamW runtime parameter coverage differs")
+
+    for identifier, amsgrad in parameter_options.items():
+        slot = slots[identifier]
+        required = {"step", "exp_avg", "exp_avg_sq"}
+        if amsgrad:
+            required.add("max_exp_avg_sq")
+        if not isinstance(slot, Mapping) or set(slot) != required:
+            raise ValueError("AdamW slot keys are invalid")
+        if _adamw_step_value(slot["step"]) != expected_step:
+            raise ValueError("AdamW slot step differs from logical step")
+        exp_avg = slot["exp_avg"]
+        exp_avg_sq = slot["exp_avg_sq"]
+        moments = [exp_avg, exp_avg_sq]
+        if amsgrad:
+            moments.append(slot["max_exp_avg_sq"])
+        if (
+            any(
+                not isinstance(moment, torch.Tensor)
+                or not moment.dtype.is_floating_point
+                or not bool(torch.isfinite(moment).all())
+                for moment in moments
+            )
+            or any(
+                tuple(moment.shape) != tuple(exp_avg.shape)
+                or moment.dtype != exp_avg.dtype
+                for moment in moments[1:]
+            )
+        ):
+            raise ValueError("AdamW slot tensor contract is invalid")
+        if runtime_parameters is not None:
+            parameter = runtime_parameters[identifier]
+            if (
+                tuple(exp_avg.shape) != tuple(parameter.shape)
+                or exp_avg.dtype != parameter.dtype
+            ):
+                raise ValueError("AdamW slot tensor differs from runtime parameter")
+
+
+def _validate_scheduler_step(state_dict: Any, *, expected_step: int) -> None:
+    if (
+        not isinstance(state_dict, Mapping)
+        or type(state_dict.get("last_epoch")) is not int
+        or state_dict["last_epoch"] != expected_step
+    ):
+        raise ValueError("scheduler step differs from logical step")
 
 
 def _validate_state_topology(
@@ -791,12 +924,26 @@ def save_planner_checkpoint(
 
     optimizer_state = optimizer.state_dict()
     scheduler_state = scheduler.state_dict()
-    optimizer_step = _optimizer_step(optimizer_state)
-    scheduler_step = int(scheduler_state.get("last_epoch", -1))
-    if step != optimizer_step or step != scheduler_step:
-        raise ValueError(
-            "current step, optimizer step, and scheduler step must match"
+    saved_parameter_map: dict[int, nn.Parameter] = {}
+    for saved_group, runtime_group in zip(
+        optimizer_state["param_groups"],
+        optimizer.param_groups,
+    ):
+        saved_parameter_map.update(
+            zip(saved_group["params"], runtime_group["params"])
         )
+    try:
+        _validate_adamw_state(
+            optimizer_state,
+            expected_step=step,
+            runtime_parameters=saved_parameter_map,
+        )
+        _validate_scheduler_step(scheduler_state, expected_step=step)
+    except ValueError as error:
+        raise ValueError(
+            "current step, optimizer step, and scheduler step must match "
+            f"valid persisted state: {error}"
+        ) from error
 
     root = Path(output_dir)
     _assert_safe_output(
@@ -873,8 +1020,8 @@ def save_planner_checkpoint(
             {
                 "format_version": 1,
                 "current_step": step,
-                "optimizer_step": optimizer_step,
-                "scheduler_step": scheduler_step,
+                "optimizer_step": step,
+                "scheduler_step": step,
                 "optimizer_groups": {
                     name: optimizer_initial_lrs[name]
                     for name in _GROUP_LRS
@@ -983,6 +1130,25 @@ def validate_planner_checkpoint(
         actual_hash = _artifact_hash(checkpoint / name)
         if actual_hash != expected_hash:
             raise ValueError(f"planner checkpoint artifact hash mismatch: {name}")
+    optimizer_state = torch.load(
+        checkpoint / "optimizer.pt",
+        weights_only=True,
+        map_location="cpu",
+    )
+    scheduler_state = torch.load(
+        checkpoint / "scheduler.pt",
+        weights_only=True,
+        map_location="cpu",
+    )
+    logical_step = int(trainer_state["current_step"])
+    _validate_adamw_state(
+        optimizer_state,
+        expected_step=logical_step,
+    )
+    _validate_scheduler_step(
+        scheduler_state,
+        expected_step=logical_step,
+    )
 
     shape = (
         codebook_metadata.get("shape")
@@ -1127,6 +1293,11 @@ def load_planner_checkpoint(
                 and tuple(value.shape) != tuple(parameter.shape)
             ):
                 raise ValueError("optimizer state tensor shape mismatch")
+    _validate_adamw_state(
+        optimizer_state,
+        expected_step=int(trainer_state["current_step"]),
+        runtime_parameters=saved_param_map,
+    )
     runtime_scheduler = scheduler.state_dict()
     _validate_state_topology(
         scheduler_state,
@@ -1139,12 +1310,10 @@ def load_planner_checkpoint(
         "enabled", "state_dict"
     }:
         raise ValueError("checkpoint scaler payload is invalid")
-    if _optimizer_step(optimizer_state) != int(trainer_state["optimizer_step"]):
-        raise ValueError("optimizer step differs from trainer_state")
-    if int(scheduler_state.get("last_epoch", -1)) != int(
-        trainer_state["scheduler_step"]
-    ):
-        raise ValueError("scheduler step differs from trainer_state")
+    _validate_scheduler_step(
+        scheduler_state,
+        expected_step=int(trainer_state["current_step"]),
+    )
     if bool(scaler_state.get("enabled")) != (scaler is not None):
         raise ValueError("checkpoint scaler mode differs from runtime")
     if scaler is not None:
