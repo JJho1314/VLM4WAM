@@ -16,6 +16,7 @@ from safetensors import safe_open
 from transformers import AutoConfig, AutoImageProcessor, AutoModel, AutoProcessor
 
 from qwen35_planx.official_ta_tok import inspect_released_checkpoint
+from qwen35_planx.hashing import sha256_file, sha256_json
 
 
 _MINIMUM_CODEBOOK_EXPORT_BYTES = 1024 * 1024 * 1024
@@ -526,6 +527,265 @@ def collect_hindsight_cache_preflight_errors(
     return errors
 
 
+def _artifact_directory_hash(path: Path) -> str:
+    entries = []
+    for child in sorted(item for item in path.rglob("*") if item.is_file()):
+        entries.append(
+            (
+                child.relative_to(path).as_posix(),
+                child.stat().st_size,
+                sha256_file(child),
+            )
+        )
+    if not entries:
+        raise ValueError(f"artifact directory is empty: {path}")
+    return sha256_json(entries)
+
+
+def _load_codebook_export_metadata(path: Path) -> dict[str, object]:
+    if not path.is_file():
+        raise FileNotFoundError(f"TA codebook metadata does not exist: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"TA codebook metadata is invalid: {error}") from error
+    required = {
+        "format_version",
+        "checkpoint_sha256",
+        "state_sha256",
+        "geometry",
+        "teacher",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        raise ValueError("TA codebook metadata fields are invalid")
+    geometry = payload["geometry"]
+    teacher = payload["teacher"]
+    if (
+        payload["format_version"] != 1
+        or not isinstance(geometry, Mapping)
+        or geometry.get("visual_vocab_size") != 65_536
+        or geometry.get("ta_code_dim") != 1_536
+        or geometry.get("tokens_per_frame") != 729
+        or not isinstance(teacher, Mapping)
+        or teacher.get("checkpoint_hash") != payload["checkpoint_sha256"]
+        or teacher.get("image_size") != 384
+        or teacher.get("grid_size") != 27
+    ):
+        raise ValueError("TA codebook metadata geometry/hash contract is invalid")
+    for name in ("checkpoint_sha256", "state_sha256"):
+        if not isinstance(payload[name], str) or not payload[name]:
+            raise ValueError(f"TA codebook metadata {name} must be nonempty")
+    return payload
+
+
+def _validate_codebook_export(
+    tensor_path: Path,
+    metadata_path: Path,
+) -> dict[str, object]:
+    metadata = _load_codebook_export_metadata(metadata_path)
+    if not tensor_path.is_file():
+        raise FileNotFoundError(f"TA codebook safetensors does not exist: {tensor_path}")
+    if tensor_path.stat().st_size == 0:
+        raise ValueError("TA codebook safetensors is zero-byte")
+    with safe_open(tensor_path, framework="pt", device="cpu") as handle:
+        if list(handle.keys()) != ["codebook"]:
+            raise ValueError("TA codebook safetensors must contain only codebook")
+        shape = tuple(handle.get_slice("codebook").get_shape())
+    if shape != (65_536, 1_536):
+        raise ValueError(
+            f"TA codebook shape must be (65536, 1536), got {shape}"
+        )
+    return {
+        "checkpoint_hash": metadata["checkpoint_sha256"],
+        "state_hash": metadata["state_sha256"],
+        "artifact_hash": sha256_file(tensor_path),
+        "shape": shape,
+    }
+
+
+def _estimate_sample_bytes(base_config: Mapping[str, object]) -> int:
+    text_config = base_config.get("text_config")
+    values = text_config if isinstance(text_config, Mapping) else base_config
+    hidden = int(values.get("hidden_size", 2_048))
+    layers = int(values.get("num_hidden_layers", 32))
+    sequence = 3_200
+    bytes_per_value = 2
+    recompute_factor = 12
+    camera_views = 2
+    return (
+        sequence
+        * hidden
+        * layers
+        * bytes_per_value
+        * recompute_factor
+        * camera_views
+    )
+
+
+def planner_training_preflight_report(
+    config: object,
+    *,
+    num_processes: int | None = None,
+) -> dict[str, object]:
+    """Load one real sample and validate all stage-one artifact identities."""
+
+    from qwen35_planx.cli.train_semantic_planner import (
+        PlannerTrainingConfig,
+        estimate_per_gpu_batch_candidates,
+        validate_planner_checkpoint,
+    )
+
+    if isinstance(config, Mapping):
+        config = PlannerTrainingConfig.from_mapping(config)
+    if not isinstance(config, PlannerTrainingConfig):
+        raise TypeError("config must be a PlannerTrainingConfig or mapping")
+    if config.resume_from is not None:
+        validate_planner_checkpoint(
+            config.resume_from,
+            allow_test_artifacts=config.tiny_smoke,
+        )
+    if config.tiny_smoke:
+        return {
+            "tiny_smoke": True,
+            "sample_shapes": None,
+            "batch_candidates": (
+                (config.per_device_batch, config.gradient_accumulation_steps),
+            ),
+        }
+
+    from qwen35_planx.hindsight_schema import HindsightCache
+    from qwen35_planx.planner_dataset import (
+        CachedPlannerTargets,
+        HindsightPlannerDataset,
+    )
+
+    base_model = Path(str(config.base_model)).resolve()
+    if not base_model.is_dir():
+        raise FileNotFoundError(f"base Qwen directory does not exist: {base_model}")
+    base_config_path = base_model / "config.json"
+    if not base_config_path.is_file():
+        raise FileNotFoundError(f"base Qwen config.json is missing: {base_config_path}")
+    try:
+        base_config = json.loads(base_config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"base Qwen config.json is invalid: {error}") from error
+    if (
+        not isinstance(base_config, Mapping)
+        or base_config.get("model_type") != "qwen3_5"
+    ):
+        raise ValueError("base Qwen config model_type must be 'qwen3_5'")
+    processor_errors = _validate_processor_artifacts(
+        base_model,
+        label="Qwen3.5",
+        requires_text=True,
+    )
+    if processor_errors:
+        raise ValueError("; ".join(processor_errors))
+    base_model_hash = _artifact_directory_hash(base_model)
+
+    output_dir = Path(config.output_dir).resolve()
+    codebook_path = Path(str(config.ta_codebook)).resolve()
+    for label, protected in (
+        ("base Qwen", base_model),
+        ("released TA-Tok/codebook", codebook_path.parent),
+    ):
+        if output_dir == protected or protected in output_dir.parents:
+            raise ValueError(
+                f"checkpoint output must not be inside the {label} directory"
+            )
+    codebook_report = _validate_codebook_export(
+        codebook_path,
+        Path(str(config.ta_codebook_metadata)).resolve(),
+    )
+    cache_dir = Path(str(config.hindsight_cache)).resolve()
+    hdf5_manifest = Path(str(config.hdf5_manifest)).resolve()
+    with HindsightCache.open(cache_dir) as cache:
+        dataset = HindsightPlannerDataset(cache, hdf5_manifest)
+        sample = dataset[0]
+        targets = CachedPlannerTargets(
+            codes=sample["codes"].unsqueeze(0).long(),
+            relevance=sample["relevance"].unsqueeze(0),
+            relevance_confidence=sample["relevance_confidence"].unsqueeze(0),
+            flow=sample["flow"].unsqueeze(0),
+            phrase_embeddings=sample["phrase_embeddings"].unsqueeze(0),
+        )
+        if tuple(sample["current_images"].shape) != (2, 3, 256, 256):
+            raise ValueError("HDF5 current images must have shape [2,3,256,256]")
+        splits = {record.split for record in cache.records}
+        if not {"train", "val"}.issubset(splits):
+            raise ValueError("hindsight cache must contain train and val records")
+        sample_shapes = {
+            "current_images": tuple(sample["current_images"].shape),
+            "codes": tuple(targets.codes.shape),
+            "relevance": tuple(targets.relevance.shape),
+            "flow": tuple(targets.flow.shape),
+            "phrase_embeddings": tuple(targets.phrase_embeddings.shape),
+        }
+        cache_hash = cache.cache_hash
+        cache_ta_hash = cache.metadata.ta_tok_hash
+    if cache_ta_hash != codebook_report["checkpoint_hash"]:
+        raise ValueError("hindsight cache TA-Tok hash differs from codebook export")
+
+    if config.resume_from is not None:
+        resume_metadata, _ = validate_planner_checkpoint(config.resume_from)
+        expected_hashes = {
+            "base_model_hash": base_model_hash,
+            "hindsight_cache_hash": cache_hash,
+            "ta_tok_hash": codebook_report["checkpoint_hash"],
+        }
+        for name, expected in expected_hashes.items():
+            if resume_metadata[name] != expected:
+                raise ValueError(
+                    f"resume checkpoint {name} mismatch: "
+                    f"expected {expected!r}, got {resume_metadata[name]!r}"
+                )
+
+    if num_processes is None:
+        num_processes = int(
+            os.environ.get(
+                "WORLD_SIZE",
+                max(1, torch.cuda.device_count()),
+            )
+        )
+    if torch.cuda.is_available():
+        free_bytes = min(
+            torch.cuda.mem_get_info(index)[0]
+            for index in range(torch.cuda.device_count())
+        )
+        batch_candidates = estimate_per_gpu_batch_candidates(
+            num_processes=num_processes,
+            available_bytes=int(free_bytes),
+            estimated_bytes_per_sample=_estimate_sample_bytes(base_config),
+        )
+    else:
+        batch_candidates = ()
+    return {
+        "tiny_smoke": False,
+        "base_model_hash": base_model_hash,
+        "hindsight_cache_hash": cache_hash,
+        "ta_codebook": codebook_report,
+        "sample_shapes": sample_shapes,
+        "batch_candidates": batch_candidates,
+    }
+
+
+def collect_planner_training_preflight_errors(
+    config: object,
+    *,
+    num_processes: int | None = None,
+) -> list[str]:
+    """Return a single actionable fail-closed stage-one preflight error."""
+
+    try:
+        planner_training_preflight_report(
+            config,
+            num_processes=num_processes,
+        )
+    except Exception as error:
+        return [f"planner training preflight failed: {error}"]
+    return []
+
+
 def _released_ta_command(arguments: argparse.Namespace) -> int:
     errors = collect_released_ta_preflight_errors(
         arguments.ta_checkpoint,
@@ -565,6 +825,33 @@ def _hindsight_cache_command(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _planner_training_command(arguments: argparse.Namespace) -> int:
+    try:
+        payload = json.loads(arguments.config.read_text(encoding="utf-8"))
+        if not isinstance(payload, Mapping):
+            raise ValueError("config must contain an object")
+        from qwen35_planx.cli.train_semantic_planner import PlannerTrainingConfig
+
+        config = PlannerTrainingConfig.from_mapping(payload)
+        if arguments.resume_from is not None:
+            from dataclasses import replace
+
+            config = replace(config, resume_from=str(arguments.resume_from))
+        report = planner_training_preflight_report(
+            config,
+            num_processes=arguments.num_processes,
+        )
+    except Exception as error:
+        print(f"ERROR: planner training preflight failed: {error}", file=sys.stderr)
+        return 2
+    print(
+        "planner-training preflight OK: "
+        f"sample_shapes={report['sample_shapes']} "
+        f"batch_candidates={report['batch_candidates']}"
+    )
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -587,6 +874,14 @@ def _parser() -> argparse.ArgumentParser:
     hindsight.add_argument("--dinov3-model", type=Path, required=True)
     hindsight.add_argument("--output-dir", type=Path, required=True)
     hindsight.set_defaults(handler=_hindsight_cache_command)
+    training = subparsers.add_parser(
+        "planner-training",
+        help="validate real HDF5/cache/Qwen/codebook inputs and resume state",
+    )
+    training.add_argument("--config", type=Path, required=True)
+    training.add_argument("--resume-from", type=Path)
+    training.add_argument("--num-processes", type=int)
+    training.set_defaults(handler=_planner_training_command)
     return parser
 
 

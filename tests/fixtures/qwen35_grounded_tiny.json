@@ -1,0 +1,13 @@
+{
+  "activation_checkpointing": true,
+  "gradient_accumulation_steps": 1,
+  "log_every": 1,
+  "max_steps": 1,
+  "num_workers": 0,
+  "output_dir": "/tmp/qwen35-grounded-tiny-${PID}",
+  "per_device_batch": 256,
+  "save_every": 1,
+  "tiny_smoke": true,
+  "validate_every": 1,
+  "warmup_steps": 0
+}

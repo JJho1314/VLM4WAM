@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import copy
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -443,3 +446,436 @@ def test_all_zero_auxiliary_supervision_remains_finite() -> None:
         atol=1e-6,
         rtol=0,
     )
+
+
+class _CheckpointableLanguage(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.projection = nn.Linear(5, 5)
+        self.gradient_checkpointing_kwargs = None
+
+    def gradient_checkpointing_enable(self, kwargs=None) -> None:
+        self.gradient_checkpointing_kwargs = kwargs
+
+
+class _GroupedBackbone(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.vision_model = nn.Linear(5, 5)
+        self.language_model = _CheckpointableLanguage()
+        self.embed_tokens = nn.Embedding(20, 5)
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.embed_tokens
+
+
+class _GroupedPlanner(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.backbone = _GroupedBackbone()
+        self.visual_regression = nn.Linear(5, 3)
+        self.semantic_projection = nn.Linear(5, 4)
+        self.phrase_projection = nn.Linear(5, 4)
+        self.grounding_query = nn.Linear(5, 4, bias=False)
+        self.fusion_gate = nn.Sequential(nn.Linear(8, 2), nn.SiLU(), nn.Linear(2, 1))
+
+
+class _SaveableArtifact:
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+
+    def save_pretrained(self, output_dir: Path) -> None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "artifact.json").write_text(
+            json.dumps({"kind": self.kind}),
+            encoding="utf-8",
+        )
+
+
+def _tiny_checkpoint_metadata() -> dict[str, object]:
+    return {
+        "format_version": 1,
+        "planner_backend": "qwen35_planx_grounded",
+        "visual_vocab_size": 13,
+        "visual_token_start_id": 7,
+        "visual_token_end_id": 20,
+        "hindsight_cache_hash": "cache-sha256",
+        "ta_tok_hash": "released-ta-sha256",
+        "tokenizer_hash": "tokenizer-sha256",
+        "base_model_hash": "base-model-sha256",
+    }
+
+
+def test_optimizer_groups_are_exact_exhaustive_and_duplicate_free() -> None:
+    from qwen35_planx.cli.train_semantic_planner import build_optimizer_groups
+
+    planner = _GroupedPlanner()
+    groups = build_optimizer_groups(
+        planner,
+        visual_token_start_id=7,
+        qwen_language_lr=1e-5,
+        qwen_vision_lr=5e-6,
+        head_lr=1e-4,
+    )
+
+    assert {group["name"]: group["lr"] for group in groups} == {
+        "qwen_language": 1e-5,
+        "qwen_vision": 5e-6,
+        "visual_vocab_and_prediction_head": 1e-4,
+        "semantic_phrase_grounding_fusion_heads": 1e-4,
+    }
+    grouped_ids = [
+        id(parameter)
+        for group in groups
+        for parameter in group["params"]
+    ]
+    trainable_ids = {
+        id(parameter)
+        for parameter in planner.parameters()
+        if parameter.requires_grad
+    }
+    assert len(grouped_ids) == len(set(grouped_ids))
+    assert set(grouped_ids) == trainable_ids
+
+    names = {
+        id(parameter): name
+        for name, parameter in planner.named_parameters()
+    }
+    grouped_names = {
+        group["name"]: {names[id(parameter)] for parameter in group["params"]}
+        for group in groups
+    }
+    assert grouped_names["qwen_vision"] == {
+        "backbone.vision_model.weight",
+        "backbone.vision_model.bias",
+    }
+    assert "backbone.embed_tokens.weight" in grouped_names[
+        "visual_vocab_and_prediction_head"
+    ]
+    assert {
+        name
+        for name in grouped_names["visual_vocab_and_prediction_head"]
+        if name.startswith("visual_regression.")
+    } == {"visual_regression.weight", "visual_regression.bias"}
+    assert grouped_names["semantic_phrase_grounding_fusion_heads"] == {
+        "semantic_projection.weight",
+        "semantic_projection.bias",
+        "phrase_projection.weight",
+        "phrase_projection.bias",
+        "grounding_query.weight",
+        "fusion_gate.0.weight",
+        "fusion_gate.0.bias",
+        "fusion_gate.2.weight",
+        "fusion_gate.2.bias",
+    }
+
+
+def test_selective_checkpointing_and_effective_batch_contract() -> None:
+    from qwen35_planx.cli.train_semantic_planner import (
+        enable_selective_qwen_activation_checkpointing,
+        validate_effective_global_batch,
+    )
+
+    planner = _GroupedPlanner()
+    validate_effective_global_batch(
+        per_device_batch=4,
+        num_processes=8,
+        grad_accum=8,
+    )
+    with pytest.raises(ValueError, match="effective global batch must be 256, got 32"):
+        validate_effective_global_batch(
+            per_device_batch=2,
+            num_processes=8,
+            grad_accum=2,
+        )
+
+    enable_selective_qwen_activation_checkpointing(planner)
+
+    assert planner.backbone.language_model.gradient_checkpointing_kwargs == {
+        "use_reentrant": False
+    }
+    assert not hasattr(planner.backbone.vision_model, "gradient_checkpointing_kwargs")
+
+
+def test_atomic_checkpoint_resume_restores_all_training_state(tmp_path: Path) -> None:
+    from qwen35_planx.cli.train_semantic_planner import (
+        REQUIRED_CHECKPOINT_ENTRIES,
+        build_optimizer_groups,
+        load_planner_checkpoint,
+        save_planner_checkpoint,
+    )
+
+    torch.manual_seed(27)
+    planner = _GroupedPlanner()
+    groups = build_optimizer_groups(
+        planner,
+        visual_token_start_id=7,
+        qwen_language_lr=1e-5,
+        qwen_vision_lr=5e-6,
+        head_lr=1e-4,
+    )
+    optimizer = torch.optim.AdamW(groups)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda step: max(0.0, 1.0 - (step / 10.0)),
+    )
+    loss = sum(parameter.square().sum() for parameter in planner.parameters())
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad(set_to_none=True)
+    expected_model = {
+        name: value.detach().clone()
+        for name, value in planner.state_dict().items()
+    }
+    expected_optimizer = copy.deepcopy(optimizer.state_dict())
+    expected_scheduler = copy.deepcopy(scheduler.state_dict())
+
+    base_dir = tmp_path / "base-qwen"
+    released_ta_dir = tmp_path / "released-ta"
+    base_dir.mkdir()
+    released_ta_dir.mkdir()
+    checkpoint = save_planner_checkpoint(
+        output_dir=tmp_path / "runs",
+        step=3,
+        planner=planner,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        processor=_SaveableArtifact("processor"),
+        tokenizer=_SaveableArtifact("tokenizer"),
+        metadata=_tiny_checkpoint_metadata(),
+        codebook=torch.randn(13, 3),
+        scaler=None,
+        optimizer_group_lrs={
+            group["name"]: group["lr"] for group in groups
+        },
+        base_model_dir=base_dir,
+        released_ta_dir=released_ta_dir,
+        allow_test_artifacts=True,
+    )
+
+    assert checkpoint.name == "step_000003"
+    assert all((checkpoint / name).exists() for name in REQUIRED_CHECKPOINT_ENTRIES)
+    assert (checkpoint / "scaler.pt").is_file()
+    assert (checkpoint / "rng_state.pt").is_file()
+    assert not tuple(checkpoint.parent.glob(".*.incomplete-*"))
+    assert not tuple(base_dir.iterdir())
+    assert not tuple(released_ta_dir.iterdir())
+
+    for parameter in planner.parameters():
+        parameter.data.zero_()
+    optimizer.state.clear()
+    scheduler.last_epoch = -1
+
+    resumed_step = load_planner_checkpoint(
+        checkpoint,
+        planner=planner,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=None,
+        expected_metadata=_tiny_checkpoint_metadata(),
+        allow_test_artifacts=True,
+    )
+
+    assert resumed_step == 3
+    for name, value in planner.state_dict().items():
+        torch.testing.assert_close(value, expected_model[name])
+    actual_optimizer = optimizer.state_dict()
+    assert actual_optimizer["param_groups"] == expected_optimizer["param_groups"]
+    assert actual_optimizer["state"].keys() == expected_optimizer["state"].keys()
+    for key, state in actual_optimizer["state"].items():
+        assert state.keys() == expected_optimizer["state"][key].keys()
+        for name, value in state.items():
+            expected = expected_optimizer["state"][key][name]
+            if isinstance(value, torch.Tensor):
+                torch.testing.assert_close(value, expected)
+            else:
+                assert value == expected
+    assert scheduler.state_dict() == expected_scheduler
+
+
+def test_resume_fails_closed_before_mutation_on_missing_or_mismatch(
+    tmp_path: Path,
+) -> None:
+    from qwen35_planx.cli.train_semantic_planner import (
+        build_optimizer_groups,
+        load_planner_checkpoint,
+        save_planner_checkpoint,
+    )
+
+    planner = _GroupedPlanner()
+    groups = build_optimizer_groups(planner, visual_token_start_id=7)
+    optimizer = torch.optim.AdamW(groups)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    checkpoint = save_planner_checkpoint(
+        output_dir=tmp_path / "runs",
+        step=1,
+        planner=planner,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        processor=_SaveableArtifact("processor"),
+        tokenizer=_SaveableArtifact("tokenizer"),
+        metadata=_tiny_checkpoint_metadata(),
+        codebook=torch.randn(13, 3),
+        scaler=None,
+        optimizer_group_lrs={
+            group["name"]: group["lr"] for group in groups
+        },
+        allow_test_artifacts=True,
+    )
+    original = {
+        name: value.detach().clone()
+        for name, value in planner.state_dict().items()
+    }
+
+    mismatched = dict(_tiny_checkpoint_metadata())
+    mismatched["hindsight_cache_hash"] = "different-cache"
+    with pytest.raises(ValueError, match="hindsight_cache_hash"):
+        load_planner_checkpoint(
+            checkpoint,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=None,
+            expected_metadata=mismatched,
+            allow_test_artifacts=True,
+        )
+    for name, value in planner.state_dict().items():
+        torch.testing.assert_close(value, original[name])
+
+    trainer_state_path = checkpoint / "trainer_state.json"
+    original_trainer_state = trainer_state_path.read_text(encoding="utf-8")
+    trainer_state = json.loads(original_trainer_state)
+    trainer_state["optimizer_groups"]["qwen_language"] = 9e-5
+    trainer_state_path.write_text(
+        json.dumps(trainer_state),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="optimizer group learning rates"):
+        load_planner_checkpoint(
+            checkpoint,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=None,
+            expected_metadata=_tiny_checkpoint_metadata(),
+            allow_test_artifacts=True,
+        )
+    trainer_state_path.write_text(original_trainer_state, encoding="utf-8")
+
+    (checkpoint / "rng_state.pt").unlink()
+    with pytest.raises(FileNotFoundError, match="incomplete planner checkpoint"):
+        load_planner_checkpoint(
+            checkpoint,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=None,
+            expected_metadata=_tiny_checkpoint_metadata(),
+            allow_test_artifacts=True,
+        )
+
+
+def test_stage_one_schedule_and_batch_candidates_preserve_exact_contract() -> None:
+    from qwen35_planx.cli.train_semantic_planner import (
+        PlannerTrainingConfig,
+        cosine_lr_multiplier,
+        estimate_per_gpu_batch_candidates,
+    )
+
+    config = PlannerTrainingConfig.from_mapping(
+        {
+            "tiny_smoke": True,
+            "output_dir": "/tmp/planx-tiny",
+            "per_device_batch": 256,
+            "gradient_accumulation_steps": 1,
+        }
+    )
+    assert config.max_steps == 30_000
+    assert config.warmup_steps == 1_000
+    assert config.save_every == 5_000
+    assert config.validate_every == 5_000
+    assert config.log_every == 20
+    assert config.mixed_precision == "bf16"
+    assert config.gradient_clip_norm == 1.0
+    assert config.tf32 is True
+    assert cosine_lr_multiplier(0, warmup_steps=1_000, max_steps=30_000) == 0.0
+    assert cosine_lr_multiplier(
+        1_000,
+        warmup_steps=1_000,
+        max_steps=30_000,
+    ) == 1.0
+    assert cosine_lr_multiplier(
+        30_000,
+        warmup_steps=1_000,
+        max_steps=30_000,
+    ) == 0.0
+
+    assert estimate_per_gpu_batch_candidates(
+        num_processes=8,
+        available_bytes=8 * 1024**3,
+        estimated_bytes_per_sample=3 * 1024**3,
+    ) == ((2, 16), (1, 32))
+
+
+def test_tiny_accelerate_training_writes_reloadable_one_step_checkpoint(
+    tmp_path: Path,
+) -> None:
+    from qwen35_planx.cli.train_semantic_planner import (
+        main,
+        validate_planner_checkpoint,
+    )
+
+    config_path = tmp_path / "tiny.json"
+    output_dir = tmp_path / "run"
+    config_path.write_text(
+        json.dumps(
+            {
+                "tiny_smoke": True,
+                "output_dir": str(output_dir),
+                "per_device_batch": 256,
+                "gradient_accumulation_steps": 1,
+                "max_steps": 1,
+                "warmup_steps": 0,
+                "save_every": 1,
+                "validate_every": 1,
+                "log_every": 1,
+                "num_workers": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["--config", str(config_path), "--max-steps", "1"]) == 0
+
+    checkpoint = output_dir / "step_000001"
+    _, trainer_state = validate_planner_checkpoint(
+        checkpoint,
+        expected_metadata=_tiny_checkpoint_metadata(),
+        allow_test_artifacts=True,
+    )
+    assert trainer_state["current_step"] == 1
+    assert trainer_state["optimizer_step"] == 1
+    assert trainer_state["scheduler_step"] == 1
+
+
+def test_training_preflight_refuses_incomplete_resume(tmp_path: Path) -> None:
+    from qwen35_planx.cli.preflight import (
+        collect_planner_training_preflight_errors,
+    )
+    from qwen35_planx.cli.train_semantic_planner import PlannerTrainingConfig
+
+    incomplete = tmp_path / "incomplete"
+    incomplete.mkdir()
+    config = PlannerTrainingConfig(
+        tiny_smoke=True,
+        output_dir=str(tmp_path / "run"),
+        resume_from=str(incomplete),
+        per_device_batch=256,
+        gradient_accumulation_steps=1,
+    )
+
+    errors = collect_planner_training_preflight_errors(config)
+
+    assert len(errors) == 1
+    assert "incomplete planner checkpoint" in errors[0]
