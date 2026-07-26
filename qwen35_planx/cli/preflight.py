@@ -13,12 +13,13 @@ from typing import Sequence
 
 import torch
 from safetensors import safe_open
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoImageProcessor, AutoModel, AutoProcessor
 
 from qwen35_planx.official_ta_tok import inspect_released_checkpoint
 
 
 _MINIMUM_CODEBOOK_EXPORT_BYTES = 1024 * 1024 * 1024
+_MINIMUM_HINDSIGHT_CACHE_BYTES = 1024 * 1024 * 1024
 _SIGLIP_CONFIG_VALUES = {
     ("model_type",): "siglip",
     ("vision_config", "hidden_size"): 1152,
@@ -244,6 +245,105 @@ def _validate_local_siglip_model(model_path: Path) -> list[str]:
     return _validate_weight_inventory(inventory, expected)
 
 
+def _validate_processor_artifacts(
+    model_path: Path,
+    *,
+    label: str,
+    requires_text: bool,
+) -> list[str]:
+    preprocessor = model_path / "preprocessor_config.json"
+    if not preprocessor.is_file() or preprocessor.stat().st_size == 0:
+        return [f"local {label} preprocessor_config.json is missing or empty"]
+    try:
+        payload = json.loads(preprocessor.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        return [f"local {label} preprocessor_config.json is invalid: {error}"]
+    if not isinstance(payload, Mapping):
+        return [f"local {label} preprocessor_config.json must contain an object"]
+    if not requires_text:
+        loader = AutoImageProcessor
+    else:
+        tokenizer_config = model_path / "tokenizer_config.json"
+        tokenizer_files = (
+            model_path / "tokenizer.json",
+            model_path / "tokenizer.model",
+            model_path / "sentencepiece.bpe.model",
+        )
+        if (
+            not tokenizer_config.is_file()
+            or tokenizer_config.stat().st_size == 0
+            or not any(
+                path.is_file() and path.stat().st_size > 0
+                for path in tokenizer_files
+            )
+        ):
+            return [f"local {label} tokenizer artifacts are missing or empty"]
+        loader = AutoProcessor
+    try:
+        loader.from_pretrained(model_path, local_files_only=True)
+    except Exception as error:
+        return [f"local {label} processor artifacts are invalid: {error}"]
+    return []
+
+
+def _validate_local_dinov3_model(model_path: Path) -> list[str]:
+    if not model_path.exists():
+        return [f"local DINOv3 model path does not exist: {model_path}"]
+    if not model_path.is_dir():
+        return [f"local DINOv3 model path must be a directory: {model_path}"]
+    config_path = model_path / "config.json"
+    if not config_path.is_file() or config_path.stat().st_size == 0:
+        return [f"local DINOv3 config.json is missing or empty: {config_path}"]
+    try:
+        config = AutoConfig.from_pretrained(model_path, local_files_only=True)
+    except Exception as error:
+        return [f"local DINOv3 config cannot be parsed by transformers: {error}"]
+    if not str(getattr(config, "model_type", "")).startswith("dinov3"):
+        return [
+            "local DINOv3 config model_type must identify DINOv3, got "
+            f"{getattr(config, 'model_type', None)!r}"
+        ]
+    artifacts = [
+        model_path / name
+        for name in (*_WEIGHT_INDEX_NAMES, *_WEIGHT_FILE_NAMES)
+        if (model_path / name).is_file()
+    ]
+    if not artifacts:
+        if list(model_path.glob("model-*.safetensors")) or list(
+            model_path.glob("pytorch_model-*.bin")
+        ):
+            return ["local DINOv3 sharded weights are incomplete without an index"]
+        return [f"local DINOv3 model weights are missing from: {model_path}"]
+    if any(path.stat().st_size == 0 for path in artifacts):
+        return ["local DINOv3 model contains a zero-byte weight artifact"]
+    index_paths = [
+        path for path in artifacts if path.name in _WEIGHT_INDEX_NAMES
+    ]
+    if len(artifacts) != 1:
+        return ["local DINOv3 model has ambiguous duplicate weight artifacts"]
+    try:
+        inventory = (
+            _inventory_indexed_weights(model_path, index_paths[0])
+            if index_paths
+            else _inventory_weight_file(artifacts[0])
+        )
+        expected = _expected_weight_shapes(config)
+    except Exception as error:
+        return [f"local DINOv3 weights are invalid: {error}"]
+    errors = _validate_weight_inventory(inventory, expected)
+    errors = [
+        error.replace("local SigLIP2", "local DINOv3")
+        for error in errors
+    ]
+    if errors:
+        return errors
+    return _validate_processor_artifacts(
+        model_path,
+        label="DINOv3",
+        requires_text=False,
+    )
+
+
 def _existing_ancestor(path: Path) -> Path | None:
     candidate = path
     while not candidate.exists() and candidate != candidate.parent:
@@ -293,6 +393,125 @@ def collect_released_ta_preflight_errors(
     return errors
 
 
+def collect_hindsight_cache_preflight_errors(
+    *,
+    hdf5_manifest: Path | str,
+    window_manifest: Path | str,
+    ta_checkpoint: Path | str,
+    siglip_model: Path | str,
+    dinov3_model: Path | str,
+    output_dir: Path | str,
+    minimum_free_bytes: int = _MINIMUM_HINDSIGHT_CACHE_BYTES,
+    require_new_output: bool = True,
+) -> list[str]:
+    """Validate every local cache-build input without allocating teachers."""
+
+    errors: list[str] = []
+    hdf5_path = Path(hdf5_manifest)
+    windows_path = Path(window_manifest)
+    checkpoint_path = Path(ta_checkpoint)
+    output_path = Path(output_dir)
+    episode_lookup: dict[str, object] = {}
+
+    if not hdf5_path.is_file():
+        errors.append(f"HDF5 manifest does not exist: {hdf5_path}")
+    else:
+        try:
+            from ge_act.data.libero_fastwam_hdf5_schema import load_manifest
+
+            _, episodes = load_manifest(hdf5_path)
+            episode_lookup = {episode.key: episode for episode in episodes}
+        except Exception as error:
+            errors.append(f"HDF5 manifest failed safe validation: {error}")
+            episode_lookup = {}
+
+    if not windows_path.is_file():
+        errors.append(f"window manifest does not exist: {windows_path}")
+    else:
+        try:
+            from qwen35_planx.cli.build_hindsight_cache import load_window_records
+
+            windows = load_window_records(windows_path)
+            if episode_lookup:
+                for window in windows:
+                    episode = episode_lookup.get(window.episode_key)
+                    if episode is None:
+                        errors.append(
+                            "window manifest references unknown HDF5 episode: "
+                            f"{window.episode_key}"
+                        )
+                        continue
+                    if window.caption != episode.caption:
+                        errors.append(
+                            "window caption does not match HDF5 episode: "
+                            f"{window.episode_key}"
+                        )
+                    indices = (
+                        window.current_index,
+                        *window.future_indices,
+                        *window.frame_indices,
+                        *window.action_indices,
+                    )
+                    if any(index < 0 or index >= episode.length for index in indices):
+                        errors.append(
+                            "window indices exceed complete trajectory bounds "
+                            f"for {window.sample_id}: [0, {episode.length})"
+                        )
+                unknown = sorted(
+                    window.episode_key
+                    for window in windows
+                    if window.episode_key not in episode_lookup
+                )
+                if unknown and not any(
+                    "unknown HDF5 episode" in error for error in errors
+                ):
+                    errors.append(
+                        "window manifest references unknown HDF5 episodes: "
+                        + ", ".join(unknown[:5])
+                    )
+        except Exception as error:
+            errors.append(f"window manifest failed safe validation: {error}")
+
+    if not checkpoint_path.is_file():
+        errors.append(f"released TA-Tok checkpoint does not exist: {checkpoint_path}")
+    else:
+        try:
+            inspect_released_checkpoint(
+                checkpoint_path,
+                compute_state_hash=False,
+            )
+        except Exception as error:
+            errors.append(f"released TA-Tok checkpoint failed safe validation: {error}")
+
+    siglip_path = Path(siglip_model)
+    errors.extend(_validate_local_siglip_model(siglip_path))
+    if siglip_path.is_dir():
+        errors.extend(
+            _validate_processor_artifacts(
+                siglip_path,
+                label="SigLIP2",
+                requires_text=True,
+            )
+        )
+    errors.extend(_validate_local_dinov3_model(Path(dinov3_model)))
+
+    if require_new_output and output_path.exists():
+        errors.append(f"output directory already exists: {output_path}")
+    existing_output = _existing_ancestor(output_path)
+    if existing_output is None:
+        errors.append(f"no existing parent for output directory: {output_path}")
+    else:
+        if not os.access(existing_output, os.W_OK):
+            errors.append(f"output directory is not writable: {existing_output}")
+        free_bytes = shutil.disk_usage(existing_output).free
+        if free_bytes < minimum_free_bytes:
+            errors.append(
+                "insufficient free hindsight-cache space: "
+                f"need at least {minimum_free_bytes} bytes, found {free_bytes}"
+            )
+    return errors
+
+
 def _released_ta_command(arguments: argparse.Namespace) -> int:
     errors = collect_released_ta_preflight_errors(
         arguments.ta_checkpoint,
@@ -315,6 +534,23 @@ def _released_ta_command(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _hindsight_cache_command(arguments: argparse.Namespace) -> int:
+    errors = collect_hindsight_cache_preflight_errors(
+        hdf5_manifest=arguments.hdf5_manifest,
+        window_manifest=arguments.window_manifest,
+        ta_checkpoint=arguments.ta_checkpoint,
+        siglip_model=arguments.siglip_model,
+        dinov3_model=arguments.dinov3_model,
+        output_dir=arguments.output_dir,
+    )
+    if errors:
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        return 2
+    print("hindsight-cache preflight OK: all artifacts are local and validated")
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -326,6 +562,17 @@ def _parser() -> argparse.ArgumentParser:
     released.add_argument("--siglip-model", type=Path, required=True)
     released.add_argument("--output-dir", type=Path, default=Path("."))
     released.set_defaults(handler=_released_ta_command)
+    hindsight = subparsers.add_parser(
+        "hindsight-cache",
+        help="validate local teachers, HDF5 windows, and cache output capacity",
+    )
+    hindsight.add_argument("--hdf5-manifest", type=Path, required=True)
+    hindsight.add_argument("--window-manifest", type=Path, required=True)
+    hindsight.add_argument("--ta-checkpoint", type=Path, required=True)
+    hindsight.add_argument("--siglip-model", type=Path, required=True)
+    hindsight.add_argument("--dinov3-model", type=Path, required=True)
+    hindsight.add_argument("--output-dir", type=Path, required=True)
+    hindsight.set_defaults(handler=_hindsight_cache_command)
     return parser
 
 
