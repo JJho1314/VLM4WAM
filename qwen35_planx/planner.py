@@ -21,6 +21,11 @@ from qwen35_planx.planner_dataset import GroundedPlannerBatch
 
 _NUM_KEYFRAMES = 4
 _NUM_ROLES = 3
+_TOKENS_PER_FRAME = 729
+_VISUAL_VOCAB_SIZE = 65_536
+_CODEBOOK_DIM = 1_536
+_QWEN_HIDDEN_DIM = 2_048
+_TEXT_DIM = 1_152
 _MAX_CODE_CHUNK_SIZE = 64
 _NORMALIZED_TARGET_TIMES = (0.0, 3.0 / 8.0, 5.0 / 8.0, 1.0)
 
@@ -113,6 +118,7 @@ class GroundedQwen35Planner(nn.Module):
         hidden_dim: int,
         text_dim: int,
         code_chunk_size: int = _MAX_CODE_CHUNK_SIZE,
+        _enforce_released_geometry: bool = True,
     ) -> None:
         super().__init__()
         if not isinstance(backbone, nn.Module):
@@ -139,6 +145,23 @@ class GroundedQwen35Planner(nn.Module):
             raise ValueError("codebook width must be positive")
         if not 1 <= code_chunk_size <= _MAX_CODE_CHUNK_SIZE:
             raise ValueError("code_chunk_size must be in [1,64]")
+        released_geometry = (
+            visual_embedding_weight.shape[0],
+            codebook.shape[1],
+            hidden_dim,
+            text_dim,
+        )
+        expected_geometry = (
+            _VISUAL_VOCAB_SIZE,
+            _CODEBOOK_DIM,
+            _QWEN_HIDDEN_DIM,
+            _TEXT_DIM,
+        )
+        if _enforce_released_geometry and released_geometry != expected_geometry:
+            raise ValueError(
+                "released planner geometry requires visual_vocab=65536, "
+                "codebook_dim=1536, hidden_dim=2048, and text_dim=1152"
+            )
 
         self.backbone = backbone
         self.visual_embedding_weight = visual_embedding_weight
@@ -146,6 +169,7 @@ class GroundedQwen35Planner(nn.Module):
         self.hidden_dim = hidden_dim
         self.text_dim = text_dim
         self.code_chunk_size = code_chunk_size
+        self._enforce_released_geometry = _enforce_released_geometry
 
         code_dim = int(codebook.shape[1])
         self.visual_regression = nn.Linear(hidden_dim, code_dim)
@@ -186,6 +210,29 @@ class GroundedQwen35Planner(nn.Module):
             code_chunk_size=code_chunk_size,
         )
 
+    @classmethod
+    def _from_test_components(
+        cls,
+        *,
+        backbone: nn.Module,
+        visual_embedding_weight: Tensor,
+        codebook: Tensor,
+        hidden_dim: int,
+        text_dim: int,
+        code_chunk_size: int = _MAX_CODE_CHUNK_SIZE,
+    ) -> GroundedQwen35Planner:
+        """Build a reduced-geometry unit-test planner, never a checkpoint model."""
+
+        return cls(
+            backbone=backbone,
+            visual_embedding_weight=visual_embedding_weight,
+            codebook=codebook,
+            hidden_dim=hidden_dim,
+            text_dim=text_dim,
+            code_chunk_size=code_chunk_size,
+            _enforce_released_geometry=False,
+        )
+
     @staticmethod
     def _last_hidden(output: Any) -> Tensor:
         if isinstance(output, Mapping):
@@ -196,13 +243,20 @@ class GroundedQwen35Planner(nn.Module):
             raise TypeError("Qwen backbone output must expose last_hidden_state")
         return hidden
 
-    @staticmethod
-    def _geometry(batch: GroundedPlannerBatch) -> tuple[int, int]:
+    def _language_backbone(self) -> nn.Module:
+        base_model = getattr(self.backbone, "model", None)
+        return base_model if isinstance(base_model, nn.Module) else self.backbone
+
+    def _geometry(self, batch: GroundedPlannerBatch) -> tuple[int, int]:
         if batch.relevance_targets.ndim != 4:
             raise ValueError("relevance targets must have shape [B,4,3,N]")
         camera_batch, frames, roles, tokens = batch.relevance_targets.shape
         if frames != _NUM_KEYFRAMES or roles != _NUM_ROLES or tokens <= 0:
             raise ValueError("relevance targets must have shape [B,4,3,N]")
+        if self._enforce_released_geometry and tokens != _TOKENS_PER_FRAME:
+            raise ValueError(
+                "released planner geometry requires 729 patches per frame"
+            )
         if batch.code_targets.shape != (camera_batch, frames * tokens):
             raise ValueError("code targets must align with four future grids")
         if batch.pre_positions.shape != batch.code_targets.shape:
@@ -224,7 +278,7 @@ class GroundedQwen35Planner(nn.Module):
             raise ValueError(
                 "qwen_inputs must not override planner backbone output options"
             )
-        backbone_output = self.backbone(
+        backbone_output = self._language_backbone()(
             **batch.qwen_inputs,
             output_hidden_states=False,
             return_dict=True,

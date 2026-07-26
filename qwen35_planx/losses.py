@@ -23,6 +23,79 @@ def _weighted_mean(value: Tensor, weight: Tensor) -> Tensor:
     return (finite_value * finite_weight).sum() / finite_weight.sum().clamp_min(1e-12)
 
 
+class _MemoryBoundedVisualCrossEntropy(torch.autograd.Function):
+    """Recompute each visual-logit chunk instead of saving logits for backward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden: Tensor,
+        visual_weight: Tensor,
+        targets: Tensor,
+        chunk_size: int,
+    ) -> tuple[Tensor, Tensor]:
+        flat_hidden = hidden.reshape(-1, hidden.shape[-1])
+        flat_targets = targets.reshape(-1)
+        loss_sum = hidden.new_zeros(())
+        predictions = torch.empty_like(flat_targets)
+        for start in range(0, flat_hidden.shape[0], chunk_size):
+            stop = min(start + chunk_size, flat_hidden.shape[0])
+            logits = F.linear(flat_hidden[start:stop], visual_weight)
+            loss_sum.add_(
+                F.cross_entropy(
+                    logits,
+                    flat_targets[start:stop],
+                    reduction="sum",
+                )
+            )
+            predictions[start:stop] = logits.argmax(dim=-1)
+
+        predictions = predictions.reshape(targets.shape)
+        ctx.save_for_backward(hidden, visual_weight, targets)
+        ctx.chunk_size = chunk_size
+        ctx.mark_non_differentiable(predictions)
+        return loss_sum / flat_hidden.shape[0], predictions
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_loss: Tensor | None,
+        _grad_predictions: Tensor | None,
+    ) -> tuple[Tensor | None, Tensor | None, None, None]:
+        hidden, visual_weight, targets = ctx.saved_tensors
+        needs_hidden, needs_weight = ctx.needs_input_grad[:2]
+        if grad_loss is None or not (needs_hidden or needs_weight):
+            return None, None, None, None
+
+        flat_hidden = hidden.reshape(-1, hidden.shape[-1])
+        flat_targets = targets.reshape(-1)
+        grad_hidden = torch.zeros_like(flat_hidden) if needs_hidden else None
+        grad_weight = torch.zeros_like(visual_weight) if needs_weight else None
+        scale = grad_loss / flat_hidden.shape[0]
+
+        for start in range(0, flat_hidden.shape[0], ctx.chunk_size):
+            stop = min(start + ctx.chunk_size, flat_hidden.shape[0])
+            hidden_chunk = flat_hidden[start:stop]
+            logits = F.linear(hidden_chunk, visual_weight)
+            grad_logits = logits.softmax(dim=-1)
+            target_column = flat_targets[start:stop].unsqueeze(-1)
+            grad_logits.scatter_add_(
+                dim=1,
+                index=target_column,
+                src=-torch.ones_like(target_column, dtype=grad_logits.dtype),
+            )
+            grad_logits.mul_(scale)
+            if grad_hidden is not None:
+                grad_hidden[start:stop] = grad_logits.matmul(visual_weight)
+            if grad_weight is not None:
+                grad_weight.addmm_(grad_logits.transpose(0, 1), hidden_chunk)
+
+        hidden_gradient = (
+            None if grad_hidden is None else grad_hidden.reshape(hidden.shape)
+        )
+        return hidden_gradient, grad_weight, None, None
+
+
 def _chunked_visual_objective(
     hidden: Tensor,
     visual_weight: Tensor,
@@ -48,19 +121,12 @@ def _chunked_visual_objective(
     if flat_hidden.shape[0] == 0:
         raise ValueError("hidden must contain at least one prediction position")
 
-    loss_sum = flat_hidden.sum() * 0.0
-    predictions: list[Tensor] = []
-    for start in range(0, flat_hidden.shape[0], chunk_size):
-        stop = min(start + chunk_size, flat_hidden.shape[0])
-        logits = F.linear(flat_hidden[start:stop], visual_weight)
-        loss_sum = loss_sum + F.cross_entropy(
-            logits,
-            flat_targets[start:stop],
-            reduction="sum",
-        )
-        predictions.append(logits.argmax(dim=-1))
-    loss = loss_sum / flat_hidden.shape[0]
-    return loss, torch.cat(predictions).reshape(targets.shape)
+    return _MemoryBoundedVisualCrossEntropy.apply(
+        hidden,
+        visual_weight,
+        flat_targets.reshape(targets.shape),
+        chunk_size,
+    )
 
 
 def chunked_visual_cross_entropy(

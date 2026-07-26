@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -9,8 +10,8 @@ import torch.nn.functional as F
 from qwen35_planx.planner_dataset import GroundedPlannerBatch
 
 
-class RaisingOutputHead:
-    def __call__(self, *_args, **_kwargs):
+class RaisingOutputHead(nn.Module):
+    def forward(self, *_args, **_kwargs):
         raise AssertionError("the full Qwen vocabulary output head was called")
 
 
@@ -31,6 +32,19 @@ class FakeBackbone(nn.Module):
         hidden = hidden + 0.05 * self.embedding(input_ids)
         self.last_hidden_state = hidden
         return SimpleNamespace(last_hidden_state=hidden)
+
+
+class FakeConditionalWrapper(nn.Module):
+    def __init__(self, model: FakeBackbone) -> None:
+        super().__init__()
+        self.model = model
+        self.lm_head = RaisingOutputHead()
+        self.public_forward_calls = 0
+
+    def forward(self, *args, **kwargs):
+        self.public_forward_calls += 1
+        output = self.model(*args, **kwargs)
+        return self.lm_head(output.last_hidden_state)
 
 
 def make_batch(
@@ -115,7 +129,7 @@ def make_planner_and_batch():
         code_dim,
         requires_grad=True,
     )
-    planner = GroundedQwen35Planner.from_components(
+    planner = GroundedQwen35Planner._from_test_components(
         backbone=backbone,
         visual_embedding_weight=backbone.embedding.weight,
         codebook=original_codebook,
@@ -219,6 +233,139 @@ def test_planner_visual_logits_are_bounded_and_never_use_qwen_output_head(
     assert seen
     assert max(seen) <= 64
     assert sum(seen) == batch.code_targets.numel()
+
+
+def test_planner_bypasses_a_conditional_generation_wrapper() -> None:
+    from qwen35_planx.planner import GroundedQwen35Planner
+
+    _, base_model, batch, _ = make_planner_and_batch()
+    wrapper = FakeConditionalWrapper(base_model)
+    planner = GroundedQwen35Planner._from_test_components(
+        backbone=wrapper,
+        visual_embedding_weight=base_model.embedding.weight,
+        codebook=torch.randn(13, 7),
+        hidden_dim=8,
+        text_dim=6,
+    )
+
+    output = planner(batch)
+
+    assert output.codes.shape == (batch.size, 4, 4)
+    assert wrapper.public_forward_calls == 0
+    assert len(base_model.calls) == 1
+
+
+def test_production_planner_rejects_nonreleased_geometry() -> None:
+    from qwen35_planx.planner import GroundedQwen35Planner
+
+    backbone = FakeBackbone(vocab_size=13, hidden_dim=8, sequence_length=35)
+
+    with pytest.raises(ValueError, match="released.*geometry"):
+        GroundedQwen35Planner.from_components(
+            backbone=backbone,
+            visual_embedding_weight=backbone.embedding.weight,
+            codebook=torch.randn(13, 7),
+            hidden_dim=8,
+            text_dim=6,
+        )
+
+
+def test_production_planner_exact_released_shapes_on_meta_device() -> None:
+    from qwen35_planx.planner import GroundedQwen35Planner
+
+    class MetaBackbone(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embedding = nn.Embedding(65_536, 2_048)
+            self.calls = 0
+
+        def forward(self, input_ids: torch.Tensor, **kwargs):
+            self.calls += 1
+            assert kwargs["output_hidden_states"] is False
+            assert kwargs["return_dict"] is True
+            return SimpleNamespace(
+                last_hidden_state=torch.empty(
+                    input_ids.shape[0],
+                    input_ids.shape[1],
+                    2_048,
+                )
+            )
+
+    with torch.device("meta"):
+        backbone = MetaBackbone()
+        wrapper = FakeConditionalWrapper(backbone)
+        planner = GroundedQwen35Planner.from_components(
+            backbone=wrapper,
+            visual_embedding_weight=backbone.embedding.weight,
+            codebook=torch.empty(65_536, 1_536),
+            hidden_dim=2_048,
+            text_dim=1_152,
+        )
+        camera_batch = 2
+        tokens = 729
+        sequence_length = 2 * 4 * tokens + 3
+        batch = GroundedPlannerBatch(
+            qwen_inputs={
+                "input_ids": torch.empty(
+                    camera_batch,
+                    sequence_length,
+                    dtype=torch.long,
+                ),
+                "attention_mask": torch.empty(
+                    camera_batch,
+                    sequence_length,
+                    dtype=torch.long,
+                ),
+            },
+            code_targets=torch.empty(
+                camera_batch,
+                4 * tokens,
+                dtype=torch.long,
+            ),
+            pre_positions=torch.empty(
+                camera_batch,
+                4 * tokens,
+                dtype=torch.long,
+            ),
+            post_positions=torch.empty(
+                camera_batch,
+                4 * tokens,
+                dtype=torch.long,
+            ),
+            field_positions=torch.empty(camera_batch, 3, dtype=torch.long),
+            field_mask=torch.empty(camera_batch, 3, dtype=torch.bool),
+            relevance_targets=torch.empty(camera_batch, 4, 3, tokens),
+            relevance_confidence=torch.empty(camera_batch, 4, 3),
+            flow_targets=torch.empty(camera_batch, 3, tokens, 3),
+            phrase_embeddings=torch.empty(camera_batch, 3, 1_152),
+            counterfactual_embeddings=torch.empty(
+                camera_batch,
+                3,
+                1,
+                1_152,
+            ),
+            counterfactual_mask=torch.empty(
+                camera_batch,
+                3,
+                1,
+                dtype=torch.bool,
+            ),
+        )
+
+        output = planner(batch)
+
+    assert output.codes.shape == (2, 4, 729)
+    assert output.code_embeddings.shape == (2, 4, 729, 1_536)
+    assert output.post_hidden.shape == (2, 4, 729, 2_048)
+    assert output.predicted_phrase_embeddings.shape == (2, 3, 1_152)
+    assert output.visual_regression.shape == (2, 2_916, 1_536)
+    assert output.semantic_features.shape == (2, 4, 729, 1_152)
+    assert output.relevance_logits.shape == (2, 4, 3, 729)
+    assert output.fusion_gate.shape == (2, 4, 729, 1)
+    assert output.times.shape == (4,)
+    assert output.total_loss.shape == ()
+    assert backbone.calls == 1
+    assert wrapper.public_forward_calls == 0
 
 
 def test_output_unflattens_only_per_camera_tensors() -> None:

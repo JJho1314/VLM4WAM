@@ -62,6 +62,44 @@ def test_chunked_visual_ce_never_materializes_more_than_requested_positions(
     assert sum(seen) == hidden.shape[0] * hidden.shape[1]
 
 
+def test_chunked_visual_ce_retains_no_vocabulary_sized_activations() -> None:
+    from qwen35_planx.losses import chunked_visual_cross_entropy
+
+    vocabulary_size = 65_536
+    hidden = torch.randn(2, 7, 4, requires_grad=True)
+    weight = torch.randn(vocabulary_size, 4, requires_grad=True)
+    targets = torch.randint(0, vocabulary_size, (2, 7))
+    input_storages = {
+        hidden.untyped_storage().data_ptr(),
+        weight.untyped_storage().data_ptr(),
+        targets.untyped_storage().data_ptr(),
+    }
+    saved: list[torch.Tensor] = []
+
+    def pack(tensor: torch.Tensor) -> torch.Tensor:
+        saved.append(tensor)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        loss = chunked_visual_cross_entropy(
+            hidden,
+            weight,
+            targets,
+            chunk_size=5,
+        )
+    retained_activations = [
+        tensor
+        for tensor in saved
+        if vocabulary_size in tensor.shape
+        and tensor.untyped_storage().data_ptr() not in input_storages
+    ]
+
+    assert retained_activations == []
+    loss.backward()
+    assert hidden.grad is not None
+    assert weight.grad is not None
+
+
 def test_dense_feature_loss_is_zero_for_exact_normalized_targets() -> None:
     from qwen35_planx.losses import dense_feature_loss
 
