@@ -15,6 +15,7 @@ import torch.nn.functional as F
 _GRID_SIZE = 27
 _TOKENS = _GRID_SIZE * _GRID_SIZE
 _MIN_EVIDENCE = 1e-6
+_MIN_PAIRWISE_BHATTACHARYYA = 0.25
 
 EVIDENCE_EXPONENTS = {
     "source": (0.45, 0.30, 0.15, 0.10),
@@ -25,7 +26,7 @@ EVIDENCE_EXPONENTS = {
 
 @dataclass(frozen=True)
 class DinoTracks:
-    """Adjacent-frame flow ``(dx, dy, cycle confidence)`` on a patch grid."""
+    """Adjacent flow ``(dx,dy,bidirectional-cycle confidence)``."""
 
     flow: Tensor
 
@@ -128,6 +129,7 @@ def _track_single(features: Tensor, *, search_radius: int) -> Tensor:
     forward_chunks: list[Tensor] = []
     score_chunks: list[Tensor] = []
     backward_chunks: list[Tensor] = []
+    backward_score_chunks: list[Tensor] = []
     for start in range(0, before.shape[0], 16):
         stop = start + 16
         forward_indices, forward_scores = _local_nearest(
@@ -136,7 +138,7 @@ def _track_single(features: Tensor, *, search_radius: int) -> Tensor:
             grid=grid,
             radius=search_radius,
         )
-        backward_indices, _ = _local_nearest(
+        backward_indices, backward_scores = _local_nearest(
             after[start:stop],
             before[start:stop],
             grid=grid,
@@ -145,30 +147,44 @@ def _track_single(features: Tensor, *, search_radius: int) -> Tensor:
         forward_chunks.append(forward_indices)
         score_chunks.append(forward_scores)
         backward_chunks.append(backward_indices)
+        backward_score_chunks.append(backward_scores)
     forward_indices = torch.cat(forward_chunks)
     forward_scores = torch.cat(score_chunks)
     backward_indices = torch.cat(backward_chunks)
+    backward_scores = torch.cat(backward_score_chunks)
     cycle_indices = backward_indices.gather(1, forward_indices)
+    reverse_match_scores = backward_scores.gather(1, forward_indices)
 
     source = torch.arange(features.shape[1], device=features.device).view(1, -1)
     source_y = torch.div(source, grid, rounding_mode="floor")
     source_x = source.remainder(grid)
     cycle_y = torch.div(cycle_indices, grid, rounding_mode="floor")
     cycle_x = cycle_indices.remainder(grid)
-    cycle_consistent = torch.maximum(
+    cycle_error = torch.maximum(
         (cycle_x - source_x).abs(),
         (cycle_y - source_y).abs(),
-    ) <= 1
+    )
+    cycle_consistent = cycle_error <= 1
 
     target_y = torch.div(forward_indices, grid, rounding_mode="floor")
     target_x = forward_indices.remainder(grid)
     dx = (target_x - source_x).to(features.dtype)
     dy = (target_y - source_y).to(features.dtype)
-    confidence = forward_scores.clamp(0, 1).to(features.dtype)
+    bidirectional_quality = torch.sqrt(
+        forward_scores.clamp(0, 1) * reverse_match_scores.clamp(0, 1)
+    )
+    cycle_quality = torch.where(
+        cycle_error == 0,
+        torch.ones_like(bidirectional_quality),
+        torch.full_like(bidirectional_quality, 0.5),
+    )
+    confidence = (bidirectional_quality * cycle_quality).to(features.dtype)
     valid = (
         cycle_consistent
         & torch.isfinite(forward_scores)
+        & torch.isfinite(reverse_match_scores)
         & (forward_scores >= 0.5)
+        & (reverse_match_scores >= 0.5)
     )
     dx = torch.where(valid, dx, torch.zeros_like(dx))
     dy = torch.where(valid, dy, torch.zeros_like(dy))
@@ -350,7 +366,15 @@ def detect_action_phases(
     *,
     persistence: int = 3,
 ) -> ActionPhases:
-    """Derive close/transport/release priors from the seventh action channel."""
+    """Derive close/transport/release priors from action and state grippers.
+
+    LIBERO states are ``[eef_xyz(3), eef_axis_angle(3), finger_qpos(2)]``.
+    Channels 6 and 7 are therefore the two finger joints, and their physical
+    aperture is ``abs(state[:, 6] - state[:, 7])``. A smaller aperture means
+    closed. State closure/release must persist and temporally agree with the
+    seventh action channel; agreement with only one boundary yields confidence
+    0.5, while missing or unreliable state evidence fails closed.
+    """
 
     if actions is None:
         if states is None:
@@ -365,10 +389,6 @@ def detect_action_phases(
     if persistence <= 0:
         raise ValueError("persistence must be positive")
     length = actions.shape[0]
-    if states is not None:
-        states = torch.as_tensor(states)
-        if states.ndim != 2 or states.shape[0] != length:
-            raise ValueError("states must align with action steps")
     if (
         actions.shape[1] < 7
         or not bool(torch.isfinite(actions[:, 6]).all())
@@ -398,12 +418,54 @@ def detect_action_phases(
     if release is None or release <= closure + 1:
         return _uniform_phases(length, device=actions.device)
 
+    if states is None:
+        return _uniform_phases(length, device=actions.device)
+    states = torch.as_tensor(states, device=actions.device)
+    if (
+        states.ndim != 2
+        or states.shape[0] != length
+        or states.shape[1] < 8
+        or not bool(torch.isfinite(states[:, 6:8]).all())
+    ):
+        return _uniform_phases(length, device=actions.device)
+    aperture = (states[:, 6] - states[:, 7]).abs()
+    aperture_range = aperture.amax() - aperture.amin()
+    if not bool(torch.isfinite(aperture_range)) or float(aperture_range) <= 1e-6:
+        return _uniform_phases(length, device=actions.device)
+    aperture_threshold = 0.5 * (aperture.amin() + aperture.amax())
+    state_closed = aperture <= aperture_threshold
+    state_closure = _transition(
+        state_closed,
+        from_closed=False,
+        to_closed=True,
+        start=persistence,
+        persistence=persistence,
+    )
+    state_release = None
+    if state_closure is not None:
+        state_release = _transition(
+            state_closed,
+            from_closed=True,
+            to_closed=False,
+            start=state_closure + persistence,
+            persistence=persistence,
+        )
+    agreement = int(
+        state_closure is not None
+        and abs(state_closure - closure) <= persistence
+    ) + int(
+        state_release is not None
+        and abs(state_release - release) <= persistence
+    )
+    if agreement == 0:
+        return _uniform_phases(length, device=actions.device)
+
     source = _gaussian_prior(length, closure, device=actions.device)
     target = _gaussian_prior(length, release, device=actions.device)
     transport = torch.zeros(length, device=actions.device, dtype=torch.float32)
     transport[closure + 1 : release] = 1
     transport /= transport.sum().clamp_min(_MIN_EVIDENCE)
-    return ActionPhases(source, transport, target, 1.0)
+    return ActionPhases(source, transport, target, 0.5 * agreement)
 
 
 def _prepare_evidence(value: Tensor | Sequence[float]) -> tuple[Tensor, bool]:
@@ -417,6 +479,20 @@ def _prepare_evidence(value: Tensor | Sequence[float]) -> tuple[Tensor, bool]:
     return tensor, valid
 
 
+def _evidence_agrees(active: Sequence[tuple[Tensor, float]]) -> bool:
+    """Require every valid pair's Bhattacharyya coefficient to be at least .25."""
+
+    distributions = [
+        evidence / evidence.sum().clamp_min(_MIN_EVIDENCE)
+        for evidence, _ in active
+    ]
+    return all(
+        float(torch.sqrt(first * second).sum()) >= _MIN_PAIRWISE_BHATTACHARYYA
+        for index, first in enumerate(distributions)
+        for second in distributions[index + 1 :]
+    )
+
+
 def fuse_hindsight_maps(
     role: str,
     *,
@@ -426,7 +502,13 @@ def fuse_hindsight_maps(
     phase: Tensor | Sequence[float],
     confidences: Sequence[float] = (1.0, 1.0, 1.0, 1.0),
 ) -> FusedHindsightMap:
-    """Fuse four spatial signals with a confidence-weighted geometric mean."""
+    """Fuse evidence, failing confidence on material spatial disagreement.
+
+    Agreement is the minimum pairwise Bhattacharyya coefficient between
+    normalized valid inputs. A value below 0.25 marks disjoint distributions;
+    the fused probability map is still returned, but its grounding confidence
+    is zero.
+    """
 
     if role not in EVIDENCE_EXPONENTS:
         raise ValueError(f"role must be one of {tuple(EVIDENCE_EXPONENTS)}")
@@ -461,7 +543,7 @@ def fuse_hindsight_maps(
         fused = torch.full_like(reference, 1.0 / _TOKENS)
 
     output_confidence = 0.0
-    if len(active) >= 2:
+    if len(active) >= 2 and _evidence_agrees(active):
         output_confidence = min(
             1.0,
             sum(

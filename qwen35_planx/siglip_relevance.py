@@ -134,15 +134,32 @@ class SiglipRelevanceTeacher:
             phrases=phrases,
             counterfactual_phrases=counterfactual_phrases,
         )
+        available_counterfactuals = (
+            (False, False, False)
+            if counterfactual_phrases is None
+            else tuple(
+                bool(negative.strip()) and negative.strip() != positive.strip()
+                for positive, negative in zip(phrases, counterfactual_phrases)
+            )
+        )
         field_confidence = torch.tensor(
             fields.confidences,
+            device=result.confidence.device,
+            dtype=result.confidence.dtype,
+        )
+        counterfactual_confidence = torch.tensor(
+            available_counterfactuals,
             device=result.confidence.device,
             dtype=result.confidence.dtype,
         )
         return PhraseRelevance(
             phrase_embeddings=result.phrase_embeddings,
             maps=result.maps,
-            confidence=result.confidence * field_confidence.unsqueeze(0),
+            confidence=(
+                result.confidence
+                * field_confidence.unsqueeze(0)
+                * counterfactual_confidence.unsqueeze(0)
+            ),
         )
 
     def _pooling_attention_hook(self) -> tuple[Any | None, list[Tensor]]:
@@ -269,7 +286,11 @@ class SiglipRelevanceTeacher:
         confidence = torch.sqrt(peak_signal * margin_signal)
         return torch.where(finite, confidence, torch.zeros_like(confidence)).clamp(0, 1)
 
-    def _counterfactual_scores(self, images: Tensor, phrase: str) -> Tensor:
+    def _counterfactual_scores(
+        self,
+        images: Tensor,
+        phrase: str,
+    ) -> tuple[Tensor, Tensor]:
         processed = self.processor(
             images=images,
             text=[phrase],
@@ -289,7 +310,20 @@ class SiglipRelevanceTeacher:
         logits = getattr(output, "logits_per_image", None)
         if logits is None:
             raise ValueError("SigLIP2 output must contain per-image similarity logits")
-        return logits[:, 0].detach()
+        embedding = getattr(output, "text_embeds", None)
+        if (
+            embedding is None
+            or embedding.ndim != 2
+            or embedding.shape != (1, _TEXT_WIDTH)
+        ):
+            raise ValueError(
+                "counterfactual SigLIP2 output must contain one "
+                f"{_TEXT_WIDTH}-wide text embedding"
+            )
+        score = logits[:, 0]
+        finite = torch.isfinite(score) & torch.isfinite(embedding).all()
+        score = torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)
+        return score.detach(), finite.detach()
 
     def encode(
         self,
@@ -347,14 +381,23 @@ class SiglipRelevanceTeacher:
                         images, phrase
                     )
                 negative_score = None
+                counterfactual_finite = torch.ones_like(finite)
                 if counterfactual_phrases is not None:
                     negative = counterfactual_phrases[index].strip()
                     if negative:
-                        negative_score = self._counterfactual_scores(images, negative)
+                        (
+                            negative_score,
+                            counterfactual_finite,
+                        ) = self._counterfactual_scores(images, negative)
                 embeddings.append(embedding)
                 maps.append(relevance)
                 confidences.append(
-                    self._confidence(relevance, score, negative_score, finite)
+                    self._confidence(
+                        relevance,
+                        score,
+                        negative_score,
+                        finite & counterfactual_finite,
+                    )
                 )
                 gradients.append(gradient)
                 self._captured_spatial_activations = None

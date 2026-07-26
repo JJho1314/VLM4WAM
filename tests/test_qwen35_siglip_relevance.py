@@ -167,6 +167,84 @@ def test_instruction_fields_are_encoded_in_canonical_role_order(fake_siglip) -> 
 
     torch.testing.assert_close(structured.phrase_embeddings, direct.phrase_embeddings)
     torch.testing.assert_close(structured.maps, direct.maps)
+    assert torch.count_nonzero(structured.confidence) == 0
+
+
+def test_encode_fields_requires_counterfactual_for_each_supervised_role(
+    fake_siglip,
+) -> None:
+    from qwen35_planx.siglip_relevance import SiglipRelevanceTeacher
+
+    fields = InstructionFields(
+        original="put the bowl on the plate",
+        action="put",
+        source="the bowl",
+        target="on the plate",
+        confidences=(1.0, 1.0, 1.0),
+    )
+    teacher = SiglipRelevanceTeacher.from_components(
+        model=fake_siglip.model,
+        processor=fake_siglip.processor,
+    )
+
+    missing = teacher.encode_fields(torch.zeros(1, 3, 384, 384), fields)
+    partial = teacher.encode_fields(
+        torch.zeros(1, 3, 384, 384),
+        fields,
+        counterfactual_phrases=("the cup", "", "open"),
+    )
+
+    assert torch.count_nonzero(missing.confidence) == 0
+    assert partial.confidence[0, 0] > 0
+    assert partial.confidence[0, 1] == 0
+    assert partial.confidence[0, 2] > 0
+
+
+def test_nonfinite_counterfactual_is_sanitized_and_fails_closed(
+    fake_siglip,
+) -> None:
+    from qwen35_planx.siglip_relevance import SiglipRelevanceTeacher
+
+    fields = InstructionFields(
+        original="put the bowl on the plate",
+        action="put",
+        source="the bowl",
+        target="on the plate",
+        confidences=(1.0, 1.0, 1.0),
+    )
+    nan_embedding_phrase = "negative-6"
+    inf_logit_phrase = "negative-7"
+    nan_embedding_token = (sum(map(ord, nan_embedding_phrase)) % 13) + 1
+    inf_logit_token = (sum(map(ord, inf_logit_phrase)) % 13) + 1
+    original_forward = fake_siglip.model.forward
+
+    def nonfinite_counterfactual_forward(**inputs):
+        output = original_forward(**inputs)
+        if inputs["input_ids"].item() == nan_embedding_token:
+            output.text_embeds[:] = torch.nan
+        if inputs["input_ids"].item() == inf_logit_token:
+            output.logits_per_image[:] = torch.inf
+        return output
+
+    fake_siglip.model.forward = nonfinite_counterfactual_forward
+    output = SiglipRelevanceTeacher.from_components(
+        model=fake_siglip.model,
+        processor=fake_siglip.processor,
+    ).encode_fields(
+        torch.zeros(1, 3, 384, 384),
+        fields,
+        counterfactual_phrases=(
+            nan_embedding_phrase,
+            inf_logit_phrase,
+            "open",
+        ),
+    )
+
+    assert torch.isfinite(output.phrase_embeddings).all()
+    assert torch.isfinite(output.maps).all()
+    assert torch.isfinite(output.confidence).all()
+    assert torch.count_nonzero(output.confidence[0, :2]) == 0
+    assert output.confidence[0, 2] > 0
 
 
 def test_nonfinite_teacher_output_is_sanitized_and_disables_confidence(
