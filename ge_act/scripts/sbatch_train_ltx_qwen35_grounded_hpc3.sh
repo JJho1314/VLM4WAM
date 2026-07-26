@@ -23,10 +23,18 @@ if [[ ! -f "$GE_ACT_ROOT/main.py" ]]; then
   exit 2
 fi
 
-CONDA_ENV="${CONDA_ENV:-/data/LFT-W02_data/.conda/envs/ge-act}"
+if [[ -z "${CONDA_ENV:-}" ]]; then
+  echo "CONDA_ENV must point to an environment installed from ge_act/requirements-qwen35-grounded.txt" >&2
+  exit 2
+fi
+if [[ ! -x "$CONDA_ENV/bin/python" ]]; then
+  echo "CONDA_ENV must point to an environment with bin/python: $CONDA_ENV" >&2
+  exit 2
+fi
 CONFIG="${CONFIG:-$GE_ACT_ROOT/configs/ltx_model/libero/action_model_libero_qwen35_grounded_hdf5.yaml}"
 
 export PATH="$CONDA_ENV/bin:$PATH"
+export PYTHON_BIN="$CONDA_ENV/bin/python"
 export PYTHONUNBUFFERED=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1

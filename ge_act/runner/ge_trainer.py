@@ -4,6 +4,7 @@ import random
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping
 
@@ -436,6 +437,36 @@ def build_grounded_semantic_condition(
     return compress_grounded_plan(fused, relevance), planner_loss
 
 
+def generate_grounded_condition_for_validation(
+    provider: torch.nn.Module,
+    batch: Mapping[str, Any],
+    *,
+    qwen_gradient_scale: float,
+):
+    """Generate without gradients and restore the provider's prior mode."""
+
+    was_training = provider.training
+    provider.eval()
+    try:
+        with torch.no_grad():
+            condition, _ = build_grounded_semantic_condition(
+                provider,
+                batch,
+                training=False,
+                qwen_gradient_scale=qwen_gradient_scale,
+            )
+            return condition
+    finally:
+        provider.train(was_training)
+
+
+@dataclass(frozen=True)
+class JointGroundedForwardOutput:
+    latents: Mapping[str, torch.Tensor]
+    planner_loss: torch.Tensor
+    semantic_condition: Any
+
+
 class JointGroundedTrainingModel(torch.nn.Module):
     """One registered module for DeepSpeed containing both trainable models."""
 
@@ -453,8 +484,191 @@ class JointGroundedTrainingModel(torch.nn.Module):
         self.diffusion_model = diffusion_model
         self.semantic_provider = semantic_provider
 
-    def forward(self, *args, **kwargs):
-        return self.diffusion_model(*args, **kwargs)
+    def forward(
+        self,
+        *,
+        grounded_batch: Mapping[str, Any],
+        qwen_gradient_scale: float,
+        **diffusion_kwargs,
+    ) -> JointGroundedForwardOutput:
+        semantic_condition, planner_loss = build_grounded_semantic_condition(
+            self.semantic_provider,
+            grounded_batch,
+            training=True,
+            qwen_gradient_scale=qwen_gradient_scale,
+        )
+        reference = diffusion_kwargs.get("noisy_latents")
+        if not isinstance(reference, torch.Tensor):
+            raise TypeError("joint forward requires noisy_latents")
+        from qwen35_planx.compression import CompressedSemanticPlan
+
+        aligned_condition = CompressedSemanticPlan(
+            tokens=semantic_condition.tokens.to(
+                device=reference.device,
+                dtype=reference.dtype,
+            ),
+            positions=semantic_condition.positions.to(
+                device=reference.device,
+                dtype=torch.float32,
+            ),
+            mask=semantic_condition.mask.to(device=reference.device),
+            relevance=semantic_condition.relevance.to(
+                device=reference.device,
+                dtype=reference.dtype,
+            ),
+            source_indices=semantic_condition.source_indices.to(
+                device=reference.device,
+            ),
+        )
+        for field in (
+            "semantic_plan",
+            "semantic_plan_positions",
+            "semantic_plan_mask",
+            "semantic_plan_relevance",
+        ):
+            if field in diffusion_kwargs:
+                raise ValueError(
+                    f"joint forward constructs {field}; callers must not supply it"
+                )
+        latents = forward_pass(
+            model=self.diffusion_model,
+            semantic_plan=aligned_condition.tokens,
+            semantic_plan_positions=aligned_condition.positions,
+            semantic_plan_mask=aligned_condition.mask,
+            semantic_plan_relevance=aligned_condition.relevance,
+            **diffusion_kwargs,
+        )["latents"]
+        return JointGroundedForwardOutput(
+            latents=latents,
+            planner_loss=planner_loss,
+            semantic_condition=aligned_condition,
+        )
+
+
+class EpochSeededRandomSampler(torch.utils.data.Sampler[int]):
+    """Reconstruct each epoch permutation from an immutable seed and epoch."""
+
+    def __init__(self, data_source, *, seed: int) -> None:
+        if type(seed) is not int:
+            raise TypeError("sampler seed must be an integer")
+        self.data_source = data_source
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        if type(epoch) is not int or epoch < 0:
+            raise ValueError("sampler epoch must be a non-negative integer")
+        self.epoch = epoch
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        return iter(
+            torch.randperm(
+                len(self.data_source),
+                generator=generator,
+            ).tolist()
+        )
+
+    def __len__(self) -> int:
+        return len(self.data_source)
+
+
+@dataclass(frozen=True)
+class TrainingCursor:
+    """Exact next-microbatch position for deterministic joint resume."""
+
+    global_step: int
+    epoch: int
+    consumed_microbatches: int
+    microbatches_per_epoch: int
+    sampler_seed: int
+
+    def __post_init__(self) -> None:
+        for field in (
+            "global_step",
+            "epoch",
+            "consumed_microbatches",
+            "microbatches_per_epoch",
+            "sampler_seed",
+        ):
+            if type(getattr(self, field)) is not int:
+                raise TypeError(f"training cursor {field} must be an integer")
+        if self.global_step < 0 or self.epoch < 0:
+            raise ValueError("training cursor step and epoch must be non-negative")
+        if self.microbatches_per_epoch <= 0:
+            raise ValueError(
+                "training cursor microbatches_per_epoch must be positive"
+            )
+        if not 0 <= self.consumed_microbatches < self.microbatches_per_epoch:
+            raise ValueError(
+                "training cursor consumed_microbatches must identify the next "
+                "batch within the epoch"
+            )
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "global_step": self.global_step,
+            "epoch": self.epoch,
+            "consumed_microbatches": self.consumed_microbatches,
+            "microbatches_per_epoch": self.microbatches_per_epoch,
+            "sampler_seed": self.sampler_seed,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> "TrainingCursor":
+        expected = {
+            "global_step",
+            "epoch",
+            "consumed_microbatches",
+            "microbatches_per_epoch",
+            "sampler_seed",
+        }
+        if not isinstance(payload, dict) or set(payload) != expected:
+            raise ValueError("joint checkpoint training cursor is invalid")
+        return cls(**payload)
+
+
+def advance_training_cursor(
+    cursor: TrainingCursor,
+    *,
+    epoch: int,
+    consumed_microbatches: int,
+    global_step: int,
+) -> TrainingCursor:
+    """Normalize an exhausted epoch to the next epoch's first microbatch."""
+
+    if consumed_microbatches == cursor.microbatches_per_epoch:
+        epoch += 1
+        consumed_microbatches = 0
+    return TrainingCursor(
+        global_step=global_step,
+        epoch=epoch,
+        consumed_microbatches=consumed_microbatches,
+        microbatches_per_epoch=cursor.microbatches_per_epoch,
+        sampler_seed=cursor.sampler_seed,
+    )
+
+
+def set_dataloader_epoch(
+    dataloader,
+    *,
+    epoch: int,
+    sampler_seed: int,
+) -> None:
+    """Set both permutation epoch and private worker-base-seed generator."""
+
+    set_epoch = getattr(dataloader, "set_epoch", None)
+    if callable(set_epoch):
+        set_epoch(epoch)
+    else:
+        sampler = getattr(dataloader, "sampler", None)
+        sampler_set_epoch = getattr(sampler, "set_epoch", None)
+        if callable(sampler_set_epoch):
+            sampler_set_epoch(epoch)
+    generator = getattr(dataloader, "generator", None)
+    if isinstance(generator, torch.Generator):
+        generator.manual_seed(sampler_seed + epoch)
 
 
 def prepare_joint_training_components(
@@ -503,15 +717,15 @@ def save_joint_training_checkpoint(
     accelerator,
     output_dir: str | Path,
     *,
-    step: int,
+    cursor: TrainingCursor,
     joint_model: JointGroundedTrainingModel,
 ) -> Path:
     """Atomically publish Accelerate state containing diffusion and provider."""
 
-    if type(step) is not int or step < 0:
-        raise ValueError("joint checkpoint step must be a non-negative integer")
+    if not isinstance(cursor, TrainingCursor):
+        raise TypeError("joint checkpoint requires a TrainingCursor")
     root = Path(output_dir)
-    destination = root / f"step_{step:06d}"
+    destination = root / f"step_{cursor.global_step:06d}"
     staging = root / f".{destination.name}.incomplete"
     if getattr(accelerator, "is_main_process", True):
         root.mkdir(parents=True, exist_ok=True)
@@ -530,13 +744,13 @@ def save_joint_training_checkpoint(
         accelerator.wait_for_everyone()
         if getattr(accelerator, "is_main_process", True):
             metadata = {
-                "format_version": 1,
-                "step": step,
+                "format_version": 2,
                 "model_children": [
                     "diffusion_model",
                     "semantic_provider",
                 ],
                 "topology_hash": _joint_topology_hash(joint_model),
+                "cursor": cursor.to_dict(),
             }
             (staging / "joint_state.json").write_text(
                 json.dumps(
@@ -562,7 +776,9 @@ def load_joint_training_checkpoint(
     checkpoint_dir: str | Path,
     *,
     joint_model: JointGroundedTrainingModel,
-) -> int:
+    expected_microbatches_per_epoch: int,
+    expected_sampler_seed: int,
+) -> TrainingCursor:
     """Validate both child topologies before restoring Accelerate state."""
 
     checkpoint = Path(checkpoint_dir)
@@ -577,24 +793,31 @@ def load_joint_training_checkpoint(
         raise ValueError("joint checkpoint metadata is invalid") from error
     expected_fields = {
         "format_version",
-        "step",
         "model_children",
         "topology_hash",
+        "cursor",
     }
     if not isinstance(metadata, dict) or set(metadata) != expected_fields:
         raise ValueError("joint checkpoint metadata fields are invalid")
     if (
-        metadata["format_version"] != 1
-        or type(metadata["step"]) is not int
-        or metadata["step"] < 0
+        metadata["format_version"] != 2
         or metadata["model_children"]
         != ["diffusion_model", "semantic_provider"]
         or metadata["topology_hash"] != _joint_topology_hash(joint_model)
     ):
         raise ValueError("joint checkpoint is incompatible with runtime models")
+    try:
+        cursor = TrainingCursor.from_dict(metadata["cursor"])
+    except (TypeError, ValueError) as error:
+        raise ValueError("joint checkpoint training cursor is invalid") from error
+    if (
+        cursor.microbatches_per_epoch != expected_microbatches_per_epoch
+        or cursor.sampler_seed != expected_sampler_seed
+    ):
+        raise ValueError("joint checkpoint data cursor differs from runtime")
     accelerator.load_state(str(checkpoint))
     accelerator.wait_for_everyone()
-    return int(metadata["step"])
+    return cursor
 
 
 def should_save_checkpoint(global_step: int, args: argparse.Namespace) -> bool:
@@ -663,9 +886,12 @@ class Trainer:
         self.semantic_encoder = None
         self.semantic_planner = None
         self.grounded_provider = None
+        self.grounded_training_enabled = False
         self.qwen_ownership = None
         self.joint_model = None
-        self.resume_global_step = 0
+        self.sampler_seed = int(self.args.seed) if self.args.seed is not None else 0
+        self.resume_cursor = None
+        self.current_cursor = None
         self.video_frame_rate = compute_effective_video_fps(self.args.data["train"])
 
         self._init_distributed()
@@ -797,9 +1023,15 @@ class Trainer:
         )
         self.train_dataset = train_dataset_class(**self.args.data['train'])
 
+        self.train_sampler = EpochSeededRandomSampler(
+            self.train_dataset,
+            seed=self.sampler_seed,
+        )
+        self.train_dataloader_generator = torch.Generator()
+        self.train_dataloader_generator.manual_seed(self.sampler_seed)
         self.train_dataloader = torch.utils.data.DataLoader(
             dataset=self.train_dataset,
-            shuffle=True,
+            sampler=self.train_sampler,
             batch_size=self.args.batch_size,
             num_workers=self.args.dataloader_num_workers,
             pin_memory=getattr(self.args, "pin_memory", False),
@@ -810,6 +1042,7 @@ class Trainer:
                 else None
             ),
             multiprocessing_context=None,
+            generator=self.train_dataloader_generator,
         )
         logger.info(f">>>>>>>>>>>>>Total Train Eps: {len(self.train_dataset)}<<<<<<<<<<<<<<<<<<\n")
 
@@ -948,6 +1181,7 @@ class Trainer:
                     device=device,
                     dtype=dtype,
                 )
+                self.grounded_training_enabled = True
             else:
                 raise ValueError(f"unknown semantic_plan.source: {semantic_source}")
 
@@ -1097,11 +1331,13 @@ class Trainer:
         
 
     def prepare_for_training(self):
-        if self.grounded_provider is None:
+        if not self.grounded_training_enabled:
             self.diffusion_model, self.optimizer, self.train_dataloader, self.lr_scheduler = self.state.accelerator.prepare(
                 self.diffusion_model, self.optimizer, self.train_dataloader, self.lr_scheduler
             )
             return
+        if self.grounded_provider is None:
+            raise RuntimeError("grounded provider was lost before joint preparation")
         self.joint_model = JointGroundedTrainingModel(
             diffusion_model=self.diffusion_model,
             semantic_provider=self.grounded_provider,
@@ -1119,23 +1355,42 @@ class Trainer:
             self.lr_scheduler,
         )
         self.diffusion_model = self.joint_model
+        self.grounded_provider = None
+        microbatches_per_epoch = len(self.train_dataloader)
         resume_from = getattr(self.args, "resume_from_checkpoint", None)
         if resume_from:
             unwrapped = unwrap_model(
                 self.state.accelerator,
                 self.joint_model,
             )
-            self.resume_global_step = load_joint_training_checkpoint(
+            self.resume_cursor = load_joint_training_checkpoint(
                 self.state.accelerator,
                 resume_from,
                 joint_model=unwrapped,
+                expected_microbatches_per_epoch=microbatches_per_epoch,
+                expected_sampler_seed=self.sampler_seed,
             )
+        else:
+            self.resume_cursor = TrainingCursor(
+                global_step=0,
+                epoch=0,
+                consumed_microbatches=0,
+                microbatches_per_epoch=microbatches_per_epoch,
+                sampler_seed=self.sampler_seed,
+            )
+        self.current_cursor = self.resume_cursor
 
     def _unwrapped_diffusion_model(self, accelerator):
         model = unwrap_model(accelerator, self.diffusion_model)
         if isinstance(model, JointGroundedTrainingModel):
             return model.diffusion_model
         return model
+
+    def _unwrapped_grounded_provider(self, accelerator):
+        model = unwrap_model(accelerator, self.diffusion_model)
+        if not isinstance(model, JointGroundedTrainingModel):
+            raise RuntimeError("grounded provider requires a prepared joint model")
+        return model.semantic_provider
 
 
     def prepare_trackers(self):
@@ -1164,8 +1419,20 @@ class Trainer:
         }
         logger.info(f"Training configuration: {json.dumps(info, indent=4)}")
         
-        global_step = int(self.resume_global_step)
-        first_epoch = 0
+        if self.grounded_training_enabled:
+            if not isinstance(self.resume_cursor, TrainingCursor):
+                raise RuntimeError("grounded training cursor was not prepared")
+            cursor = self.resume_cursor
+        else:
+            cursor = TrainingCursor(
+                global_step=0,
+                epoch=0,
+                consumed_microbatches=0,
+                microbatches_per_epoch=len(self.train_dataloader),
+                sampler_seed=self.sampler_seed,
+            )
+        global_step = cursor.global_step
+        first_epoch = cursor.epoch
         initial_global_step = global_step
         progress_bar = tqdm(
             range(0, self.state.train_steps),
@@ -1177,11 +1444,6 @@ class Trainer:
         accelerator = self.state.accelerator
         weight_dtype = self.state.weight_dtype
         scheduler_sigmas = self.scheduler.sigmas.clone().to(device=accelerator.device, dtype=weight_dtype)
-        generator = torch.Generator(device=accelerator.device)
-        if self.args.seed is not None:
-            generator = generator.manual_seed(self.args.seed)
-        self.state.generator = generator
-
         for epoch in range(first_epoch, self.state.train_epochs):
             if global_step >= self.state.train_steps:
                 break
@@ -1191,7 +1453,20 @@ class Trainer:
             self.diffusion_model.train()
 
             running_loss = 0.0
-            for step, batch in enumerate(self.train_dataloader):
+            set_dataloader_epoch(
+                self.train_dataloader,
+                epoch=epoch,
+                sampler_seed=cursor.sampler_seed,
+            )
+            skipped_microbatches = (
+                cursor.consumed_microbatches if epoch == first_epoch else 0
+            )
+            epoch_dataloader = accelerator.skip_first_batches(
+                self.train_dataloader,
+                num_batches=skipped_microbatches,
+            )
+            for step, batch in enumerate(epoch_dataloader):
+                absolute_microbatch = skipped_microbatches + step + 1
                 logger.debug(f"Starting step {step + 1}")
                 logs = {}
                 with accelerator.accumulate(self.diffusion_model):
@@ -1205,7 +1480,6 @@ class Trainer:
                     semantic_keyframes = None
                     planner_semantic_plan = None
                     planner_semantic_times = None
-                    grounded_condition = None
                     planner_aux_loss = None
                     if self.semantic_encoder is not None:
                         semantic_config = self.args.semantic_plan
@@ -1225,16 +1499,6 @@ class Trainer:
                                 batch['caption'],
                                 n_previous=mem_size,
                             )
-                        )
-                    elif self.grounded_provider is not None:
-                        (
-                            grounded_condition,
-                            planner_aux_loss,
-                        ) = build_grounded_semantic_condition(
-                            self.grounded_provider,
-                            batch,
-                            training=True,
-                            qwen_gradient_scale=self.args.qwen_ge_gradient_scale,
                         )
                     video = rearrange(video, 'b c v t h w -> (b v) c t h w')
 
@@ -1288,22 +1552,7 @@ class Trainer:
                             device=accelerator.device,
                             dtype=torch.float32,
                         )
-                    elif grounded_condition is not None:
-                        semantic_plan = grounded_condition.tokens.to(
-                            device=accelerator.device,
-                            dtype=weight_dtype,
-                        )
-                        semantic_plan_positions = grounded_condition.positions.to(
-                            device=accelerator.device,
-                            dtype=torch.float32,
-                        )
-                        semantic_plan_mask = grounded_condition.mask.to(
-                            device=accelerator.device,
-                        )
-                        semantic_plan_relevance = grounded_condition.relevance.to(
-                            device=accelerator.device,
-                            dtype=weight_dtype,
-                        )
+                    elif self.grounded_training_enabled:
                         semantic_plan_times = build_semantic_plan_times(
                             batch_size=batch_size,
                             n_view=n_view,
@@ -1318,7 +1567,7 @@ class Trainer:
                             ),
                             device=accelerator.device,
                         )
-                    if semantic_plan is not None:
+                    if semantic_plan is not None or self.grounded_training_enabled:
                         semantic_condition_mask = sample_semantic_condition_mask(
                             batch_size=batch_size,
                             n_view=n_view,
@@ -1431,8 +1680,7 @@ class Trainer:
                         weighting_scheme=self.args.flow_weighting_scheme, sigmas=sigmas
                     ).reshape(-1, 1, 1).repeat(1, 1, latents.size(-1))
 
-                    pred_all = forward_pass(
-                        model=self.diffusion_model, 
+                    diffusion_forward_kwargs = dict(
                         timesteps=timesteps, 
                         noisy_latents=noisy_latents,
                         prompt_embeds=prompt_embeds, 
@@ -1457,7 +1705,27 @@ class Trainer:
                         semantic_plan_mask=semantic_plan_mask,
                         semantic_plan_relevance=semantic_plan_relevance,
                         semantic_condition_mask=semantic_condition_mask,
-                    )['latents']
+                    )
+                    if self.grounded_training_enabled:
+                        for field in (
+                            "semantic_plan",
+                            "semantic_plan_positions",
+                            "semantic_plan_mask",
+                            "semantic_plan_relevance",
+                        ):
+                            diffusion_forward_kwargs.pop(field)
+                        joint_output = self.diffusion_model(
+                            grounded_batch=batch,
+                            qwen_gradient_scale=self.args.qwen_ge_gradient_scale,
+                            **diffusion_forward_kwargs,
+                        )
+                        pred_all = joint_output.latents
+                        planner_aux_loss = joint_output.planner_loss
+                    else:
+                        pred_all = forward_pass(
+                            model=self.diffusion_model,
+                            **diffusion_forward_kwargs,
+                        )["latents"]
 
                     if self.args.train_mode == 'all' or self.args.train_mode == 'video_only':
                         pred = pred_all['video']
@@ -1512,6 +1780,13 @@ class Trainer:
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
                     global_step += 1
+                cursor = advance_training_cursor(
+                    cursor,
+                    epoch=epoch,
+                    consumed_microbatches=absolute_microbatch,
+                    global_step=global_step,
+                )
+                self.current_cursor = cursor
 
                 logs = {"loss": loss.detach().item(), "lr": self.lr_scheduler.get_last_lr()[0]}
                 progress_bar.set_postfix(logs)
@@ -1540,11 +1815,11 @@ class Trainer:
                 
                 if accelerator.sync_gradients and should_save_checkpoint(global_step, self.args):
                     accelerator.wait_for_everyone()
-                    if self.grounded_provider is not None:
+                    if self.grounded_training_enabled:
                         save_joint_training_checkpoint(
                             accelerator,
                             self.save_folder,
-                            step=global_step,
+                            cursor=cursor,
                             joint_model=unwrap_model(
                                 accelerator,
                                 self.diffusion_model,
@@ -1557,6 +1832,15 @@ class Trainer:
                         model_to_save.save_pretrained(model_save_dir, safe_serialization=True)
                         del  model_to_save
                         
+            if cursor.epoch == epoch and global_step < self.state.train_steps:
+                cursor = TrainingCursor(
+                    global_step=global_step,
+                    epoch=epoch + 1,
+                    consumed_microbatches=0,
+                    microbatches_per_epoch=cursor.microbatches_per_epoch,
+                    sampler_seed=cursor.sampler_seed,
+                )
+                self.current_cursor = cursor
             memory_statistics = get_memory_statistics()
             logger.info(f"Memory after epoch {epoch + 1}: {json.dumps(memory_statistics, indent=4)}")
 
@@ -1565,13 +1849,13 @@ class Trainer:
                 self.writer.add_scalar("Average Training Loss", avg_loss, epoch)
 
         accelerator.wait_for_everyone()
-        if self.grounded_provider is not None:
+        if self.grounded_training_enabled:
             final_checkpoint = Path(self.save_folder) / f"step_{global_step:06d}"
             if not final_checkpoint.exists():
                 save_joint_training_checkpoint(
                     accelerator,
                     self.save_folder,
-                    step=global_step,
+                    cursor=cursor,
                     joint_model=unwrap_model(
                         accelerator,
                         self.diffusion_model,
@@ -1634,7 +1918,7 @@ class Trainer:
         if (
             self.semantic_encoder is not None
             or self.semantic_planner is not None
-            or self.grounded_provider is not None
+            or self.grounded_training_enabled
         ):
             semantic_mode = semantic_mode or self.args.semantic_plan.get("validation_mode", "gt")
             if semantic_mode == "gt":
@@ -1676,23 +1960,25 @@ class Trainer:
             elif semantic_mode == "planner":
                 if (
                     self.semantic_planner is None
-                    and self.grounded_provider is None
+                    and not self.grounded_training_enabled
                 ):
                     raise ValueError(
                         "planner semantic validation requires a planner source"
                     )
-                if self.grounded_provider is not None:
-                    grounded_condition, _ = (
-                        build_grounded_semantic_condition(
-                            self.grounded_provider,
+                if self.grounded_training_enabled:
+                    provider = self._unwrapped_grounded_provider(accelerator)
+                    grounded_condition = (
+                        generate_grounded_condition_for_validation(
+                            provider,
                             {
-                                "current_images": batch["current_images"][
-                                    :batch_size
-                                ],
+                                "current_images": batch[
+                                    "current_images"
+                                ][:batch_size],
                                 "caption": prompt[:batch_size],
                             },
-                            training=False,
-                            qwen_gradient_scale=self.args.qwen_ge_gradient_scale,
+                            qwen_gradient_scale=(
+                                self.args.qwen_ge_gradient_scale
+                            ),
                         )
                     )
                     semantic_plan = grounded_condition.tokens.to(

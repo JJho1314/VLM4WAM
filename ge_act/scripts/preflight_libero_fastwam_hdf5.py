@@ -22,8 +22,10 @@ REQUIRED_MODULES = (
     "diffusers",
     "transformers",
     "accelerate",
+    "deepspeed",
     "safetensors",
     "h5py",
+    "cv2",
 )
 DATASET_CLASS_PATH = "data/libero_fastwam_hdf5_dataset.py"
 DATASET_CLASS = "LiberoFastWAMHDF5Dataset"
@@ -516,11 +518,15 @@ def _collect_path_errors(
                 errors.append("hindsight cache differs from HDF5 manifest")
             from ge_act.models.ltx_models.vlm_semantic_planner import (
                 _validate_grounded_checkpoint_contract,
+                validate_qwen35_model_config_runtime,
             )
 
             _validate_grounded_checkpoint_contract(
                 Path(str(raw_planner)),
                 hindsight_cache_hash=cache.cache_hash,
+            )
+            validate_qwen35_model_config_runtime(
+                Path(str(raw_planner)) / "model_config"
             )
         except (ImportError, OSError, RuntimeError, ValueError) as error:
             errors.append(f"invalid grounded planner/cache: {error}")

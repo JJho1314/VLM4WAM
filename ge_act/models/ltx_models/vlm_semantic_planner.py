@@ -256,10 +256,47 @@ def _validate_grounded_checkpoint_contract(
     return metadata
 
 
+def validate_qwen35_model_config_runtime(
+    model_config_dir: str | Path,
+):
+    """Resolve the saved Qwen3.5 config and image-text model class without weights."""
+
+    try:
+        from transformers import AutoConfig, AutoModelForImageTextToText
+    except (ImportError, AttributeError) as error:
+        raise RuntimeError(
+            "grounded training requires Qwen3.5-capable Transformers; "
+            "install ge_act/requirements-qwen35-grounded.txt"
+        ) from error
+    try:
+        config = AutoConfig.from_pretrained(
+            Path(model_config_dir),
+            local_files_only=True,
+        )
+    except (OSError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            "saved model_config requires Qwen3.5-capable Transformers; "
+            "install ge_act/requirements-qwen35-grounded.txt"
+        ) from error
+    if getattr(config, "model_type", None) != "qwen3_5":
+        raise RuntimeError(
+            "saved grounded planner model_config must have model_type qwen3_5"
+        )
+    try:
+        model_class = AutoModelForImageTextToText._model_mapping[type(config)]
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            "Qwen3.5 image-text model class is unavailable; "
+            "install ge_act/requirements-qwen35-grounded.txt"
+        ) from error
+    return config, model_class
+
+
 def _load_grounded_checkpoint_components(
     checkpoint_dir: Path,
     *,
     metadata,
+    config,
     cache_dir: Path,
     dataset: Any,
     condition_dim: int,
@@ -270,7 +307,6 @@ def _load_grounded_checkpoint_components(
 
     from safetensors.torch import load_file, load_model
     from transformers import (
-        AutoConfig,
         AutoModelForImageTextToText,
         AutoProcessor,
         AutoTokenizer,
@@ -288,10 +324,6 @@ def _load_grounded_checkpoint_components(
     )
     processor = AutoProcessor.from_pretrained(
         checkpoint_dir / "processor",
-        local_files_only=True,
-    )
-    config = AutoConfig.from_pretrained(
-        checkpoint_dir / "model_config",
         local_files_only=True,
     )
     backbone = AutoModelForImageTextToText.from_config(
@@ -385,9 +417,13 @@ def load_qwen35_grounded_provider(
         checkpoint,
         hindsight_cache_hash=hindsight_cache_hash,
     )
+    config, _ = validate_qwen35_model_config_runtime(
+        checkpoint / "model_config",
+    )
     return _load_grounded_checkpoint_components(
         checkpoint,
         metadata=metadata,
+        config=config,
         cache_dir=Path(cache_dir),
         dataset=dataset,
         condition_dim=condition_dim,

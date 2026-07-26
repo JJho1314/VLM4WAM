@@ -16,6 +16,12 @@ NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
 WORLD_SIZE="$((NNODES * NUM_PROCESSES))"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "PYTHON_BIN is not executable: $PYTHON_BIN" >&2
+  exit 2
+fi
 
 if ((NNODES > 1)) && [[ -z "${MASTER_ADDR:-}" ]]; then
   echo "MASTER_ADDR must be set when NNODES > 1" >&2
@@ -41,7 +47,7 @@ export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export TOKENIZERS_PARALLELISM=false
 
 cd "$GE_ACT_ROOT"
-python scripts/preflight_libero_fastwam_hdf5.py \
+"$PYTHON_BIN" scripts/preflight_libero_fastwam_hdf5.py \
   --config "$CONFIG" \
   --world-size "$WORLD_SIZE"
 
@@ -50,7 +56,7 @@ if [[ -n "$MAX_TRAIN_STEPS" ]]; then
   MAIN_ARGS+=(--max_train_steps "$MAX_TRAIN_STEPS")
 fi
 
-torchrun \
+"$PYTHON_BIN" -m torch.distributed.run \
   "${TORCHRUN_ARGS[@]}" \
   main.py \
   "${MAIN_ARGS[@]}"

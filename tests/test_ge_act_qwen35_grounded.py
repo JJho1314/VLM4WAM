@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch import nn
 import yaml
 
@@ -696,6 +702,31 @@ class _TinyJointLTX(nn.Module):
         }
 
 
+class _JointForwardDiffusion(_TinyJointLTX):
+    def __init__(self) -> None:
+        super().__init__()
+        self.forward_calls = 0
+
+    def forward(
+        self,
+        *,
+        semantic_plan: torch.Tensor,
+        semantic_plan_positions: torch.Tensor,
+        semantic_plan_mask: torch.Tensor,
+        semantic_plan_relevance: torch.Tensor,
+        semantic_plan_times: torch.Tensor,
+        semantic_condition_mask: torch.Tensor,
+        **_diffusion_kwargs,
+    ) -> tuple[dict[str, torch.Tensor]]:
+        self.forward_calls += 1
+        assert semantic_plan_positions.shape == (1, 2, 4, 96, 2)
+        assert semantic_plan_mask.shape == (1, 2, 4, 96)
+        assert semantic_plan_relevance.shape == (1, 2, 4, 96)
+        assert semantic_plan_times.shape == (2, 4)
+        assert semantic_condition_mask.shape == (2,)
+        return (super().forward(semantic_plan),)
+
+
 def test_joint_optimizer_has_five_exhaustive_disjoint_owned_groups() -> None:
     from runner.ge_trainer import build_optimizer_parameter_groups
     from models.ltx_models.vlm_semantic_planner import (
@@ -893,6 +924,32 @@ def test_grounded_validation_generates_without_cache_targets() -> None:
     assert condition.tokens.shape == (1, 2, 4, 96, 1)
 
 
+def test_grounded_validation_helper_restores_provider_training_mode() -> None:
+    from runner.ge_trainer import generate_grounded_condition_for_validation
+
+    provider = _RecordingGroundedProvider()
+    provider.train()
+    condition = generate_grounded_condition_for_validation(
+        provider,
+        {
+            "current_images": torch.zeros(
+                1,
+                2,
+                3,
+                8,
+                8,
+                dtype=torch.uint8,
+            ),
+            "caption": ["pick"],
+        },
+        qwen_gradient_scale=0.1,
+    )
+
+    assert provider.training
+    assert provider.generate_calls == 1
+    assert condition.tokens.shape == (1, 2, 4, 96, 1)
+
+
 class _TinySmokeProvider(_TinyGroundedProvider):
     def teacher_force(self, current_images, instructions, targets):
         assert current_images.shape[1] == 2
@@ -905,7 +962,7 @@ class _TinySmokeProvider(_TinyGroundedProvider):
             4,
             729,
             4,
-            device=current_images.device,
+            device=next(self.parameters()).device,
         )
         language = self.planner.backbone.model.language_model
         for layer in language.layers:
@@ -947,19 +1004,256 @@ class _TinySmokeProvider(_TinyGroundedProvider):
         return self.output_norm(codes + hidden + position_features)
 
 
+def _joint_forward_kwargs() -> dict[str, object]:
+    return {
+        "prompt_embeds": torch.zeros(1, 1, 4),
+        "prompt_attention_mask": torch.ones(1, 1, dtype=torch.bool),
+        "noisy_latents": torch.zeros(2, 1, 4),
+        "timesteps": torch.zeros(2, 1, dtype=torch.long),
+        "num_frames": 1,
+        "height": 1,
+        "width": 1,
+        "n_view": 2,
+        "frame_rate": 20,
+        "temporal_compression_ratio": 8,
+        "spatial_compression_ratio": 32,
+        "semantic_plan_times": torch.ones(2, 4),
+        "semantic_condition_mask": torch.ones(2),
+    }
+
+
+def test_joint_wrapper_runs_grounded_provider_and_diffusion_in_one_forward() -> None:
+    from runner.ge_trainer import JointGroundedTrainingModel
+
+    diffusion = _JointForwardDiffusion()
+    provider = _TinySmokeProvider()
+    joint = JointGroundedTrainingModel(
+        diffusion_model=diffusion,
+        semantic_provider=provider,
+    )
+
+    output = joint(
+        grounded_batch=_grounded_batch(),
+        qwen_gradient_scale=0.1,
+        **_joint_forward_kwargs(),
+    )
+
+    assert diffusion.forward_calls == 1
+    assert output.latents["video"].shape == (1, 4)
+    assert output.latents["action"].shape == (1, 4)
+    assert output.planner_loss.ndim == 0
+    assert output.semantic_condition.tokens.shape == (1, 2, 4, 96, 4)
+
+
+def _two_rank_joint_forward_worker(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    result_path: str,
+) -> None:
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        torch.manual_seed(123)
+        diffusion = _JointForwardDiffusion()
+        provider = _TinySmokeProvider()
+        __import__(
+            "models.ltx_models.vlm_semantic_planner",
+            fromlist=["configure_qwen_top_layers_for_joint_training"],
+        ).configure_qwen_top_layers_for_joint_training(
+            provider,
+            top_language_layers=8,
+        )
+        joint = torch.nn.parallel.DistributedDataParallel(
+            __import__(
+                "runner.ge_trainer",
+                fromlist=["JointGroundedTrainingModel"],
+            ).JointGroundedTrainingModel(
+                diffusion_model=diffusion,
+                semantic_provider=provider,
+            ),
+            find_unused_parameters=False,
+        )
+        optimizer = torch.optim.SGD(joint.parameters(), lr=0.01)
+        optimizer.zero_grad(set_to_none=True)
+        for microbatch in range(2):
+            synchronization = (
+                joint.no_sync()
+                if microbatch == 0
+                else contextlib.nullcontext()
+            )
+            with synchronization:
+                output = joint(
+                    grounded_batch=_grounded_batch(),
+                    qwen_gradient_scale=0.1,
+                    **_joint_forward_kwargs(),
+                )
+                loss = float(rank + 1 + microbatch) * (
+                    output.latents["video"].square().mean()
+                    + output.latents["action"].square().mean()
+                    + 0.25 * output.planner_loss
+                )
+                loss.backward()
+        optimizer.step()
+        flattened = torch.cat(
+            [
+                parameter.detach().reshape(-1)
+                for parameter in joint.module.parameters()
+            ]
+        )
+        gathered = [torch.empty_like(flattened) for _ in range(world_size)]
+        dist.all_gather(gathered, flattened)
+        if rank == 0:
+            torch.save(gathered, result_path)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_two_rank_ddp_joint_forward_synchronizes_provider_and_diffusion(
+    tmp_path: Path,
+) -> None:
+    init_file = tmp_path / "ddp.init"
+    result_path = tmp_path / "ddp-result.pt"
+    context = mp.get_context("spawn")
+    processes = [
+        context.Process(
+            target=_two_rank_joint_forward_worker,
+            args=(rank, 2, str(init_file), str(result_path)),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+        assert process.exitcode == 0
+    gathered = torch.load(result_path, weights_only=True)
+    torch.testing.assert_close(gathered[0], gathered[1], rtol=0, atol=0)
+
+
+def _single_gpu_accelerator_joint_worker(result_path: str) -> None:
+    from accelerate import Accelerator
+    from runner.ge_trainer import (
+        Trainer,
+    )
+
+    accelerator = Accelerator()
+    if accelerator.device.type != "cuda":
+        raise RuntimeError("single-GPU smoke did not receive a CUDA device")
+    torch.manual_seed(321)
+    diffusion = _JointForwardDiffusion()
+    provider = _TinySmokeProvider()
+    __import__(
+        "models.ltx_models.vlm_semantic_planner",
+        fromlist=["configure_qwen_top_layers_for_joint_training"],
+    ).configure_qwen_top_layers_for_joint_training(
+        provider,
+        top_language_layers=8,
+    )
+    optimizer = torch.optim.SGD(
+        [*diffusion.parameters(), *provider.parameters()],
+        lr=0.01,
+    )
+    dataloader = torch.utils.data.DataLoader(_CursorToyDataset(), batch_size=1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda _step: 1.0,
+    )
+    trainer = Trainer.__new__(Trainer)
+    trainer.grounded_training_enabled = True
+    trainer.grounded_provider = provider
+    trainer.diffusion_model = diffusion
+    trainer.optimizer = optimizer
+    trainer.train_dataloader = dataloader
+    trainer.lr_scheduler = scheduler
+    trainer.state = SimpleNamespace(accelerator=accelerator)
+    trainer.args = SimpleNamespace(resume_from_checkpoint=None)
+    trainer.sampler_seed = 19
+    trainer.joint_model = None
+    trainer.resume_cursor = None
+    trainer.current_cursor = None
+    trainer.prepare_for_training()
+    model = trainer.diffusion_model
+    optimizer = trainer.optimizer
+    scheduler = trainer.lr_scheduler
+    assert trainer.grounded_provider is None
+    assert trainer.resume_cursor.microbatches_per_epoch == len(
+        trainer.train_dataloader
+    )
+    kwargs = {
+        key: (
+            value.to(accelerator.device)
+            if isinstance(value, torch.Tensor)
+            else value
+        )
+        for key, value in _joint_forward_kwargs().items()
+    }
+    output = model(
+        grounded_batch=_grounded_batch(),
+        qwen_gradient_scale=0.1,
+        **kwargs,
+    )
+    loss = (
+        output.latents["video"].square().mean()
+        + output.latents["action"].square().mean()
+        + 0.25 * output.planner_loss
+    )
+    accelerator.backward(loss)
+    unwrapped = accelerator.unwrap_model(model)
+    result = {
+        "device": str(accelerator.device),
+        "diffusion_grad": float(
+            unwrapped.diffusion_model.video_proj.weight.grad.abs().sum()
+        ),
+        "provider_grad": float(
+            unwrapped.semantic_provider.planner.backbone.model.visual[
+                0
+            ].weight.grad.abs().sum()
+        ),
+    }
+    optimizer.step()
+    scheduler.step()
+    torch.save(result, result_path)
+    accelerator.end_training()
+
+
+def test_single_gpu_accelerator_joint_step_updates_both_children(
+    tmp_path: Path,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    result_path = tmp_path / "single-gpu.pt"
+    context = mp.get_context("spawn")
+    process = context.Process(
+        target=_single_gpu_accelerator_joint_worker,
+        args=(str(result_path),),
+    )
+    process.start()
+    process.join(timeout=60)
+    assert process.exitcode == 0
+    result = torch.load(result_path, weights_only=True)
+    assert result["device"].startswith("cuda")
+    assert result["diffusion_grad"] > 0
+    assert result["provider_grad"] > 0
+
+
 def test_tiny_joint_one_step_has_gradients_in_all_five_groups_and_freezes_lower_qwen() -> None:
     from models.ltx_models.vlm_semantic_planner import (
         configure_qwen_top_layers_for_joint_training,
     )
     from runner.ge_trainer import (
         JointGroundedTrainingModel,
-        build_grounded_semantic_condition,
         build_optimizer_parameter_groups,
         compute_joint_loss,
     )
 
     torch.manual_seed(0)
-    diffusion = _TinyJointLTX()
+    diffusion = _JointForwardDiffusion()
     provider = _TinySmokeProvider()
     ownership = configure_qwen_top_layers_for_joint_training(
         provider,
@@ -981,17 +1275,15 @@ def test_tiny_joint_one_step_has_gradients_in_all_five_groups_and_freezes_lower_
         semantic_provider=provider,
     )
     optimizer = torch.optim.AdamW(groups)
-    condition, planner_loss = build_grounded_semantic_condition(
-        joint.semantic_provider,
-        _grounded_batch(),
-        training=True,
+    output = joint(
+        grounded_batch=_grounded_batch(),
         qwen_gradient_scale=0.1,
+        **_joint_forward_kwargs(),
     )
-    outputs = joint(condition.tokens)
     loss = compute_joint_loss(
-        loss_video=outputs["video"].square().mean(),
-        loss_action=outputs["action"].square().mean(),
-        planner_loss=planner_loss,
+        loss_video=output.latents["video"].square().mean(),
+        loss_action=output.latents["action"].square().mean(),
+        planner_loss=output.planner_loss,
         action_loss_scale=0.4,
         planner_aux_weight=0.25,
     )
@@ -1050,6 +1342,7 @@ def test_joint_container_checkpoint_restores_diffusion_and_provider_atomically(
 ) -> None:
     from runner.ge_trainer import (
         JointGroundedTrainingModel,
+        TrainingCursor,
         load_joint_training_checkpoint,
         save_joint_training_checkpoint,
     )
@@ -1066,7 +1359,13 @@ def test_joint_container_checkpoint_restores_diffusion_and_provider_atomically(
     checkpoint = save_joint_training_checkpoint(
         accelerator,
         tmp_path,
-        step=7,
+        cursor=TrainingCursor(
+            global_step=7,
+            epoch=1,
+            consumed_microbatches=2,
+            microbatches_per_epoch=5,
+            sampler_seed=42,
+        ),
         joint_model=joint,
     )
     assert checkpoint == tmp_path / "step_000007"
@@ -1076,13 +1375,15 @@ def test_joint_container_checkpoint_restores_diffusion_and_provider_atomically(
         joint.diffusion_model.weight.zero_()
         joint.semantic_provider.weight.zero_()
 
-    step = load_joint_training_checkpoint(
+    cursor = load_joint_training_checkpoint(
         accelerator,
         checkpoint,
         joint_model=joint,
+        expected_microbatches_per_epoch=5,
+        expected_sampler_seed=42,
     )
 
-    assert step == 7
+    assert cursor.global_step == 7
     torch.testing.assert_close(
         joint.diffusion_model.weight,
         torch.full_like(joint.diffusion_model.weight, 2.0),
@@ -1091,6 +1392,306 @@ def test_joint_container_checkpoint_restores_diffusion_and_provider_atomically(
         joint.semantic_provider.weight,
         torch.full_like(joint.semantic_provider.weight, 3.0),
     )
+
+
+def test_joint_checkpoint_round_trips_exact_training_cursor(
+    tmp_path: Path,
+) -> None:
+    from runner.ge_trainer import (
+        JointGroundedTrainingModel,
+        TrainingCursor,
+        load_joint_training_checkpoint,
+        save_joint_training_checkpoint,
+    )
+
+    joint = JointGroundedTrainingModel(
+        diffusion_model=nn.Linear(2, 2, bias=False),
+        semantic_provider=nn.Linear(2, 2, bias=False),
+    )
+    accelerator = _CheckpointAccelerator(joint)
+    cursor = TrainingCursor(
+        global_step=7,
+        epoch=2,
+        consumed_microbatches=3,
+        microbatches_per_epoch=5,
+        sampler_seed=42,
+    )
+
+    checkpoint = save_joint_training_checkpoint(
+        accelerator,
+        tmp_path,
+        cursor=cursor,
+        joint_model=joint,
+    )
+    metadata = json.loads(
+        (checkpoint / "joint_state.json").read_text(encoding="utf-8")
+    )
+    assert metadata["format_version"] == 2
+    assert metadata["cursor"] == {
+        "global_step": 7,
+        "epoch": 2,
+        "consumed_microbatches": 3,
+        "microbatches_per_epoch": 5,
+        "sampler_seed": 42,
+    }
+
+    restored = load_joint_training_checkpoint(
+        accelerator,
+        checkpoint,
+        joint_model=joint,
+        expected_microbatches_per_epoch=5,
+        expected_sampler_seed=42,
+    )
+    assert restored == cursor
+
+
+def test_epoch_seeded_sampler_reconstructs_each_epoch_without_rng_state() -> None:
+    from runner.ge_trainer import EpochSeededRandomSampler
+
+    sampler = EpochSeededRandomSampler(range(8), seed=19)
+    sampler.set_epoch(3)
+    first = list(sampler)
+    torch.rand(100)
+    sampler.set_epoch(3)
+    reconstructed = list(sampler)
+    sampler.set_epoch(4)
+    next_epoch = list(sampler)
+
+    assert reconstructed == first
+    assert sorted(first) == list(range(8))
+    assert sorted(next_epoch) == list(range(8))
+    assert next_epoch != first
+
+
+class _CursorToyDataset(torch.utils.data.Dataset):
+    def __len__(self) -> int:
+        return 4
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        return {"sample_id": torch.tensor(index)}
+
+
+def _save_tiny_training_result(
+    path: str,
+    *,
+    accelerator,
+    model,
+    optimizer,
+    scheduler,
+    sequence: list[int],
+) -> None:
+    torch.save(
+        {
+            "sequence": sequence,
+            "model": accelerator.unwrap_model(model).state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+        },
+        path,
+    )
+
+
+def _tiny_cursor_training_worker(
+    mode: str,
+    checkpoint_root: str,
+    result_path: str,
+) -> None:
+    from accelerate import Accelerator
+    from runner.ge_trainer import (
+        EpochSeededRandomSampler,
+        JointGroundedTrainingModel,
+        TrainingCursor,
+        load_joint_training_checkpoint,
+        prepare_joint_training_components,
+        save_joint_training_checkpoint,
+        set_dataloader_epoch,
+    )
+
+    torch.set_num_threads(1)
+    torch.manual_seed(123)
+    accelerator = Accelerator(
+        cpu=True,
+        gradient_accumulation_steps=2,
+    )
+    dataset = _CursorToyDataset()
+    sampler = EpochSeededRandomSampler(dataset, seed=19)
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=1,
+        sampler=sampler,
+        generator=torch.Generator().manual_seed(19),
+    )
+    diffusion = _JointForwardDiffusion()
+    provider = _TinySmokeProvider()
+    __import__(
+        "models.ltx_models.vlm_semantic_planner",
+        fromlist=["configure_qwen_top_layers_for_joint_training"],
+    ).configure_qwen_top_layers_for_joint_training(
+        provider,
+        top_language_layers=8,
+    )
+    joint = JointGroundedTrainingModel(
+        diffusion_model=diffusion,
+        semantic_provider=provider,
+    )
+    optimizer = torch.optim.AdamW(joint.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda step: 1.0 / (step + 1),
+    )
+    model, optimizer, dataloader, scheduler = (
+        prepare_joint_training_components(
+            accelerator,
+            joint,
+            optimizer,
+            dataloader,
+            scheduler,
+        )
+    )
+    cursor = TrainingCursor(
+        global_step=0,
+        epoch=0,
+        consumed_microbatches=0,
+        microbatches_per_epoch=4,
+        sampler_seed=19,
+    )
+    if mode == "resume":
+        cursor = load_joint_training_checkpoint(
+            accelerator,
+            Path(checkpoint_root) / "step_000002",
+            joint_model=accelerator.unwrap_model(model),
+            expected_microbatches_per_epoch=4,
+            expected_sampler_seed=19,
+        )
+    sequence: list[int] = []
+    stop_after = 4 if mode == "interrupt" else None
+    processed = 0
+    start_epoch = cursor.epoch
+    for epoch in range(start_epoch, 2):
+        set_dataloader_epoch(
+            dataloader,
+            epoch=epoch,
+            sampler_seed=19,
+        )
+        skipped = cursor.consumed_microbatches if epoch == start_epoch else 0
+        active_loader = accelerator.skip_first_batches(
+            dataloader,
+            num_batches=skipped,
+        )
+        for offset, batch in enumerate(active_loader):
+            absolute_microbatch = skipped + offset + 1
+            sequence.append(int(batch["sample_id"].item()))
+            with accelerator.accumulate(model):
+                output = model(
+                    grounded_batch=_grounded_batch(),
+                    qwen_gradient_scale=0.1,
+                    **_joint_forward_kwargs(),
+                )
+                stochastic_scale = 0.5 + torch.rand(())
+                loss = stochastic_scale * (
+                    output.latents["video"].square().mean()
+                    + output.latents["action"].square().mean()
+                    + 0.25 * output.planner_loss
+                )
+                accelerator.backward(loss)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+            global_step = cursor.global_step + int(accelerator.sync_gradients)
+            if absolute_microbatch == 4:
+                cursor = TrainingCursor(
+                    global_step=global_step,
+                    epoch=epoch + 1,
+                    consumed_microbatches=0,
+                    microbatches_per_epoch=4,
+                    sampler_seed=19,
+                )
+            else:
+                cursor = TrainingCursor(
+                    global_step=global_step,
+                    epoch=epoch,
+                    consumed_microbatches=absolute_microbatch,
+                    microbatches_per_epoch=4,
+                    sampler_seed=19,
+                )
+            processed += 1
+            if stop_after is not None and processed == stop_after:
+                assert accelerator.sync_gradients
+                save_joint_training_checkpoint(
+                    accelerator,
+                    checkpoint_root,
+                    cursor=cursor,
+                    joint_model=accelerator.unwrap_model(model),
+                )
+                _save_tiny_training_result(
+                    result_path,
+                    accelerator=accelerator,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    sequence=sequence,
+                )
+                accelerator.end_training()
+                return
+        cursor = TrainingCursor(
+            global_step=cursor.global_step,
+            epoch=epoch + 1,
+            consumed_microbatches=0,
+            microbatches_per_epoch=4,
+            sampler_seed=19,
+        )
+    _save_tiny_training_result(
+        result_path,
+        accelerator=accelerator,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        sequence=sequence,
+    )
+    accelerator.end_training()
+
+
+def _assert_nested_state_equal(left, right) -> None:
+    assert type(left) is type(right)
+    if isinstance(left, torch.Tensor):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+    elif isinstance(left, dict):
+        assert set(left) == set(right)
+        for key in left:
+            _assert_nested_state_equal(left[key], right[key])
+    elif isinstance(left, (list, tuple)):
+        assert len(left) == len(right)
+        for left_item, right_item in zip(left, right, strict=True):
+            _assert_nested_state_equal(left_item, right_item)
+    else:
+        assert left == right
+
+
+def test_accelerator_resume_matches_uninterrupted_samples_and_training_state(
+    tmp_path: Path,
+) -> None:
+    context = mp.get_context("spawn")
+    checkpoint_root = tmp_path / "checkpoint"
+    paths = {
+        name: tmp_path / f"{name}.pt"
+        for name in ("baseline", "interrupt", "resume")
+    }
+    for mode in ("baseline", "interrupt", "resume"):
+        process = context.Process(
+            target=_tiny_cursor_training_worker,
+            args=(mode, str(checkpoint_root), str(paths[mode])),
+        )
+        process.start()
+        process.join(timeout=60)
+        assert process.exitcode == 0
+
+    baseline = torch.load(paths["baseline"], weights_only=True)
+    interrupted = torch.load(paths["interrupt"], weights_only=True)
+    resumed = torch.load(paths["resume"], weights_only=True)
+    assert interrupted["sequence"] + resumed["sequence"] == baseline["sequence"]
+    _assert_nested_state_equal(baseline["model"], resumed["model"])
+    _assert_nested_state_equal(baseline["optimizer"], resumed["optimizer"])
+    _assert_nested_state_equal(baseline["scheduler"], resumed["scheduler"])
 
 
 def test_joint_prepare_passes_one_registered_model_and_all_training_state() -> None:
@@ -1281,3 +1882,103 @@ def test_joint_video_action_training_keeps_the_real_future_clip() -> None:
         action_only,
         video[:, :, 4:5].repeat(1, 1, 9),
     )
+
+
+def _write_qwen35_model_config(path: Path) -> Path:
+    path.mkdir()
+    (path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_5",
+                "text_config": {
+                    "model_type": "qwen3_5_text",
+                    "vocab_size": 32,
+                },
+                "vision_config": {
+                    "depth": 1,
+                    "hidden_size": 8,
+                    "intermediate_size": 16,
+                    "num_heads": 1,
+                    "out_hidden_size": 8,
+                    "patch_size": 2,
+                    "spatial_merge_size": 1,
+                    "temporal_patch_size": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_qwen35_runtime_gate_rejects_unsupported_transformers_actionably(
+    tmp_path: Path,
+) -> None:
+    from models.ltx_models.vlm_semantic_planner import (
+        validate_qwen35_model_config_runtime,
+    )
+
+    model_config = _write_qwen35_model_config(tmp_path / "model_config")
+    with pytest.raises(RuntimeError, match="Qwen3.5-capable Transformers"):
+        validate_qwen35_model_config_runtime(model_config)
+
+
+def test_qwen35_runtime_gate_resolves_saved_model_class_in_supported_interpreter(
+    tmp_path: Path,
+) -> None:
+    model_config = _write_qwen35_model_config(tmp_path / "model_config")
+    qwen_python = Path("/data/LFT-W02_data/.conda/envs/qwen35/bin/python")
+    if not qwen_python.is_file():
+        pytest.skip("Qwen3.5-capable reference interpreter is unavailable")
+    code = """
+import sys
+from models.ltx_models.vlm_semantic_planner import validate_qwen35_model_config_runtime
+config, model_class = validate_qwen35_model_config_runtime(sys.argv[1])
+assert config.model_type == "qwen3_5"
+assert model_class.__name__ == "Qwen3_5ForConditionalGeneration"
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = (
+        f"{REPOSITORY_ROOT}:{GE_ACT_ROOT}"
+        + (
+            f":{environment['PYTHONPATH']}"
+            if environment.get("PYTHONPATH")
+            else ""
+        )
+    )
+    completed = subprocess.run(
+        [str(qwen_python), "-c", code, str(model_config)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_sbatch_requires_explicit_coherent_grounded_environment(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("{}\n", encoding="utf-8")
+    environment = os.environ.copy()
+    environment.pop("CONDA_ENV", None)
+    environment["GE_ACT_ROOT"] = str(GE_ACT_ROOT)
+    environment["CONFIG"] = str(config)
+
+    completed = subprocess.run(
+        [
+            "bash",
+            str(
+                GE_ACT_ROOT
+                / "scripts/sbatch_train_ltx_qwen35_grounded_hpc3.sh"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 2
+    assert "CONDA_ENV must point to" in completed.stderr
