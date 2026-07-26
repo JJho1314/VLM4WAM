@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
+from typing import Sequence
 
 import h5py
 import numpy as np
@@ -10,6 +12,8 @@ import torch
 
 from ge_act.data.libero_fastwam_hdf5_schema import load_manifest
 from qwen35_planx.config import HindsightCacheMetadata
+from qwen35_planx.hashing import sha256_json
+from qwen35_planx.hindsight_data import HindsightWindowRecord
 
 
 def _write_hdf5_manifest(
@@ -183,11 +187,18 @@ def test_read_full_trajectory_validates_and_preserves_camera_order(
     assert np.all(trajectory.rgb[1] == 100)
 
 
-def _metadata(**overrides: str) -> HindsightCacheMetadata:
+def _window_manifest_hash(records: Sequence[HindsightWindowRecord]) -> str:
+    return sha256_json([record.to_dict() for record in records])
+
+
+def _metadata(
+    records: Sequence[HindsightWindowRecord] = (),
+    **overrides: str,
+) -> HindsightCacheMetadata:
     values = {
         "format_version": 1,
         "hdf5_manifest_hash": "hdf5-hash",
-        "window_manifest_hash": "split-hash",
+        "window_manifest_hash": _window_manifest_hash(records),
         "instruction_parser_hash": "parser-hash",
         "ta_tok_hash": "ta-hash",
         "siglip2_hash": "siglip-hash",
@@ -234,8 +245,8 @@ def test_hindsight_shards_finalize_and_round_trip_as_read_only_memmaps(
         finalize_hindsight_cache,
     )
 
-    metadata = _metadata()
     windows = _two_windows(fake_hdf5_manifest)
+    metadata = _metadata(windows)
     shard_b = tmp_path / "shards" / "b.npz"
     shard_a = tmp_path / "shards" / "a.npz"
     HindsightShardWriter(shard_b, metadata=metadata).write(
@@ -246,11 +257,23 @@ def test_hindsight_shards_finalize_and_round_trip_as_read_only_memmaps(
     )
 
     cache_dir = tmp_path / "cache"
-    finalize_hindsight_cache(
+    finalized_manifest = finalize_hindsight_cache(
         cache_dir,
         shard_paths=(shard_b, shard_a),
         metadata=metadata,
+        expected_records=windows,
     )
+    assert finalized_manifest["phrase_roles"] == [
+        "source",
+        "target",
+        "action",
+    ]
+    with np.load(shard_a, allow_pickle=False) as archive:
+        assert json.loads(archive["phrase_roles_json"].tobytes()) == [
+            "source",
+            "target",
+            "action",
+        ]
 
     with HindsightCache.open(
         cache_dir,
@@ -270,6 +293,219 @@ def test_hindsight_shards_finalize_and_round_trip_as_read_only_memmaps(
         assert sample.phrase_embeddings.shape == (3, 1152)
         assert torch.allclose(sample.relevance.sum(-1), torch.ones(2, 4, 3))
         assert torch.all(sample.codes == 11)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["subset", "extra", "reordered", "mismatch"],
+)
+def test_finalize_requires_exact_canonical_window_membership(
+    fake_hdf5_manifest: Path,
+    tmp_path: Path,
+    case: str,
+) -> None:
+    from qwen35_planx.hindsight_data import build_fixed_windows
+    from qwen35_planx.hindsight_schema import (
+        HindsightShardWriter,
+        finalize_hindsight_cache,
+    )
+
+    windows = build_fixed_windows(
+        fake_hdf5_manifest,
+        split_seed=42,
+        window_stride=36,
+        sample_n_frames=500,
+    )
+    expected = windows[:2]
+    actual = expected
+    if case == "subset":
+        actual = expected[:1]
+    elif case == "extra":
+        actual = windows
+    elif case == "reordered":
+        expected = list(reversed(expected))
+    else:
+        actual = [
+            replace(expected[0], caption="different canonical caption"),
+            expected[1],
+        ]
+    metadata = _metadata(expected)
+    shards = []
+    for index, record in enumerate(actual):
+        shard = tmp_path / "shards" / f"{index}.npz"
+        HindsightShardWriter(shard, metadata=metadata).write(
+            [record], **_cache_arrays(1)
+        )
+        shards.append(shard)
+
+    with pytest.raises(ValueError, match="window|canonical|membership"):
+        finalize_hindsight_cache(
+            tmp_path / "cache",
+            shard_paths=shards,
+            metadata=metadata,
+            expected_records=expected,
+        )
+    assert not (tmp_path / "cache").exists()
+
+
+def test_cache_hash_changes_when_finalized_array_content_changes(
+    fake_hdf5_manifest: Path,
+    tmp_path: Path,
+) -> None:
+    from qwen35_planx.hindsight_schema import (
+        HindsightCache,
+        HindsightShardWriter,
+        finalize_hindsight_cache,
+    )
+
+    record = _two_windows(fake_hdf5_manifest)[0]
+    metadata = _metadata([record])
+    identities = []
+    for code_value in (7, 11):
+        shard = tmp_path / f"shard-{code_value}.npz"
+        HindsightShardWriter(shard, metadata=metadata).write(
+            [record], **_cache_arrays(1, code_value=code_value)
+        )
+        cache_dir = tmp_path / f"cache-{code_value}"
+        manifest = finalize_hindsight_cache(
+            cache_dir,
+            shard_paths=[shard],
+            metadata=metadata,
+            expected_records=[record],
+        )
+        with HindsightCache.open(cache_dir) as cache:
+            assert cache.manifest["cache_hash"] == manifest["cache_hash"]
+        identities.append(manifest["cache_hash"])
+
+    assert identities[0] != identities[1]
+    assert all(identity != metadata.cache_hash for identity in identities)
+
+
+def test_cache_open_binds_window_manifest_hash_to_index_records(
+    fake_hdf5_manifest: Path,
+    tmp_path: Path,
+) -> None:
+    from qwen35_planx.hindsight_schema import (
+        HindsightCache,
+        HindsightShardWriter,
+        finalize_hindsight_cache,
+    )
+
+    record = _two_windows(fake_hdf5_manifest)[0]
+    metadata = _metadata([record])
+    shard = tmp_path / "shard.npz"
+    HindsightShardWriter(shard, metadata=metadata).write([record], **_cache_arrays(1))
+    cache_dir = tmp_path / "cache"
+    finalize_hindsight_cache(
+        cache_dir,
+        shard_paths=[shard],
+        metadata=metadata,
+        expected_records=[record],
+    )
+    manifest_path = cache_dir / "manifest.json"
+    manifest_path.chmod(0o644)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["metadata"]["window_manifest_hash"] = "wrong-window-hash"
+    manifest["split_hash"] = "wrong-window-hash"
+    manifest["cache_hash"] = sha256_json(
+        {
+            "format_version": 1,
+            "metadata": manifest["metadata"],
+            "camera_names": manifest["camera_names"],
+            "phrase_roles": manifest["phrase_roles"],
+            "index": manifest["index"],
+            "arrays": manifest["arrays"],
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="window manifest hash.*index"):
+        HindsightCache.open(cache_dir)
+
+
+@pytest.mark.parametrize(
+    "phrase_roles",
+    [
+        ("target", "source", "action"),
+        ("source", "target"),
+    ],
+)
+def test_shard_writer_rejects_noncanonical_phrase_roles(
+    fake_hdf5_manifest: Path,
+    tmp_path: Path,
+    phrase_roles: tuple[str, ...],
+) -> None:
+    from qwen35_planx.hindsight_schema import HindsightShardWriter
+
+    record = _two_windows(fake_hdf5_manifest)[0]
+    with pytest.raises(ValueError, match="phrase roles"):
+        HindsightShardWriter(
+            tmp_path / "roles.npz",
+            metadata=_metadata([record]),
+            phrase_roles=phrase_roles,
+        )
+
+
+@pytest.mark.parametrize(
+    "phrase_roles",
+    [
+        ["target", "source", "action"],
+        ["source", "target"],
+    ],
+)
+def test_cache_open_rejects_noncanonical_phrase_roles(
+    fake_hdf5_manifest: Path,
+    tmp_path: Path,
+    phrase_roles: list[str],
+) -> None:
+    from qwen35_planx.hindsight_schema import (
+        HindsightCache,
+        HindsightShardWriter,
+        finalize_hindsight_cache,
+    )
+
+    record = _two_windows(fake_hdf5_manifest)[0]
+    metadata = _metadata([record])
+    shard = tmp_path / "shard.npz"
+    HindsightShardWriter(shard, metadata=metadata).write([record], **_cache_arrays(1))
+    cache_dir = tmp_path / "cache"
+    finalize_hindsight_cache(
+        cache_dir,
+        shard_paths=[shard],
+        metadata=metadata,
+        expected_records=[record],
+    )
+    manifest_path = cache_dir / "manifest.json"
+    manifest_path.chmod(0o644)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["phrase_roles"] = phrase_roles
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="phrase roles"):
+        HindsightCache.open(cache_dir)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["relevance_scale", "flow", "phrase_embeddings"],
+)
+def test_shard_writer_rejects_values_that_overflow_float16_storage(
+    fake_hdf5_manifest: Path,
+    tmp_path: Path,
+    field: str,
+) -> None:
+    from qwen35_planx.hindsight_schema import HindsightShardWriter
+
+    record = _two_windows(fake_hdf5_manifest)[0]
+    arrays = _cache_arrays(1)
+    arrays[field] = arrays[field].astype(np.float32)
+    arrays[field].flat[0] = 1e10
+
+    with pytest.raises(ValueError, match=rf"{field}.*float16"):
+        HindsightShardWriter(
+            tmp_path / f"{field}.npz",
+            metadata=_metadata([record]),
+        ).write([record], **arrays)
 
 
 def test_hindsight_cache_rejects_partial_publication(tmp_path: Path) -> None:
@@ -305,7 +541,7 @@ def test_finalized_cache_combines_multiple_trajectory_shards(
         window_stride=36,
         sample_n_frames=500,
     )
-    metadata = _metadata()
+    metadata = _metadata(windows)
     shards = []
     for episode_key in sorted({window.episode_key for window in windows}):
         records = [window for window in windows if window.episode_key == episode_key]
@@ -315,7 +551,12 @@ def test_finalized_cache_combines_multiple_trajectory_shards(
         )
         shards.append(shard)
     cache_dir = tmp_path / "cache"
-    finalize_hindsight_cache(cache_dir, shard_paths=shards, metadata=metadata)
+    finalize_hindsight_cache(
+        cache_dir,
+        shard_paths=shards,
+        metadata=metadata,
+        expected_records=windows,
+    )
 
     with HindsightCache.open(cache_dir) as cache:
         assert len(cache) == 4
@@ -334,8 +575,8 @@ def test_finalize_rejects_duplicate_sample_ids_without_publishing(
         finalize_hindsight_cache,
     )
 
-    metadata = _metadata()
     record = _two_windows(fake_hdf5_manifest)[0]
+    metadata = _metadata([record])
     shards = []
     for name in ("a.npz", "b.npz"):
         path = tmp_path / "shards" / name
@@ -350,11 +591,13 @@ def test_finalize_rejects_duplicate_sample_ids_without_publishing(
             cache_dir,
             shard_paths=shards,
             metadata=metadata,
+            expected_records=[record],
         )
     assert not cache_dir.exists()
 
 
 def test_finalize_rejects_partial_shard_without_publishing(
+    fake_hdf5_manifest: Path,
     tmp_path: Path,
 ) -> None:
     from qwen35_planx.hindsight_schema import finalize_hindsight_cache
@@ -362,12 +605,15 @@ def test_finalize_rejects_partial_shard_without_publishing(
     partial = tmp_path / "partial.npz"
     np.savez(partial, codes=np.zeros((1, 2, 4, 729), dtype=np.uint16))
     cache_dir = tmp_path / "cache"
+    record = _two_windows(fake_hdf5_manifest)[0]
+    metadata = _metadata([record])
 
     with pytest.raises(ValueError, match="shard fields"):
         finalize_hindsight_cache(
             cache_dir,
             shard_paths=[partial],
-            metadata=_metadata(),
+            metadata=metadata,
+            expected_records=[record],
         )
     assert not cache_dir.exists()
 
@@ -382,14 +628,16 @@ def test_cache_open_rejects_wrong_split_and_teacher_hashes(
         finalize_hindsight_cache,
     )
 
-    metadata = _metadata()
+    record = _two_windows(fake_hdf5_manifest)[0]
+    metadata = _metadata([record])
     shard = tmp_path / "shard.npz"
-    HindsightShardWriter(shard, metadata=metadata).write(
-        [_two_windows(fake_hdf5_manifest)[0]], **_cache_arrays(1)
-    )
+    HindsightShardWriter(shard, metadata=metadata).write([record], **_cache_arrays(1))
     cache_dir = tmp_path / "cache"
     manifest = finalize_hindsight_cache(
-        cache_dir, shard_paths=[shard], metadata=metadata
+        cache_dir,
+        shard_paths=[shard],
+        metadata=metadata,
+        expected_records=[record],
     )
 
     with pytest.raises(ValueError, match="split hash"):
@@ -414,8 +662,6 @@ def test_shard_writer_rejects_invalid_teacher_outputs_and_camera_reordering(
     mutation: str,
     message: str,
 ) -> None:
-    from dataclasses import replace
-
     from qwen35_planx.hindsight_schema import HindsightShardWriter
 
     record = _two_windows(fake_hdf5_manifest)[0]
@@ -428,6 +674,6 @@ def test_shard_writer_rejects_invalid_teacher_outputs_and_camera_reordering(
     with pytest.raises(ValueError, match=message):
         if mutation == "camera":
             record = replace(record, camera_names=("wrist", "main"))
-        HindsightShardWriter(tmp_path / f"{mutation}.npz", metadata=_metadata()).write(
-            [record], **arrays
-        )
+        HindsightShardWriter(
+            tmp_path / f"{mutation}.npz", metadata=_metadata([record])
+        ).write([record], **arrays)

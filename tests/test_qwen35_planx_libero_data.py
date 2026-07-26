@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import builtins
+import importlib
 import json
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -218,6 +221,7 @@ def test_hdf5_manifest_cli_writes_deterministic_explicit_windows(
     tmp_path: Path,
 ) -> None:
     from qwen35_planx.cli.build_libero_manifests import build_hdf5_manifests
+    from qwen35_planx.hashing import sha256_json
 
     root = tmp_path / "hdf5"
     root.mkdir()
@@ -297,6 +301,7 @@ def test_hdf5_manifest_cli_writes_deterministic_explicit_windows(
         json.loads(line)
         for line in (tmp_path / "first" / split_file).read_text().splitlines()
     ]
+    assert first["window_manifest_hash"] == sha256_json(rows)
     assert [row["sample_id"] for row in rows] == sorted(
         row["sample_id"] for row in rows
     )
@@ -315,3 +320,38 @@ def test_hdf5_manifest_cli_writes_deterministic_explicit_windows(
         31,
         35,
     ]
+
+
+def test_npy_manifest_cli_does_not_import_h5py(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    predecoded_root = tmp_path / "predecoded"
+    _write_episode(dataset_root, predecoded_root, num_frames=20)
+    original_import = builtins.__import__
+
+    def import_without_h5py(
+        name: str,
+        globals: object = None,
+        locals: object = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ):
+        if name == "h5py" or name.startswith("h5py."):
+            raise ModuleNotFoundError("h5py deliberately unavailable")
+        return original_import(name, globals, locals, fromlist, level)
+
+    sys.modules.pop("qwen35_planx.cli.build_libero_manifests", None)
+    sys.modules.pop("qwen35_planx.hindsight_data", None)
+    monkeypatch.setattr(builtins, "__import__", import_without_h5py)
+    module = importlib.import_module("qwen35_planx.cli.build_libero_manifests")
+
+    manifest = module.build_manifests(
+        dataset_roots=(dataset_root,),
+        domains=("libero_goal",),
+        predecoded_root=predecoded_root,
+        output_dir=tmp_path / "manifests",
+        split_seed=0,
+    )
+    assert manifest["files"]["trajectories.jsonl"]["records"] == 1

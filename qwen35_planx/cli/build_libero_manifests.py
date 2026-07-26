@@ -15,7 +15,6 @@ from qwen35_planx.libero_data import (
     iter_all_camera_frames,
     iter_planner_windows,
 )
-from qwen35_planx.hindsight_data import build_fixed_windows
 
 
 def _write_jsonl(
@@ -132,6 +131,8 @@ def build_hdf5_manifests(
 ) -> dict[str, object]:
     """Write deterministic train/val windows for canonical GE-Act HDF5."""
 
+    from qwen35_planx.hindsight_data import build_fixed_windows
+
     geometry = PlanGeometry()
     hdf5_manifest = Path(hdf5_manifest).resolve()
     windows = build_fixed_windows(
@@ -173,13 +174,7 @@ def build_hdf5_manifests(
     }
     contract_hash = sha256_json(contract)
     hdf5_manifest_hash = sha256_file(hdf5_manifest)
-    window_manifest_hash = sha256_json(
-        {
-            "contract_hash": contract_hash,
-            "hdf5_manifest_hash": hdf5_manifest_hash,
-            "files": file_metadata,
-        }
-    )
+    window_manifest_hash = sha256_json([window.to_dict() for window in windows])
     manifest: dict[str, object] = {
         **contract,
         "contract_hash": contract_hash,

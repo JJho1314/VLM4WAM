@@ -23,6 +23,7 @@ from qwen35_planx.hindsight_data import HindsightWindowRecord
 
 
 _FORMAT_VERSION = 1
+PHRASE_ROLES = ("source", "target", "action")
 _ARRAY_SPECS: dict[str, tuple[np.dtype[Any], tuple[int, ...]]] = {
     "codes": (np.dtype(np.uint16), (2, 4, 729)),
     "relevance_q": (np.dtype(np.uint8), (2, 4, 3, 729)),
@@ -36,6 +37,7 @@ _SHARD_FIELDS = set(_ARRAY_SPECS) | {
     "metadata_json",
     "records_jsonl",
     "camera_names_json",
+    "phrase_roles_json",
 }
 _MANIFEST_FIELDS = {
     "format_version",
@@ -44,6 +46,7 @@ _MANIFEST_FIELDS = {
     "split_hash",
     "teacher_hash",
     "camera_names",
+    "phrase_roles",
     "num_samples",
     "index",
     "arrays",
@@ -83,6 +86,39 @@ def _teacher_hash(metadata: HindsightCacheMetadata) -> str:
     )
 
 
+def _window_manifest_hash(records: Sequence[HindsightWindowRecord]) -> str:
+    return sha256_json([record.to_dict() for record in records])
+
+
+def _cache_content_hash(
+    *,
+    metadata: HindsightCacheMetadata,
+    index_manifest: Mapping[str, Any],
+    array_manifest: Mapping[str, Mapping[str, Any]],
+) -> str:
+    return sha256_json(
+        {
+            "format_version": _FORMAT_VERSION,
+            "metadata": metadata.to_dict(),
+            "camera_names": list(CAMERA_NAMES),
+            "phrase_roles": list(PHRASE_ROLES),
+            "index": dict(index_manifest),
+            "arrays": {
+                name: dict(array_manifest[name]) for name in sorted(array_manifest)
+            },
+        }
+    )
+
+
+def _validate_phrase_roles(phrase_roles: Sequence[str]) -> tuple[str, str, str]:
+    roles = tuple(phrase_roles)
+    if roles != PHRASE_ROLES:
+        raise ValueError(
+            f"phrase roles must be exactly {PHRASE_ROLES!r}, got {roles!r}"
+        )
+    return roles
+
+
 def _validate_records(
     records: Sequence[HindsightWindowRecord],
     *,
@@ -95,9 +131,9 @@ def _validate_records(
         raise ValueError("records must contain HindsightWindowRecord values")
     sample_ids = [record.sample_id for record in result]
     if len(set(sample_ids)) != len(sample_ids):
-        raise ValueError("duplicate sample_id within trajectory shard")
+        raise ValueError("duplicate sample_id within window records")
     if sample_ids != sorted(sample_ids):
-        raise ValueError("trajectory shard records must be ordered by sample_id")
+        raise ValueError("window records must use canonical sample_id order")
     episode_keys = {record.episode_key for record in result}
     if require_one_episode and len(episode_keys) != 1:
         raise ValueError("a trajectory shard must contain exactly one episode")
@@ -133,7 +169,27 @@ def _validate_and_convert_arrays(
             )
         result[name] = array
 
-    codes = result["codes"]
+    _validate_array_values(result)
+
+    with np.errstate(over="ignore", invalid="ignore"):
+        converted = {
+            name: np.asarray(result[name], dtype=spec[0])
+            for name, spec in _ARRAY_SPECS.items()
+        }
+    for name in (
+        "relevance_scale",
+        "confidence",
+        "flow",
+        "phrase_embeddings",
+    ):
+        if not np.isfinite(converted[name]).all():
+            raise ValueError(f"{name} cannot be represented as finite float16 storage")
+    _validate_array_values(converted)
+    return converted
+
+
+def _validate_array_values(arrays: Mapping[str, np.ndarray]) -> None:
+    codes = arrays["codes"]
     if codes.dtype.kind not in "iu" or codes.dtype.kind == "b":
         raise ValueError("codes must contain integers")
     if codes.size and (
@@ -141,7 +197,7 @@ def _validate_and_convert_arrays(
     ):
         raise ValueError("codes must be in the released TA-Tok vocabulary range")
 
-    relevance_q = result["relevance_q"]
+    relevance_q = arrays["relevance_q"]
     if relevance_q.dtype.kind not in "iu" or relevance_q.dtype.kind == "b":
         raise ValueError("relevance_q must contain integers")
     if relevance_q.size and (
@@ -157,18 +213,13 @@ def _validate_and_convert_arrays(
         "flow",
         "phrase_embeddings",
     ):
-        array = result[name]
+        array = arrays[name]
         if array.dtype.kind != "f" or not np.isfinite(array).all():
             raise ValueError(f"{name} must contain finite floating-point values")
-    if np.any(result["relevance_scale"] <= 0):
+    if np.any(arrays["relevance_scale"] <= 0):
         raise ValueError("relevance_scale must be positive")
-    if np.any(result["confidence"] < 0) or np.any(result["confidence"] > 1):
+    if np.any(arrays["confidence"] < 0) or np.any(arrays["confidence"] > 1):
         raise ValueError("confidence must be in [0, 1]")
-
-    return {
-        name: np.asarray(result[name], dtype=spec[0])
-        for name, spec in _ARRAY_SPECS.items()
-    }
 
 
 def _records_jsonl(records: Sequence[HindsightWindowRecord]) -> str:
@@ -202,6 +253,7 @@ class HindsightShardWriter:
         path: Path | str,
         *,
         metadata: HindsightCacheMetadata,
+        phrase_roles: Sequence[str] = PHRASE_ROLES,
     ) -> None:
         self.path = Path(path)
         if self.path.suffix != ".npz":
@@ -209,6 +261,7 @@ class HindsightShardWriter:
         if not isinstance(metadata, HindsightCacheMetadata):
             raise TypeError("metadata must be HindsightCacheMetadata")
         self.metadata = metadata
+        self.phrase_roles = _validate_phrase_roles(phrase_roles)
 
     def write(
         self,
@@ -253,6 +306,9 @@ class HindsightShardWriter:
                     ),
                     records_jsonl=_encode_text(_records_jsonl(ordered_records)),
                     camera_names_json=_encode_text(_canonical_json(list(CAMERA_NAMES))),
+                    phrase_roles_json=_encode_text(
+                        _canonical_json(list(self.phrase_roles))
+                    ),
                     **arrays,
                 )
                 handle.flush()
@@ -312,6 +368,13 @@ def _load_shard(
             raise ValueError("camera_names_json must contain valid JSON") from exc
         if cameras != list(CAMERA_NAMES):
             raise ValueError("shard camera order must be canonical main/wrist")
+        try:
+            phrase_roles = json.loads(
+                _decode_text(archive["phrase_roles_json"], name="phrase_roles_json")
+            )
+        except json.JSONDecodeError as exc:
+            raise ValueError("phrase_roles_json must contain valid JSON") from exc
+        _validate_phrase_roles(phrase_roles)
         records = _parse_records_jsonl(
             _decode_text(archive["records_jsonl"], name="records_jsonl")
         )
@@ -345,6 +408,7 @@ def finalize_hindsight_cache(
     *,
     shard_paths: Sequence[Path | str],
     metadata: HindsightCacheMetadata,
+    expected_records: Sequence[HindsightWindowRecord],
 ) -> dict[str, Any]:
     """Validate all shards and atomically publish a finalized memmap cache."""
 
@@ -353,6 +417,10 @@ def finalize_hindsight_cache(
         raise FileExistsError(f"cache directory already exists: {cache_dir}")
     if not isinstance(metadata, HindsightCacheMetadata):
         raise TypeError("metadata must be HindsightCacheMetadata")
+    canonical_records = _validate_records(expected_records, require_one_episode=False)
+    expected_window_hash = _window_manifest_hash(canonical_records)
+    if metadata.window_manifest_hash != expected_window_hash:
+        raise ValueError("canonical window manifest hash does not match cache metadata")
     paths = sorted((Path(path) for path in shard_paths), key=lambda path: str(path))
     if not paths:
         raise ValueError("shard_paths must not be empty")
@@ -368,6 +436,20 @@ def finalize_hindsight_cache(
             rows.append((record, shard.arrays, index))
     rows.sort(key=lambda item: item[0].sample_id)
     records = [row[0] for row in rows]
+    if len(records) != len(canonical_records):
+        raise ValueError(
+            "window membership count mismatch: "
+            f"expected {len(canonical_records)}, got {len(records)}"
+        )
+    if records != canonical_records:
+        actual_ids = [record.sample_id for record in records]
+        expected_ids = [record.sample_id for record in canonical_records]
+        if actual_ids != expected_ids:
+            raise ValueError(
+                "window membership identity mismatch: "
+                f"expected {expected_ids!r}, got {actual_ids!r}"
+            )
+        raise ValueError("window membership record metadata mismatch")
 
     cache_dir.parent.mkdir(parents=True, exist_ok=True)
     temporary_dir = Path(
@@ -409,10 +491,15 @@ def finalize_hindsight_cache(
         manifest: dict[str, Any] = {
             "format_version": _FORMAT_VERSION,
             "metadata": metadata.to_dict(),
-            "cache_hash": metadata.cache_hash,
+            "cache_hash": _cache_content_hash(
+                metadata=metadata,
+                index_manifest=index_manifest,
+                array_manifest=array_manifest,
+            ),
             "split_hash": metadata.window_manifest_hash,
             "teacher_hash": _teacher_hash(metadata),
             "camera_names": list(CAMERA_NAMES),
+            "phrase_roles": list(PHRASE_ROLES),
             "num_samples": len(records),
             "index": index_manifest,
             "arrays": array_manifest,
@@ -484,6 +571,7 @@ class HindsightCache:
         expected_metadata: HindsightCacheMetadata | None = None,
         expected_split_hash: str | None = None,
         expected_teacher_hash: str | None = None,
+        expected_cache_hash: str | None = None,
     ) -> HindsightCache:
         cache_dir = Path(cache_dir)
         manifest_path = cache_dir / "manifest.json"
@@ -502,9 +590,8 @@ class HindsightCache:
             raise ValueError(f"cache format_version must be {_FORMAT_VERSION}")
         if manifest["camera_names"] != list(CAMERA_NAMES):
             raise ValueError("cache camera order must be canonical main/wrist")
+        _validate_phrase_roles(manifest["phrase_roles"])
         metadata = HindsightCacheMetadata.from_dict(manifest["metadata"])
-        if manifest["cache_hash"] != metadata.cache_hash:
-            raise ValueError("cache metadata hash mismatch")
         if manifest["split_hash"] != metadata.window_manifest_hash:
             raise ValueError("cache split hash does not match metadata")
         if manifest["teacher_hash"] != _teacher_hash(metadata):
@@ -521,6 +608,11 @@ class HindsightCache:
             and manifest["teacher_hash"] != expected_teacher_hash
         ):
             raise ValueError("cache teacher hash does not match expected teacher hash")
+        if (
+            expected_cache_hash is not None
+            and manifest["cache_hash"] != expected_cache_hash
+        ):
+            raise ValueError("cache hash does not match expected cache hash")
 
         index_description = manifest["index"]
         if (
@@ -539,6 +631,8 @@ class HindsightCache:
             index_path.read_text(encoding="utf-8"),
             require_one_episode=False,
         )
+        if _window_manifest_hash(records) != metadata.window_manifest_hash:
+            raise ValueError("cache window manifest hash does not match index records")
         num_samples = manifest["num_samples"]
         if (
             type(num_samples) is not int
@@ -586,6 +680,13 @@ class HindsightCache:
                 count=num_samples,
                 require_storage_dtypes=True,
             )
+            content_hash = _cache_content_hash(
+                metadata=metadata,
+                index_manifest=index_description,
+                array_manifest=array_descriptions,
+            )
+            if manifest["cache_hash"] != content_hash:
+                raise ValueError("cache content hash mismatch")
         except Exception:
             for array in arrays.values():
                 mmap = getattr(array, "_mmap", None)
