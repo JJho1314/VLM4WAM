@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,12 +11,34 @@ from typing import Callable
 import pytest
 import torch
 from easydict import EasyDict
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from torch import nn
-from transformers import Siglip2VisionConfig, Siglip2VisionModel
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    Siglip2VisionConfig,
+    Siglip2VisionModel,
+    SiglipVisionConfig,
+    SiglipVisionModel,
+)
 
 
 class _FakeEncoder(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        config = SiglipVisionConfig(
+            hidden_size=1152,
+            intermediate_size=4304,
+            num_attention_heads=16,
+            num_hidden_layers=27,
+            patch_size=14,
+            image_size=384,
+        )
+        with torch.device("meta"):
+            reference = SiglipVisionModel(config).vision_model
+        for name, child in reference.named_children():
+            self.add_module(name, child)
+
     def forward(
         self, images: torch.Tensor, *, output_hidden_states: bool
     ) -> SimpleNamespace:
@@ -72,6 +95,16 @@ def _expanded(shape: torch.Size, value: float = 0.0) -> torch.Tensor:
 
 
 def _fake_released_state() -> dict[str, torch.Tensor]:
+    encoder_config = SiglipVisionConfig(
+        hidden_size=1152,
+        intermediate_size=4304,
+        num_attention_heads=16,
+        num_hidden_layers=27,
+        patch_size=14,
+        image_size=384,
+    )
+    with torch.device("meta"):
+        encoder = SiglipVisionModel(encoder_config).vision_model
     decoder_config = Siglip2VisionConfig()
     decoder_config.update(
         {
@@ -83,9 +116,15 @@ def _fake_released_state() -> dict[str, torch.Tensor]:
     )
     decoder = Siglip2VisionModel(decoder_config)
     state = {
-        f"decoder.{name}": _expanded(value.shape)
-        for name, value in decoder.state_dict().items()
+        f"encoder.{name}": _expanded(value.shape)
+        for name, value in encoder.state_dict().items()
     }
+    state.update(
+        {
+            f"decoder.{name}": _expanded(value.shape)
+            for name, value in decoder.state_dict().items()
+        }
+    )
     state.update(
         {
             "scale_layer.shift": _expanded(torch.Size((1, 3, 1, 1)), 0.5),
@@ -124,6 +163,42 @@ def _write_checkpoint(
         {"model": {"args": args or _released_args(), "sd": state or {}}},
         path,
     )
+    return path
+
+
+def _siglip_so400m_config(*, image_size: int = 384) -> dict[str, object]:
+    return {
+        "initializer_factor": 1.0,
+        "model_type": "siglip",
+        "text_config": {
+            "hidden_size": 1152,
+            "intermediate_size": 4304,
+            "model_type": "siglip_text_model",
+            "num_attention_heads": 16,
+            "num_hidden_layers": 27,
+            "projection_size": 1152,
+            "vocab_size": 256000,
+        },
+        "vision_config": {
+            "hidden_size": 1152,
+            "image_size": image_size,
+            "intermediate_size": 4304,
+            "model_type": "siglip_vision_model",
+            "num_attention_heads": 16,
+            "num_hidden_layers": 27,
+            "patch_size": 14,
+        },
+    }
+
+
+def _write_complete_fake_siglip_model(path: Path) -> Path:
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps(_siglip_so400m_config()))
+    config = AutoConfig.from_pretrained(path, local_files_only=True)
+    with torch.device("meta"):
+        model = AutoModel.from_config(config)
+    state = {name: _expanded(value.shape) for name, value in model.state_dict().items()}
+    torch.save(state, path / "pytorch_model.bin")
     return path
 
 
@@ -186,11 +261,8 @@ def test_released_adapter_rejects_wrong_codebook_shape_before_model_construction
 ) -> None:
     from qwen35_planx.official_ta_tok import ReleasedTATok
 
-    state = {
-        "bottleneck.regularizer.embedding.weight": torch.zeros(1024, 1536),
-        "bottleneck.regularizer.embedding_proj.weight": torch.zeros(1536, 1536),
-        "bottleneck.regularizer.embedding_proj.bias": torch.zeros(1536),
-    }
+    state = _fake_released_state()
+    state["bottleneck.regularizer.embedding.weight"] = torch.zeros(1024, 1536)
     checkpoint = _write_checkpoint(tmp_path / "bad.pth", state=state)
 
     with pytest.raises(ValueError, match="codebook.*shape"):
@@ -214,6 +286,42 @@ def test_released_adapter_rejects_missing_checkpoint_keys_before_construction(
         )
 
 
+@pytest.mark.parametrize(
+    "missing_key",
+    [
+        "encoder.encoder.layers.12.self_attn.q_proj.weight",
+        "decoder.vision_model.encoder.layers.1.mlp.fc2.bias",
+        "decode_task_layer.2.weight",
+        "bottleneck.out_linear.bias",
+    ],
+)
+def test_checkpoint_inspection_rejects_noncore_missing_state_keys(
+    tmp_path: Path,
+    missing_key: str,
+) -> None:
+    from qwen35_planx.official_ta_tok import inspect_released_checkpoint
+
+    state = _fake_released_state()
+    del state[missing_key]
+    checkpoint = _write_checkpoint(tmp_path / "missing.pth", state=state)
+
+    with pytest.raises(ValueError, match=f"missing.*{missing_key}"):
+        inspect_released_checkpoint(checkpoint, compute_state_hash=False)
+
+
+def test_checkpoint_inspection_rejects_unexpected_state_keys(
+    tmp_path: Path,
+) -> None:
+    from qwen35_planx.official_ta_tok import inspect_released_checkpoint
+
+    state = _fake_released_state()
+    state["decoder.unreleased_adapter.weight"] = torch.zeros(1)
+    checkpoint = _write_checkpoint(tmp_path / "unexpected.pth", state=state)
+
+    with pytest.raises(ValueError, match="unexpected.*decoder.unreleased_adapter"):
+        inspect_released_checkpoint(checkpoint, compute_state_hash=False)
+
+
 def test_released_adapter_rejects_unsafe_loading_before_reading_checkpoint(
     tmp_path: Path,
 ) -> None:
@@ -232,15 +340,10 @@ def test_released_adapter_rejects_nonfinite_codebook_before_construction(
 ) -> None:
     from qwen35_planx.official_ta_tok import ReleasedTATok
 
-    state = {
-        "bottleneck.regularizer.embedding.weight": _expanded(
-            torch.Size((65_536, 1536)), float("nan")
-        ),
-        "bottleneck.regularizer.embedding_proj.weight": _expanded(
-            torch.Size((1536, 1536))
-        ),
-        "bottleneck.regularizer.embedding_proj.bias": _expanded(torch.Size((1536,))),
-    }
+    state = _fake_released_state()
+    state["bottleneck.regularizer.embedding.weight"] = _expanded(
+        torch.Size((65_536, 1536)), float("nan")
+    )
     checkpoint = _write_checkpoint(tmp_path / "bad.pth", state=state)
 
     with pytest.raises(ValueError, match="non-finite"):
@@ -284,10 +387,7 @@ def test_released_ta_preflight_reports_shape_and_checkpoint_hash(
 ) -> None:
     from qwen35_planx.cli.preflight import main
 
-    siglip_model = tmp_path / "siglip"
-    siglip_model.mkdir()
-    (siglip_model / "model.safetensors").touch()
-    (siglip_model / "config.json").write_text("{}")
+    siglip_model = _write_complete_fake_siglip_model(tmp_path / "siglip")
 
     result = main(
         [
@@ -316,6 +416,7 @@ def test_released_ta_preflight_rejects_missing_weights_and_low_space(
 
     siglip_model = tmp_path / "siglip"
     siglip_model.mkdir()
+    (siglip_model / "config.json").write_text(json.dumps(_siglip_so400m_config()))
     monkeypatch.setattr(
         preflight.shutil,
         "disk_usage",
@@ -330,3 +431,64 @@ def test_released_ta_preflight_rejects_missing_weights_and_low_space(
 
     assert any("SigLIP2 model weights" in error for error in errors)
     assert any("free output space" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("artifact_case", "message"),
+    [
+        ("malformed_config", "config"),
+        ("wrong_config", "image_size"),
+        ("zero_byte", "zero-byte"),
+        ("invalid_safetensors", "invalid"),
+        ("incomplete_safetensors", "incomplete"),
+        ("missing_index_shard", "referenced.*missing"),
+    ],
+)
+def test_released_ta_preflight_rejects_unusable_siglip_artifacts(
+    fake_released_checkpoint: _FakeReleasedCheckpoint,
+    tmp_path: Path,
+    artifact_case: str,
+    message: str,
+) -> None:
+    from qwen35_planx.cli import preflight
+
+    siglip_model = tmp_path / "siglip"
+    siglip_model.mkdir()
+    config = _siglip_so400m_config(
+        image_size=256 if artifact_case == "wrong_config" else 384
+    )
+    (siglip_model / "config.json").write_text(
+        "{not-json" if artifact_case == "malformed_config" else json.dumps(config)
+    )
+    if artifact_case == "zero_byte":
+        (siglip_model / "model.safetensors").touch()
+    elif artifact_case == "invalid_safetensors":
+        (siglip_model / "model.safetensors").write_bytes(b"not-safetensors")
+    elif artifact_case in {
+        "malformed_config",
+        "wrong_config",
+        "incomplete_safetensors",
+    }:
+        save_file(
+            {"logit_scale": torch.ones(1)},
+            siglip_model / "model.safetensors",
+        )
+    elif artifact_case == "missing_index_shard":
+        (siglip_model / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {"total_size": 4},
+                    "weight_map": {"logit_scale": "model-00001-of-00001.safetensors"},
+                }
+            )
+        )
+
+    errors = preflight.collect_released_ta_preflight_errors(
+        fake_released_checkpoint.path,
+        siglip_model,
+        tmp_path,
+    )
+
+    assert any(re.search(message, error, flags=re.IGNORECASE) for error in errors), (
+        errors
+    )

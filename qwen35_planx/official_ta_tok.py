@@ -36,6 +36,104 @@ _EXPECTED_CODEBOOK_SHAPES = {
     _CODEBOOK_KEYS[1]: (1536, 1536),
     _CODEBOOK_KEYS[2]: (1536,),
 }
+
+
+def _add_siglip_transformer_shapes(
+    shapes: dict[str, tuple[int, ...]],
+    *,
+    prefix: str,
+    layers: int,
+    intermediate_size: int,
+) -> None:
+    for layer in range(layers):
+        layer_prefix = f"{prefix}.encoder.layers.{layer}"
+        for projection in ("k_proj", "v_proj", "q_proj", "out_proj"):
+            shapes[f"{layer_prefix}.self_attn.{projection}.weight"] = (1152, 1152)
+            shapes[f"{layer_prefix}.self_attn.{projection}.bias"] = (1152,)
+        for layer_norm in ("layer_norm1", "layer_norm2"):
+            shapes[f"{layer_prefix}.{layer_norm}.weight"] = (1152,)
+            shapes[f"{layer_prefix}.{layer_norm}.bias"] = (1152,)
+        shapes[f"{layer_prefix}.mlp.fc1.weight"] = (intermediate_size, 1152)
+        shapes[f"{layer_prefix}.mlp.fc1.bias"] = (intermediate_size,)
+        shapes[f"{layer_prefix}.mlp.fc2.weight"] = (1152, intermediate_size)
+        shapes[f"{layer_prefix}.mlp.fc2.bias"] = (1152,)
+
+
+def _add_siglip_head_shapes(
+    shapes: dict[str, tuple[int, ...]],
+    *,
+    prefix: str,
+    intermediate_size: int,
+) -> None:
+    shapes[f"{prefix}.head.probe"] = (1, 1, 1152)
+    shapes[f"{prefix}.head.attention.in_proj_weight"] = (3456, 1152)
+    shapes[f"{prefix}.head.attention.in_proj_bias"] = (3456,)
+    shapes[f"{prefix}.head.attention.out_proj.weight"] = (1152, 1152)
+    shapes[f"{prefix}.head.attention.out_proj.bias"] = (1152,)
+    shapes[f"{prefix}.head.layernorm.weight"] = (1152,)
+    shapes[f"{prefix}.head.layernorm.bias"] = (1152,)
+    shapes[f"{prefix}.head.mlp.fc1.weight"] = (intermediate_size, 1152)
+    shapes[f"{prefix}.head.mlp.fc1.bias"] = (intermediate_size,)
+    shapes[f"{prefix}.head.mlp.fc2.weight"] = (1152, intermediate_size)
+    shapes[f"{prefix}.head.mlp.fc2.bias"] = (1152,)
+
+
+def _released_state_shapes() -> dict[str, tuple[int, ...]]:
+    shapes: dict[str, tuple[int, ...]] = {
+        "encoder.embeddings.patch_embedding.weight": (1152, 3, 14, 14),
+        "encoder.embeddings.patch_embedding.bias": (1152,),
+        "encoder.embeddings.position_embedding.weight": (729, 1152),
+        "encoder.post_layernorm.weight": (1152,),
+        "encoder.post_layernorm.bias": (1152,),
+        "decoder.vision_model.embeddings.patch_embedding.weight": (1152, 1536),
+        "decoder.vision_model.embeddings.patch_embedding.bias": (1152,),
+        "decoder.vision_model.embeddings.position_embedding.weight": (256, 1152),
+        "decoder.vision_model.post_layernorm.weight": (1152,),
+        "decoder.vision_model.post_layernorm.bias": (1152,),
+        "scale_layer.shift": (1, 3, 1, 1),
+        "scale_layer.scale": (1, 3, 1, 1),
+        "encode_task_layer.0.weight": (1152, 1152),
+        "encode_task_layer.0.bias": (1152,),
+        "decode_task_layer.0.weight": (1152, 1152),
+        "decode_task_layer.0.bias": (1152,),
+        "decode_task_layer.2.weight": (1152, 1152),
+        "decode_task_layer.2.bias": (1152,),
+        "bottleneck.in_linear.weight": (1536, 1152),
+        "bottleneck.in_linear.bias": (1536,),
+        "bottleneck.out_linear.weight": (1536, 1536),
+        "bottleneck.out_linear.bias": (1536,),
+        **_EXPECTED_CODEBOOK_SHAPES,
+    }
+    _add_siglip_transformer_shapes(
+        shapes,
+        prefix="encoder",
+        layers=27,
+        intermediate_size=4304,
+    )
+    _add_siglip_head_shapes(
+        shapes,
+        prefix="encoder",
+        intermediate_size=4304,
+    )
+    _add_siglip_transformer_shapes(
+        shapes,
+        prefix="decoder.vision_model",
+        layers=3,
+        intermediate_size=3072,
+    )
+    _add_siglip_head_shapes(
+        shapes,
+        prefix="decoder.vision_model",
+        intermediate_size=3072,
+    )
+    if len(shapes) != 527:
+        raise AssertionError(
+            f"released TA-Tok schema must contain 527 keys: {len(shapes)}"
+        )
+    return shapes
+
+
+_EXPECTED_STATE_SHAPES = _released_state_shapes()
 _EXPECTED_ARGUMENTS: Mapping[tuple[str, ...], Any] = {
     ("bottleneck", "name"): "bottleneck",
     ("bottleneck", "args", "bottleneck_dim"): 1536,
@@ -142,19 +240,30 @@ def _validate_arguments(arguments: Mapping[str, Any]) -> None:
 def _validate_state_dict(state_dict: Mapping[str, Any]) -> None:
     if not isinstance(state_dict, Mapping):
         raise ValueError("released checkpoint model.sd must be a mapping")
-    for key in _CODEBOOK_KEYS:
-        if key not in state_dict:
-            raise ValueError(f"released checkpoint is missing required key: {key}")
+    actual_keys = set(state_dict)
+    expected_keys = set(_EXPECTED_STATE_SHAPES)
+    missing = sorted(expected_keys - actual_keys)
+    if missing:
+        raise ValueError(
+            "released checkpoint is missing required state keys: " + ", ".join(missing)
+        )
+    unexpected = sorted(actual_keys - expected_keys)
+    if unexpected:
+        raise ValueError(
+            "released checkpoint has unexpected state keys: " + ", ".join(unexpected)
+        )
+    for key, expected in _EXPECTED_STATE_SHAPES.items():
         tensor = state_dict[key]
         if not isinstance(tensor, torch.Tensor):
             raise ValueError(f"released checkpoint {key} must be a tensor")
-        expected = _EXPECTED_CODEBOOK_SHAPES[key]
         if tuple(tensor.shape) != expected:
             label = "codebook shape" if key.endswith("embedding.weight") else key
             raise ValueError(
                 f"released checkpoint {label} must be {expected}, "
                 f"got {tuple(tensor.shape)}"
             )
+    for key in _CODEBOOK_KEYS:
+        tensor = state_dict[key]
         if not bool(torch.isfinite(tensor).all()):
             raise ValueError(f"released checkpoint {key} contains non-finite values")
 
@@ -257,11 +366,7 @@ class SimVectorQuantizer(nn.Module):
             projected = bias.expand(embedding.shape[0], -1)
         else:
             projected = F.linear(embedding, weight, bias)
-        return (
-            F.normalize(projected, dim=-1)
-            if self.l2_normalized
-            else projected
-        )
+        return F.normalize(projected, dim=-1) if self.l2_normalized else projected
 
     def encode_indices(self, values: torch.Tensor) -> torch.Tensor:
         embeddings = self.get_emb()
@@ -371,7 +476,7 @@ class ReleasedTATok(nn.Module):
             )
             encoder = AutoModel.from_config(config).vision_model
         model = cls(encoder)
-        model.load_state_dict(inspection.state_dict, strict=True)
+        model.load_state_dict(inspection.state_dict, strict=True, assign=True)
         model.bottleneck.regularizer.set_eval_deterministic(True)
         model.eval()
         model.requires_grad_(False)
@@ -402,9 +507,7 @@ class ReleasedTATok(nn.Module):
         else:
             projected = projection(embedding).float()
         return (
-            F.normalize(projected, dim=-1)
-            if regularizer.l2_normalized
-            else projected
+            F.normalize(projected, dim=-1) if regularizer.l2_normalized else projected
         )
 
     @torch.inference_mode()
