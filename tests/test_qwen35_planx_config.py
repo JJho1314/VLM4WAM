@@ -55,6 +55,8 @@ def test_ta_tok_metadata_round_trip_preserves_tuple_contracts() -> None:
     assert restored == metadata
     assert restored.camera_names == ("main", "wrist")
     assert restored.selected_layer == -2
+    assert restored.qwen_model == "Qwen/Qwen3.5-2B"
+    assert restored.qwen_hidden_dim == 2048
     assert len(restored.anchor_token_ids) == 65_536
 
 
@@ -77,8 +79,17 @@ def test_planner_metadata_rejects_incompatible_tokenizer_hash() -> None:
         expected.validate_runtime(tokenizer_hash="different")
 
 
+def test_planner_metadata_matches_the_project_qwen35_backbone() -> None:
+    from qwen35_planx.config import PlannerMetadata
+
+    metadata = PlannerMetadata.example()
+
+    assert metadata.base_model == "Qwen/Qwen3.5-2B"
+    assert metadata.model_type == "qwen3_5"
+    assert metadata.qwen_hidden_dim == 2048
+
+
 def test_json_hash_is_independent_of_key_order() -> None:
     from qwen35_planx.hashing import sha256_json
 
     assert sha256_json({"b": 2, "a": 1}) == sha256_json({"a": 1, "b": 2})
-

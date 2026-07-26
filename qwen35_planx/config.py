@@ -17,6 +17,8 @@ _GE_ACT_FUTURE_INDICES = (0, 3, 5, 8)
 _NUM_KEYFRAMES = 4
 _GRID_SIZE = 16
 _VISUAL_VOCAB_SIZE = 65_536
+_QWEN_MODEL = "Qwen/Qwen3.5-2B"
+_QWEN_HIDDEN_DIM = 2048
 
 
 def _require_equal(name: str, actual: Any, expected: Any) -> None:
@@ -155,12 +157,12 @@ class TATokMetadata:
             format_version=cls.FORMAT_VERSION,
             tokenizer_type="ta_tok",
             siglip_model="google/siglip2-large-patch16-256",
-            qwen_model="Qwen/Qwen3.5-VL-4B-Instruct",
+            qwen_model=_QWEN_MODEL,
             selected_layer=-2,
             image_size=256,
             grid_size=_GRID_SIZE,
             feature_dim=1024,
-            qwen_hidden_dim=2560,
+            qwen_hidden_dim=_QWEN_HIDDEN_DIM,
             visual_vocab_size=_VISUAL_VOCAB_SIZE,
             camera_names=CAMERA_NAMES,
             image_mean=(0.5, 0.5, 0.5),
@@ -282,7 +284,7 @@ class PlannerMetadata:
         return cls(
             format_version=cls.FORMAT_VERSION,
             planner_backend=cls.BACKEND,
-            base_model="Qwen/Qwen3.5-VL-4B-Instruct",
+            base_model=_QWEN_MODEL,
             model_type="qwen3_5",
             camera_names=CAMERA_NAMES,
             camera_keys=CAMERA_KEYS,
@@ -304,7 +306,7 @@ class PlannerMetadata:
                 ("camera_wrist", 249_999),
             ),
             hidden_alignment=cls.HIDDEN_ALIGNMENT,
-            qwen_hidden_dim=2560,
+            qwen_hidden_dim=_QWEN_HIDDEN_DIM,
             tokenizer_hash="example-tokenizer-sha256",
             ta_tok_hash="example-ta-tok-sha256",
             base_model_hash="example-base-model-sha256",
