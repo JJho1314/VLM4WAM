@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Iterator, Sequence
 
 import torch
 import torch.nn as nn
@@ -63,6 +64,22 @@ def build_semantic_plan_times(
     return normalized_times.unsqueeze(0).repeat(batch_size * n_view, 1)
 
 
+@dataclass(frozen=True)
+class SemanticContext:
+    """Per-camera semantic keys and their optional grounding metadata."""
+
+    hidden_states: torch.Tensor
+    positions: torch.Tensor
+    key_mask: torch.Tensor | None
+    relevance: torch.Tensor | None
+
+    def __iter__(self) -> Iterator[torch.Tensor]:
+        """Preserve the legacy ``hidden_states, positions = adapter(...)`` API."""
+
+        yield self.hidden_states
+        yield self.positions
+
+
 class SemanticContextAdapter(nn.Module):
     """Adapt per-camera SigLIP2 grids to LTX tokens with explicit coordinates."""
 
@@ -97,7 +114,11 @@ class SemanticContextAdapter(nn.Module):
         latent_height: int,
         latent_width: int,
         latent_num_frames: int = 6,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        semantic_positions_xy: torch.Tensor | None = None,
+        semantic_token_mask: torch.Tensor | None = None,
+        semantic_relevance: torch.Tensor | None = None,
+    ) -> SemanticContext:
         if semantic_tokens.ndim != 5:
             raise ValueError(
                 "semantic_tokens must be [B,V,K,P,D], "
@@ -106,11 +127,14 @@ class SemanticContextAdapter(nn.Module):
         batch_size, n_view, num_keyframes, num_patches, _ = semantic_tokens.shape
         if n_view > self.num_views:
             raise ValueError(f"received {n_view} views, adapter supports {self.num_views}")
-        grid_size = math.isqrt(num_patches)
-        if grid_size * grid_size != num_patches:
-            raise ValueError(f"SigLIP2 patch count must be square, got {num_patches}")
 
         if semantic_plan_times.ndim == 3:
+            expected_batched_times = (batch_size, n_view, num_keyframes)
+            if tuple(semantic_plan_times.shape) != expected_batched_times:
+                raise ValueError(
+                    "semantic_plan_times must have shape "
+                    f"{expected_batched_times}, got {tuple(semantic_plan_times.shape)}"
+                )
             semantic_plan_times = semantic_plan_times.reshape(batch_size * n_view, num_keyframes)
         expected_times = (batch_size * n_view, num_keyframes)
         if tuple(semantic_plan_times.shape) != expected_times:
@@ -123,32 +147,128 @@ class SemanticContextAdapter(nn.Module):
         position_dtype = torch.float32
         normalized_times = semantic_plan_times.to(device=device, dtype=position_dtype)
 
-        grid_y = torch.linspace(0, latent_height - 1, grid_size, device=device, dtype=position_dtype)
-        grid_x = torch.linspace(0, latent_width - 1, grid_size, device=device, dtype=position_dtype)
-        y, x = torch.meshgrid(grid_y, grid_x, indexing="ij")
-        y = y.flatten()
-        x = x.flatten()
-
         raw_t = normalized_times * (latent_num_frames - 1)
-        raw_positions = torch.stack(
-            (
-                raw_t[:, :, None].expand(-1, -1, num_patches),
-                y[None, None].expand(batch_size * n_view, num_keyframes, -1),
-                x[None, None].expand(batch_size * n_view, num_keyframes, -1),
-            ),
-            dim=-1,
-        )
+        if semantic_positions_xy is None:
+            grid_size = math.isqrt(num_patches)
+            if grid_size * grid_size != num_patches:
+                raise ValueError(f"SigLIP2 patch count must be square, got {num_patches}")
 
-        coord_y = y / max(latent_height - 1, 1) * 2 - 1
-        coord_x = x / max(latent_width - 1, 1) * 2 - 1
-        normalized_positions = torch.stack(
-            (
-                (normalized_times * 2 - 1)[:, :, None].expand(-1, -1, num_patches),
-                coord_y[None, None].expand(batch_size * n_view, num_keyframes, -1),
-                coord_x[None, None].expand(batch_size * n_view, num_keyframes, -1),
-            ),
-            dim=-1,
-        )
+            grid_y = torch.linspace(
+                0,
+                latent_height - 1,
+                grid_size,
+                device=device,
+                dtype=position_dtype,
+            )
+            grid_x = torch.linspace(
+                0,
+                latent_width - 1,
+                grid_size,
+                device=device,
+                dtype=position_dtype,
+            )
+            y, x = torch.meshgrid(grid_y, grid_x, indexing="ij")
+            y = y.flatten()
+            x = x.flatten()
+
+            raw_positions = torch.stack(
+                (
+                    raw_t[:, :, None].expand(-1, -1, num_patches),
+                    y[None, None].expand(batch_size * n_view, num_keyframes, -1),
+                    x[None, None].expand(batch_size * n_view, num_keyframes, -1),
+                ),
+                dim=-1,
+            )
+
+            coord_y = y / max(latent_height - 1, 1) * 2 - 1
+            coord_x = x / max(latent_width - 1, 1) * 2 - 1
+            normalized_positions = torch.stack(
+                (
+                    (normalized_times * 2 - 1)[:, :, None].expand(-1, -1, num_patches),
+                    coord_y[None, None].expand(batch_size * n_view, num_keyframes, -1),
+                    coord_x[None, None].expand(batch_size * n_view, num_keyframes, -1),
+                ),
+                dim=-1,
+            )
+        else:
+            expected_positions = (
+                batch_size,
+                n_view,
+                num_keyframes,
+                num_patches,
+                2,
+            )
+            if tuple(semantic_positions_xy.shape) != expected_positions:
+                raise ValueError(
+                    "semantic_positions_xy must have shape "
+                    f"{expected_positions}, got {tuple(semantic_positions_xy.shape)}"
+                )
+            if not semantic_positions_xy.dtype.is_floating_point:
+                raise TypeError("semantic_positions_xy must have a floating dtype")
+            if semantic_positions_xy.device != device:
+                raise ValueError("semantic_positions_xy must be on the semantic token device")
+            if not bool(torch.isfinite(semantic_positions_xy).all()):
+                raise ValueError("semantic_positions_xy must contain only finite values")
+            if bool(((semantic_positions_xy < 0) | (semantic_positions_xy > 1)).any()):
+                raise ValueError("semantic_positions_xy must be normalized to [0,1]")
+
+            flattened_xy = semantic_positions_xy.reshape(
+                batch_size * n_view,
+                num_keyframes,
+                num_patches,
+                2,
+            ).to(dtype=position_dtype)
+            normalized_x = flattened_xy[..., 0]
+            normalized_y = flattened_xy[..., 1]
+            raw_positions = torch.stack(
+                (
+                    raw_t[:, :, None].expand(-1, -1, num_patches),
+                    normalized_y * max(latent_height - 1, 0),
+                    normalized_x * max(latent_width - 1, 0),
+                ),
+                dim=-1,
+            )
+            normalized_positions = torch.stack(
+                (
+                    (normalized_times * 2 - 1)[:, :, None].expand(-1, -1, num_patches),
+                    normalized_y * 2 - 1,
+                    normalized_x * 2 - 1,
+                ),
+                dim=-1,
+            )
+
+        expected_metadata = (batch_size, n_view, num_keyframes, num_patches)
+        if semantic_token_mask is not None:
+            if tuple(semantic_token_mask.shape) != expected_metadata:
+                raise ValueError(
+                    "semantic_token_mask must have shape "
+                    f"{expected_metadata}, got {tuple(semantic_token_mask.shape)}"
+                )
+            if semantic_token_mask.dtype != torch.bool:
+                raise TypeError("semantic_token_mask must have boolean dtype")
+            if semantic_token_mask.device != device:
+                raise ValueError("semantic_token_mask must be on the semantic token device")
+            key_mask = semantic_token_mask.reshape(batch_size * n_view, -1)
+        else:
+            key_mask = None
+
+        if semantic_relevance is not None:
+            if tuple(semantic_relevance.shape) != expected_metadata:
+                raise ValueError(
+                    "semantic_relevance must have shape "
+                    f"{expected_metadata}, got {tuple(semantic_relevance.shape)}"
+                )
+            if not semantic_relevance.dtype.is_floating_point:
+                raise TypeError("semantic_relevance must have a floating dtype")
+            if semantic_relevance.device != device:
+                raise ValueError("semantic_relevance must be on the semantic token device")
+            if not bool(torch.isfinite(semantic_relevance).all()):
+                raise ValueError("semantic_relevance must contain only finite values")
+            if bool((semantic_relevance < 0).any()):
+                raise ValueError("semantic_relevance must be non-negative")
+            flattened_relevance = semantic_relevance.reshape(batch_size * n_view, -1)
+        else:
+            flattened_relevance = None
 
         projected = self.feature_projection(self.input_norm(tokens))
         coordinate_embedding = self.coordinate_projection(
@@ -158,9 +278,11 @@ class SemanticContextAdapter(nn.Module):
         view_embedding = self.semantic_view_embedding[view_ids, None, None]
         projected = projected + coordinate_embedding + view_embedding + self.semantic_type_embedding
         projected = self.output_norm(projected)
-        return (
-            projected.flatten(1, 2),
-            raw_positions.flatten(1, 2),
+        return SemanticContext(
+            hidden_states=projected.flatten(1, 2),
+            positions=raw_positions.flatten(1, 2),
+            key_mask=key_mask,
+            relevance=flattened_relevance,
         )
 
 
