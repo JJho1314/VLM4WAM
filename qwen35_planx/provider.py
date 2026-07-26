@@ -14,6 +14,7 @@ from qwen35_planx.config import CAMERA_NAMES, PlanGeometry
 from qwen35_planx.decoding import (
     _current_visual_embedding_rows,
     GeneratedGroundedPlan,
+    GroundedDecodingConfig,
     generate_grounded_plan,
     unflatten_generated_plan,
 )
@@ -113,6 +114,7 @@ class Qwen35GroundedPlanProvider(nn.Module):
         collator: GroundedPlannerCollator | Any,
         layout: VisualVocabularyLayout | Any,
         condition_dim: int = 1024,
+        decoding_config: GroundedDecodingConfig | None = None,
         _enforce_released_geometry: bool = True,
     ) -> None:
         super().__init__()
@@ -122,6 +124,12 @@ class Qwen35GroundedPlanProvider(nn.Module):
             raise TypeError("collator must expose build_teacher_forced")
         if type(condition_dim) is not int or condition_dim <= 0:
             raise ValueError("condition_dim must be a positive integer")
+        if decoding_config is None:
+            decoding_config = GroundedDecodingConfig()
+        elif not isinstance(decoding_config, GroundedDecodingConfig):
+            raise TypeError(
+                "decoding_config must be a GroundedDecodingConfig"
+            )
         codebook = getattr(planner, "codebook", None)
         hidden_dim = getattr(planner, "hidden_dim", None)
         if (
@@ -162,6 +170,7 @@ class Qwen35GroundedPlanProvider(nn.Module):
         self.collator = collator
         self.layout = layout
         self.condition_dim = condition_dim
+        self.decoding_config = decoding_config
         self.visual_adapter = nn.Linear(int(codebook.shape[1]), condition_dim)
         self.hidden_adapter = nn.Linear(hidden_dim, condition_dim)
         self.position_encoder = LearnedPlanPositionEncoder(condition_dim)
@@ -175,6 +184,7 @@ class Qwen35GroundedPlanProvider(nn.Module):
         collator: GroundedPlannerCollator | Any,
         layout: VisualVocabularyLayout | Any,
         condition_dim: int,
+        decoding_config: GroundedDecodingConfig | None = None,
     ) -> Qwen35GroundedPlanProvider:
         """Construct a reduced-geometry provider for unit tests only."""
 
@@ -183,6 +193,7 @@ class Qwen35GroundedPlanProvider(nn.Module):
             collator=collator,
             layout=layout,
             condition_dim=condition_dim,
+            decoding_config=decoding_config,
             _enforce_released_geometry=False,
         )
 
@@ -243,6 +254,8 @@ class Qwen35GroundedPlanProvider(nn.Module):
         self,
         current_images: Tensor,
         instructions: Sequence[str],
+        *,
+        generator: torch.Generator | None = None,
     ) -> GeneratedGroundedPlan:
         """Generate with a temporarily frozen/eval planner and restore all state."""
 
@@ -279,6 +292,8 @@ class Qwen35GroundedPlanProvider(nn.Module):
                     camera_names=camera_names,
                     layout=self.layout,
                     processor=self.collator.processor,
+                    config=self.decoding_config,
+                    generator=generator,
                 )
                 return unflatten_generated_plan(flat_plan, batch_size)
         finally:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from qwen35_planx.config import CAMERA_NAMES
 from qwen35_planx.vocabulary import (
     CAMERA_TOKENS,
     FRAME_END_TOKENS,
@@ -51,7 +53,7 @@ class _Processor:
     def __init__(self, layout: VisualVocabularyLayout) -> None:
         self.layout = layout
         self.tokenizer = layout._tokenizer
-        self.calls: list[tuple[str, torch.Tensor]] = []
+        self.calls: list[tuple[tuple[str, ...], torch.Tensor]] = []
 
     def apply_chat_template(
         self,
@@ -73,26 +75,38 @@ class _Processor:
         padding: bool,
     ) -> dict[str, torch.Tensor]:
         assert return_tensors == "pt"
-        assert padding is False
-        prompt = text[0]
-        image = images[0]
-        self.calls.append((prompt, image.clone()))
-        camera = (
-            CAMERA_TOKENS[0] if CAMERA_TOKENS[0] in prompt else CAMERA_TOKENS[1]
-        )
-        ids = torch.tensor(
-            [
-                1,
-                self.layout.token_id(camera),
-                *self.layout.role_query_ids,
-            ],
-            dtype=torch.long,
-        ).unsqueeze(0)
+        assert padding is True
+        assert len(text) == len(images)
+        self.calls.append((tuple(text), torch.stack(images).clone()))
+        rows: list[torch.Tensor] = []
+        for prompt in text:
+            camera = (
+                CAMERA_TOKENS[0]
+                if CAMERA_TOKENS[0] in prompt
+                else CAMERA_TOKENS[1]
+            )
+            prefix = [1, 3] if "open the drawer" in prompt else [1]
+            rows.append(
+                torch.tensor(
+                    [
+                        *prefix,
+                        self.layout.token_id(camera),
+                        *self.layout.role_query_ids,
+                    ],
+                    dtype=torch.long,
+                )
+            )
+        width = max(int(row.numel()) for row in rows)
+        ids = torch.zeros(len(rows), width, dtype=torch.long)
+        attention_mask = torch.zeros_like(ids)
+        for index, row in enumerate(rows):
+            ids[index, : row.numel()] = row
+            attention_mask[index, : row.numel()] = 1
         return {
             "input_ids": ids,
-            "attention_mask": torch.ones_like(ids),
-            "pixel_values": image.float().unsqueeze(0),
-            "image_grid_thw": torch.tensor([[1, 1, 1]], dtype=torch.long),
+            "attention_mask": attention_mask,
+            "pixel_values": torch.stack(images).float(),
+            "image_grid_thw": torch.ones(len(rows), 3, dtype=torch.long),
         }
 
 
@@ -101,7 +115,9 @@ class _BaseModel(nn.Module):
         super().__init__()
         self.prefill_calls = 0
         self.incremental_tokens: dict[int, list[int]] = {1: [], 2: []}
-        self.kwargs_seen: list[dict[str, object]] = []
+        self.total_calls = 0
+        self.prefill_attention_mask: torch.Tensor | None = None
+        self.rope_deltas_seen: torch.Tensor | None = None
 
     def forward(
         self,
@@ -120,54 +136,54 @@ class _BaseModel(nn.Module):
         assert use_cache is True
         assert output_hidden_states is False
         assert return_dict is True
-        self.kwargs_seen.append(
-            {
-                "past_key_values": past_key_values,
-                "pixel_values": pixel_values,
-                "image_grid_thw": image_grid_thw,
-            }
-        )
+        self.total_calls += 1
         if past_key_values is None:
             assert pixel_values is not None
             assert image_grid_thw is not None
             assert position_ids is None
             self.prefill_calls += 1
-            row = int(pixel_values[0, 0, 0, 0].item())
-            sign = 1.0 if row == 1 else -1.0
+            rows = pixel_values[:, 0, 0, 0].to(dtype=torch.long)
+            signs = torch.where(rows.eq(1), 1.0, -1.0)
             assert torch.equal(
                 cache_position,
                 torch.arange(input_ids.shape[1], device=input_ids.device),
             )
-            hidden = input_ids.to(torch.float32).unsqueeze(-1) * sign
-            cache = {"row": row, "length": input_ids.shape[1]}
+            hidden = input_ids.to(torch.float32).unsqueeze(-1)
+            hidden = hidden * signs[:, None, None]
+            cache = {"rows": rows.clone(), "length": input_ids.shape[1]}
+            rope_deltas = torch.where(rows.eq(1), 11, 23).reshape(-1, 1)
+            self.prefill_attention_mask = attention_mask.clone()
+            self.rope_deltas_seen = rope_deltas.clone()
         else:
             assert pixel_values is None
             assert image_grid_thw is None
-            assert input_ids.shape == (1, 1)
-            row = int(past_key_values["row"])
-            sign = 1.0 if row == 1 else -1.0
-            token = int(input_ids.item())
+            rows = past_key_values["rows"]
+            assert input_ids.shape == (rows.numel(), 1)
+            signs = torch.where(rows.eq(1), 1.0, -1.0)
             assert cache_position.tolist() == [past_key_values["length"]]
             assert position_ids is not None
-            assert position_ids.shape == (3, 1, 1)
+            assert position_ids.shape == (3, rows.numel(), 1)
+            rope_deltas = torch.where(rows.eq(1), 11, 23)
+            expected_positions = (
+                attention_mask.to(dtype=torch.long).sum(dim=-1) - 1 + rope_deltas
+            )
             assert torch.equal(
                 position_ids,
-                torch.full_like(
-                    position_ids,
-                    past_key_values["length"] + 11,
-                ),
+                expected_positions.reshape(1, -1, 1).expand(3, -1, -1),
             )
-            self.incremental_tokens[row].append(token)
-            hidden = input_ids.to(torch.float32).unsqueeze(-1) * sign
+            for row, token in zip(rows.tolist(), input_ids[:, 0].tolist()):
+                self.incremental_tokens[int(row)].append(int(token))
+            hidden = input_ids.to(torch.float32).unsqueeze(-1)
+            hidden = hidden * signs[:, None, None]
             cache = {
-                "row": row,
+                "rows": rows.clone(),
                 "length": int(past_key_values["length"]) + 1,
             }
-        assert attention_mask.shape == (1, cache["length"])
+        assert attention_mask.shape == (input_ids.shape[0], cache["length"])
         return SimpleNamespace(
             last_hidden_state=hidden,
             past_key_values=cache,
-            rope_deltas=torch.tensor([[11]], device=input_ids.device),
+            rope_deltas=rope_deltas.to(device=input_ids.device),
         )
 
 
@@ -227,6 +243,218 @@ def decoding_components():
     return _Planner(layout), layout
 
 
+def test_decoding_config_defaults_to_deterministic_greedy_and_is_immutable() -> None:
+    from qwen35_planx.decoding import (
+        _select_visual_codes,
+        GroundedDecodingConfig,
+    )
+
+    config = GroundedDecodingConfig()
+    logits = torch.zeros(2, 65_536)
+    logits[0, 17] = 3.0
+    logits[1, 29] = 4.0
+    global_state = torch.random.get_rng_state()
+
+    first = _select_visual_codes(logits, config=config, generator=None)
+    assert torch.equal(torch.random.get_rng_state(), global_state)
+    torch.manual_seed(91)
+    second = _select_visual_codes(logits, config=config, generator=None)
+
+    assert first.tolist() == [17, 29]
+    assert torch.equal(first, second)
+    with pytest.raises(FrozenInstanceError):
+        config.top_k = 2  # type: ignore[misc]
+    torch.random.set_rng_state(global_state)
+
+
+def test_top_k_sampling_is_seeded_reproducible_and_candidate_restricted() -> None:
+    from qwen35_planx.decoding import (
+        _prepare_sampling_generator,
+        _select_visual_codes,
+        GroundedDecodingConfig,
+    )
+
+    logits = torch.full((32, 65_536), -100.0)
+    candidates = torch.tensor([5, 7, 11])
+    logits[:, candidates] = 0.0
+    config = GroundedDecodingConfig(top_k=3, temperature=0.75, seed=123)
+    global_state = torch.random.get_rng_state()
+
+    first = _select_visual_codes(
+        logits,
+        config=config,
+        generator=_prepare_sampling_generator(
+            config,
+            supplied=None,
+            device=logits.device,
+        ),
+    )
+    repeated = _select_visual_codes(
+        logits,
+        config=config,
+        generator=_prepare_sampling_generator(
+            config,
+            supplied=None,
+            device=logits.device,
+        ),
+    )
+    other_config = GroundedDecodingConfig(top_k=3, seed=124)
+    different_seed = _select_visual_codes(
+        logits,
+        config=other_config,
+        generator=_prepare_sampling_generator(
+            other_config,
+            supplied=None,
+            device=logits.device,
+        ),
+    )
+
+    assert torch.equal(first, repeated)
+    assert not torch.equal(first, different_seed)
+    assert set(first.tolist()) <= set(candidates.tolist())
+    assert set(different_seed.tolist()) <= set(candidates.tolist())
+    assert torch.equal(torch.random.get_rng_state(), global_state)
+
+    external_config = GroundedDecodingConfig(top_k=3)
+    first_generator = torch.Generator(device="cpu").manual_seed(77)
+    second_generator = torch.Generator(device="cpu").manual_seed(77)
+    generator_state = first_generator.get_state()
+    external_first = _select_visual_codes(
+        logits,
+        config=external_config,
+        generator=_prepare_sampling_generator(
+            external_config,
+            supplied=first_generator,
+            device=logits.device,
+        ),
+    )
+    external_second = _select_visual_codes(
+        logits,
+        config=external_config,
+        generator=_prepare_sampling_generator(
+            external_config,
+            supplied=second_generator,
+            device=logits.device,
+        ),
+    )
+    assert torch.equal(external_first, external_second)
+    assert not torch.equal(first_generator.get_state(), generator_state)
+    assert torch.equal(torch.random.get_rng_state(), global_state)
+
+    tiny_temperature = GroundedDecodingConfig(
+        top_k=3,
+        temperature=1e-300,
+        seed=9,
+    )
+    selected = _select_visual_codes(
+        logits[:1].clone().index_fill(1, candidates, 0.0).index_fill(
+            1,
+            candidates[:1],
+            1.0,
+        ),
+        config=tiny_temperature,
+        generator=_prepare_sampling_generator(
+            tiny_temperature,
+            supplied=None,
+            device=logits.device,
+        ),
+    )
+    assert selected.item() == 5
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        ({"top_k": 0}, ValueError),
+        ({"top_k": 65_537}, ValueError),
+        ({"top_k": True}, TypeError),
+        ({"top_k": 1.5}, TypeError),
+        ({"top_k": 2, "temperature": 0.0}, ValueError),
+        ({"top_k": 2, "temperature": -1.0}, ValueError),
+        ({"top_k": 2, "temperature": float("nan")}, ValueError),
+        ({"top_k": 2, "temperature": float("inf")}, ValueError),
+        ({"top_k": 2, "temperature": True}, TypeError),
+        ({"seed": 1}, ValueError),
+        ({"top_k": 2, "seed": True}, TypeError),
+    ],
+)
+def test_decoding_config_rejects_invalid_or_ambiguous_values(
+    kwargs,
+    error,
+) -> None:
+    from qwen35_planx.decoding import GroundedDecodingConfig
+
+    with pytest.raises(error):
+        GroundedDecodingConfig(**kwargs)
+
+
+def test_top_k_requires_exactly_one_seed_source() -> None:
+    from qwen35_planx.decoding import (
+        _prepare_sampling_generator,
+        GroundedDecodingConfig,
+    )
+
+    unseeded = GroundedDecodingConfig(top_k=2)
+    with pytest.raises(ValueError, match="seed|generator"):
+        _prepare_sampling_generator(
+            unseeded,
+            supplied=None,
+            device=torch.device("cpu"),
+        )
+
+    configured = GroundedDecodingConfig(top_k=2, seed=7)
+    supplied = torch.Generator(device="cpu").manual_seed(8)
+    with pytest.raises(ValueError, match="exactly one"):
+        _prepare_sampling_generator(
+            configured,
+            supplied=supplied,
+            device=torch.device("cpu"),
+        )
+
+
+def test_batched_decode_call_count_is_row_independent_and_cache_isolated(
+    monkeypatch,
+) -> None:
+    import qwen35_planx.decoding as decoding
+
+    monkeypatch.setattr(decoding, "_NUM_KEYFRAMES", 1)
+    monkeypatch.setattr(decoding, "_TOKENS_PER_FRAME", 3)
+    layout = _layout()
+
+    def decode(images: torch.Tensor):
+        planner = _Planner(layout)
+        values = decoding._decode_camera_batch(
+            planner,
+            backbone=planner.base_model,
+            visual_weight=planner.visual_embedding_weight,
+            images=images,
+            instructions=tuple("open the drawer" for _ in images),
+            cameras=tuple(
+                CAMERA_NAMES[index % 2] for index in range(len(images))
+            ),
+            layout=layout,
+            processor=planner.processor,
+            config=decoding.GroundedDecodingConfig(),
+            generator=None,
+        )
+        return planner, values
+
+    one_planner, _ = decode(torch.ones(1, 3, 2, 2))
+    two_planner, original = decode(
+        torch.stack((torch.ones(3, 2, 2), torch.full((3, 2, 2), 2.0)))
+    )
+    changed_planner, changed = decode(torch.ones(2, 3, 2, 2))
+
+    expected_calls = 1 + 1 + (1 + 3 + 1) + 1
+    assert one_planner.base_model.total_calls == expected_calls
+    assert two_planner.base_model.total_calls == expected_calls
+    assert changed_planner.base_model.total_calls == expected_calls
+    assert torch.equal(original[0][0], changed[0][0])
+    assert torch.equal(original[1][0], changed[1][0])
+    assert not torch.equal(original[0][1], changed[0][1])
+    assert not torch.equal(original[1][1], changed[1][1])
+
+
 def test_generation_emits_exact_structure_and_records_final_post_state(
     decoding_components,
     monkeypatch,
@@ -239,7 +467,10 @@ def test_generation_emits_exact_structure_and_records_final_post_state(
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", reject_siglip)
-    from qwen35_planx.decoding import generate_grounded_plan
+    from qwen35_planx.decoding import (
+        generate_grounded_plan,
+        unflatten_generated_plan,
+    )
 
     planner, layout = decoding_components
     images = torch.stack(
@@ -293,7 +524,21 @@ def test_generation_emits_exact_structure_and_records_final_post_state(
     )
     assert planner.backbone.public_forward_calls == 0
     assert planner.backbone.lm_head_calls == 0
-    assert planner.base_model.prefill_calls == 2
+    assert planner.base_model.prefill_calls == 1
+    assert planner.base_model.total_calls == (
+        1 + 1 + 4 * (1 + 729 + 1) + 1
+    )
+    assert planner.base_model.prefill_attention_mask is not None
+    assert planner.base_model.prefill_attention_mask.tolist() == [
+        [1, 1, 1, 1, 1, 0],
+        [1, 1, 1, 1, 1, 1],
+    ]
+    assert planner.base_model.rope_deltas_seen is not None
+    assert planner.base_model.rope_deltas_seen.tolist() == [[11], [23]]
+
+    sample_major = unflatten_generated_plan(plan, batch_size=1)
+    assert torch.equal(sample_major.codes[0, 0], plan.codes[0])
+    assert torch.equal(sample_major.codes[0, 1], plan.codes[1])
 
     for row, code in ((1, 5), (2, 7)):
         tokens = planner.base_model.incremental_tokens[row]
@@ -311,7 +556,9 @@ def test_generation_emits_exact_structure_and_records_final_post_state(
         assert tokens[cursor] == layout.token_id(PLAN_END_TOKEN)
         assert cursor + 1 == len(tokens)
 
-    main_prompt, wrist_prompt = (item[0] for item in planner.processor.calls)
+    assert len(planner.processor.calls) == 1
+    (main_prompt, wrist_prompt), batched_images = planner.processor.calls[0]
+    assert torch.equal(batched_images, images)
     assert "<CAMERA_MAIN>" in main_prompt
     assert "<CAMERA_WRIST>" in wrist_prompt
     for prompt in (main_prompt, wrist_prompt):
@@ -427,6 +674,7 @@ def test_missing_multimodal_rope_state_fails_closed() -> None:
             SimpleNamespace(),
             backbone=nn.Linear(1, 1),
             device=torch.device("cpu"),
+            camera_batch=1,
         )
 
 

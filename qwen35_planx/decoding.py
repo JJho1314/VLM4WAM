@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import math
+from numbers import Real
 from typing import Any, Mapping, Sequence
 
 import torch
@@ -27,6 +29,119 @@ _NUM_KEYFRAMES = _GEOMETRY.num_keyframes
 _TOKENS_PER_FRAME = _GEOMETRY.tokens_per_frame
 _VISUAL_VOCAB_SIZE = _GEOMETRY.visual_vocab_size
 _NUM_ROLES = 3
+
+
+@dataclass(frozen=True)
+class GroundedDecodingConfig:
+    """Immutable visual decoding policy with explicit sampling entropy."""
+
+    top_k: int | None = None
+    temperature: float | None = None
+    seed: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.top_k is None:
+            if self.temperature is not None or self.seed is not None:
+                raise ValueError(
+                    "greedy decoding does not accept temperature or seed"
+                )
+            return
+        if type(self.top_k) is not int:
+            raise TypeError("top_k must be an integer or None")
+        if not 1 <= self.top_k <= _VISUAL_VOCAB_SIZE:
+            raise ValueError("top_k must be in [1, 65536]")
+        if self.temperature is not None:
+            if isinstance(self.temperature, bool) or not isinstance(
+                self.temperature,
+                Real,
+            ):
+                raise TypeError("temperature must be a real number or None")
+            if (
+                not math.isfinite(float(self.temperature))
+                or float(self.temperature) <= 0
+            ):
+                raise ValueError("temperature must be positive and finite")
+        if self.seed is not None:
+            if type(self.seed) is not int:
+                raise TypeError("seed must be an integer or None")
+            if not -(2**63) <= self.seed <= 2**64 - 1:
+                raise ValueError("seed is outside torch.Generator's valid range")
+
+
+def _prepare_sampling_generator(
+    config: GroundedDecodingConfig,
+    *,
+    supplied: torch.Generator | None,
+    device: torch.device,
+) -> torch.Generator | None:
+    if not isinstance(config, GroundedDecodingConfig):
+        raise TypeError("config must be a GroundedDecodingConfig")
+    if supplied is not None and not isinstance(supplied, torch.Generator):
+        raise TypeError("generator must be a torch.Generator or None")
+    if config.top_k is None:
+        if supplied is not None:
+            raise ValueError("greedy decoding does not accept a generator")
+        return None
+    if (config.seed is None) == (supplied is None):
+        raise ValueError(
+            "top-k decoding requires exactly one configured seed or generator"
+        )
+    if supplied is not None:
+        if torch.device(supplied.device) != torch.device(device):
+            raise ValueError("generator device must match visual logits device")
+        return supplied
+    generator = torch.Generator(device=device)
+    generator.manual_seed(config.seed)  # type: ignore[arg-type]
+    return generator
+
+
+def _select_visual_codes(
+    logits: Tensor,
+    *,
+    config: GroundedDecodingConfig,
+    generator: torch.Generator | None,
+) -> Tensor:
+    if (
+        not isinstance(logits, Tensor)
+        or logits.ndim != 2
+        or logits.shape[1] != _VISUAL_VOCAB_SIZE
+    ):
+        raise RuntimeError("visual-only logits must cover exactly 65,536 rows")
+    if not logits.dtype.is_floating_point:
+        raise RuntimeError("visual logits must be floating-point")
+    if not bool(torch.isfinite(logits).all()):
+        raise RuntimeError("non-finite visual logits")
+    if config.top_k is None:
+        if generator is not None:
+            raise ValueError("greedy decoding does not accept a generator")
+        return logits.argmax(dim=-1)
+    if not isinstance(generator, torch.Generator):
+        raise ValueError("top-k decoding requires an explicit seeded generator")
+    temperature = 1.0 if config.temperature is None else float(config.temperature)
+    candidate_logits, candidate_codes = torch.topk(
+        logits,
+        k=config.top_k,
+        dim=-1,
+    )
+    candidate_logits = candidate_logits - candidate_logits.max(
+        dim=-1,
+        keepdim=True,
+    ).values
+    probability_dtype = (
+        torch.float64 if candidate_logits.dtype == torch.float64 else torch.float32
+    )
+    candidate_logits = candidate_logits.to(dtype=probability_dtype)
+    effective_temperature = max(
+        temperature,
+        torch.finfo(probability_dtype).tiny,
+    )
+    candidate_logits = candidate_logits / effective_temperature
+    candidate_index = torch.multinomial(
+        candidate_logits.softmax(dim=-1),
+        num_samples=1,
+        generator=generator,
+    )
+    return candidate_codes.gather(dim=-1, index=candidate_index).squeeze(-1)
 
 
 def _require_floating_tensor(
@@ -325,6 +440,7 @@ def _rope_deltas(
     *,
     backbone: nn.Module,
     device: torch.device,
+    camera_batch: int,
 ) -> Tensor:
     if isinstance(output, Mapping):
         value = output.get("rope_deltas")
@@ -338,44 +454,51 @@ def _rope_deltas(
         not isinstance(value, Tensor)
         or value.dtype == torch.bool
         or value.dtype.is_floating_point
-        or value.numel() != 1
+        or value.numel() != camera_batch
+        or value.ndim not in (1, 2)
+        or (value.ndim == 2 and value.shape != (camera_batch, 1))
     ):
-        raise RuntimeError("Qwen rope_deltas must contain one integer camera value")
-    return value.to(device=device, dtype=torch.long).reshape(1, 1)
+        raise RuntimeError(
+            "Qwen rope_deltas must contain one integer value per camera row"
+        )
+    return value.to(device=device, dtype=torch.long).reshape(camera_batch, 1)
 
 
-def _build_prompt_inputs(
+def _build_prompt_batch_inputs(
     *,
     processor: Any,
     layout: VisualVocabularyLayout,
-    image: Tensor,
-    instruction: str,
-    camera: str,
+    images: Tensor,
+    instructions: Sequence[str],
+    cameras: Sequence[str],
     device: torch.device,
-) -> dict[str, Tensor]:
-    fields = parse_libero_instruction(instruction)
-    camera_token = CAMERA_TOKENS[CAMERA_NAMES.index(camera)]
-    text = f"{camera_token}\n{format_grounded_prompt(fields)}"
+) -> tuple[dict[str, Tensor], Tensor]:
+    texts: list[str] = []
     apply_chat_template = getattr(processor, "apply_chat_template", None)
-    if callable(apply_chat_template):
-        text = apply_chat_template(
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": text},
-                    ],
-                }
-            ],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+    for image, instruction, camera in zip(images, instructions, cameras):
+        fields = parse_libero_instruction(instruction)
+        camera_token = CAMERA_TOKENS[CAMERA_NAMES.index(camera)]
+        text = f"{camera_token}\n{format_grounded_prompt(fields)}"
+        if callable(apply_chat_template):
+            text = apply_chat_template(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": image},
+                            {"type": "text", "text": text},
+                        ],
+                    }
+                ],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        texts.append(text)
     processed = processor(
-        text=[text],
-        images=[image],
+        text=texts,
+        images=list(images),
         return_tensors="pt",
-        padding=False,
+        padding=True,
     )
     if not isinstance(processed, Mapping) or "input_ids" not in processed:
         raise ValueError("Qwen processor must return a mapping with input_ids")
@@ -385,21 +508,49 @@ def _build_prompt_inputs(
             raise TypeError(f"Qwen processor field {name} must be a tensor")
         inputs[str(name)] = value.to(device=device)
     input_ids = inputs["input_ids"]
-    if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
-        raise ValueError("Qwen processor must return one nonempty prompt sequence")
+    camera_batch = int(images.shape[0])
+    if (
+        input_ids.ndim != 2
+        or input_ids.shape[0] != camera_batch
+        or input_ids.shape[1] == 0
+    ):
+        raise ValueError(
+            "Qwen processor must return one nonempty sequence per camera row"
+        )
     attention_mask = inputs.get("attention_mask")
     if attention_mask is None:
         attention_mask = torch.ones_like(input_ids)
         inputs["attention_mask"] = attention_mask
-    if attention_mask.shape != input_ids.shape or not bool(attention_mask.bool().all()):
-        raise ValueError("unpadded generation prompt must have a full attention mask")
-    camera_id = layout.token_id(camera_token)
-    if int(input_ids.eq(camera_id).sum()) != 1:
-        raise ValueError("generation prompt must contain one matching camera token")
-    for query_id in layout.role_query_ids:
-        if int(input_ids.eq(query_id).sum()) != 1:
-            raise ValueError("generation prompt must contain every role query exactly once")
-    return inputs
+    if attention_mask.shape != input_ids.shape:
+        raise ValueError("Qwen prompt attention mask must align with input_ids")
+    active = attention_mask.bool()
+    if bool((active.sum(dim=-1) == 0).any()):
+        raise ValueError("every camera prompt must contain at least one valid token")
+    query_positions = torch.empty(
+        (camera_batch, _NUM_ROLES),
+        dtype=torch.long,
+        device=device,
+    )
+    for row, camera in enumerate(cameras):
+        camera_id = layout.token_id(
+            CAMERA_TOKENS[CAMERA_NAMES.index(camera)]
+        )
+        camera_matches = input_ids[row].eq(camera_id) & active[row]
+        if int(camera_matches.sum()) != 1:
+            raise ValueError(
+                "generation prompt must contain one matching camera token per row"
+            )
+        for role, query_id in enumerate(layout.role_query_ids):
+            query_matches = input_ids[row].eq(query_id) & active[row]
+            if int(query_matches.sum()) != 1:
+                raise ValueError(
+                    "generation prompt must contain every role query exactly once"
+                )
+            query_positions[row, role] = torch.nonzero(
+                query_matches,
+                as_tuple=False,
+            )[0, 0]
+    return inputs, query_positions
 
 
 def _base_forward(
@@ -431,18 +582,28 @@ def _base_forward(
     )
 
 
-def _consume_token(
+def _consume_tokens(
     *,
     planner: nn.Module,
     backbone: nn.Module,
-    token_id: int,
+    token_ids: Tensor,
     past_key_values: Any,
     rope_deltas: Tensor,
     attention_mask: Tensor,
     device: torch.device,
 ) -> tuple[Tensor, Any, Tensor]:
-    if type(token_id) is not int or token_id < 0:
-        raise RuntimeError("decoder attempted to consume an illegal token ID")
+    camera_batch = int(attention_mask.shape[0])
+    if (
+        not isinstance(token_ids, Tensor)
+        or token_ids.shape != (camera_batch,)
+        or token_ids.dtype == torch.bool
+        or token_ids.dtype.is_floating_point
+        or bool((token_ids < 0).any())
+    ):
+        raise RuntimeError("decoder attempted to consume illegal token IDs")
+    if rope_deltas.shape != (camera_batch, 1):
+        raise RuntimeError("rope_deltas do not align with camera rows")
+    valid_positions = attention_mask.to(dtype=torch.long).sum(dim=-1)
     next_attention = torch.cat(
         (
             attention_mask,
@@ -459,12 +620,16 @@ def _consume_token(
         dtype=torch.long,
         device=device,
     )
-    position_ids = cache_position.view(1, 1, 1).expand(3, 1, 1)
-    position_ids = position_ids + rope_deltas.reshape(1, 1, 1)
+    logical_positions = valid_positions + rope_deltas[:, 0]
+    position_ids = logical_positions.reshape(1, camera_batch, 1).expand(
+        3,
+        -1,
+        -1,
+    )
     output = _base_forward(
         backbone,
         {
-            "input_ids": torch.tensor([[token_id]], dtype=torch.long, device=device),
+            "input_ids": token_ids.to(device=device, dtype=torch.long).unsqueeze(-1),
             "attention_mask": next_attention,
         },
         cache_position=cache_position,
@@ -472,29 +637,40 @@ def _consume_token(
         past_key_values=past_key_values,
     )
     hidden = _last_hidden(planner, output)
-    if hidden.shape[0] != 1 or hidden.shape[1] != 1:
-        raise RuntimeError("incremental Qwen pass must return exactly one token state")
+    if hidden.shape[:2] != (camera_batch, 1):
+        raise RuntimeError(
+            "incremental Qwen pass must return one token state per camera row"
+        )
     return hidden[:, -1], _past_key_values(output), next_attention
 
 
-def _decode_camera_row(
+def _decode_camera_batch(
     planner: nn.Module,
     *,
     backbone: nn.Module,
     visual_weight: Tensor,
-    image: Tensor,
-    instruction: str,
-    camera: str,
+    images: Tensor,
+    instructions: Sequence[str],
+    cameras: Sequence[str],
     layout: VisualVocabularyLayout,
     processor: Any,
+    config: GroundedDecodingConfig,
+    generator: torch.Generator | None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     device = visual_weight.device
-    inputs = _build_prompt_inputs(
+    camera_batch = int(images.shape[0])
+    if (
+        camera_batch <= 0
+        or len(instructions) != camera_batch
+        or len(cameras) != camera_batch
+    ):
+        raise ValueError("batched camera decode inputs must align")
+    inputs, query_positions = _build_prompt_batch_inputs(
         processor=processor,
         layout=layout,
-        image=image,
-        instruction=instruction,
-        camera=camera,
+        images=images,
+        instructions=instructions,
+        cameras=cameras,
         device=device,
     )
     prompt_ids = inputs["input_ids"]
@@ -515,21 +691,27 @@ def _decode_camera_row(
     ):
         raise RuntimeError("prompt hidden states do not align with Qwen inputs")
     past = _past_key_values(output)
-    rope_deltas = _rope_deltas(output, backbone=backbone, device=device)
-    query_positions = torch.tensor(
-        [
-            int(torch.nonzero(prompt_ids[0].eq(query_id), as_tuple=False).item())
-            for query_id in layout.role_query_ids
-        ],
-        dtype=torch.long,
+    rope_deltas = _rope_deltas(
+        output,
+        backbone=backbone,
         device=device,
+        camera_batch=camera_batch,
     )
-    field_hidden = prompt_hidden[:, query_positions]
+    row_indices = torch.arange(camera_batch, device=device).unsqueeze(-1)
+    field_hidden = prompt_hidden[row_indices, query_positions]
 
-    current_hidden, past, attention_mask = _consume_token(
+    def repeated_token(token: str) -> Tensor:
+        return torch.full(
+            (camera_batch,),
+            layout.token_id(token),
+            dtype=torch.long,
+            device=device,
+        )
+
+    current_hidden, past, attention_mask = _consume_tokens(
         planner=planner,
         backbone=backbone,
-        token_id=layout.token_id(PLAN_START_TOKEN),
+        token_ids=repeated_token(PLAN_START_TOKEN),
         past_key_values=past,
         rope_deltas=rope_deltas,
         attention_mask=attention_mask,
@@ -538,64 +720,66 @@ def _decode_camera_row(
     frame_codes: list[Tensor] = []
     frame_post_hidden: list[Tensor] = []
     for frame_index in range(_NUM_KEYFRAMES):
-        current_hidden, past, attention_mask = _consume_token(
+        current_hidden, past, attention_mask = _consume_tokens(
             planner=planner,
             backbone=backbone,
-            token_id=layout.token_id(FRAME_START_TOKENS[frame_index]),
+            token_ids=repeated_token(FRAME_START_TOKENS[frame_index]),
             past_key_values=past,
             rope_deltas=rope_deltas,
             attention_mask=attention_mask,
             device=device,
         )
-        codes: list[int] = []
+        codes: list[Tensor] = []
         post_states: list[Tensor] = []
         for _ in range(_TOKENS_PER_FRAME):
             logits = F.linear(current_hidden, visual_weight)
-            if logits.shape != (1, _VISUAL_VOCAB_SIZE):
-                raise RuntimeError(
-                    "visual-only logits must cover exactly 65,536 rows"
-                )
-            if not bool(torch.isfinite(logits).all()):
-                raise RuntimeError("non-finite visual logits")
-            code = int(logits.argmax(dim=-1).item())
-            if not 0 <= code < _VISUAL_VOCAB_SIZE:
+            code = _select_visual_codes(
+                logits,
+                config=config,
+                generator=generator,
+            )
+            if (
+                code.shape != (camera_batch,)
+                or bool((code < 0).any())
+                or bool((code >= _VISUAL_VOCAB_SIZE).any())
+            ):
                 raise RuntimeError("decoder selected an illegal visual ID")
-            token_id = layout.code_token_id(code)
-            current_hidden, past, attention_mask = _consume_token(
+            token_ids = code + layout.visual_start_id
+            current_hidden, past, attention_mask = _consume_tokens(
                 planner=planner,
                 backbone=backbone,
-                token_id=token_id,
+                token_ids=token_ids,
                 past_key_values=past,
                 rope_deltas=rope_deltas,
                 attention_mask=attention_mask,
                 device=device,
             )
             codes.append(code)
-            post_states.append(current_hidden.squeeze(0))
-        frame_codes.append(torch.tensor(codes, dtype=torch.long, device=device))
-        frame_post_hidden.append(torch.stack(post_states))
-        current_hidden, past, attention_mask = _consume_token(
+            post_states.append(current_hidden)
+        frame_codes.append(torch.stack(codes, dim=1))
+        frame_post_hidden.append(torch.stack(post_states, dim=1))
+        current_hidden, past, attention_mask = _consume_tokens(
             planner=planner,
             backbone=backbone,
-            token_id=layout.token_id(FRAME_END_TOKENS[frame_index]),
+            token_ids=repeated_token(FRAME_END_TOKENS[frame_index]),
             past_key_values=past,
             rope_deltas=rope_deltas,
             attention_mask=attention_mask,
             device=device,
         )
-    _consume_token(
+    _consume_tokens(
         planner=planner,
         backbone=backbone,
-        token_id=layout.token_id(PLAN_END_TOKEN),
+        token_ids=repeated_token(PLAN_END_TOKEN),
         past_key_values=past,
         rope_deltas=rope_deltas,
         attention_mask=attention_mask,
         device=device,
     )
     return (
-        torch.stack(frame_codes),
-        torch.stack(frame_post_hidden),
-        field_hidden.squeeze(0),
+        torch.stack(frame_codes, dim=1),
+        torch.stack(frame_post_hidden, dim=1),
+        field_hidden,
     )
 
 
@@ -608,14 +792,20 @@ def generate_grounded_plan(
     camera_names: Sequence[str],
     layout: VisualVocabularyLayout | None = None,
     processor: Any | None = None,
+    config: GroundedDecodingConfig | None = None,
+    generator: torch.Generator | None = None,
 ) -> GeneratedGroundedPlan:
-    """Greedily generate exact four-frame plans through independent KV caches."""
+    """Generate exact four-frame plans with one row-isolated batched KV cache."""
 
     layout, processor = _resolve_components(
         planner,
         layout=layout,
         processor=processor,
     )
+    if config is None:
+        config = GroundedDecodingConfig()
+    elif not isinstance(config, GroundedDecodingConfig):
+        raise TypeError("config must be a GroundedDecodingConfig")
     if (
         not isinstance(current_images, Tensor)
         or current_images.ndim != 4
@@ -633,6 +823,11 @@ def generate_grounded_plan(
         raise ValueError(f"camera_names must contain only {CAMERA_NAMES!r}")
 
     visual_weight = _current_visual_embedding_rows(planner, layout)
+    sampling_generator = _prepare_sampling_generator(
+        config,
+        supplied=generator,
+        device=visual_weight.device,
+    )
     hidden_dim = int(visual_weight.shape[1])
     if hidden_dim <= 0 or int(getattr(planner, "hidden_dim", hidden_dim)) != hidden_dim:
         raise ValueError("planner hidden width differs from visual embedding rows")
@@ -670,26 +865,18 @@ def generate_grounded_plan(
             raise TypeError(f"planner is missing the Task 7 {name} interface")
 
     backbone = _language_backbone(planner)
-    rows = [
-        _decode_camera_row(
-            planner,
-            backbone=backbone,
-            visual_weight=visual_weight,
-            image=image,
-            instruction=instruction,
-            camera=camera,
-            layout=layout,
-            processor=processor,
-        )
-        for image, instruction, camera in zip(
-            current_images,
-            instructions,
-            camera_names,
-        )
-    ]
-    codes = torch.stack([row[0] for row in rows])
-    post_hidden = torch.stack([row[1] for row in rows])
-    field_hidden = torch.stack([row[2] for row in rows])
+    codes, post_hidden, field_hidden = _decode_camera_batch(
+        planner,
+        backbone=backbone,
+        visual_weight=visual_weight,
+        images=current_images,
+        instructions=instructions,
+        cameras=camera_names,
+        layout=layout,
+        processor=processor,
+        config=config,
+        generator=sampling_generator,
+    )
     predicted_phrases = F.normalize(
         planner.phrase_projection(field_hidden),
         dim=-1,

@@ -94,6 +94,7 @@ def test_generate_duplicates_camera_rows_and_restores_planner_state(
     monkeypatch,
 ) -> None:
     import qwen35_planx.provider as provider_module
+    from qwen35_planx.decoding import GroundedDecodingConfig
     from qwen35_planx.provider import Qwen35GroundedPlanProvider
 
     planner = _ProviderPlanner()
@@ -116,6 +117,8 @@ def test_generate_duplicates_camera_rows_and_restores_planner_state(
         camera_names,
         layout,
         processor,
+        config,
+        generator,
     ):
         assert actual_planner is planner
         assert not actual_planner.training
@@ -128,15 +131,19 @@ def test_generate_duplicates_camera_rows_and_restores_planner_state(
             camera_names=tuple(camera_names),
             layout=layout,
             processor=processor,
+            config=config,
+            generator=generator,
         )
         return _generated_flat(current_images.shape[0])
 
     monkeypatch.setattr(provider_module, "generate_grounded_plan", fake_generate)
+    decoding_config = GroundedDecodingConfig(top_k=2, seed=17)
     provider = Qwen35GroundedPlanProvider._from_test_components(
         planner=planner,
         collator=collator,
         layout=layout,
         condition_dim=7,
+        decoding_config=decoding_config,
     )
     images = torch.arange(2 * 2 * 3 * 2 * 2).reshape(2, 2, 3, 2, 2).float()
     output = provider.generate(images, ("first", "second"))
@@ -147,6 +154,8 @@ def test_generate_duplicates_camera_rows_and_restores_planner_state(
     assert received["camera_names"] == ("main", "wrist", "main", "wrist")
     assert received["layout"] is layout
     assert received["processor"] is collator.processor
+    assert received["config"] is decoding_config
+    assert received["generator"] is None
     assert planner.training
     assert not planner.child.training
     assert planner.child.rope_deltas is original_rope_deltas
