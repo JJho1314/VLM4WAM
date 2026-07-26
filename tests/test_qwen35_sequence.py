@@ -90,8 +90,17 @@ def test_sequence_exposes_pre_and_post_positions(layout) -> None:
     assert sequence.field_positions.shape == (3,)
     assert sequence.field_mask.tolist() == [True, True, True]
     assert torch.equal(sequence.post_positions, sequence.code_positions)
-    assert sequence.pre_positions[0] == sequence.frame_start_positions[0]
-    assert torch.equal(sequence.pre_positions[1:], sequence.code_positions[:-1])
+    for frame_index in range(4):
+        start = frame_index * 729
+        end = start + 729
+        assert (
+            sequence.pre_positions[start]
+            == sequence.frame_start_positions[frame_index]
+        )
+        assert torch.equal(
+            sequence.pre_positions[start + 1 : end],
+            sequence.code_positions[start : end - 1],
+        )
 
 
 def test_sequence_preserves_raster_targets_and_exact_frame_structure(layout) -> None:
@@ -157,6 +166,45 @@ def test_role_queries_are_canonical_and_missing_roles_fail_closed(layout) -> Non
         layout.role_query_ids
     )
     assert sequence.field_positions.max() < sequence.plan_start_position
+
+
+def test_tokenized_prompt_without_field_evidence_fails_closed(layout) -> None:
+    from qwen35_planx.sequence import build_plan_sequence
+
+    prompt = (
+        "<ACT>open</ACT><SRC>drawer</SRC><TGT></TGT>"
+        "<SRC_QUERY><TGT_QUERY><ACT_QUERY>"
+    )
+    prompt_ids = torch.tensor(
+        layout._tokenizer.encode(prompt, add_special_tokens=False)
+    )
+    sequence = build_plan_sequence(
+        camera="main",
+        prompt=prompt_ids,
+        codes=torch.zeros((4, 729), dtype=torch.long),
+        layout=layout,
+    )
+    assert sequence.field_mask.tolist() == [False, False, False]
+
+
+def test_tokenized_missing_target_uses_explicit_canonical_field_mask(layout) -> None:
+    from qwen35_planx.sequence import build_plan_sequence
+
+    prompt = (
+        "<ACT>open</ACT><SRC>drawer</SRC><TGT></TGT>"
+        "<SRC_QUERY><TGT_QUERY><ACT_QUERY>"
+    )
+    prompt_ids = torch.tensor(
+        layout._tokenizer.encode(prompt, add_special_tokens=False)
+    )
+    sequence = build_plan_sequence(
+        camera="main",
+        prompt=prompt_ids,
+        codes=torch.zeros((4, 729), dtype=torch.long),
+        layout=layout,
+        field_mask=(True, False, True),
+    )
+    assert sequence.field_mask.tolist() == [True, False, True]
 
 
 def test_camera_streams_have_independent_sequences(layout) -> None:

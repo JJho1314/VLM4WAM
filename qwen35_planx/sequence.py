@@ -95,7 +95,7 @@ def _prompt_ids(
             )
         if identifiers.count(camera_id) == 0:
             identifiers.insert(0, camera_id)
-        field_mask = (True, True, True)
+        field_mask = (False, False, False)
 
     if identifiers.count(camera_id) != 1:
         raise ValueError("prompt must contain exactly one matching camera token")
@@ -172,8 +172,11 @@ def build_plan_sequence(
     code_positions_tensor = torch.tensor(code_positions, dtype=torch.long)
     flattened_codes = codes.flatten()
     pre_positions = torch.empty_like(code_positions_tensor)
-    pre_positions[0] = frame_start_positions[0]
-    pre_positions[1:] = code_positions_tensor[:-1]
+    for frame_index, frame_start_position in enumerate(frame_start_positions):
+        start = frame_index * geometry.tokens_per_frame
+        end = start + geometry.tokens_per_frame
+        pre_positions[start] = frame_start_position
+        pre_positions[start + 1 : end] = code_positions_tensor[start : end - 1]
     labels = torch.full_like(input_ids, -100)
     labels[code_positions_tensor] = input_ids[code_positions_tensor]
     return CausalPlanSequence(

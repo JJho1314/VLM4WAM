@@ -930,12 +930,21 @@ def test_sequence_exposes_pre_and_post_positions(layout) -> None:
     assert sequence.field_positions.shape == (3,)
     assert sequence.field_mask.tolist() == [True, True, True]
     assert torch.equal(sequence.post_positions, sequence.code_positions)
-    assert sequence.pre_positions[0] == sequence.frame_start_positions[0]
-    assert torch.equal(sequence.pre_positions[1:], sequence.code_positions[:-1])
+    for frame_index in range(4):
+        start = frame_index * 729
+        end = start + 729
+        assert sequence.pre_positions[start] == sequence.frame_start_positions[frame_index]
+        assert torch.equal(
+            sequence.pre_positions[start + 1:end],
+            sequence.code_positions[start:end - 1],
+        )
 ```
 
-Also assert frame boundaries reset only structural layout, raster order is
-stable, prompt/structure positions are excluded from code loss, and main/wrist
+At every frame boundary, causal correctness requires the first code's
+`h_pre` to be the matching `<FRAME_n>` state; it must never reuse the final
+code state from the preceding frame. Subsequent codes within that frame use
+the immediately preceding code state. Also assert raster order is stable,
+prompt/structure positions are excluded from code loss, and main/wrist
 examples never share a sequence.
 
 - [ ] **Step 4: Implement target contract, sequence, and collator**

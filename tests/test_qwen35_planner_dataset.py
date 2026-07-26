@@ -224,7 +224,7 @@ def _sample_targets(*, batch: int = 1):
 
 def _phrase_tables():
     vocabulary = {
-        "source": ["bowl", "mug", "cross suite object"],
+        "source": ["the bowl", "the mug", "cross suite object"],
         "target": ["on the plate", "in the drawer", "cross suite target"],
         "action": ["pick up and place", "put", "cross suite action"],
     }
@@ -236,7 +236,7 @@ def _phrase_tables():
     }
     suite_vocabulary = {
         "libero_goal": {
-            "source": ("bowl", "mug"),
+            "source": ("the bowl", "the mug"),
             "target": ("on the plate", "in the drawer"),
             "action": ("pick up and place", "put"),
         },
@@ -309,6 +309,9 @@ def test_collator_flattens_cameras_and_builds_exact_target_shapes(
     assert batch.phrase_embeddings.shape == (2, 3, 1152)
     assert batch.counterfactual_embeddings.shape == (2, 3, 1, 1152)
     assert batch.counterfactual_mask.all()
+    assert torch.all(batch.counterfactual_embeddings[:, 0, 0] == 2)
+    assert torch.all(batch.counterfactual_embeddings[:, 1, 0] == 2)
+    assert torch.all(batch.counterfactual_embeddings[:, 2, 0] == 2)
     assert len(processor.calls) == 2
     assert "<CAMERA_MAIN>" in processor.calls[0][0]
     assert "<CAMERA_WRIST>" in processor.calls[1][0]
@@ -422,3 +425,43 @@ def test_real_processor_path_uses_multimodal_chat_template(
     assert processor.messages[0][0]["content"][0]["type"] == "image"
     assert processor.messages[0][0]["content"][1]["type"] == "text"
     assert processor.calls[0][0].startswith("<image>\n<CAMERA_MAIN>")
+
+
+def test_collator_rejects_missing_suite_provenance(planner_components) -> None:
+    from qwen35_planx.planner_dataset import GroundedPlannerCollator
+
+    tokenizer, layout = planner_components
+    vocabulary, embeddings, _ = _phrase_tables()
+    with pytest.raises(ValueError, match="suite provenance"):
+        GroundedPlannerCollator(
+            FakeProcessor(tokenizer),
+            layout,
+            phrase_vocabulary=vocabulary,
+            phrase_embeddings=embeddings,
+        )
+
+
+def test_unknown_instruction_suite_has_no_counterfactuals(
+    planner_components,
+) -> None:
+    from qwen35_planx.planner_dataset import GroundedPlannerCollator
+
+    tokenizer, layout = planner_components
+    vocabulary, embeddings, suite_vocabulary = _phrase_tables()
+    known = "pick up the bowl and place it on the plate"
+    unknown = "pick up the mug and place it in the drawer"
+    collator = GroundedPlannerCollator(
+        FakeProcessor(tokenizer),
+        layout,
+        phrase_vocabulary=vocabulary,
+        phrase_embeddings=embeddings,
+        suite_vocabularies=suite_vocabulary,
+        instruction_suites={known: "libero_goal"},
+    )
+    batch = collator.build_teacher_forced(
+        torch.zeros((1, 2, 3, 8, 8), dtype=torch.uint8),
+        [unknown],
+        _sample_targets(),
+    )
+    assert not batch.counterfactual_mask.any()
+    assert torch.count_nonzero(batch.counterfactual_embeddings) == 0

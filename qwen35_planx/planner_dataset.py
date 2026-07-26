@@ -282,16 +282,39 @@ class GroundedPlannerCollator:
                 suite_vocabularies = dataset.suite_vocabularies
             if instruction_suites is None:
                 instruction_suites = dataset.instruction_suites
+        if not suite_vocabularies or not instruction_suites:
+            raise ValueError(
+                "explicit train-only suite provenance and instruction suites "
+                "are required for counterfactual negatives"
+            )
+        if "*" in suite_vocabularies:
+            raise ValueError("global '*' suite provenance is not permitted")
         self.suite_vocabularies = {
             str(suite): _normalise_vocabulary(vocabulary)
-            for suite, vocabulary in (suite_vocabularies or {}).items()
+            for suite, vocabulary in suite_vocabularies.items()
         }
         self.instruction_suites = {
             str(instruction): str(suite)
-            for instruction, suite in (instruction_suites or {}).items()
+            for instruction, suite in instruction_suites.items()
         }
-        if not self.suite_vocabularies:
-            self.suite_vocabularies = {"*": self.phrase_vocabulary}
+        unknown_suites = sorted(
+            set(self.instruction_suites.values()).difference(self.suite_vocabularies)
+        )
+        if unknown_suites:
+            raise ValueError(
+                "instruction suite provenance references unknown suites: "
+                + ", ".join(unknown_suites)
+            )
+        for suite, vocabulary in self.suite_vocabularies.items():
+            for role in _ROLES:
+                unavailable = sorted(
+                    set(vocabulary[role]).difference(self._embedding_lookup[role])
+                )
+                if unavailable:
+                    raise ValueError(
+                        f"suite {suite!r} contains unverified {role} phrases: "
+                        + ", ".join(unavailable)
+                    )
         if metadata is not None:
             if (
                 metadata.visual_token_start_id != layout.visual_start_id
@@ -379,11 +402,7 @@ class GroundedPlannerCollator:
         return sequence, processed
 
     def _suite_for(self, instruction: str) -> str | None:
-        if instruction in self.instruction_suites:
-            return self.instruction_suites[instruction]
-        if "*" in self.suite_vocabularies:
-            return "*"
-        return None
+        return self.instruction_suites.get(instruction)
 
     def _counterfactuals(
         self,
