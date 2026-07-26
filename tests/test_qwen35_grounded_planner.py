@@ -541,6 +541,7 @@ def _make_one_step_checkpoint(
     output_dir: Path,
     *,
     scaler=None,
+    lr_lambda=None,
 ):
     from qwen35_planx.cli.train_semantic_planner import (
         build_optimizer_groups,
@@ -550,7 +551,8 @@ def _make_one_step_checkpoint(
     planner = _GroupedPlanner()
     groups = build_optimizer_groups(planner, visual_token_start_id=7)
     optimizer = torch.optim.AdamW(groups)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    schedule = lr_lambda or (lambda _step: 1.0)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
     sum(parameter.square().sum() for parameter in planner.parameters()).backward()
     optimizer.step()
     scheduler.step()
@@ -960,6 +962,147 @@ def test_resume_prevalidates_adamw_slots_and_rng_before_mutation(
             allow_test_artifacts=True,
         )
     assert_unchanged()
+
+
+@pytest.mark.parametrize("option", ["capturable", "amsgrad"])
+def test_resume_rejects_incompatible_adamw_static_options_before_mutation(
+    tmp_path: Path,
+    option: str,
+) -> None:
+    from qwen35_planx.cli.train_semantic_planner import (
+        _capture_rng_state,
+        load_planner_checkpoint,
+    )
+
+    scaler = _FakeScaler()
+    checkpoint, planner, optimizer, scheduler = _make_one_step_checkpoint(
+        tmp_path / option,
+        scaler=scaler,
+    )
+    for parameter in planner.parameters():
+        parameter.data.zero_()
+    sentinel_model = {
+        name: value.detach().clone() for name, value in planner.state_dict().items()
+    }
+    sentinel_optimizer = copy.deepcopy(optimizer.state_dict())
+    sentinel_scheduler = copy.deepcopy(scheduler.state_dict())
+    sentinel_scaler = copy.deepcopy(scaler.state_dict())
+    sentinel_rng = _capture_rng_state()
+
+    optimizer_path = checkpoint / "optimizer.pt"
+    optimizer_payload = torch.load(
+        optimizer_path,
+        weights_only=True,
+        map_location="cpu",
+    )
+    saved_group = optimizer_payload["param_groups"][0]
+    saved_group[option] = True
+    if option == "amsgrad":
+        for identifier in saved_group["params"]:
+            slot = optimizer_payload["state"][identifier]
+            slot["max_exp_avg_sq"] = slot["exp_avg_sq"].clone()
+    torch.save(optimizer_payload, optimizer_path)
+    _refresh_checkpoint_hash(checkpoint, "optimizer.pt")
+
+    with pytest.raises(ValueError, match="AdamW group.*static option"):
+        load_planner_checkpoint(
+            checkpoint,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            expected_metadata=_tiny_checkpoint_metadata(),
+            allow_test_artifacts=True,
+        )
+    for name, value in planner.state_dict().items():
+        torch.testing.assert_close(value, sentinel_model[name])
+    actual_optimizer = optimizer.state_dict()
+    assert actual_optimizer["param_groups"] == sentinel_optimizer["param_groups"]
+    assert actual_optimizer["state"].keys() == sentinel_optimizer["state"].keys()
+    for key, state in actual_optimizer["state"].items():
+        for name, value in state.items():
+            expected = sentinel_optimizer["state"][key][name]
+            if isinstance(value, torch.Tensor):
+                torch.testing.assert_close(value, expected)
+            else:
+                assert value == expected
+    assert scheduler.state_dict() == sentinel_scheduler
+    for name, value in scaler.state_dict().items():
+        torch.testing.assert_close(value, sentinel_scaler[name])
+    _assert_rng_states_equal(_capture_rng_state(), sentinel_rng)
+
+
+def test_directory_validation_rejects_nonproduction_adamw_step_tensor(
+    tmp_path: Path,
+) -> None:
+    from qwen35_planx.cli.train_semantic_planner import validate_planner_checkpoint
+
+    checkpoint, _, _, _ = _make_one_step_checkpoint(tmp_path / "run")
+    optimizer_path = checkpoint / "optimizer.pt"
+    optimizer_payload = torch.load(
+        optimizer_path,
+        weights_only=True,
+        map_location="cpu",
+    )
+    first_slot = next(iter(optimizer_payload["state"].values()))
+    first_slot["step"] = torch.tensor(1, dtype=torch.int64)
+    torch.save(optimizer_payload, optimizer_path)
+    _refresh_checkpoint_hash(checkpoint, "optimizer.pt")
+
+    with pytest.raises(ValueError, match="AdamW slot step tensor"):
+        validate_planner_checkpoint(
+            checkpoint,
+            expected_metadata=_tiny_checkpoint_metadata(),
+            allow_test_artifacts=True,
+        )
+
+
+def test_valid_decayed_lr_resume_can_execute_next_adamw_step(
+    tmp_path: Path,
+) -> None:
+    from qwen35_planx.cli.train_semantic_planner import (
+        build_optimizer_groups,
+        load_planner_checkpoint,
+    )
+
+    def schedule(step: int) -> float:
+        return max(0.0, 1.0 - (step / 10.0))
+
+    checkpoint, _, _, _ = _make_one_step_checkpoint(
+        tmp_path / "run",
+        lr_lambda=schedule,
+    )
+    planner = _GroupedPlanner()
+    groups = build_optimizer_groups(planner, visual_token_start_id=7)
+    optimizer = torch.optim.AdamW(groups)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
+
+    resumed_step = load_planner_checkpoint(
+        checkpoint,
+        planner=planner,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=None,
+        expected_metadata=_tiny_checkpoint_metadata(),
+        allow_test_artifacts=True,
+    )
+
+    assert resumed_step == 1
+    expected_lrs = {
+        "qwen_language": 9e-6,
+        "qwen_vision": 4.5e-6,
+        "visual_vocab_and_prediction_head": 9e-5,
+        "semantic_phrase_grounding_fusion_heads": 9e-5,
+    }
+    for group in optimizer.param_groups:
+        assert group["lr"] == pytest.approx(expected_lrs[group["name"]])
+    sum(parameter.square().sum() for parameter in planner.parameters()).backward()
+    optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad(set_to_none=True)
+    assert scheduler.last_epoch == 2
+    for slot in optimizer.state_dict()["state"].values():
+        assert int(slot["step"].item()) == 2
 
 
 def test_resume_fails_closed_before_mutation_on_missing_or_mismatch(

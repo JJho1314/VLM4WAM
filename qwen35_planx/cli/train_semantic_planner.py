@@ -675,29 +675,15 @@ def _rng_state_from_wire(state: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _adamw_step_value(value: Any) -> int:
-    if isinstance(value, torch.Tensor):
-        if (
-            value.numel() != 1
-            or value.dtype == torch.bool
-            or not (
-                value.dtype.is_floating_point
-                or value.dtype
-                in {
-                    torch.uint8,
-                    torch.int8,
-                    torch.int16,
-                    torch.int32,
-                    torch.int64,
-                }
-            )
-            or not bool(torch.isfinite(value).all())
-        ):
-            raise ValueError("AdamW slot step is invalid")
-        scalar = float(value.item())
-    elif type(value) in (int, float) and math.isfinite(float(value)):
-        scalar = float(value)
-    else:
-        raise ValueError("AdamW slot step is invalid")
+    if (
+        not isinstance(value, torch.Tensor)
+        or value.shape != torch.Size([])
+        or value.dtype != torch.float32
+        or value.device.type != "cpu"
+        or not bool(torch.isfinite(value))
+    ):
+        raise ValueError("AdamW slot step tensor must be a finite scalar CPU float32")
+    scalar = float(value.item())
     if scalar < 0 or not scalar.is_integer():
         raise ValueError("AdamW slot step is invalid")
     return int(scalar)
@@ -708,6 +694,7 @@ def _validate_adamw_state(
     *,
     expected_step: int,
     runtime_parameters: Mapping[int, nn.Parameter] | None = None,
+    trusted_amsgrad: Mapping[int, bool] | None = None,
 ) -> None:
     if (
         not isinstance(state_dict, Mapping)
@@ -738,8 +725,17 @@ def _validate_adamw_state(
         parameter_options
     ):
         raise ValueError("AdamW runtime parameter coverage differs")
+    if trusted_amsgrad is not None and set(trusted_amsgrad) != set(
+        parameter_options
+    ):
+        raise ValueError("AdamW trusted slot schema coverage differs")
 
-    for identifier, amsgrad in parameter_options.items():
+    for identifier, saved_amsgrad in parameter_options.items():
+        amsgrad = (
+            trusted_amsgrad[identifier]
+            if trusted_amsgrad is not None
+            else saved_amsgrad
+        )
         slot = slots[identifier]
         required = {"step", "exp_avg", "exp_avg_sq"}
         if amsgrad:
@@ -823,6 +819,164 @@ def _validate_state_topology(
         return
     if type(saved) is not type(runtime):
         raise ValueError(f"{label} state topology mismatch")
+
+
+def _static_option_equal(saved: Any, runtime: Any) -> bool:
+    if type(saved) is not type(runtime):
+        return False
+    if isinstance(runtime, (list, tuple)):
+        return len(saved) == len(runtime) and all(
+            _static_option_equal(saved_value, runtime_value)
+            for saved_value, runtime_value in zip(saved, runtime)
+        )
+    if isinstance(runtime, Mapping):
+        return set(saved) == set(runtime) and all(
+            _static_option_equal(saved[name], runtime[name]) for name in runtime
+        )
+    return bool(saved == runtime)
+
+
+def _validate_adamw_group_compatibility(
+    saved_groups: Any,
+    runtime_groups: Sequence[Mapping[str, Any]],
+    *,
+    runtime_state_groups: Sequence[Mapping[str, Any]],
+) -> tuple[dict[int, nn.Parameter], dict[int, bool]]:
+    if (
+        not isinstance(saved_groups, list)
+        or len(saved_groups) != len(runtime_groups)
+        or len(saved_groups) != len(runtime_state_groups)
+    ):
+        raise ValueError("optimizer group topology mismatch")
+    saved_parameter_map: dict[int, nn.Parameter] = {}
+    trusted_amsgrad: dict[int, bool] = {}
+    for saved_group, runtime_group, runtime_state_group in zip(
+        saved_groups,
+        runtime_groups,
+        runtime_state_groups,
+    ):
+        if (
+            not isinstance(saved_group, Mapping)
+            or not isinstance(runtime_state_group, Mapping)
+            or set(saved_group) != set(runtime_group)
+            or not isinstance(saved_group.get("params"), list)
+            or saved_group["params"] != runtime_state_group.get("params")
+            or len(saved_group["params"]) != len(runtime_group["params"])
+        ):
+            raise ValueError("optimizer group topology mismatch")
+        group_name = runtime_group.get("name")
+        if (
+            not isinstance(group_name, str)
+            or group_name not in _GROUP_LRS
+            or saved_group.get("name") != group_name
+        ):
+            raise ValueError("AdamW group name is incompatible")
+        for name in set(runtime_group).difference({"params", "lr"}):
+            if not _static_option_equal(
+                saved_group[name],
+                runtime_group[name],
+            ):
+                raise ValueError(
+                    f"AdamW group {group_name} static option {name} differs"
+                )
+        expected_initial_lr = _GROUP_LRS[group_name]
+        if (
+            type(saved_group.get("initial_lr")) is not float
+            or type(runtime_group.get("initial_lr")) is not float
+            or saved_group["initial_lr"] != expected_initial_lr
+            or runtime_group["initial_lr"] != expected_initial_lr
+        ):
+            raise ValueError(
+                f"AdamW group {group_name} initial_lr differs from Task 8"
+            )
+        trusted_group_amsgrad = runtime_group.get("amsgrad")
+        if type(trusted_group_amsgrad) is not bool:
+            raise ValueError("runtime AdamW amsgrad option is invalid")
+        for identifier, parameter in zip(
+            saved_group["params"],
+            runtime_group["params"],
+        ):
+            if (
+                type(identifier) is not int
+                or not isinstance(parameter, nn.Parameter)
+                or identifier in saved_parameter_map
+            ):
+                raise ValueError("optimizer parameter order/topology mismatch")
+            saved_parameter_map[identifier] = parameter
+            trusted_amsgrad[identifier] = trusted_group_amsgrad
+    return saved_parameter_map, trusted_amsgrad
+
+
+def _finite_learning_rate(value: Any, *, label: str) -> float:
+    if type(value) is not float or not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"{label} must be a finite non-negative float")
+    return value
+
+
+def _expected_scheduler_lrs(scheduler: Any, *, step: int) -> list[float]:
+    candidate = getattr(scheduler, "scheduler", scheduler)
+    base_lrs = getattr(candidate, "base_lrs", None)
+    lr_lambdas = getattr(candidate, "lr_lambdas", None)
+    if (
+        not isinstance(base_lrs, list)
+        or not isinstance(lr_lambdas, list)
+        or len(base_lrs) != len(lr_lambdas)
+    ):
+        raise ValueError("planner scheduler does not expose LambdaLR semantics")
+    result = []
+    for base_lr, lr_lambda in zip(base_lrs, lr_lambdas):
+        base = _finite_learning_rate(base_lr, label="scheduler base LR")
+        multiplier = float(lr_lambda(step))
+        value = base * multiplier
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError("planner scheduler produced an invalid LR")
+        result.append(value)
+    return result
+
+
+def _validate_saved_learning_rates(
+    optimizer_state: Mapping[str, Any],
+    scheduler_state: Mapping[str, Any],
+    *,
+    expected_lrs: Sequence[float] | None = None,
+) -> None:
+    groups = optimizer_state.get("param_groups")
+    last_lrs = scheduler_state.get("_last_lr")
+    base_lrs = scheduler_state.get("base_lrs")
+    if (
+        not isinstance(groups, list)
+        or not isinstance(last_lrs, list)
+        or not isinstance(base_lrs, list)
+        or len(groups) != len(last_lrs)
+        or len(groups) != len(base_lrs)
+        or (expected_lrs is not None and len(expected_lrs) != len(groups))
+    ):
+        raise ValueError("optimizer/scheduler LR topology mismatch")
+    for index, group in enumerate(groups):
+        if not isinstance(group, Mapping):
+            raise ValueError("optimizer LR group is invalid")
+        current_lr = _finite_learning_rate(
+            group.get("lr"),
+            label="saved optimizer LR",
+        )
+        last_lr = _finite_learning_rate(
+            last_lrs[index],
+            label="saved scheduler last LR",
+        )
+        initial_lr = _finite_learning_rate(
+            group.get("initial_lr"),
+            label="saved optimizer initial LR",
+        )
+        base_lr = _finite_learning_rate(
+            base_lrs[index],
+            label="saved scheduler base LR",
+        )
+        if current_lr != last_lr or initial_lr != base_lr:
+            raise ValueError("saved optimizer/scheduler LRs are inconsistent")
+        if expected_lrs is not None and current_lr != expected_lrs[index]:
+            raise ValueError(
+                "saved optimizer LR differs from scheduler at logical step"
+            )
 
 
 def _validate_metadata_payload(
@@ -924,19 +1078,22 @@ def save_planner_checkpoint(
 
     optimizer_state = optimizer.state_dict()
     scheduler_state = scheduler.state_dict()
-    saved_parameter_map: dict[int, nn.Parameter] = {}
-    for saved_group, runtime_group in zip(
+    saved_parameter_map, trusted_amsgrad = _validate_adamw_group_compatibility(
         optimizer_state["param_groups"],
         optimizer.param_groups,
-    ):
-        saved_parameter_map.update(
-            zip(saved_group["params"], runtime_group["params"])
-        )
+        runtime_state_groups=optimizer_state["param_groups"],
+    )
     try:
+        _validate_saved_learning_rates(
+            optimizer_state,
+            scheduler_state,
+            expected_lrs=_expected_scheduler_lrs(scheduler, step=step),
+        )
         _validate_adamw_state(
             optimizer_state,
             expected_step=step,
             runtime_parameters=saved_parameter_map,
+            trusted_amsgrad=trusted_amsgrad,
         )
         _validate_scheduler_step(scheduler_state, expected_step=step)
     except ValueError as error:
@@ -1149,6 +1306,10 @@ def validate_planner_checkpoint(
         scheduler_state,
         expected_step=logical_step,
     )
+    _validate_saved_learning_rates(
+        optimizer_state,
+        scheduler_state,
+    )
 
     shape = (
         codebook_metadata.get("shape")
@@ -1260,25 +1421,19 @@ def load_planner_checkpoint(
         or len(saved_groups) != len(runtime_groups)
     ):
         raise ValueError("optimizer group topology mismatch")
-    saved_param_map: dict[int, nn.Parameter] = {}
-    for saved_group, runtime_group in zip(saved_groups, runtime_groups):
-        if not isinstance(saved_group, Mapping):
-            raise ValueError("optimizer group topology mismatch")
-        saved_params = saved_group.get("params", [])
-        runtime_params = runtime_group.get("params", [])
-        if (
-            saved_group.get("name") != runtime_group.get("name")
-            or set(saved_group) != set(runtime_group)
-            or len(saved_params) != len(runtime_params)
-        ):
-            raise ValueError("optimizer group topology mismatch")
-        for name in set(runtime_group).difference({"params"}):
-            _validate_state_topology(
-                saved_group[name],
-                runtime_group[name],
-                label=f"optimizer group {saved_group.get('name')}.{name}",
-            )
-        saved_param_map.update(zip(saved_params, runtime_params))
+    saved_param_map, trusted_amsgrad = _validate_adamw_group_compatibility(
+        saved_groups,
+        runtime_groups,
+        runtime_state_groups=optimizer.state_dict()["param_groups"],
+    )
+    _validate_saved_learning_rates(
+        optimizer_state,
+        scheduler_state,
+        expected_lrs=_expected_scheduler_lrs(
+            scheduler,
+            step=int(trainer_state["current_step"]),
+        ),
+    )
     saved_optimizer_slots = optimizer_state.get("state")
     if not isinstance(saved_optimizer_slots, Mapping):
         raise ValueError("optimizer state topology mismatch")
@@ -1297,6 +1452,7 @@ def load_planner_checkpoint(
         optimizer_state,
         expected_step=int(trainer_state["current_step"]),
         runtime_parameters=saved_param_map,
+        trusted_amsgrad=trusted_amsgrad,
     )
     runtime_scheduler = scheduler.state_dict()
     _validate_state_topology(
