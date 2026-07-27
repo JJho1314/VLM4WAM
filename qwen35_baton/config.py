@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import re
 from typing import Any, ClassVar, Mapping
 
 
@@ -16,6 +17,13 @@ def _require_nonempty_strings(instance: object, names: tuple[str, ...]) -> None:
         value = getattr(instance, name)
         if not isinstance(value, str) or not value:
             raise ValueError(f"{name} must be a non-empty string")
+
+
+def _require_sha256(instance: object, names: tuple[str, ...]) -> None:
+    for name in names:
+        value = getattr(instance, name)
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError(f"{name} must be a canonical lowercase SHA-256 hex digest")
 
 
 def _require_keys(payload: Mapping[str, Any], required: tuple[str, ...]) -> None:
@@ -98,9 +106,13 @@ class BatonCheckpointMetadata:
 
     FORMAT_VERSION: ClassVar[int] = 1
     ARCHITECTURE_KIND: ClassVar[str] = "qwen35_baton_continuous"
+    QWEN_BACKBONE: ClassVar[str] = "dense Qwen3.5-4B"
+    SIGLIP2_MODEL: ClassVar[str] = "SigLIP2-large-patch16-256"
+    QUERY_NORM_STYLE: ClassVar[str] = "pre_norm"
     _REQUIRED_FIELDS: ClassVar[tuple[str, ...]] = (
         "format_version",
         "architecture_kind",
+        "qwen_backbone",
         "qwen_config_hash",
         "tokenizer_hash",
         "processor_hash",
@@ -123,6 +135,7 @@ class BatonCheckpointMetadata:
         "query_heads",
         "query_ffn_dim",
         "query_dropout",
+        "query_norm_style",
         "query_mask_version",
         "trainable_qwen_layer_indices",
         "loss_weights",
@@ -148,6 +161,7 @@ class BatonCheckpointMetadata:
 
     format_version: int
     architecture_kind: str
+    qwen_backbone: str
     qwen_config_hash: str
     tokenizer_hash: str
     processor_hash: str
@@ -170,6 +184,7 @@ class BatonCheckpointMetadata:
     query_heads: int
     query_ffn_dim: int
     query_dropout: float
+    query_norm_style: str
     query_mask_version: str
     trainable_qwen_layer_indices: tuple[int, ...]
     loss_weights: BatonLossWeights
@@ -186,12 +201,24 @@ class BatonCheckpointMetadata:
         _require_equal(
             "architecture_kind", self.architecture_kind, self.ARCHITECTURE_KIND
         )
-        _require_nonempty_strings(self, self._HASH_FIELDS + ("siglip2_model", "teacher_dtype", "query_mask_version"))
+        _require_equal("qwen_backbone", self.qwen_backbone, self.QWEN_BACKBONE)
+        _require_sha256(self, self._HASH_FIELDS)
+        _require_nonempty_strings(self, ("teacher_dtype", "query_mask_version"))
         _require_equal("added_tokens", self.added_tokens, _PLAN_TOKENS)
-        if len(self.added_token_ids) != len(self.added_tokens) or len(set(self.added_token_ids)) != len(self.added_token_ids):
+        if (
+            len(self.added_token_ids) != len(self.added_tokens)
+            or any(
+                isinstance(token_id, bool)
+                or not isinstance(token_id, int)
+                or token_id < 0
+                for token_id in self.added_token_ids
+            )
+            or len(set(self.added_token_ids)) != len(self.added_token_ids)
+        ):
             raise ValueError("added_token_ids must contain one unique ID per added token")
         _require_equal("camera_names", self.camera_names, geometry.camera_names)
         _require_equal("camera_flattening", self.camera_flattening, "sample_major")
+        _require_equal("siglip2_model", self.siglip2_model, self.SIGLIP2_MODEL)
         _require_equal("teacher_image_size", self.teacher_image_size, geometry.image_size)
         _require_equal("teacher_patch_size", self.teacher_patch_size, geometry.patch_size)
         _require_equal("teacher_feature_layer", self.teacher_feature_layer, -2)
@@ -202,6 +229,7 @@ class BatonCheckpointMetadata:
         _require_equal("query_heads", self.query_heads, geometry.query_heads)
         _require_equal("query_ffn_dim", self.query_ffn_dim, geometry.query_ffn_dim)
         _require_equal("query_dropout", self.query_dropout, geometry.query_dropout)
+        _require_equal("query_norm_style", self.query_norm_style, self.QUERY_NORM_STYLE)
         _require_equal("query_mask_version", self.query_mask_version, "block_causal_v1")
         _require_equal("trainable_qwen_layer_indices", self.trainable_qwen_layer_indices, tuple(range(28, 36)))
         if not isinstance(self.loss_weights, BatonLossWeights):
@@ -210,8 +238,19 @@ class BatonCheckpointMetadata:
             raise ValueError("global_step must be non-negative")
         if not self.distributed_cursor:
             raise ValueError("distributed_cursor must not be empty")
-        if any(not isinstance(name, str) or not name or not isinstance(value, int) or value < 0 for name, value in self.distributed_cursor):
+        if any(
+            not isinstance(name, str)
+            or not name
+            or isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for name, value in self.distributed_cursor
+        ):
             raise ValueError("distributed_cursor must contain non-negative named integer values")
+        if len({name for name, _ in self.distributed_cursor}) != len(
+            self.distributed_cursor
+        ):
+            raise ValueError("distributed_cursor names must be unique")
 
     @classmethod
     def example(cls) -> BatonCheckpointMetadata:
@@ -219,20 +258,21 @@ class BatonCheckpointMetadata:
         return cls(
             format_version=cls.FORMAT_VERSION,
             architecture_kind=cls.ARCHITECTURE_KIND,
-            qwen_config_hash="example-qwen-config-sha256",
-            tokenizer_hash="example-tokenizer-sha256",
-            processor_hash="example-processor-sha256",
-            input_template_hash="example-input-template-sha256",
+            qwen_backbone=cls.QWEN_BACKBONE,
+            qwen_config_hash=_example_sha256("qwen-config"),
+            tokenizer_hash=_example_sha256("tokenizer"),
+            processor_hash=_example_sha256("processor"),
+            input_template_hash=_example_sha256("input-template"),
             added_tokens=_PLAN_TOKENS,
             added_token_ids=tuple(range(151_665, 151_672)),
             camera_names=geometry.camera_names,
             camera_flattening="sample_major",
-            siglip2_model="google/siglip2-large-patch16-256",
-            siglip2_artifact_hash="example-siglip2-artifact-sha256",
+            siglip2_model=cls.SIGLIP2_MODEL,
+            siglip2_artifact_hash=_example_sha256("siglip2-artifact"),
             teacher_image_size=geometry.image_size,
             teacher_patch_size=geometry.patch_size,
             teacher_feature_layer=-2,
-            teacher_preprocessing_hash="example-siglip2-preprocessing-sha256",
+            teacher_preprocessing_hash=_example_sha256("siglip2-preprocessing"),
             teacher_dtype="bfloat16",
             target_shape=(2, 4, geometry.tokens_per_frame, geometry.feature_dim),
             future_indices=geometry.future_indices,
@@ -241,15 +281,16 @@ class BatonCheckpointMetadata:
             query_heads=geometry.query_heads,
             query_ffn_dim=geometry.query_ffn_dim,
             query_dropout=geometry.query_dropout,
+            query_norm_style=cls.QUERY_NORM_STYLE,
             query_mask_version="block_causal_v1",
             trainable_qwen_layer_indices=tuple(range(28, 36)),
             loss_weights=BatonLossWeights(),
-            hdf5_manifest_hash="example-hdf5-manifest-sha256",
-            optimizer_topology_hash="example-optimizer-topology-sha256",
-            scheduler_topology_hash="example-scheduler-topology-sha256",
+            hdf5_manifest_hash=_example_sha256("hdf5-manifest"),
+            optimizer_topology_hash=_example_sha256("optimizer-topology"),
+            scheduler_topology_hash=_example_sha256("scheduler-topology"),
             global_step=0,
             distributed_cursor=(("epoch", 0), ("consumed_microbatches", 0), ("sampler_seed", 0)),
-            rng_state_hash="example-rng-state-sha256",
+            rng_state_hash=_example_sha256("rng-state"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -287,3 +328,11 @@ _PLAN_TOKENS = (
     "<PLAN_PAD>",
     "<PLAN_END>",
 )
+
+
+def _example_sha256(label: str) -> str:
+    """Return deterministic, syntactically valid fixture provenance."""
+
+    from hashlib import sha256
+
+    return sha256(f"qwen35-baton-example:{label}".encode("utf-8")).hexdigest()
