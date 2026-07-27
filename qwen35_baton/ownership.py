@@ -83,14 +83,18 @@ def _parameter_ids(modules: tuple[nn.Module, ...]) -> set[int]:
 
 
 def _require_nonoverlapping(ownership: Stage1Ownership) -> None:
-    groups = (
-        ("planner", _parameter_ids(ownership.planner_modules)),
-        ("qwen_top_layers", _parameter_ids(ownership.qwen_top_layers)),
-        ("qwen_vision", _parameter_ids(ownership.qwen_vision_modules)),
+    owners = tuple(
+        (f"{group_name}[{index}]", _parameter_ids((module,)))
+        for group_name, modules in (
+            ("planner_modules", ownership.planner_modules),
+            ("qwen_top_layers", ownership.qwen_top_layers),
+            ("qwen_vision_modules", ownership.qwen_vision_modules),
+        )
+        for index, module in enumerate(modules)
     )
-    for index, (left_name, left_ids) in enumerate(groups):
-        for right_name, right_ids in groups[index + 1 :]:
-            if left_ids.intersection(right_ids):
+    for index, (left_name, left_ids) in enumerate(owners):
+        for right_name, right_ids in owners[index + 1 :]:
+            if left_ids & right_ids:
                 raise ValueError(
                     f"Stage-1 parameter ownership overlap: "
                     f"{left_name} and {right_name}"

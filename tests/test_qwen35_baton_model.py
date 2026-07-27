@@ -28,16 +28,47 @@ class TinyLanguageModel(nn.Module):
         self.norm = nn.LayerNorm(width)
 
 
+class TinyMultimodalBase(nn.Module):
+    def __init__(self, embedding: nn.Module, width: int) -> None:
+        super().__init__()
+        self.language_model = TinyLanguageModel(embedding, width)
+        self.visual = nn.Linear(width, width)
+        self.forward_calls = 0
+        self.received_kwargs: dict[str, object] | None = None
+
+    def forward(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+        use_cache: bool,
+        output_hidden_states: bool,
+        return_dict: bool,
+    ) -> SimpleNamespace:
+        self.forward_calls += 1
+        self.received_kwargs = {
+            "attention_mask": attention_mask,
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "mm_token_type_ids": mm_token_type_ids,
+            "use_cache": use_cache,
+            "output_hidden_states": output_hidden_states,
+            "return_dict": return_dict,
+        }
+        hidden = self.language_model.embed_tokens(input_ids)
+        row_signal = input_ids[:, :1].to(hidden.dtype).unsqueeze(-1)
+        return SimpleNamespace(last_hidden_state=hidden + row_signal)
+
+
 class TinyQwen(nn.Module):
     def __init__(self, *, vocab_size: int = 64, width: int = 8) -> None:
         super().__init__()
-        self.model = nn.Module()
-        self.model.language_model = TinyLanguageModel(
-            nn.Embedding(vocab_size, width), width
-        )
-        self.model.visual = nn.Linear(width, width)
+        embedding = nn.Embedding(vocab_size, width)
+        self.model = TinyMultimodalBase(embedding, width)
         self.lm_head = nn.Linear(width, vocab_size, bias=False)
-        self.forward_calls = 0
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.language_model.embed_tokens
@@ -45,20 +76,8 @@ class TinyQwen(nn.Module):
     def set_input_embeddings(self, embedding: nn.Module) -> None:
         self.model.language_model.embed_tokens = embedding
 
-    def forward(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        output_hidden_states: bool,
-        return_dict: bool,
-        **_: torch.Tensor,
-    ) -> SimpleNamespace:
-        assert output_hidden_states
-        assert return_dict
-        self.forward_calls += 1
-        hidden = self.get_input_embeddings()(input_ids)
-        row_signal = input_ids[:, :1].to(hidden.dtype).unsqueeze(-1)
-        return SimpleNamespace(hidden_states=(hidden, hidden + row_signal))
+    def forward(self, **_: object) -> None:
+        raise AssertionError("conditional-generation LM/logits path must not run")
 
 
 class TinyQueryTower(nn.Module):
@@ -134,6 +153,18 @@ def make_planner() -> tuple[BatonQwen35Planner, TinyQwen]:
     return planner, qwen
 
 
+def make_unmodified_planner() -> tuple[BatonQwen35Planner, TinyQwen]:
+    qwen = TinyQwen()
+    return (
+        BatonQwen35Planner(
+            qwen,
+            added_token_ids=ADDED_TOKEN_IDS,
+            query_tower=TinyQueryTower(),
+        ),
+        qwen,
+    )
+
+
 def test_model_splits_positive_and_negative_predictions() -> None:
     planner, qwen = make_planner()
 
@@ -144,7 +175,38 @@ def test_model_splits_positive_and_negative_predictions() -> None:
     assert output.negative is not None
     assert output.negative.shape == (2, 2, 4, 256, 1024)
     assert output.flat.shape == (8, 4, 256, 1024)
-    assert qwen.forward_calls == 1
+    assert qwen.model.forward_calls == 1
+
+
+def test_model_calls_multimodal_base_without_lm_logits_or_cache() -> None:
+    planner, qwen = make_planner()
+    batch = make_batch(batch_size=1)
+    pixel_values = torch.randn(4, 3, 2, 2)
+    image_grid_thw = torch.ones(4, 3, dtype=torch.long)
+    mm_token_type_ids = torch.zeros_like(batch.qwen_inputs["input_ids"])
+    qwen_inputs = {
+        **batch.qwen_inputs,
+        "pixel_values": pixel_values,
+        "image_grid_thw": image_grid_thw,
+        "mm_token_type_ids": mm_token_type_ids,
+    }
+
+    planner.forward_rows(
+        qwen_inputs,
+        batch.plan_positions,
+        camera_ids=torch.tensor([0, 1, 0, 1]),
+    )
+
+    assert qwen.model.forward_calls == 1
+    assert qwen.model.received_kwargs == {
+        "attention_mask": batch.qwen_inputs["attention_mask"],
+        "pixel_values": pixel_values,
+        "image_grid_thw": image_grid_thw,
+        "mm_token_type_ids": mm_token_type_ids,
+        "use_cache": False,
+        "output_hidden_states": False,
+        "return_dict": True,
+    }
 
 
 def test_plan_token_adapter_changes_only_added_rows() -> None:
@@ -209,7 +271,7 @@ def test_wrong_plan_pad_count_fails_before_qwen(count: int) -> None:
     with pytest.raises(ValueError, match="each Qwen row.*exactly 1024"):
         planner(malformed)
 
-    assert qwen.forward_calls == 0
+    assert qwen.model.forward_calls == 0
 
 
 def test_forward_rows_requires_positions_to_match_plan_pad_tokens() -> None:
@@ -225,7 +287,7 @@ def test_forward_rows_requires_positions_to_match_plan_pad_tokens() -> None:
             camera_ids=torch.tensor([0, 1, 0, 1]),
         )
 
-    assert qwen.forward_calls == 0
+    assert qwen.model.forward_calls == 0
 
 
 def test_forward_can_return_flat_query_tower_attention_maps() -> None:
@@ -235,6 +297,51 @@ def test_forward_can_return_flat_query_tower_attention_maps() -> None:
 
     assert output.cross_attention_maps is not None
     assert output.cross_attention_maps[0].shape == (4, 1024, 1024)
+
+
+def test_sem_mlp_has_exact_1024_2048_1024_structure_without_output_norm() -> None:
+    planner, _ = make_unmodified_planner()
+
+    assert len(planner.sem_mlp) == 3
+    first, activation, output = planner.sem_mlp
+    assert isinstance(first, nn.Linear)
+    assert (first.in_features, first.out_features) == (1024, 2048)
+    assert isinstance(activation, nn.GELU)
+    assert isinstance(output, nn.Linear)
+    assert (output.in_features, output.out_features) == (2048, 1024)
+
+
+def test_planner_state_dict_round_trips_overlay_and_frozen_base() -> None:
+    source, _ = make_planner()
+    with torch.no_grad():
+        source.frozen_base_embedding.weight.add_(3)
+        source.plan_token_adapter.plan_embeddings.weight.sub_(7)
+    adapter_keys = set(source.plan_token_adapter.state_dict())
+    state = {name: value.clone() for name, value in source.state_dict().items()}
+
+    assert adapter_keys == {"added_token_ids", "plan_embeddings.weight"}
+    assert "frozen_base_embedding.weight" in state
+    overlay_key = (
+        "backbone.model.language_model.embed_tokens.plan_embeddings.weight"
+    )
+    assert overlay_key in state
+    assert not any(
+        "embed_tokens.frozen_base_embedding" in name for name in state
+    )
+
+    restored, _ = make_planner()
+    incompatible = restored.load_state_dict(state)
+
+    assert incompatible.missing_keys == []
+    assert incompatible.unexpected_keys == []
+    torch.testing.assert_close(
+        restored.frozen_base_embedding.weight,
+        source.frozen_base_embedding.weight,
+    )
+    torch.testing.assert_close(
+        restored.plan_token_adapter.plan_embeddings.weight,
+        source.plan_token_adapter.plan_embeddings.weight,
+    )
 
 
 def test_stage1_ownership_is_explicit_disjoint_and_exhaustive() -> None:
@@ -310,6 +417,23 @@ def test_stage1_ownership_rejects_parameter_overlap() -> None:
     planner, _ = make_planner()
     shared = planner.backbone.model.language_model.layers[-1]
     planner.backbone.model.visual = shared
+
+    with pytest.raises(ValueError, match="overlap"):
+        configure_stage1_trainable_modules(planner)
+
+
+def test_stage1_ownership_rejects_shared_planner_module_parameters() -> None:
+    planner, _ = make_planner()
+    planner.sem_mlp = planner.query_tower
+
+    with pytest.raises(ValueError, match="overlap"):
+        configure_stage1_trainable_modules(planner)
+
+
+def test_stage1_ownership_rejects_shared_parameters_between_top_layers() -> None:
+    planner, _ = make_planner()
+    layers = planner.backbone.model.language_model.layers
+    layers[-1].weight = layers[-2].weight
 
     with pytest.raises(ValueError, match="overlap"):
         configure_stage1_trainable_modules(planner)

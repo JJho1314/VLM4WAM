@@ -107,17 +107,24 @@ class BatonPlannerOutput:
     cross_attention_maps: tuple[torch.Tensor, ...] | None
 
 
-def _last_hidden_state(output: Any) -> torch.Tensor:
-    hidden_states = getattr(output, "hidden_states", None)
-    if (
-        not isinstance(hidden_states, (tuple, list))
-        or not hidden_states
-        or not isinstance(hidden_states[-1], torch.Tensor)
-    ):
-        raise RuntimeError(
-            "Qwen output must expose a nonempty hidden_states tensor sequence"
+def _multimodal_base_model(backbone: nn.Module) -> nn.Module:
+    """Resolve the released Qwen3.5 conditional wrapper's logits-free base."""
+
+    base_model = getattr(backbone, "model", None)
+    if not isinstance(base_model, nn.Module):
+        raise ValueError(
+            "Qwen multimodal base must resolve through explicit path 'model'"
         )
-    return hidden_states[-1]
+    return base_model
+
+
+def _last_hidden_state(output: Any) -> torch.Tensor:
+    last_hidden_state = getattr(output, "last_hidden_state", None)
+    if not isinstance(last_hidden_state, torch.Tensor):
+        raise RuntimeError(
+            "Qwen multimodal base output must expose last_hidden_state"
+        )
+    return last_hidden_state
 
 
 class BatonQwen35Planner(nn.Module):
@@ -144,6 +151,7 @@ class BatonQwen35Planner(nn.Module):
             raise TypeError("Qwen input embedding must be a torch module")
 
         self.backbone = backbone
+        _multimodal_base_model(backbone)
         self.frozen_base_embedding = base_embedding
         adapter = PlanTokenEmbeddingAdapter(base_embedding, added_token_ids)
         set_embeddings(adapter)
@@ -261,9 +269,10 @@ class BatonQwen35Planner(nn.Module):
             plan_positions,
             camera_ids,
         )
-        forwarded["output_hidden_states"] = True
+        forwarded["use_cache"] = False
+        forwarded["output_hidden_states"] = False
         forwarded["return_dict"] = True
-        qwen_output = self.backbone(**forwarded)
+        qwen_output = _multimodal_base_model(self.backbone)(**forwarded)
         last_hidden = _last_hidden_state(qwen_output)
         input_ids = forwarded["input_ids"]
         if (
