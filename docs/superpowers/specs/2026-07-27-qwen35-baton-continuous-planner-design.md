@@ -1,7 +1,7 @@
 # Qwen3.5 Baton-Style Continuous Semantic Planner Design
 
 Date: 2026-07-27
-Status: approved design, pending implementation plan
+Status: approved design, implementation planned
 
 ## 1. Objective
 
