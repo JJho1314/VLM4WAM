@@ -13,6 +13,48 @@ import torch.nn.functional as F
 
 
 DEFAULT_FUTURE_KEYFRAME_INDICES = (0, 3, 5, 8)
+BATON_NUM_VIEWS = 2
+BATON_NUM_KEYFRAMES = 4
+BATON_GRID_SIZE = 16
+
+
+def build_patch_center_positions(
+    batch_size: int,
+    num_views: int,
+    num_keyframes: int,
+    grid_size: int = BATON_GRID_SIZE,
+    *,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Return exact row-major normalized centers for the fixed Baton grid."""
+
+    for name, value in (
+        ("batch_size", batch_size),
+        ("num_views", num_views),
+        ("num_keyframes", num_keyframes),
+        ("grid_size", grid_size),
+    ):
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+
+    centers = (
+        torch.arange(grid_size, device=device, dtype=torch.float32) + 0.5
+    ) / grid_size
+    y, x = torch.meshgrid(centers, centers, indexing="ij")
+    xy = torch.stack((x, y), dim=-1).reshape(
+        1,
+        1,
+        1,
+        grid_size * grid_size,
+        2,
+    )
+    return xy.expand(
+        batch_size,
+        num_views,
+        num_keyframes,
+        -1,
+        -1,
+    ).contiguous()
 
 
 def select_future_keyframes(

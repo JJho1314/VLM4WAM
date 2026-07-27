@@ -725,6 +725,7 @@ class LTXVideoTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin
         super().__init__()
         out_channels = out_channels or in_channels
         inner_dim = num_attention_heads * attention_head_dim
+        self.inner_dim = inner_dim
 
         # TODO: replace it with our dim if needed
         self.proj_in = nn.Linear(in_channels, inner_dim)
