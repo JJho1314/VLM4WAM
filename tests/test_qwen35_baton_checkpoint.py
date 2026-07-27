@@ -133,7 +133,9 @@ def test_zero_step_checkpoint_supports_validated_model_only_loading(
 ) -> None:
     torch.manual_seed(7)
     planner = nn.Linear(2, 1)
-    optimizer = torch.optim.AdamW(planner.parameters(), lr=5e-5)
+    optimizer = torch.optim.AdamW(
+        [{"name": "planner", "params": list(planner.parameters()), "lr": 5e-5}]
+    )
     scheduler = BatonCosineWarmupScheduler(
         optimizer, warmup_steps=0, max_steps=10
     )
@@ -213,6 +215,36 @@ def test_checkpoint_save_requires_every_contiguous_rank_publication(
         )
 
     assert not (tmp_path / "step_000001").exists()
+
+
+def test_checkpoint_save_rejects_unnamed_optimizer_lr_groups(
+    tmp_path: Path,
+) -> None:
+    planner = nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(planner.parameters(), lr=5e-5)
+    scheduler = BatonCosineWarmupScheduler(
+        optimizer, warmup_steps=0, max_steps=10
+    )
+    destination = tmp_path / "step_000000"
+
+    with pytest.raises(ValueError, match="LR group names"):
+        save_baton_checkpoint(
+            destination,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            metadata=BatonCheckpointMetadata.example(),
+            cursor=BatonTrainingCursor(
+                global_step=0,
+                epoch=0,
+                consumed_microbatches=0,
+                microbatches_per_epoch=11,
+                sampler_seed=41,
+            ),
+            rank_rng_state={0: capture_rank_rng_state(distributed_rank=0)},
+        )
+
+    assert not destination.exists()
 
 
 def test_continuous_loader_rejects_ta_tok_metadata_before_model_mutation(
@@ -501,6 +533,40 @@ def test_loader_rejects_scheduler_current_lr_inconsistent_with_recipe(
         )
 
     _assert_state_equal(planner.state_dict(), before)
+
+
+def test_loader_rejects_optimizer_current_lr_inconsistent_with_scheduler(
+    tmp_path: Path,
+) -> None:
+    from qwen35_baton.hashing import sha256_file
+
+    checkpoint = tmp_path / "step_000001"
+    _save_valid_checkpoint(checkpoint)
+    optimizer_state = torch.load(
+        checkpoint / "optimizer.pt", weights_only=True, map_location="cpu"
+    )
+    optimizer_state["param_groups"][0]["lr"] = 0.123
+    torch.save(optimizer_state, checkpoint / "optimizer.pt")
+    manifest = json.loads((checkpoint / "manifest.json").read_text())
+    manifest["files"]["optimizer.pt"] = sha256_file(checkpoint / "optimizer.pt")
+    (checkpoint / "manifest.json").write_text(json.dumps(manifest))
+    planner, optimizer, scheduler = _runtime(seed=99)
+    before_planner = _clone_state(planner)
+    before_optimizer = optimizer.state_dict()
+    before_scheduler = scheduler.state_dict()
+
+    with pytest.raises(ValueError, match="optimizer current LR.*scheduler"):
+        load_baton_checkpoint(
+            checkpoint,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            expected_contract=BatonCheckpointMetadata.example(),
+        )
+
+    _assert_state_equal(planner.state_dict(), before_planner)
+    _assert_nested_equal(optimizer.state_dict(), before_optimizer)
+    _assert_nested_equal(scheduler.state_dict(), before_scheduler)
 
 
 def test_loader_rejects_same_shaped_optimizer_parameter_reordering(

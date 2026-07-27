@@ -557,6 +557,7 @@ def save_baton_checkpoint(
         )
         scheduler_state = scheduler.state_dict()
         _validate_scheduler_state_values(scheduler_state)
+        _validate_optimizer_scheduler_lrs(optimizer_state, scheduler_state)
         torch.save(optimizer_state, staging / "optimizer.pt")
         torch.save(scheduler_state, staging / "scheduler.pt")
         torch.save(
@@ -758,6 +759,57 @@ def _validate_scheduler_runtime(
         raise ValueError("scheduler state topology differs from runtime")
 
 
+def _validate_optimizer_scheduler_lrs(
+    optimizer_state: Mapping[str, Any],
+    scheduler_state: Mapping[str, Any],
+) -> None:
+    groups = optimizer_state.get("param_groups")
+    contract = scheduler_state.get("baton_contract")
+    current_lrs = scheduler_state.get("_last_lr")
+    if (
+        not isinstance(groups, list)
+        or not isinstance(contract, Mapping)
+        or not isinstance(contract.get("base_lrs"), list)
+        or not isinstance(current_lrs, list)
+        or not len(groups) == len(contract["base_lrs"]) == len(current_lrs)
+    ):
+        raise ValueError("optimizer and scheduler LR group topology differs")
+    names = [group.get("name") for group in groups if isinstance(group, Mapping)]
+    if (
+        len(names) != len(groups)
+        or any(not isinstance(name, str) or not name for name in names)
+        or len(names) != len(set(names))
+    ):
+        raise ValueError("optimizer LR group names must be ordered and unique")
+    for group, base_lr, current_lr in zip(
+        groups, contract["base_lrs"], current_lrs
+    ):
+        saved_base_lr = group.get("initial_lr", group.get("lr"))
+        saved_current_lr = group.get("lr")
+        if (
+            type(saved_base_lr) not in (int, float)
+            or type(saved_current_lr) not in (int, float)
+            or not math.isclose(
+                float(saved_base_lr),
+                float(base_lr),
+                rel_tol=1e-12,
+                abs_tol=1e-15,
+            )
+        ):
+            raise ValueError(
+                "optimizer initial LR differs from scheduler base LR contract"
+            )
+        if not math.isclose(
+            float(saved_current_lr),
+            float(current_lr),
+            rel_tol=1e-12,
+            abs_tol=1e-15,
+        ):
+            raise ValueError(
+                "optimizer current LR differs from scheduler current LR contract"
+            )
+
+
 def _validate_scaler_runtime(saved: Mapping[str, Any], scaler: Any | None) -> None:
     if not isinstance(saved, Mapping) or set(saved) != {"enabled", "state_dict"}:
         raise ValueError("checkpoint scaler payload is invalid")
@@ -911,6 +963,8 @@ def load_baton_checkpoint(
     if not isinstance(scheduler_state, Mapping):
         raise ValueError("scheduler state topology is invalid")
     _validate_persisted_steps(optimizer_state, scheduler_state, cursor)
+    _validate_scheduler_state_values(scheduler_state)
+    _validate_optimizer_scheduler_lrs(optimizer_state, scheduler_state)
     optimizer_hash = sha256_json(
         _optimizer_topology(optimizer_state)
     )

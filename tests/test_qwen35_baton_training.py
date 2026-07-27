@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -458,6 +459,90 @@ def test_epoch_tail_does_not_force_a_partial_accumulation_update(
     assert artifacts.scheduler.last_epoch == 2
 
 
+def test_skipped_optimizer_update_does_not_advance_step_scheduler_or_metrics(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import accelerate
+
+    config = _config(tmp_path)
+    artifacts = _artifacts(config)
+
+    class _PreparedOptimizer:
+        def __init__(self, optimizer: torch.optim.Optimizer, accelerator: Any) -> None:
+            self.optimizer = optimizer
+            self.accelerator = accelerator
+            self.step_was_skipped = False
+
+        def step(self) -> None:
+            if self.accelerator.sync_gradients:
+                self.step_was_skipped = self.accelerator.skip_updates.pop(0)
+                if not self.step_was_skipped:
+                    self.optimizer.step()
+
+        def zero_grad(self, *, set_to_none: bool) -> None:
+            if self.accelerator.sync_gradients:
+                self.optimizer.zero_grad(set_to_none=set_to_none)
+
+    class _FakeAccelerator:
+        def __init__(self, **_: Any) -> None:
+            self.device = torch.device("cpu")
+            self.num_processes = 1
+            self.process_index = 0
+            self.is_main_process = True
+            self.scaler = None
+            self.sync_gradients = False
+            self.microbatch = 0
+            self.skip_updates = [True, False]
+            self.prepared_optimizer: _PreparedOptimizer | None = None
+
+        def prepare(self, planner: nn.Module, optimizer: torch.optim.Optimizer):
+            self.prepared_optimizer = _PreparedOptimizer(optimizer, self)
+            return planner, self.prepared_optimizer
+
+        def accumulate(self, _planner: nn.Module):
+            self.microbatch += 1
+            self.sync_gradients = self.microbatch % 4 == 0
+            return nullcontext()
+
+        def backward(self, loss: torch.Tensor) -> None:
+            loss.backward()
+
+        def clip_grad_norm_(self, parameters: Any, max_norm: float) -> None:
+            torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+
+        @property
+        def optimizer_step_was_skipped(self) -> bool:
+            assert self.prepared_optimizer is not None
+            return self.prepared_optimizer.step_was_skipped
+
+        def reduce(self, tensor: torch.Tensor, reduction: str) -> torch.Tensor:
+            assert reduction == "mean"
+            return tensor
+
+        def gather(self, tensor: torch.Tensor) -> torch.Tensor:
+            return tensor
+
+        def unwrap_model(self, planner: nn.Module) -> nn.Module:
+            return planner
+
+        def wait_for_everyone(self) -> None:
+            pass
+
+    monkeypatch.setattr(accelerate, "Accelerator", _FakeAccelerator)
+
+    result = run_training(config, artifacts=artifacts)
+
+    assert result.global_step == 1
+    assert result.cursor.consumed_microbatches == 8
+    assert artifacts.scheduler.last_epoch == 1
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "training_metrics.jsonl").read_text().splitlines()
+    ]
+    assert [record["step"] for record in records] == [1]
+    assert result.checkpoint == tmp_path / "step_000001"
+
+
 def test_rank_zero_jsonl_metrics_cover_the_full_accumulation_window(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -484,6 +569,94 @@ def test_rank_zero_jsonl_metrics_cover_the_full_accumulation_window(
         result.last_metrics["loss/total"]
     )
     assert records[0]["throughput"] > 0
+
+
+def test_throughput_uses_slowest_rank_elapsed_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from accelerate import Accelerator
+
+    config = _config(tmp_path)
+    artifacts = _artifacts(config)
+    original_reduce = Accelerator.reduce
+    original_gather = Accelerator.gather
+    reductions: list[tuple[int, str]] = []
+    gather_calls = 0
+
+    def simulated_two_rank_reduce(
+        self: Accelerator,
+        tensor: torch.Tensor,
+        reduction: str = "sum",
+        scale: float = 1.0,
+    ) -> torch.Tensor:
+        reductions.append((tensor.numel(), reduction))
+        return original_reduce(self, tensor, reduction=reduction, scale=scale)
+
+    def simulated_two_rank_gather(
+        self: Accelerator,
+        tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        nonlocal gather_calls
+        gather_calls += 1
+        if tensor.numel() == 1:
+            return tensor.new_tensor([float(tensor.item()), 4.0])
+        return original_gather(self, tensor)
+
+    monkeypatch.setattr(Accelerator, "reduce", simulated_two_rank_reduce)
+    monkeypatch.setattr(Accelerator, "gather", simulated_two_rank_gather)
+
+    result = run_training(config, artifacts=artifacts)
+
+    assert result.last_metrics["throughput"] == pytest.approx(32.0)
+    assert gather_calls == 1
+    assert any(size > 1 and reduction == "mean" for size, reduction in reductions)
+
+
+def test_resume_reconciles_metrics_to_one_canonical_record_per_completed_step(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, max_steps=4, save_every=2)
+    first = run_training(config, artifacts=_artifacts(config), stop_at_step=2)
+    metrics_path = tmp_path / "training_metrics.jsonl"
+    original_records = [
+        json.loads(line) for line in metrics_path.read_text().splitlines()
+    ]
+    with metrics_path.open("a", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps({"step": 2, "loss/total": 999.0, "throughput": 1.0})
+            + "\n"
+        )
+        stream.write(
+            json.dumps({"step": 3, "loss/total": 888.0, "throughput": 1.0})
+            + "\n"
+        )
+        stream.write("malformed crash tail\n")
+    resumed_config = _config(
+        tmp_path,
+        max_steps=4,
+        save_every=2,
+        resume_from=first.checkpoint,
+    )
+
+    run_training(resumed_config, artifacts=_artifacts(resumed_config))
+
+    reconciled = [
+        json.loads(line) for line in metrics_path.read_text().splitlines()
+    ]
+    assert [record["step"] for record in reconciled] == [1, 2, 3, 4]
+    assert reconciled[1] == original_records[1]
+
+
+def test_fresh_training_rejects_a_stale_metrics_file(tmp_path: Path) -> None:
+    metrics_path = tmp_path / "training_metrics.jsonl"
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text('{"step": 99, "loss/total": 0.0}\n')
+    config = _config(tmp_path)
+
+    with pytest.raises(FileExistsError, match="stale Stage-1 metrics"):
+        run_training(config, artifacts=_artifacts(config))
+
+    assert metrics_path.read_text() == '{"step": 99, "loss/total": 0.0}\n'
 
 
 def test_interrupted_non_epoch_boundary_resume_matches_uninterrupted_training(

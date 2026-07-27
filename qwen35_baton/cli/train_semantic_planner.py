@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import random
+import tempfile
 import time
 from typing import Any
 
@@ -703,6 +704,72 @@ def _append_metrics(path: Path, *, step: int, metrics: Mapping[str, float]) -> N
         os.fsync(stream.fileno())
 
 
+def _reconcile_metrics(path: Path, *, completed_step: int) -> None:
+    """Atomically retain one valid record per completed checkpoint step."""
+
+    if type(completed_step) is not int or completed_step < 0:
+        raise ValueError("completed metric step must be a non-negative integer")
+    if not path.exists():
+        return
+    canonical: dict[int, dict[str, float | int]] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise ValueError(f"Stage-1 metrics JSONL is unreadable: {path}") from error
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, Mapping):
+            continue
+        step = record.get("step")
+        values = {key: value for key, value in record.items() if key != "step"}
+        if (
+            type(step) is not int
+            or not 0 < step <= completed_step
+            or step in canonical
+            or not values
+            or any(
+                not isinstance(key, str)
+                or type(value) not in (int, float)
+                or not math.isfinite(float(value))
+                for key, value in values.items()
+            )
+        ):
+            continue
+        canonical[step] = {"step": step, **values}
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.reconcile-",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            for step in sorted(canonical):
+                stream.write(
+                    json.dumps(
+                        canonical[step],
+                        sort_keys=True,
+                        allow_nan=False,
+                    )
+                    + "\n"
+                )
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def run_training(
     config: Stage1TrainingConfig,
     *,
@@ -754,6 +821,7 @@ def run_training(
         microbatches_per_epoch=microbatches_per_epoch,
         sampler_seed=config.seed,
     )
+    metrics_path = Path(config.output_dir) / "training_metrics.jsonl"
     if config.resume_from is not None:
         resumed = load_baton_checkpoint(
             Path(config.resume_from),
@@ -768,6 +836,13 @@ def run_training(
             world_size=accelerator.num_processes,
         )
         cursor = resumed.cursor
+        if accelerator.is_main_process:
+            _reconcile_metrics(metrics_path, completed_step=cursor.global_step)
+        accelerator.wait_for_everyone()
+    elif metrics_path.exists():
+        raise FileExistsError(
+            f"stale Stage-1 metrics file exists for fresh training: {metrics_path}"
+        )
     planner, optimizer = accelerator.prepare(
         artifacts.planner,
         artifacts.optimizer,
@@ -793,7 +868,6 @@ def run_training(
     window_started = last_batch_end
     window_sums: dict[str, float] = {}
     window_microbatches = 0
-    metrics_path = Path(config.output_dir) / "training_metrics.jsonl"
     while cursor.global_step < target_step:
         epoch = cursor.epoch
         _set_dataloader_epoch(
@@ -912,10 +986,14 @@ def run_training(
                         planner.parameters(), config.gradient_clip_norm
                     )
                 optimizer.step()
-                if accelerator.sync_gradients:
+                synchronized = bool(accelerator.sync_gradients)
+                completed_update = synchronized and not bool(
+                    accelerator.optimizer_step_was_skipped
+                )
+                if completed_update:
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
-            next_step = cursor.global_step + int(accelerator.sync_gradients)
+            next_step = cursor.global_step + int(completed_update)
             cursor = _advance_cursor(
                 cursor,
                 epoch=epoch,
@@ -940,7 +1018,7 @@ def run_training(
             for name, value in micro_metrics.items():
                 window_sums[name] = window_sums.get(name, 0.0) + value
             window_microbatches += 1
-            if accelerator.sync_gradients:
+            if completed_update:
                 _synchronize_device(accelerator.device)
                 elapsed = max(time.perf_counter() - window_started, 1e-12)
                 last_metrics = _average_metrics(
@@ -948,17 +1026,27 @@ def run_training(
                     window_sums,
                     microbatches=window_microbatches,
                 )
-                window_summary = accelerator.reduce(
+                gathered_elapsed = accelerator.gather(
                     torch.tensor(
-                        [elapsed, float(window_microbatches)],
+                        [elapsed],
                         dtype=torch.float64,
                         device=accelerator.device,
-                    ),
-                    reduction="mean",
+                    )
                 )
-                reduced_elapsed, reduced_microbatches = (
-                    float(value)
-                    for value in window_summary.detach().cpu().tolist()
+                reduced_elapsed = float(
+                    gathered_elapsed.detach().max().cpu()
+                )
+                reduced_microbatches = float(
+                    accelerator.reduce(
+                        torch.tensor(
+                            float(window_microbatches),
+                            dtype=torch.float64,
+                            device=accelerator.device,
+                        ),
+                        reduction="mean",
+                    )
+                    .detach()
+                    .cpu()
                 )
                 last_metrics.update(
                     {
@@ -988,6 +1076,7 @@ def run_training(
                         scheduler=scheduler,
                         cursor=cursor,
                     )
+            if synchronized:
                 window_sums = {}
                 window_microbatches = 0
             last_batch_end = time.perf_counter()
