@@ -88,6 +88,24 @@ class _BaseDataset:
         return {"video": normalized, "caption": record.caption}
 
 
+class _TwoSuiteBaseDataset(_BaseDataset):
+    def __init__(self) -> None:
+        super().__init__()
+        self.records = (
+            *self.records,
+            SimpleNamespace(
+                key="libero_spatial:000000",
+                caption="open the top drawer",
+                domain="libero_spatial",
+            ),
+            SimpleNamespace(
+                key="libero_spatial:000001",
+                caption="close the bottom drawer",
+                domain="libero_spatial",
+            ),
+        )
+
+
 @pytest.fixture
 def dataset():
     from qwen35_baton.data import BatonLiberoDataset
@@ -115,6 +133,27 @@ def test_dataset_rejects_suites_without_an_alternative_instruction() -> None:
     base.records = base.records[:1]
     with pytest.raises(ValueError, match="at least two distinct instructions"):
         BatonLiberoDataset(base)
+
+
+def test_dataset_negatives_never_cross_suite_boundaries() -> None:
+    from qwen35_baton.data import BatonLiberoDataset
+
+    dataset = BatonLiberoDataset(_TwoSuiteBaseDataset(), seed=7)
+    all_captions = {
+        suite: set(captions) for suite, captions in dataset.suite_to_captions.items()
+    }
+    for index in range(len(dataset)):
+        sample = dataset[index]
+        same_suite = all_captions[sample["suite"]]
+        other_suite = set().union(
+            *(
+                captions
+                for suite, captions in all_captions.items()
+                if suite != sample["suite"]
+            )
+        )
+        assert sample["negative_instruction"] in same_suite
+        assert sample["negative_instruction"] not in other_suite
 
 
 def test_plan_template_and_positions_fail_closed() -> None:
