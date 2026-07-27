@@ -417,11 +417,15 @@ def _validate_scheduler_state_values(state: Mapping[str, Any]) -> None:
         "schedule_type",
         "warmup_steps",
         "max_steps",
+        "max_consecutive_skipped_updates",
         "base_lrs",
     }:
         raise ValueError("scheduler contract is missing or invalid")
     warmup_steps = contract["warmup_steps"]
     max_steps = contract["max_steps"]
+    max_consecutive_skipped_updates = contract[
+        "max_consecutive_skipped_updates"
+    ]
     base_lrs = contract["base_lrs"]
     last_epoch = state.get("last_epoch")
     current_lrs = state.get("_last_lr")
@@ -429,6 +433,8 @@ def _validate_scheduler_state_values(state: Mapping[str, Any]) -> None:
         contract["schedule_type"] != "linear_warmup_cosine_v1"
         or type(warmup_steps) is not int
         or type(max_steps) is not int
+        or type(max_consecutive_skipped_updates) is not int
+        or max_consecutive_skipped_updates <= 0
         or warmup_steps < 0
         or max_steps <= warmup_steps
         or not isinstance(base_lrs, list)

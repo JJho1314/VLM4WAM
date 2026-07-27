@@ -482,7 +482,10 @@ def test_loader_rejects_scheduler_recipe_mismatch_before_model_mutation(
     _save_valid_checkpoint(checkpoint)
     planner, optimizer, _ = _runtime(seed=99)
     scheduler = BatonCosineWarmupScheduler(
-        optimizer, warmup_steps=1, max_steps=10
+        optimizer,
+        warmup_steps=0,
+        max_steps=10,
+        max_consecutive_skipped_updates=7,
     )
     before = _clone_state(planner)
 

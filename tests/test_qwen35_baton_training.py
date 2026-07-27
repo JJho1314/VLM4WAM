@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextlib import nullcontext
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -69,7 +70,7 @@ class _TinyPlanner(nn.Module):
         value = self.query_tower(value)
         value = self.sem_mlp(value)
         value = self.plan_token_adapter(value)
-        prediction = value.reshape(-1, 1, 1, 1, 1).expand(-1, 2, 1, 1, 1)
+        prediction = value.reshape(-1, 1, 1, 1, 1).expand(-1, 2, 4, 1, 1)
         return SimpleNamespace(positive=prediction, negative=-prediction)
 
 
@@ -112,7 +113,7 @@ def _tiny_batches(count: int = 25) -> tuple[_TinyBatch, ...]:
             x=torch.tensor([[0.1 + index / 100]], dtype=torch.float32),
             current_images=torch.zeros(1, 2, 1, 1),
             future_images=torch.full(
-                (1, 2, 1, 1, 1), 0.2 + index / 100, dtype=torch.float32
+                (1, 2, 4, 1, 1), 0.2 + index / 100, dtype=torch.float32
             ),
         )
         for index in range(count)
@@ -173,6 +174,75 @@ def _artifacts(
     )
 
 
+def _skipping_accelerator(skip_updates: list[bool]) -> type:
+    class _PreparedOptimizer:
+        def __init__(self, optimizer: torch.optim.Optimizer, accelerator: Any) -> None:
+            self.optimizer = optimizer
+            self.accelerator = accelerator
+            self.step_was_skipped = False
+
+        def step(self) -> None:
+            if self.accelerator.sync_gradients:
+                if not self.accelerator.skip_updates:
+                    raise AssertionError(
+                        "training exceeded the configured synchronized update pattern"
+                    )
+                self.step_was_skipped = self.accelerator.skip_updates.pop(0)
+                if not self.step_was_skipped:
+                    self.optimizer.step()
+
+        def zero_grad(self, *, set_to_none: bool) -> None:
+            if self.accelerator.sync_gradients:
+                self.optimizer.zero_grad(set_to_none=set_to_none)
+
+    class _FakeAccelerator:
+        def __init__(self, **_: Any) -> None:
+            self.device = torch.device("cpu")
+            self.num_processes = 1
+            self.process_index = 0
+            self.is_main_process = True
+            self.scaler = None
+            self.sync_gradients = False
+            self.microbatch = 0
+            self.skip_updates = list(skip_updates)
+            self.prepared_optimizer: _PreparedOptimizer | None = None
+
+        def prepare(self, planner: nn.Module, optimizer: torch.optim.Optimizer):
+            self.prepared_optimizer = _PreparedOptimizer(optimizer, self)
+            return planner, self.prepared_optimizer
+
+        def accumulate(self, _planner: nn.Module):
+            self.microbatch += 1
+            self.sync_gradients = self.microbatch % 4 == 0
+            return nullcontext()
+
+        def backward(self, loss: torch.Tensor) -> None:
+            loss.backward()
+
+        def clip_grad_norm_(self, parameters: Any, max_norm: float) -> None:
+            torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+
+        @property
+        def optimizer_step_was_skipped(self) -> bool:
+            assert self.prepared_optimizer is not None
+            return self.prepared_optimizer.step_was_skipped
+
+        def reduce(self, tensor: torch.Tensor, reduction: str) -> torch.Tensor:
+            assert reduction == "mean"
+            return tensor
+
+        def gather(self, tensor: torch.Tensor) -> torch.Tensor:
+            return tensor
+
+        def unwrap_model(self, planner: nn.Module) -> nn.Module:
+            return planner
+
+        def wait_for_everyone(self) -> None:
+            pass
+
+    return _FakeAccelerator
+
+
 def _clone_parameters(module: nn.Module) -> dict[str, torch.Tensor]:
     return {
         name: parameter.detach().clone()
@@ -194,6 +264,27 @@ def _assert_nested_equal(left: Any, right: Any) -> None:
             _assert_nested_equal(left_value, right_value)
     else:
         assert left == right
+
+
+def _durable_metrics_record(
+    *, step: int, metrics: dict[str, float]
+) -> dict[str, Any]:
+    unsigned = {
+        "schema_version": 1,
+        "step": step,
+        "metrics": {name: float(value) for name, value in metrics.items()},
+    }
+    canonical = json.dumps(
+        unsigned,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        **unsigned,
+        "checksum": hashlib.sha256(canonical).hexdigest(),
+    }
 
 
 def test_stage1_optimizer_groups_are_exact_and_exhaustive(tmp_path: Path) -> None:
@@ -347,6 +438,7 @@ def test_scheduler_state_carries_the_exact_schedule_contract(tmp_path: Path) -> 
         "schedule_type": "linear_warmup_cosine_v1",
         "warmup_steps": 2,
         "max_steps": 10,
+        "max_consecutive_skipped_updates": 8,
         "base_lrs": [5e-5],
     }
 
@@ -466,69 +558,11 @@ def test_skipped_optimizer_update_does_not_advance_step_scheduler_or_metrics(
 
     config = _config(tmp_path)
     artifacts = _artifacts(config)
-
-    class _PreparedOptimizer:
-        def __init__(self, optimizer: torch.optim.Optimizer, accelerator: Any) -> None:
-            self.optimizer = optimizer
-            self.accelerator = accelerator
-            self.step_was_skipped = False
-
-        def step(self) -> None:
-            if self.accelerator.sync_gradients:
-                self.step_was_skipped = self.accelerator.skip_updates.pop(0)
-                if not self.step_was_skipped:
-                    self.optimizer.step()
-
-        def zero_grad(self, *, set_to_none: bool) -> None:
-            if self.accelerator.sync_gradients:
-                self.optimizer.zero_grad(set_to_none=set_to_none)
-
-    class _FakeAccelerator:
-        def __init__(self, **_: Any) -> None:
-            self.device = torch.device("cpu")
-            self.num_processes = 1
-            self.process_index = 0
-            self.is_main_process = True
-            self.scaler = None
-            self.sync_gradients = False
-            self.microbatch = 0
-            self.skip_updates = [True, False]
-            self.prepared_optimizer: _PreparedOptimizer | None = None
-
-        def prepare(self, planner: nn.Module, optimizer: torch.optim.Optimizer):
-            self.prepared_optimizer = _PreparedOptimizer(optimizer, self)
-            return planner, self.prepared_optimizer
-
-        def accumulate(self, _planner: nn.Module):
-            self.microbatch += 1
-            self.sync_gradients = self.microbatch % 4 == 0
-            return nullcontext()
-
-        def backward(self, loss: torch.Tensor) -> None:
-            loss.backward()
-
-        def clip_grad_norm_(self, parameters: Any, max_norm: float) -> None:
-            torch.nn.utils.clip_grad_norm_(parameters, max_norm)
-
-        @property
-        def optimizer_step_was_skipped(self) -> bool:
-            assert self.prepared_optimizer is not None
-            return self.prepared_optimizer.step_was_skipped
-
-        def reduce(self, tensor: torch.Tensor, reduction: str) -> torch.Tensor:
-            assert reduction == "mean"
-            return tensor
-
-        def gather(self, tensor: torch.Tensor) -> torch.Tensor:
-            return tensor
-
-        def unwrap_model(self, planner: nn.Module) -> nn.Module:
-            return planner
-
-        def wait_for_everyone(self) -> None:
-            pass
-
-    monkeypatch.setattr(accelerate, "Accelerator", _FakeAccelerator)
+    monkeypatch.setattr(
+        accelerate,
+        "Accelerator",
+        _skipping_accelerator([True, False]),
+    )
 
     result = run_training(config, artifacts=artifacts)
 
@@ -540,7 +574,87 @@ def test_skipped_optimizer_update_does_not_advance_step_scheduler_or_metrics(
         for line in (tmp_path / "training_metrics.jsonl").read_text().splitlines()
     ]
     assert [record["step"] for record in records] == [1]
+    assert records[0]["schema_version"] == 1
+    assert set(records[0]) == {
+        "schema_version",
+        "step",
+        "metrics",
+        "checksum",
+    }
     assert result.checkpoint == tmp_path / "step_000001"
+
+
+@pytest.mark.parametrize("invalid_limit", (True, 0, -1, 1.5))
+def test_stage1_config_rejects_invalid_consecutive_skip_limit(
+    tmp_path: Path, invalid_limit: Any
+) -> None:
+    baseline = _config(tmp_path)
+
+    with pytest.raises(ValueError, match="max_consecutive_skipped_updates"):
+        Stage1TrainingConfig(
+            **{
+                **baseline.to_dict(),
+                "max_consecutive_skipped_updates": invalid_limit,
+            }
+        )
+
+
+def test_always_skipped_optimizer_updates_fail_at_the_bounded_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import accelerate
+
+    config = _config(tmp_path)
+    artifacts = _artifacts(config)
+    monkeypatch.setattr(
+        accelerate,
+        "Accelerator",
+        _skipping_accelerator([True] * 8),
+    )
+
+    with pytest.raises(
+        FloatingPointError,
+        match=(
+            "8 consecutive synchronized optimizer updates were skipped"
+            ".*global_step=0.*epoch=1.*consumed_microbatches=7"
+        ),
+    ):
+        run_training(config, artifacts=artifacts)
+
+    assert artifacts.scheduler.last_epoch == 0
+    assert not (tmp_path / "training_metrics.jsonl").exists()
+    assert not list(tmp_path.glob("step_*"))
+
+
+def test_successful_optimizer_update_resets_consecutive_skip_count(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import accelerate
+
+    baseline = _config(tmp_path, max_steps=2, save_every=2)
+    config = Stage1TrainingConfig(
+        **{
+            **baseline.to_dict(),
+            "max_consecutive_skipped_updates": 2,
+        }
+    )
+    artifacts = _artifacts(config)
+    monkeypatch.setattr(
+        accelerate,
+        "Accelerator",
+        _skipping_accelerator([True, False, True, False]),
+    )
+
+    result = run_training(config, artifacts=artifacts)
+
+    assert result.global_step == 2
+    assert result.cursor.consumed_microbatches == 16
+    assert artifacts.scheduler.last_epoch == 2
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "training_metrics.jsonl").read_text().splitlines()
+    ]
+    assert [record["step"] for record in records] == [1, 2]
 
 
 def test_rank_zero_jsonl_metrics_cover_the_full_accumulation_window(
@@ -564,11 +678,15 @@ def test_rank_zero_jsonl_metrics_cover_the_full_accumulation_window(
     ]
     assert len(records) == 1
     assert records[0]["step"] == 1
-    assert records[0]["microbatches"] == 4.0
-    assert records[0]["loss/total"] == pytest.approx(
+    assert records[0]["metrics"]["microbatches"] == 4.0
+    assert records[0]["metrics"]["loss/total"] == pytest.approx(
         result.last_metrics["loss/total"]
     )
-    assert records[0]["throughput"] > 0
+    assert records[0]["metrics"]["throughput"] > 0
+    assert records[0] == _durable_metrics_record(
+        step=1,
+        metrics=result.last_metrics,
+    )
 
 
 def test_throughput_uses_slowest_rank_elapsed_time(
@@ -612,25 +730,32 @@ def test_throughput_uses_slowest_rank_elapsed_time(
     assert any(size > 1 and reduction == "mean" for size, reduction in reductions)
 
 
-def test_resume_reconciles_metrics_to_one_canonical_record_per_completed_step(
+def test_resume_ignores_partial_record_before_complete_record_for_same_step(
     tmp_path: Path,
 ) -> None:
     config = _config(tmp_path, max_steps=4, save_every=2)
     first = run_training(config, artifacts=_artifacts(config), stop_at_step=2)
     metrics_path = tmp_path / "training_metrics.jsonl"
-    original_records = [
-        json.loads(line) for line in metrics_path.read_text().splitlines()
-    ]
-    with metrics_path.open("a", encoding="utf-8") as stream:
-        stream.write(
-            json.dumps({"step": 2, "loss/total": 999.0, "throughput": 1.0})
-            + "\n"
-        )
-        stream.write(
-            json.dumps({"step": 3, "loss/total": 888.0, "throughput": 1.0})
-            + "\n"
-        )
-        stream.write("malformed crash tail\n")
+    complete_step_two = _durable_metrics_record(
+        step=2,
+        metrics=dict(first.last_metrics),
+    )
+    future_step = _durable_metrics_record(
+        step=3,
+        metrics=dict(first.last_metrics),
+    )
+    metrics_path.write_text(
+        "\n".join(
+            (
+                json.dumps({"step": 2, "loss/total": 999.0}),
+                json.dumps(complete_step_two),
+                json.dumps(future_step),
+                "malformed crash tail",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
     resumed_config = _config(
         tmp_path,
         max_steps=4,
@@ -643,8 +768,88 @@ def test_resume_reconciles_metrics_to_one_canonical_record_per_completed_step(
     reconciled = [
         json.loads(line) for line in metrics_path.read_text().splitlines()
     ]
-    assert [record["step"] for record in reconciled] == [1, 2, 3, 4]
-    assert reconciled[1] == original_records[1]
+    assert [record["step"] for record in reconciled] == [2, 3, 4]
+    assert reconciled[0] == complete_step_two
+
+
+def test_resume_rejects_metrics_record_with_corrupt_checksum(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, max_steps=4, save_every=2)
+    first = run_training(config, artifacts=_artifacts(config), stop_at_step=2)
+    metrics_path = tmp_path / "training_metrics.jsonl"
+    corrupt = _durable_metrics_record(step=2, metrics=dict(first.last_metrics))
+    corrupt["checksum"] = "0" * 64
+    metrics_path.write_text(json.dumps(corrupt) + "\n", encoding="utf-8")
+    resumed_config = _config(
+        tmp_path,
+        max_steps=4,
+        save_every=2,
+        resume_from=first.checkpoint,
+    )
+
+    run_training(resumed_config, artifacts=_artifacts(resumed_config))
+
+    records = [
+        json.loads(line) for line in metrics_path.read_text().splitlines()
+    ]
+    assert [record["step"] for record in records] == [3, 4]
+
+
+def test_resume_deduplicates_identical_integrity_valid_metrics_records(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, max_steps=4, save_every=2)
+    first = run_training(config, artifacts=_artifacts(config), stop_at_step=2)
+    metrics_path = tmp_path / "training_metrics.jsonl"
+    complete = _durable_metrics_record(step=2, metrics=dict(first.last_metrics))
+    serialized = json.dumps(complete)
+    metrics_path.write_text(f"{serialized}\n{serialized}\n", encoding="utf-8")
+    resumed_config = _config(
+        tmp_path,
+        max_steps=4,
+        save_every=2,
+        resume_from=first.checkpoint,
+    )
+
+    run_training(resumed_config, artifacts=_artifacts(resumed_config))
+
+    records = [
+        json.loads(line) for line in metrics_path.read_text().splitlines()
+    ]
+    assert [record["step"] for record in records] == [2, 3, 4]
+    assert records[0] == complete
+
+
+def test_resume_fails_closed_on_conflicting_integrity_valid_metrics_records(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, max_steps=4, save_every=2)
+    first = run_training(config, artifacts=_artifacts(config), stop_at_step=2)
+    metrics_path = tmp_path / "training_metrics.jsonl"
+    first_record = _durable_metrics_record(
+        step=2,
+        metrics=dict(first.last_metrics),
+    )
+    conflicting_metrics = dict(first.last_metrics)
+    conflicting_metrics["loss/total"] += 1.0
+    second_record = _durable_metrics_record(
+        step=2,
+        metrics=conflicting_metrics,
+    )
+    original = f"{json.dumps(first_record)}\n{json.dumps(second_record)}\n"
+    metrics_path.write_text(original, encoding="utf-8")
+    resumed_config = _config(
+        tmp_path,
+        max_steps=4,
+        save_every=2,
+        resume_from=first.checkpoint,
+    )
+
+    with pytest.raises(ValueError, match="conflicting.*step 2"):
+        run_training(resumed_config, artifacts=_artifacts(resumed_config))
+
+    assert metrics_path.read_text(encoding="utf-8") == original
 
 
 def test_fresh_training_rejects_a_stale_metrics_file(tmp_path: Path) -> None:
@@ -916,6 +1121,7 @@ def test_stage1_recipe_requirements_and_launchers_are_fixed(tmp_path: Path) -> N
     )
     assert config["max_steps"] == 30_000
     assert config["save_every"] == 5_000
+    assert config["max_consecutive_skipped_updates"] == 8
     assert config["planner_lr"] == 5e-5
     assert config["qwen_top8_lr"] == 1e-6
     assert config["qwen_vision_lr"] == 5e-7

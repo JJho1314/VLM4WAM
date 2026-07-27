@@ -42,6 +42,33 @@ _APPROVED_LRS = {
     "qwen_top8": 1e-6,
     "qwen_vision": 5e-7,
 }
+_METRICS_SCHEMA_VERSION = 1
+_METRICS_RECORD_KEYS = frozenset(
+    {"schema_version", "step", "metrics", "checksum"}
+)
+_DURABLE_METRIC_NAMES = frozenset(
+    {
+        "loss/total",
+        "loss/mse",
+        "loss/cosine",
+        "loss/delta",
+        "loss/instruction_counterfactual",
+        "counterfactual_ranking_accuracy",
+        "data_time",
+        "qwen_time",
+        "teacher_time",
+        "query_tower_time",
+        "backward_time",
+        "throughput",
+        "microbatches",
+        *(
+            f"{metric}/{camera}/frame_{frame}"
+            for metric in ("mse", "cosine")
+            for camera in ("main", "wrist")
+            for frame in range(4)
+        ),
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -64,6 +91,7 @@ class Stage1TrainingConfig:
     warmup_steps: int = 1_000
     save_every: int = 5_000
     log_every: int = 20
+    max_consecutive_skipped_updates: int = 8
     planner_lr: float = 5e-5
     qwen_top8_lr: float = 1e-6
     qwen_vision_lr: float = 5e-7
@@ -96,6 +124,7 @@ class Stage1TrainingConfig:
             "max_steps",
             "save_every",
             "log_every",
+            "max_consecutive_skipped_updates",
         ):
             if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be a positive integer")
@@ -308,6 +337,7 @@ def build_cosine_warmup_scheduler(
         optimizer,
         warmup_steps=config.warmup_steps,
         max_steps=config.max_steps,
+        max_consecutive_skipped_updates=config.max_consecutive_skipped_updates,
     )
 
 
@@ -322,11 +352,13 @@ class BatonCosineWarmupScheduler(torch.optim.lr_scheduler.LambdaLR):
         *,
         warmup_steps: int,
         max_steps: int,
+        max_consecutive_skipped_updates: int = 8,
     ) -> None:
         self.baton_contract = {
             "schedule_type": self.SCHEDULE_TYPE,
             "warmup_steps": warmup_steps,
             "max_steps": max_steps,
+            "max_consecutive_skipped_updates": max_consecutive_skipped_updates,
             "base_lrs": [
                 float(group.get("initial_lr", group["lr"]))
                 for group in optimizer.param_groups
@@ -695,9 +727,77 @@ def _average_metrics(
     }
 
 
+def _durable_metrics_record(
+    *, step: int, metrics: Mapping[str, float]
+) -> dict[str, Any]:
+    if type(step) is not int or step <= 0:
+        raise ValueError("durable metric step must be a positive integer")
+    if not isinstance(metrics, Mapping) or set(metrics) != _DURABLE_METRIC_NAMES:
+        raise ValueError("durable metric names differ from the Stage-1 contract")
+    if any(
+        not isinstance(name, str)
+        or type(value) not in (int, float)
+        or not math.isfinite(float(value))
+        for name, value in metrics.items()
+    ):
+        raise ValueError("durable metric values must be finite numbers")
+    unsigned = {
+        "schema_version": _METRICS_SCHEMA_VERSION,
+        "step": step,
+        "metrics": {
+            name: float(metrics[name])
+            for name in sorted(_DURABLE_METRIC_NAMES)
+        },
+    }
+    return {
+        **unsigned,
+        "checksum": sha256_json(unsigned),
+    }
+
+
+def _validated_durable_metrics_record(
+    record: Any,
+) -> dict[str, Any] | None:
+    if not isinstance(record, Mapping) or set(record) != _METRICS_RECORD_KEYS:
+        return None
+    schema_version = record.get("schema_version")
+    step = record.get("step")
+    metrics = record.get("metrics")
+    checksum = record.get("checksum")
+    if (
+        type(schema_version) is not int
+        or schema_version != _METRICS_SCHEMA_VERSION
+        or type(step) is not int
+        or step <= 0
+        or not isinstance(metrics, Mapping)
+        or set(metrics) != _DURABLE_METRIC_NAMES
+        or any(
+            not isinstance(name, str)
+            or type(value) is not float
+            or not math.isfinite(value)
+            for name, value in metrics.items()
+        )
+        or not isinstance(checksum, str)
+        or len(checksum) != 64
+        or any(character not in "0123456789abcdef" for character in checksum)
+    ):
+        return None
+    unsigned = {
+        "schema_version": schema_version,
+        "step": step,
+        "metrics": dict(metrics),
+    }
+    if checksum != sha256_json(unsigned):
+        return None
+    return {
+        **unsigned,
+        "checksum": checksum,
+    }
+
+
 def _append_metrics(path: Path, *, step: int, metrics: Mapping[str, float]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"step": step, **metrics}
+    payload = _durable_metrics_record(step=step, metrics=metrics)
     with path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(payload, sort_keys=True, allow_nan=False) + "\n")
         stream.flush()
@@ -711,7 +811,7 @@ def _reconcile_metrics(path: Path, *, completed_step: int) -> None:
         raise ValueError("completed metric step must be a non-negative integer")
     if not path.exists():
         return
-    canonical: dict[int, dict[str, float | int]] = {}
+    canonical: dict[int, dict[str, Any]] = {}
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError) as error:
@@ -721,24 +821,20 @@ def _reconcile_metrics(path: Path, *, completed_step: int) -> None:
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(record, Mapping):
+        validated = _validated_durable_metrics_record(record)
+        if validated is None:
             continue
-        step = record.get("step")
-        values = {key: value for key, value in record.items() if key != "step"}
-        if (
-            type(step) is not int
-            or not 0 < step <= completed_step
-            or step in canonical
-            or not values
-            or any(
-                not isinstance(key, str)
-                or type(value) not in (int, float)
-                or not math.isfinite(float(value))
-                for key, value in values.items()
+        step = validated["step"]
+        if step > completed_step:
+            continue
+        previous = canonical.get(step)
+        if previous is not None:
+            if previous == validated:
+                continue
+            raise ValueError(
+                f"conflicting integrity-valid metrics records for step {step}"
             )
-        ):
-            continue
-        canonical[step] = {"step": step, **values}
+        canonical[step] = validated
 
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -868,6 +964,7 @@ def run_training(
     window_started = last_batch_end
     window_sums: dict[str, float] = {}
     window_microbatches = 0
+    consecutive_skipped_updates = 0
     while cursor.global_step < target_step:
         epoch = cursor.epoch
         _set_dataloader_epoch(
@@ -1000,6 +1097,23 @@ def run_training(
                 consumed_microbatches=offset,
                 global_step=next_step,
             )
+            if synchronized:
+                if completed_update:
+                    consecutive_skipped_updates = 0
+                else:
+                    consecutive_skipped_updates += 1
+                    if (
+                        consecutive_skipped_updates
+                        >= config.max_consecutive_skipped_updates
+                    ):
+                        raise FloatingPointError(
+                            "Stage-1 aborted after "
+                            f"{consecutive_skipped_updates} consecutive synchronized "
+                            "optimizer updates were skipped; "
+                            f"global_step={cursor.global_step}, epoch={cursor.epoch}, "
+                            "consumed_microbatches="
+                            f"{cursor.consumed_microbatches}"
+                        )
             micro_metrics = _loss_metrics(
                 losses,
                 positive=planner_output.positive,
