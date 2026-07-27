@@ -33,6 +33,9 @@ CAMERAS = [
     "observation.images.image",
     "observation.images.wrist_image",
 ]
+BATON_TEACHER_SOURCE = "qwen35_baton_teacher"
+BATON_PREDICTION_SOURCE = "qwen35_baton_prediction"
+BATON_SOURCES = {BATON_TEACHER_SOURCE, BATON_PREDICTION_SOURCE}
 OLD_LOADER_KEYS = {
     "data_roots",
     "domains",
@@ -193,8 +196,20 @@ def _validate_training_config(config: dict[str, Any], world_size: int) -> list[s
     semantic = _mapping(config.get("semantic_plan"))
     diffusion = _mapping(config.get("diffusion_model"))
     model_config = _mapping(diffusion.get("config"))
-    if semantic.get("source") == "qwen35_grounded":
+    semantic_source = semantic.get("source")
+    if semantic_source == "qwen35_grounded":
         _validate_grounded_training_config(
+            config,
+            semantic=semantic,
+            model_config=model_config,
+            train_data=train_data,
+            val_data=val_data,
+            world_size=world_size,
+            errors=errors,
+        )
+        return errors
+    if semantic.get("source") in BATON_SOURCES:
+        _validate_baton_training_config(
             config,
             semantic=semantic,
             model_config=model_config,
@@ -440,6 +455,142 @@ def _validate_grounded_training_config(
         )
 
 
+def _validate_baton_training_config(
+    config: dict[str, Any],
+    *,
+    semantic: dict[str, Any],
+    model_config: dict[str, Any],
+    train_data: dict[str, Any],
+    val_data: dict[str, Any],
+    world_size: int,
+    errors: list[str],
+) -> None:
+    """Validate only the two action+video Baton HDF5 curricula."""
+
+    source = semantic.get("source")
+    expected_steps = (
+        20_000 if source == BATON_TEACHER_SOURCE else 30_000
+    )
+    expected_mode = (
+        "teacher" if source == BATON_TEACHER_SOURCE else "prediction"
+    )
+    for field, expected in {
+        "model_name": "ltx_train",
+        "is_i2v": True,
+        "return_action": True,
+        "return_video": True,
+        "train_mode": "all",
+        "train_steps": expected_steps,
+        "steps_to_save": 5_000,
+        "mixed_precision": "bf16",
+        "allow_tf32": True,
+        "gradient_checkpointing": True,
+        "add_state": False,
+        "noisy_video": False,
+        "load_weights": True,
+        "use_deepspeed": True,
+        "lr": 2e-5,
+        "action_lr": 1e-4,
+        "semantic_lr": 5e-5,
+        "diffusion_model_class_path": (
+            "models/ltx_models/transformer_ltx_multiview.py"
+        ),
+        "diffusion_model_class": "LTXVideoTransformer3DModel",
+    }.items():
+        _append_exact_error(errors, field, config.get(field), expected)
+    for field, expected in {
+        "enabled": True,
+        "source": source,
+        "tokens_per_frame": 256,
+        "feature_dim": 1024,
+        "keyframe_indices": [0, 3, 5, 8],
+        "dropout": 0.15,
+        "validation_mode": expected_mode,
+        "validation_modes": [expected_mode, "semantic_disabled"],
+    }.items():
+        _append_exact_error(
+            errors,
+            f"semantic_plan.{field}",
+            semantic.get(field),
+            expected,
+        )
+    for field, expected in {
+        "action_expert": True,
+        "action_in_channels": 7,
+        "action_out_channels": 7,
+        "semantic_plan_context": True,
+        "semantic_plan_in_dim": 1024,
+        "semantic_plan_num_keyframes": 4,
+        "semantic_plan_num_views": 2,
+        "semantic_plan_cross_attention_blocks": list(range(28)),
+        "num_layers": 28,
+    }.items():
+        _append_exact_error(
+            errors,
+            f"diffusion {field}",
+            model_config.get(field),
+            expected,
+        )
+    required_artifacts = (
+        (
+            "siglip2_model_path",
+            "siglip2_config_hash",
+            "siglip2_artifact_hash",
+            "teacher_preprocessing_hash",
+        )
+        if source == BATON_TEACHER_SOURCE
+        else (
+            "planner_checkpoint",
+            "expected_planner_topology",
+            "qwen_model_path",
+            "qwen_tokenizer_path",
+            "qwen_processor_path",
+            "siglip2_model_path",
+        )
+    )
+    for field in required_artifacts:
+        if type(semantic.get(field)) is not str or not semantic[field]:
+            errors.append(f"semantic_plan.{field} must be a non-empty string")
+    if source == BATON_PREDICTION_SOURCE:
+        for field in ("stage2_init_checkpoint", "stage2_init_topology_hash"):
+            if type(config.get(field)) is not str or not config[field]:
+                errors.append(f"{field} must be a non-empty string")
+    if type(world_size) is not int or type(world_size) is bool or world_size <= 0:
+        errors.append("Baton training world_size must be a positive integer")
+    batch_size = config.get("batch_size")
+    accumulation = config.get("gradient_accumulation_steps")
+    if all(
+        type(value) is int and type(value) is not bool and value > 0
+        for value in (batch_size, accumulation, world_size)
+    ):
+        global_batch = batch_size * accumulation * world_size
+        if global_batch != 128:
+            errors.append(f"global batch must be 128, got {global_batch}")
+    else:
+        errors.append(
+            "batch_size and gradient_accumulation_steps must be positive integers"
+        )
+    deepspeed = _mapping(config.get("deepspeed"))
+    zero = _mapping(deepspeed.get("zero_optimization"))
+    _append_exact_error(errors, "DeepSpeed ZeRO stage", zero.get("stage"), 2)
+    _append_exact_error(
+        errors,
+        "DeepSpeed bf16.enabled",
+        _mapping(deepspeed.get("bf16")).get("enabled"),
+        True,
+    )
+    _append_exact_error(
+        errors,
+        "DeepSpeed fp16.enabled",
+        _mapping(deepspeed.get("fp16")).get("enabled"),
+        False,
+    )
+    if train_data.get("stat_file") != val_data.get("stat_file"):
+        errors.append(
+            "train and validation must use the same normalization statistics"
+        )
+
+
 def _resolve_ge_act_path(raw_path: str, ge_act_root: Path) -> Path:
     path = Path(raw_path)
     return path if path.is_absolute() else ge_act_root / path
@@ -492,16 +643,24 @@ def _collect_path_errors(
             if not component_path.is_dir():
                 errors.append(f"LTX component directory is missing: {component_path}")
 
+    semantic = _mapping(config.get("semantic_plan"))
+    semantic_source = semantic.get("source")
     diffusion = _mapping(config.get("diffusion_model"))
     raw_diffusion = diffusion.get("model_path")
     diffusion_path = (
         Path(raw_diffusion) if type(raw_diffusion) is str and raw_diffusion else None
     )
-    if diffusion_path is None or not diffusion_path.is_file():
+    valid_diffusion_path = diffusion_path is not None and (
+        diffusion_path.is_file()
+        or (
+            semantic_source == BATON_PREDICTION_SOURCE
+            and diffusion_path.is_dir()
+        )
+    )
+    if not valid_diffusion_path:
         errors.append(f"missing base diffusion checkpoint: {raw_diffusion}")
 
-    semantic = _mapping(config.get("semantic_plan"))
-    if semantic.get("source") == "qwen35_grounded":
+    if semantic_source == "qwen35_grounded":
         raw_cache = train_data.get("hindsight_cache")
         raw_planner = semantic.get("planner_checkpoint")
         cache = None
@@ -534,7 +693,11 @@ def _collect_path_errors(
             if cache is not None:
                 cache.close()
     else:
-        raw_siglip = semantic.get("model_name_or_path")
+        raw_siglip = (
+            semantic.get("siglip2_model_path")
+            if semantic_source in BATON_SOURCES
+            else semantic.get("model_name_or_path")
+        )
         siglip_path = Path(raw_siglip) if type(raw_siglip) is str and raw_siglip else None
         if siglip_path is None or not siglip_path.exists():
             errors.append(f"missing SigLIP2 checkpoint: {raw_siglip}")
@@ -543,6 +706,17 @@ def _collect_path_errors(
             or (siglip_path / "pytorch_model.bin").is_file()
         ):
             errors.append(f"SigLIP2 checkpoint directory has no weights: {siglip_path}")
+        if semantic_source == BATON_PREDICTION_SOURCE:
+            raw_stage2 = config.get("stage2_init_checkpoint")
+            stage2_path = (
+                Path(raw_stage2)
+                if type(raw_stage2) is str and raw_stage2
+                else None
+            )
+            if stage2_path is None or not stage2_path.is_dir():
+                errors.append(
+                    f"missing Stage-2 GE-Act checkpoint: {raw_stage2}"
+                )
 
     raw_output = config.get("output_dir")
     if type(raw_output) is not str or not raw_output:

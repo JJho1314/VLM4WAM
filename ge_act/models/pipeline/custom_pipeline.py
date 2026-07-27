@@ -737,6 +737,7 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
         semantic_plan_mask: Optional[torch.Tensor] = None,
         semantic_plan_relevance: Optional[torch.Tensor] = None,
         semantic_condition_mask: Optional[torch.Tensor] = None,
+        capture_validation_trace: bool = False,
         **kwargs,
     ):
         r"""
@@ -940,6 +941,21 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
             actions = randn_tensor((batch_size, action_chunk, action_dim), device=device, dtype=prompt_embeds.dtype, generator=action_generator)
         else:
             actions = None
+        validation_trace = (
+            {
+                "prompt_embeds": prompt_embeds.detach().clone(),
+                "prompt_attention_mask": (
+                    prompt_attention_mask.detach().clone()
+                ),
+                "initial_actions": (
+                    actions.detach().clone()
+                    if actions is not None
+                    else torch.empty(0, device=device)
+                )
+            }
+            if capture_validation_trace
+            else None
+        )
 
 
         # 5. Prepare timesteps
@@ -974,6 +990,8 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
             self.scheduler.sigmas[-1] = self.scheduler.sigmas[-2]
 
         self._num_timesteps = len(timesteps)
+        if validation_trace is not None:
+            validation_trace["timesteps"] = timesteps.detach().clone()
 
         # 6. Prepare micro-conditions
         latent_frame_rate = frame_rate / self.vae_temporal_compression_ratio
@@ -996,6 +1014,10 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
             latents, conditioning_mask, cond_indicator = gen_noise_from_condition_frame_latent(
                 init_latents, latent_num_frames, latent_height, latent_width, video_generator, noise_to_condition_frames=0
             )
+            if validation_trace is not None and i_chunk == 0:
+                validation_trace["initial_video_noise"] = (
+                    latents.detach().clone()
+                )
 
             if self.do_classifier_free_guidance:
                 conditioning_mask = torch.cat([conditioning_mask, conditioning_mask], dim=0)
@@ -1172,6 +1194,8 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
 
         if return_action:
             preds["action"] = actions
+        if validation_trace is not None:
+            preds["validation_trace"] = validation_trace
 
         self.transformer.train()
 

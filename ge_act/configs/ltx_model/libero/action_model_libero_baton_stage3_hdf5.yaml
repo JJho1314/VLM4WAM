@@ -80,6 +80,12 @@ flow_logit_std: 1.0
 flow_mode_scale: 1.29
 pixel_wise_timestep: true
 
+# These are fail-closed template sentinels. The Stage-3 launcher requires
+# BATON_STAGE2_INIT_CHECKPOINT and BATON_STAGE2_INIT_TOPOLOGY_HASH, validates
+# the completed Stage-2 envelope, then loads its diffusion_model snapshot.
+stage2_init_checkpoint: __BATON_STAGE2_INIT_CHECKPOINT_REQUIRED__
+stage2_init_topology_hash: __BATON_STAGE2_INIT_TOPOLOGY_HASH_REQUIRED__
+
 semantic_plan:
   enabled: true
   source: qwen35_baton_prediction
@@ -97,7 +103,7 @@ semantic_plan:
   validation_modes: [prediction, semantic_disabled]
 
 diffusion_model:
-  model_path: /data/user/jhe724/junjie/weights/Genie-Envisioner/GE_base_fast_actinterp.safetensors
+  model_path: __BATON_STAGE2_INIT_CHECKPOINT_REQUIRED__/diffusion_model
   config:
     activation_fn: gelu-approximate
     attention_bias: true

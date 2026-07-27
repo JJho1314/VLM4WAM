@@ -28,6 +28,8 @@ if ((DENOMINATOR <= 0 || GLOBAL_BATCH % DENOMINATOR != 0)); then
 fi
 GRADIENT_ACCUMULATION_STEPS="$((GLOBAL_BATCH / DENOMINATOR))"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-}"
+export BATON_PER_DEVICE_BATCH="$PER_DEVICE_BATCH"
+export BATON_GRADIENT_ACCUMULATION_STEPS="$GRADIENT_ACCUMULATION_STEPS"
 
 if ((NNODES > 1)) && [[ -z "${MASTER_ADDR:-}" ]]; then
   echo "MASTER_ADDR must be set when NNODES > 1" >&2
@@ -45,6 +47,15 @@ else
 fi
 
 cd "$GE_ACT_ROOT"
+RESOLVED_CONFIG="$(mktemp "${TMPDIR:-/tmp}/ge-act-baton-stage3.XXXXXX.yaml")"
+cleanup() {
+  rm -f -- "$RESOLVED_CONFIG"
+}
+trap cleanup EXIT
+"$PYTHON_BIN" scripts/preflight_ltx_siglip2.py \
+  --config "$CONFIG" \
+  --materialize-output "$RESOLVED_CONFIG"
+CONFIG="$RESOLVED_CONFIG"
 "$PYTHON_BIN" scripts/preflight_libero_fastwam_hdf5.py \
   --config "$CONFIG" \
   --world-size "$WORLD_SIZE"

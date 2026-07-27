@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import importlib.util
 import os
 import shutil
@@ -19,10 +20,98 @@ BATON_PREDICTION_SOURCE = "qwen35_baton_prediction"
 BATON_SOURCES = {BATON_TEACHER_SOURCE, BATON_PREDICTION_SOURCE}
 
 
+def _is_concrete_sha256(value: Any) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and value != "0" * 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 def _nearest_existing_parent(path: Path) -> Path:
     while not path.exists() and path != path.parent:
         path = path.parent
     return path
+
+
+def materialize_baton_config(
+    template: dict[str, Any],
+    environ: dict[str, str],
+) -> dict[str, Any]:
+    """Resolve one immutable Baton recipe from explicit deployment inputs."""
+
+    if type(template) is not dict or type(environ) is not dict:
+        raise TypeError("Baton template and environment must be mappings")
+    resolved = deepcopy(template)
+    semantic = resolved.get("semantic_plan")
+    if type(semantic) is not dict:
+        raise ValueError("Baton template semantic_plan must be a mapping")
+    source = semantic.get("source")
+    if source not in BATON_SOURCES:
+        raise ValueError("materialization requires a Baton semantic source")
+
+    def require(name: str) -> str:
+        value = environ.get(name)
+        if type(value) is not str or not value.strip():
+            raise ValueError(f"required deployment variable is missing: {name}")
+        return value.strip()
+
+    resolved["pretrained_model_name_or_path"] = require(
+        "BATON_LTX_PRETRAINED_PATH"
+    )
+    manifest = require("BATON_HDF5_MANIFEST_PATH")
+    stat_file = require("BATON_STAT_FILE")
+    resolved["output_dir"] = require("BATON_OUTPUT_DIR")
+    for split in ("train", "val"):
+        resolved["data"][split]["manifest_path"] = manifest
+        resolved["data"][split]["stat_file"] = stat_file
+    if "BATON_PER_DEVICE_BATCH" in environ:
+        resolved["batch_size"] = int(require("BATON_PER_DEVICE_BATCH"))
+    if "BATON_GRADIENT_ACCUMULATION_STEPS" in environ:
+        resolved["gradient_accumulation_steps"] = int(
+            require("BATON_GRADIENT_ACCUMULATION_STEPS")
+        )
+    resume_from = environ.get("BATON_RESUME_FROM_CHECKPOINT", "").strip()
+    resolved["resume_from_checkpoint"] = resume_from or None
+
+    semantic["siglip2_model_path"] = require("BATON_SIGLIP2_MODEL_PATH")
+    if source == BATON_TEACHER_SOURCE:
+        resolved["diffusion_model"]["model_path"] = require(
+            "BATON_GE_BASE_CHECKPOINT"
+        )
+        semantic["siglip2_config_hash"] = require(
+            "BATON_SIGLIP2_CONFIG_HASH"
+        )
+        semantic["siglip2_artifact_hash"] = require(
+            "BATON_SIGLIP2_ARTIFACT_HASH"
+        )
+        semantic["teacher_preprocessing_hash"] = require(
+            "BATON_TEACHER_PREPROCESSING_HASH"
+        )
+    else:
+        stage2_checkpoint = require("BATON_STAGE2_INIT_CHECKPOINT")
+        resolved["stage2_init_checkpoint"] = stage2_checkpoint
+        resolved["stage2_init_topology_hash"] = require(
+            "BATON_STAGE2_INIT_TOPOLOGY_HASH"
+        )
+        resolved["diffusion_model"]["model_path"] = str(
+            Path(stage2_checkpoint) / "diffusion_model"
+        )
+        semantic["planner_checkpoint"] = require(
+            "BATON_PLANNER_CHECKPOINT"
+        )
+        semantic["expected_planner_topology"] = require(
+            "BATON_PLANNER_TOPOLOGY"
+        )
+        semantic["qwen_model_path"] = require("BATON_QWEN_MODEL_PATH")
+        semantic["qwen_tokenizer_path"] = require(
+            "BATON_QWEN_TOKENIZER_PATH"
+        )
+        semantic["qwen_processor_path"] = require(
+            "BATON_QWEN_PROCESSOR_PATH"
+        )
+    return resolved
 
 
 def collect_preflight_errors(
@@ -116,6 +205,18 @@ def collect_preflight_errors(
             ):
                 if not semantic.get(field):
                     errors.append(f"semantic_plan.{field} is required")
+            for field in (
+                "siglip2_config_hash",
+                "siglip2_artifact_hash",
+                "teacher_preprocessing_hash",
+            ):
+                if semantic.get(field) and not _is_concrete_sha256(
+                    semantic[field]
+                ):
+                    errors.append(
+                        f"semantic_plan.{field} must be a concrete nonzero "
+                        "lowercase SHA-256, not a placeholder"
+                    )
         else:
             if semantic.get("frame_microbatch_size") is not None:
                 errors.append(
@@ -177,6 +278,29 @@ def collect_preflight_errors(
                 errors.append(f"{field} must be {expected}")
         if config.get("steps_to_save") != 5_000:
             errors.append("steps_to_save must be 5000")
+        if semantic_source == BATON_PREDICTION_SOURCE:
+            stage2_checkpoint = config.get("stage2_init_checkpoint")
+            stage2_topology = config.get("stage2_init_topology_hash")
+            if type(stage2_checkpoint) is not str or not stage2_checkpoint:
+                errors.append("stage2_init_checkpoint is required")
+            if not _is_concrete_sha256(stage2_topology):
+                errors.append(
+                    "stage2_init_topology_hash must be a concrete nonzero "
+                    "lowercase SHA-256, not a placeholder"
+                )
+            expected_model_path = (
+                str(Path(stage2_checkpoint) / "diffusion_model")
+                if type(stage2_checkpoint) is str and stage2_checkpoint
+                else None
+            )
+            if (
+                config.get("diffusion_model", {}).get("model_path")
+                != expected_model_path
+            ):
+                errors.append(
+                    "Stage 3 diffusion model_path must be the validated "
+                    "Stage-2 checkpoint diffusion_model directory"
+                )
     if train_data.get("chunk") != 9 or train_data.get("n_previous") != 4:
         errors.append("FastWAM clip layout must use four memory and nine future frames")
     if train_data.get("source_fps") != 20:
@@ -266,6 +390,9 @@ def collect_preflight_errors(
                 "Qwen tokenizer": semantic.get("qwen_tokenizer_path"),
                 "Qwen processor": semantic.get("qwen_processor_path"),
                 "SigLIP2 checkpoint": semantic.get("siglip2_model_path"),
+                "Stage-2 GE-Act checkpoint": config.get(
+                    "stage2_init_checkpoint"
+                ),
             }
         )
     elif semantic_source == "gt_siglip2":
@@ -346,8 +473,31 @@ def collect_preflight_errors(
                 != sha256_file(Path(manifest_path))
             ):
                 errors.append("Baton planner checkpoint differs from HDF5 manifest")
-        except (ImportError, OSError, RuntimeError, ValueError) as error:
-            errors.append(f"invalid Baton planner provenance/topology: {error}")
+            from runner.ge_trainer import (
+                validate_baton_stage2_checkpoint_envelope,
+            )
+
+            stage2_model_dir = validate_baton_stage2_checkpoint_envelope(
+                config["stage2_init_checkpoint"],
+                expected_topology_hash=config[
+                    "stage2_init_topology_hash"
+                ],
+                expected_hdf5_manifest_hash=(
+                    sha256_file(Path(manifest_path))
+                    if isinstance(manifest_path, str)
+                    and Path(manifest_path).is_file()
+                    else ""
+                ),
+            )
+            if Path(config["diffusion_model"]["model_path"]) != stage2_model_dir:
+                errors.append(
+                    "Stage-3 diffusion model path differs from validated "
+                    "Stage-2 checkpoint"
+                )
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
+            errors.append(
+                f"invalid Baton planner/Stage-2 provenance/topology: {error}"
+            )
     ltx_path = Path(config.get("pretrained_model_name_or_path", ""))
     if ltx_path.is_dir():
         for component in ("tokenizer", "text_encoder", "vae"):
@@ -388,9 +538,23 @@ def main() -> int:
     parser.add_argument("--minimum-free-gb", type=float, default=100.0)
     parser.add_argument("--per-device-batch", type=int)
     parser.add_argument("--gradient-accumulation-steps", type=int)
+    parser.add_argument("--materialize-output", type=Path)
     args = parser.parse_args()
     with args.config.open() as handle:
         config = yaml.safe_load(handle)
+    if args.materialize_output is not None:
+        try:
+            resolved = materialize_baton_config(config, dict(os.environ))
+            args.materialize_output.write_text(
+                yaml.safe_dump(resolved, sort_keys=False),
+                encoding="utf-8",
+            )
+            args.materialize_output.chmod(0o600)
+        except (OSError, TypeError, ValueError, yaml.YAMLError) as error:
+            print(f"GE-Act Baton config materialization failed: {error}")
+            return 1
+        print(f"GE-Act Baton config materialized: {args.materialize_output}")
+        return 0
     errors = collect_preflight_errors(
         config,
         world_size=args.world_size,

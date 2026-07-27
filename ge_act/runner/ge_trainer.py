@@ -71,7 +71,7 @@ from models.ltx_models.vlm_semantic_planner import (
     configure_qwen_top_layers_for_joint_training,
     load_qwen35_grounded_provider,
 )
-from qwen35_baton.hashing import sha256_artifact, sha256_file
+from qwen35_baton.hashing import sha256_artifact, sha256_file, sha256_json
 from qwen35_baton.teacher import FrozenSiglip2Teacher
 
 LOG_LEVEL = "INFO"
@@ -484,6 +484,56 @@ def baton_validation_metric_name(source: str, mode: str, metric: str) -> str:
     if metric not in {"video", "action"}:
         raise ValueError("Baton validation metric must be video or action")
     return f"validation/{source}/{mode}/{metric}"
+
+
+def forward_baton_ge_act(
+    model: torch.nn.Module,
+    condition: BatonSemanticCondition,
+    *,
+    semantic_condition_mask: torch.Tensor,
+    diffusion_kwargs: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Forward one complete Baton grid through the normal GE-Act model."""
+
+    if not isinstance(condition, BatonSemanticCondition):
+        raise TypeError("condition must be a BatonSemanticCondition")
+    if tuple(condition.tokens.shape[1:]) != (2, 4, 256, 1024):
+        raise ValueError("Baton forward requires [B,2,4,256,1024] tokens")
+    if (
+        tuple(condition.positions.shape)
+        != (*condition.tokens.shape[:4], 2)
+        or condition.mask is not None
+        or condition.relevance is not None
+    ):
+        raise ValueError("Baton forward requires positions and no mask/relevance")
+    if tuple(semantic_condition_mask.shape) != (
+        condition.tokens.shape[0] * condition.tokens.shape[1],
+    ):
+        raise ValueError("Baton gate requires one value per sample camera")
+    semantic_fields = {
+        "semantic_plan",
+        "semantic_plan_times",
+        "semantic_plan_positions",
+        "semantic_plan_mask",
+        "semantic_plan_relevance",
+        "semantic_condition_mask",
+    }
+    overlap = semantic_fields & set(diffusion_kwargs)
+    if overlap:
+        raise ValueError(
+            "Baton forward constructs semantic fields: "
+            + ", ".join(sorted(overlap))
+        )
+    return forward_pass(
+        model=model,
+        semantic_plan=condition.tokens,
+        semantic_plan_times=condition.times,
+        semantic_plan_positions=condition.positions,
+        semantic_plan_mask=None,
+        semantic_plan_relevance=None,
+        semantic_condition_mask=semantic_condition_mask,
+        **dict(diffusion_kwargs),
+    )
 
 
 def compute_effective_video_fps(data_config: Dict[str, Any], default_source_fps: float = 30.0) -> float:
@@ -1316,6 +1366,390 @@ def load_joint_training_checkpoint(
     return cursor
 
 
+def _module_topology_hash(model: torch.nn.Module) -> str:
+    if not isinstance(model, torch.nn.Module):
+        raise TypeError("diffusion_model must be a torch module")
+    return sha256_json(
+        [
+            {
+                "name": name,
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+            }
+            for name, value in model.state_dict().items()
+        ]
+    )
+
+
+_SAFETENSORS_TORCH_DTYPES = {
+    "BOOL": "torch.bool",
+    "U8": "torch.uint8",
+    "I8": "torch.int8",
+    "I16": "torch.int16",
+    "I32": "torch.int32",
+    "I64": "torch.int64",
+    "F16": "torch.float16",
+    "BF16": "torch.bfloat16",
+    "F32": "torch.float32",
+    "F64": "torch.float64",
+}
+
+
+def _diffusion_snapshot_topology_hash(diffusion_dir: Path) -> str:
+    from safetensors import safe_open
+    from utils.model_utils import resolve_checkpoint_files
+
+    topology: list[dict[str, Any]] = []
+    for checkpoint_file in resolve_checkpoint_files(diffusion_dir):
+        with safe_open(
+            str(checkpoint_file),
+            framework="pt",
+            device="cpu",
+        ) as handle:
+            for name in handle.keys():
+                tensor_slice = handle.get_slice(name)
+                raw_dtype = tensor_slice.get_dtype()
+                dtype = _SAFETENSORS_TORCH_DTYPES.get(raw_dtype)
+                if dtype is None:
+                    raise ValueError(
+                        f"unsupported diffusion snapshot dtype: {raw_dtype}"
+                    )
+                topology.append(
+                    {
+                        "name": name,
+                        "shape": list(tensor_slice.get_shape()),
+                        "dtype": dtype,
+                    }
+                )
+    topology.sort(key=lambda item: item["name"])
+    if not topology:
+        raise ValueError("diffusion snapshot topology is empty")
+    return sha256_json(topology)
+
+
+def _diffusion_snapshot_files(diffusion_dir: Path) -> dict[str, str]:
+    files = {
+        path.relative_to(diffusion_dir).as_posix(): sha256_file(path)
+        for path in sorted(diffusion_dir.rglob("*"))
+        if path.is_file()
+    }
+    if not files:
+        raise ValueError("diffusion snapshot is empty")
+    return files
+
+
+_BATON_STATE_FIELDS = {
+    "format_version",
+    "checkpoint_kind",
+    "model_children",
+    "source",
+    "topology_hash",
+    "snapshot_topology_hash",
+    "cursor",
+    "accelerator_files",
+    "diffusion_subdir",
+    "diffusion_files",
+    "training_provenance",
+}
+
+
+def _accelerator_state_files(checkpoint: Path) -> dict[str, str]:
+    files = {
+        path.relative_to(checkpoint).as_posix(): sha256_file(path)
+        for path in sorted(checkpoint.rglob("*"))
+        if path.is_file()
+        and path.name != "baton_state.json"
+        and "diffusion_model" not in path.relative_to(checkpoint).parts
+    }
+    if not files:
+        raise ValueError("Baton checkpoint has no Accelerator state")
+    return files
+
+
+def _load_baton_training_metadata(
+    checkpoint_dir: str | Path,
+) -> tuple[Path, dict[str, Any], TrainingCursor]:
+    checkpoint = Path(checkpoint_dir)
+    metadata_path = checkpoint / "baton_state.json"
+    if not metadata_path.is_file():
+        raise ValueError(
+            f"Baton checkpoint is incomplete: missing {metadata_path}"
+        )
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("Baton checkpoint metadata is invalid") from error
+    if type(metadata) is not dict or set(metadata) != _BATON_STATE_FIELDS:
+        raise ValueError("Baton checkpoint metadata fields are invalid")
+    if (
+        metadata["format_version"] != 1
+        or metadata["checkpoint_kind"] != "ge_act_baton"
+        or metadata["model_children"] != ["diffusion_model"]
+        or metadata["source"] not in BATON_SOURCES
+        or type(metadata["topology_hash"]) is not str
+        or type(metadata["snapshot_topology_hash"]) is not str
+        or metadata["diffusion_subdir"] != "diffusion_model"
+        or type(metadata["training_provenance"]) is not dict
+    ):
+        raise ValueError("Baton checkpoint envelope is incompatible")
+    provenance = metadata["training_provenance"]
+    expected_provenance_fields = (
+        {
+            "hdf5_manifest_hash",
+            "siglip2_config_hash",
+            "siglip2_artifact_hash",
+            "teacher_preprocessing_hash",
+        }
+        if metadata["source"] == BATON_TEACHER_SOURCE
+        else {
+            "hdf5_manifest_hash",
+            "planner_manifest_hash",
+            "planner_topology_hash",
+            "siglip2_artifact_hash",
+        }
+    )
+    if set(provenance) != expected_provenance_fields or not all(
+        type(value) is str
+        and len(value) == 64
+        and value != "0" * 64
+        and all(character in "0123456789abcdef" for character in value)
+        for value in provenance.values()
+    ):
+        raise ValueError("Baton checkpoint training provenance is invalid")
+    try:
+        cursor = TrainingCursor.from_dict(metadata["cursor"])
+    except (TypeError, ValueError) as error:
+        raise ValueError("Baton checkpoint training cursor is invalid") from error
+    expected_accelerator_files = metadata["accelerator_files"]
+    if (
+        type(expected_accelerator_files) is not dict
+        or not expected_accelerator_files
+    ):
+        raise ValueError("Baton checkpoint Accelerator manifest is invalid")
+    try:
+        actual_accelerator_files = _accelerator_state_files(checkpoint)
+    except (OSError, ValueError) as error:
+        raise ValueError("Baton checkpoint Accelerator state is incomplete") from error
+    if actual_accelerator_files != expected_accelerator_files:
+        raise ValueError("Baton checkpoint Accelerator state hash mismatch")
+    diffusion_dir = checkpoint / metadata["diffusion_subdir"]
+    if not diffusion_dir.is_dir():
+        raise ValueError("Baton checkpoint diffusion snapshot is missing")
+    expected_files = metadata["diffusion_files"]
+    if (
+        type(expected_files) is not dict
+        or not expected_files
+        or not all(
+            type(name) is str
+            and name
+            and type(digest) is str
+            and len(digest) == 64
+            for name, digest in expected_files.items()
+        )
+    ):
+        raise ValueError("Baton checkpoint diffusion artifact manifest is invalid")
+    try:
+        actual_files = _diffusion_snapshot_files(diffusion_dir)
+    except (OSError, ValueError) as error:
+        raise ValueError("Baton checkpoint diffusion artifact is invalid") from error
+    if actual_files != expected_files:
+        raise ValueError("Baton checkpoint diffusion artifact hash mismatch")
+    try:
+        snapshot_topology_hash = _diffusion_snapshot_topology_hash(
+            diffusion_dir
+        )
+    except (OSError, ValueError) as error:
+        raise ValueError("Baton checkpoint snapshot topology is invalid") from error
+    if snapshot_topology_hash != metadata["snapshot_topology_hash"]:
+        raise ValueError("Baton checkpoint snapshot topology mismatch")
+    return checkpoint, metadata, cursor
+
+
+def save_baton_training_checkpoint(
+    accelerator,
+    output_dir: str | Path,
+    *,
+    cursor: TrainingCursor,
+    diffusion_model: torch.nn.Module,
+    source: str,
+    training_provenance: Mapping[str, str],
+) -> Path:
+    """Atomically save mutable GE-Act state and a deployable diffusion snapshot."""
+
+    if not isinstance(cursor, TrainingCursor):
+        raise TypeError("Baton checkpoint requires a TrainingCursor")
+    if source not in BATON_SOURCES:
+        raise ValueError("Baton checkpoint source is invalid")
+    if type(training_provenance) is not dict or not training_provenance:
+        raise ValueError("Baton checkpoint training provenance is required")
+    root = Path(output_dir)
+    destination = root / f"step_{cursor.global_step:06d}"
+    staging = root / f".{destination.name}.incomplete"
+    is_main = getattr(accelerator, "is_main_process", True)
+    if is_main:
+        root.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
+    if destination.exists():
+        raise FileExistsError(f"Baton checkpoint already exists: {destination}")
+    if staging.exists():
+        raise FileExistsError(
+            f"incomplete Baton checkpoint already exists: {staging}"
+        )
+    if is_main:
+        staging.mkdir()
+    try:
+        accelerator.wait_for_everyone()
+        accelerator.save_state(str(staging))
+        accelerator.wait_for_everyone()
+        if is_main:
+            diffusion_dir = staging / "diffusion_model"
+            diffusion_model.save_pretrained(
+                diffusion_dir,
+                safe_serialization=True,
+            )
+            metadata = {
+                "format_version": 1,
+                "checkpoint_kind": "ge_act_baton",
+                "model_children": ["diffusion_model"],
+                "source": source,
+                "topology_hash": _module_topology_hash(diffusion_model),
+                "snapshot_topology_hash": (
+                    _diffusion_snapshot_topology_hash(diffusion_dir)
+                ),
+                "cursor": cursor.to_dict(),
+                "accelerator_files": _accelerator_state_files(staging),
+                "diffusion_subdir": "diffusion_model",
+                "diffusion_files": _diffusion_snapshot_files(diffusion_dir),
+                "training_provenance": dict(training_provenance),
+            }
+            (staging / "baton_state.json").write_text(
+                json.dumps(
+                    metadata,
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.replace(staging, destination)
+        accelerator.wait_for_everyone()
+    except Exception:
+        if is_main:
+            shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return destination
+
+
+def load_baton_training_checkpoint(
+    accelerator,
+    checkpoint_dir: str | Path,
+    *,
+    diffusion_model: torch.nn.Module,
+    expected_source: str,
+    expected_microbatches_per_epoch: int,
+    expected_sampler_seed: int,
+) -> TrainingCursor:
+    """Validate the complete Baton envelope before restoring Accelerate state."""
+
+    checkpoint, metadata, cursor = _load_baton_training_metadata(
+        checkpoint_dir
+    )
+    if metadata["source"] != expected_source:
+        raise ValueError("Baton checkpoint conditioning source mismatch")
+    if metadata["topology_hash"] != _module_topology_hash(diffusion_model):
+        raise ValueError("Baton checkpoint runtime topology mismatch")
+    if (
+        cursor.microbatches_per_epoch != expected_microbatches_per_epoch
+        or cursor.sampler_seed != expected_sampler_seed
+    ):
+        raise ValueError("Baton checkpoint data cursor mismatch")
+    accelerator.load_state(str(checkpoint))
+    accelerator.wait_for_everyone()
+    return cursor
+
+
+def validate_baton_stage2_checkpoint_envelope(
+    checkpoint_dir: str | Path,
+    *,
+    expected_topology_hash: str,
+    expected_hdf5_manifest_hash: str,
+) -> Path:
+    """Validate a completed teacher curriculum before Stage-3 allocation."""
+
+    checkpoint, metadata, cursor = _load_baton_training_metadata(
+        checkpoint_dir
+    )
+    if metadata["source"] != BATON_TEACHER_SOURCE:
+        raise ValueError("Stage-3 initialization requires a Stage-2 teacher checkpoint")
+    if cursor.global_step != 20_000:
+        raise ValueError("Stage-2 initialization checkpoint must be step 20000")
+    if metadata["snapshot_topology_hash"] != expected_topology_hash:
+        raise ValueError("Stage-2 initialization topology mismatch")
+    provenance = metadata["training_provenance"]
+    if provenance.get("hdf5_manifest_hash") != expected_hdf5_manifest_hash:
+        raise ValueError("Stage-2 initialization dataset provenance mismatch")
+    for field in (
+        "siglip2_config_hash",
+        "siglip2_artifact_hash",
+        "teacher_preprocessing_hash",
+    ):
+        value = provenance.get(field)
+        if type(value) is not str or len(value) != 64:
+            raise ValueError(
+                f"Stage-2 initialization provenance is missing {field}"
+            )
+    return checkpoint / "diffusion_model"
+
+
+def build_baton_training_provenance(
+    config: Mapping[str, Any],
+) -> dict[str, str]:
+    """Bind a Baton checkpoint to its local dataset and frozen source."""
+
+    config_mapping = _config_mapping(config)
+    semantic, source = _validated_baton_semantic_config(config_mapping)
+    manifest_path = Path(
+        config_mapping.get("data", {})
+        .get("train", {})
+        .get("manifest_path", "")
+    )
+    if not manifest_path.is_file():
+        raise ValueError(
+            f"Baton training HDF5 manifest is missing: {manifest_path}"
+        )
+    provenance = {
+        "hdf5_manifest_hash": sha256_file(manifest_path),
+    }
+    if source == BATON_TEACHER_SOURCE:
+        provenance.update(
+            {
+                field: semantic[field]
+                for field in (
+                    "siglip2_config_hash",
+                    "siglip2_artifact_hash",
+                    "teacher_preprocessing_hash",
+                )
+            }
+        )
+        return provenance
+    planner_checkpoint = Path(semantic["planner_checkpoint"])
+    planner_manifest = planner_checkpoint / "manifest.json"
+    planner_topology = Path(semantic["expected_planner_topology"])
+    if not planner_manifest.is_file() or not planner_topology.is_file():
+        raise ValueError("Baton planner provenance files are missing")
+    provenance.update(
+        {
+            "planner_manifest_hash": sha256_file(planner_manifest),
+            "planner_topology_hash": sha256_file(planner_topology),
+            "siglip2_artifact_hash": sha256_artifact(
+                semantic["siglip2_model_path"]
+            ),
+        }
+    )
+    return provenance
+
+
 def should_save_checkpoint(global_step: int, args: argparse.Namespace) -> bool:
     explicit_steps = getattr(args, "save_steps", None)
     if explicit_steps:
@@ -1383,6 +1817,7 @@ class Trainer:
         self.semantic_encoder = None
         self.semantic_planner = None
         self.baton_components = None
+        self.baton_training_provenance = None
         self.grounded_provider = None
         self.grounded_training_enabled = False
         self.qwen_ownership = None
@@ -1583,11 +2018,39 @@ class Trainer:
         if semantic_source in BATON_SOURCES:
             # Baton provenance and source ownership fail closed before any
             # tokenizer, VAE, or LTX allocation in direct Trainer use.
+            if semantic_source == BATON_PREDICTION_SOURCE:
+                manifest_path = Path(
+                    self.raw_config["data"]["train"]["manifest_path"]
+                )
+                if not manifest_path.is_file():
+                    raise ValueError(
+                        f"Stage-3 HDF5 manifest is missing: {manifest_path}"
+                    )
+                stage2_model_dir = validate_baton_stage2_checkpoint_envelope(
+                    self.raw_config.get("stage2_init_checkpoint", ""),
+                    expected_topology_hash=self.raw_config.get(
+                        "stage2_init_topology_hash",
+                        "",
+                    ),
+                    expected_hdf5_manifest_hash=sha256_file(manifest_path),
+                )
+                configured_model_path = Path(
+                    self.raw_config["diffusion_model"]["model_path"]
+                )
+                if configured_model_path != stage2_model_dir:
+                    raise ValueError(
+                        "Stage-3 diffusion model path differs from the "
+                        "validated Stage-2 checkpoint"
+                    )
+                self.args.diffusion_model["model_path"] = str(stage2_model_dir)
             self.baton_components = prepare_baton_conditioning(
                 self.raw_config,
                 self.train_dataset,
                 device=device,
                 dtype=dtype,
+            )
+            self.baton_training_provenance = (
+                build_baton_training_provenance(self.raw_config)
             )
 
         ### Load Tokenizer
@@ -1853,6 +2316,36 @@ class Trainer:
             self.diffusion_model, self.optimizer, self.train_dataloader, self.lr_scheduler = self.state.accelerator.prepare(
                 self.diffusion_model, self.optimizer, self.train_dataloader, self.lr_scheduler
             )
+            if self.baton_components is not None:
+                microbatches_per_epoch = len(self.train_dataloader)
+                resume_from = getattr(
+                    self.args,
+                    "resume_from_checkpoint",
+                    None,
+                )
+                if resume_from:
+                    self.resume_cursor = load_baton_training_checkpoint(
+                        self.state.accelerator,
+                        resume_from,
+                        diffusion_model=unwrap_model(
+                            self.state.accelerator,
+                            self.diffusion_model,
+                        ),
+                        expected_source=self.baton_components.source,
+                        expected_microbatches_per_epoch=(
+                            microbatches_per_epoch
+                        ),
+                        expected_sampler_seed=self.sampler_seed,
+                    )
+                else:
+                    self.resume_cursor = TrainingCursor(
+                        global_step=0,
+                        epoch=0,
+                        consumed_microbatches=0,
+                        microbatches_per_epoch=microbatches_per_epoch,
+                        sampler_seed=self.sampler_seed,
+                    )
+                self.current_cursor = self.resume_cursor
             return
         if self.grounded_provider is None:
             raise RuntimeError("grounded provider was lost before joint preparation")
@@ -1937,9 +2430,9 @@ class Trainer:
         }
         logger.info(f"Training configuration: {json.dumps(info, indent=4)}")
         
-        if self.grounded_training_enabled:
+        if self.grounded_training_enabled or self.baton_components is not None:
             if not isinstance(self.resume_cursor, TrainingCursor):
-                raise RuntimeError("grounded training cursor was not prepared")
+                raise RuntimeError("resumable training cursor was not prepared")
             cursor = self.resume_cursor
         else:
             cursor = TrainingCursor(
@@ -2261,6 +2754,22 @@ class Trainer:
                         )
                         pred_all = joint_output.latents
                         planner_aux_loss = joint_output.planner_loss
+                    elif self.baton_components is not None:
+                        for field in (
+                            "semantic_plan",
+                            "semantic_plan_times",
+                            "semantic_plan_positions",
+                            "semantic_plan_mask",
+                            "semantic_plan_relevance",
+                            "semantic_condition_mask",
+                        ):
+                            diffusion_forward_kwargs.pop(field)
+                        pred_all = forward_baton_ge_act(
+                            self.diffusion_model,
+                            baton_condition,
+                            semantic_condition_mask=semantic_condition_mask,
+                            diffusion_kwargs=diffusion_forward_kwargs,
+                        )["latents"]
                     else:
                         pred_all = forward_pass(
                             model=self.diffusion_model,
@@ -2367,21 +2876,13 @@ class Trainer:
                         if self.baton_components is None:
                             self.validate(accelerator, model_save_dir, global_step, n_view=n_view, n_chunk=1)
                         else:
-                            for validation_mode in self.args.semantic_plan.get(
-                                "validation_modes",
-                                [self.args.semantic_plan["validation_mode"]],
-                            ):
-                                self.validate(
-                                    accelerator,
-                                    os.path.join(
-                                        model_save_dir,
-                                        str(validation_mode),
-                                    ),
-                                    global_step,
-                                    n_view=n_view,
-                                    n_chunk=1,
-                                    semantic_mode=str(validation_mode),
-                                )
+                            self.validate_baton_modes(
+                                accelerator,
+                                model_save_dir,
+                                global_step,
+                                n_view=n_view,
+                                n_chunk=1,
+                            )
 
                 
                 if accelerator.sync_gradients and should_save_checkpoint(global_step, self.args):
@@ -2394,6 +2895,20 @@ class Trainer:
                             joint_model=unwrap_model(
                                 accelerator,
                                 self.diffusion_model,
+                            ),
+                        )
+                    elif self.baton_components is not None:
+                        save_baton_training_checkpoint(
+                            accelerator,
+                            self.save_folder,
+                            cursor=cursor,
+                            diffusion_model=unwrap_model(
+                                accelerator,
+                                self.diffusion_model,
+                            ),
+                            source=self.baton_components.source,
+                            training_provenance=(
+                                self.baton_training_provenance
                             ),
                         )
                     elif accelerator.is_main_process:
@@ -2432,6 +2947,20 @@ class Trainer:
                         self.diffusion_model,
                     ),
                 )
+        elif self.baton_components is not None:
+            final_checkpoint = Path(self.save_folder) / f"step_{global_step:06d}"
+            if not final_checkpoint.exists():
+                save_baton_training_checkpoint(
+                    accelerator,
+                    self.save_folder,
+                    cursor=cursor,
+                    diffusion_model=unwrap_model(
+                        accelerator,
+                        self.diffusion_model,
+                    ),
+                    source=self.baton_components.source,
+                    training_provenance=self.baton_training_provenance,
+                )
         elif accelerator.is_main_process:
             self.diffusion_model = unwrap_model(accelerator, self.diffusion_model)
 
@@ -2444,6 +2973,88 @@ class Trainer:
         logger.info(f"Memory after training end: {json.dumps(memory_statistics, indent=4)}")
 
         accelerator.end_training()
+
+
+    def validate_baton_modes(
+        self,
+        accelerator,
+        model_save_dir,
+        global_step,
+        *,
+        n_view: int,
+        n_chunk: int,
+        to_log: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Evaluate enabled/disabled gates from one batch and RNG state."""
+
+        if self.baton_components is None:
+            raise RuntimeError("paired Baton validation requires a Baton source")
+        batch = next(iter(self.val_dataloader))
+        batch_size = 1
+        mem_size = self.args.data["train"]["n_previous"]
+        raw_future_frames = self.args.data["train"]["chunk"]
+        latent_num_frames = compute_ltx_latent_frames(
+            raw_future_frames,
+            temporal_compression_ratio=self.TEMPORAL_DOWN_RATIO,
+            n_previous=mem_size,
+        )
+        baton_condition = build_baton_semantic_condition(
+            self.baton_components,
+            self.args.semantic_plan,
+            batch["video"][:batch_size],
+            batch["caption"][:batch_size],
+            n_previous=mem_size,
+            num_future_frames=raw_future_frames,
+            num_latent_frames=latent_num_frames,
+            device=accelerator.device,
+            dtype=self.state.weight_dtype,
+        )
+        base_generator = torch.Generator(
+            device=accelerator.device,
+        ).manual_seed(42)
+        generator_state = base_generator.get_state()
+        results: list[dict[str, Any]] = []
+        reference_trace = None
+        for mode in self.args.semantic_plan.get(
+            "validation_modes",
+            [self.args.semantic_plan["validation_mode"]],
+        ):
+            generator = torch.Generator(device=accelerator.device)
+            generator.set_state(generator_state)
+            result = self.validate(
+                accelerator,
+                os.path.join(model_save_dir, str(mode)),
+                global_step,
+                n_view=n_view,
+                n_chunk=n_chunk,
+                to_log=to_log,
+                semantic_mode=str(mode),
+                batch=batch,
+                baton_condition=baton_condition,
+                inference_generator=generator,
+                capture_validation_trace=True,
+            )
+            trace = result.get("validation_trace")
+            if type(trace) is not dict:
+                raise RuntimeError("Baton validation pipeline omitted its trace")
+            if reference_trace is None:
+                reference_trace = trace
+            else:
+                if set(trace) != set(reference_trace):
+                    raise RuntimeError("paired Baton validation trace fields differ")
+                for field, expected in reference_trace.items():
+                    actual = trace[field]
+                    if (
+                        not isinstance(expected, torch.Tensor)
+                        or not isinstance(actual, torch.Tensor)
+                        or not torch.equal(actual, expected)
+                    ):
+                        raise RuntimeError(
+                            "paired Baton validation stochastic input "
+                            f"differs: {field}"
+                        )
+            results.append(result)
+        return results
 
 
     def validate(
@@ -2466,6 +3077,10 @@ class Trainer:
         semantic_plan_relevance=None,
         semantic_condition_mask=None,
         semantic_mode=None,
+        batch=None,
+        baton_condition=None,
+        inference_generator=None,
+        capture_validation_trace=False,
     ):
 
         os.makedirs(model_save_dir,exist_ok=True)
@@ -2475,7 +3090,8 @@ class Trainer:
             self._unwrapped_diffusion_model(accelerator) if accelerator is not None else self.diffusion_model
         )
 
-        batch = next(iter(self.val_dataloader))
+        if batch is None:
+            batch = next(iter(self.val_dataloader))
         image = batch['video'][:,:,:,:self.args.data['train']['n_previous']].clone()  # shape b,c,v,t,h,w 
         prompt = batch['caption']
         gt_video = batch['video']
@@ -2501,17 +3117,18 @@ class Trainer:
                     temporal_compression_ratio=self.TEMPORAL_DOWN_RATIO,
                     n_previous=mem_size,
                 )
-                baton_condition = build_baton_semantic_condition(
-                    self.baton_components,
-                    self.args.semantic_plan,
-                    gt_video[:batch_size],
-                    prompt[:batch_size],
-                    n_previous=mem_size,
-                    num_future_frames=raw_future_frames,
-                    num_latent_frames=latent_num_frames,
-                    device=accelerator.device,
-                    dtype=self.state.weight_dtype,
-                )
+                if baton_condition is None:
+                    baton_condition = build_baton_semantic_condition(
+                        self.baton_components,
+                        self.args.semantic_plan,
+                        gt_video[:batch_size],
+                        prompt[:batch_size],
+                        n_previous=mem_size,
+                        num_future_frames=raw_future_frames,
+                        num_latent_frames=latent_num_frames,
+                        device=accelerator.device,
+                        dtype=self.state.weight_dtype,
+                    )
                 selection = apply_baton_validation_mode(
                     self.baton_components,
                     tokens=baton_condition.tokens,
@@ -2701,6 +3318,8 @@ class Trainer:
             semantic_plan_mask=semantic_plan_mask,
             semantic_plan_relevance=semantic_plan_relevance,
             semantic_condition_mask=semantic_condition_mask,
+            generator=inference_generator,
+            capture_validation_trace=capture_validation_trace,
         )[0]
 
         if self.baton_components is None:
@@ -2734,17 +3353,18 @@ class Trainer:
                     predicted[:, :, :, :common_frames].float()
                     - target[:, :, :, :common_frames]
                 ).square().mean()
-                self.writer.add_scalar(
-                    baton_validation_metric_name(
-                        self.baton_components.source,
-                        str(semantic_mode),
-                        "video",
-                    ),
-                    video_mse.item(),
-                    global_step,
-                )
+                if self.writer is not None:
+                    self.writer.add_scalar(
+                        baton_validation_metric_name(
+                            self.baton_components.source,
+                            str(semantic_mode),
+                            "video",
+                        ),
+                        video_mse.item(),
+                        global_step,
+                    )
 
-        if to_log:
+        if to_log and self.writer is not None:
             self.writer.add_text(f'step_{global_step}/{cap} prompt:', prompt[0], global_step)
 
         if self.args.return_action:
@@ -2769,4 +3389,10 @@ class Trainer:
 
             if to_log:
                 for key, value in action_logs.items():
-                    self.writer.add_scalar(key, value, global_step)
+                    if self.writer is not None:
+                        self.writer.add_scalar(key, value, global_step)
+        return {
+            "batch": batch,
+            "semantic_condition_mask": semantic_condition_mask,
+            "validation_trace": preds.get("validation_trace"),
+        }

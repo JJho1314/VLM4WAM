@@ -83,6 +83,7 @@ pixel_wise_timestep: true
 semantic_plan:
   enabled: true
   source: qwen35_baton_teacher
+  # Deployment launchers replace every artifact/hash below from BATON_* env.
   siglip2_model_path: /data/user/jhe724/junjie/weights/siglip2-large-patch16-256
   siglip2_config_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   siglip2_artifact_hash: "0000000000000000000000000000000000000000000000000000000000000000"
@@ -96,6 +97,7 @@ semantic_plan:
   validation_modes: [teacher, semantic_disabled]
 
 diffusion_model:
+  # Deployment launcher requires BATON_GE_BASE_CHECKPOINT.
   model_path: /data/user/jhe724/junjie/weights/Genie-Envisioner/GE_base_fast_actinterp.safetensors
   config:
     activation_fn: gelu-approximate
