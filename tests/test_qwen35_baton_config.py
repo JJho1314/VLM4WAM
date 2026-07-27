@@ -50,6 +50,7 @@ def test_continuous_metadata_round_trips_the_complete_contract() -> None:
         "camera_names",
         "camera_flattening",
         "siglip2_model",
+        "siglip2_config_hash",
         "siglip2_artifact_hash",
         "teacher_image_size",
         "teacher_patch_size",
@@ -75,7 +76,8 @@ def test_continuous_metadata_round_trips_the_complete_contract() -> None:
         "rng_state_hash",
     }
     assert payload["architecture_kind"] == "qwen35_baton_continuous"
-    assert payload["qwen_backbone"] == "dense Qwen3.5-4B"
+    assert payload["qwen_backbone"] == "dense Qwen3.5-2B"
+    assert payload["trainable_qwen_layer_indices"] == list(range(16, 24))
     assert payload["target_shape"] == [2, 4, 256, 1024]
     assert payload["future_indices"] == [0, 3, 5, 8]
     assert payload["teacher_feature_layer"] == -2
@@ -92,7 +94,7 @@ def test_continuous_metadata_round_trips_the_complete_contract() -> None:
 def test_continuous_metadata_rejects_wrong_backbone_identity() -> None:
     payload = BatonCheckpointMetadata.example().to_dict()
 
-    payload["qwen_backbone"] = "Qwen3.5-4B-MoE"
+    payload["qwen_backbone"] = "Qwen3.5-2B-MoE"
 
     with pytest.raises(ValueError, match="qwen_backbone"):
         BatonCheckpointMetadata.from_dict(payload)

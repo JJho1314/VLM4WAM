@@ -16,8 +16,12 @@ same-camera semantic cross-attention and Relative Semantic RoPE.
 
 The existing Qwen3-VL-2B planner remains unchanged.
 
-The planner backbone is the dense Qwen3.5-4B vision-language model, not a
-mixture-of-experts variant.
+The planner backbone is the dense `Qwen/Qwen3.5-2B` model, not a
+mixture-of-experts variant. Its immutable geometry is outer model type
+`qwen3_5`, architecture `Qwen3_5ForConditionalGeneration`, text model type
+`qwen3_5_text`, 24 language layers, hidden width `2048`, intermediate width
+`6144`, and a 24-layer vision tower with hidden width `1024` and output width
+`2048`. Stage 1 trains language layers `16..23`.
 
 ## 2. Motivation
 
@@ -420,7 +424,7 @@ Every continuous-planner checkpoint records and validates:
 - Qwen config, tokenizer, processor, and input-template hashes;
 - all added special tokens and exact IDs;
 - camera order and sample-major flattening;
-- SigLIP2 model identifier and artifact hash;
+- SigLIP2 model identifier plus exact config and artifact hashes;
 - teacher image size, patch size, feature layer, preprocessing, and dtype;
 - target shape `[2, 4, 256, 1024]`;
 - future offsets `[0, 3, 5, 8]`;
@@ -428,7 +432,9 @@ Every continuous-planner checkpoint records and validates:
 - Qwen trainable-layer ownership;
 - loss definitions and weights;
 - HDF5 manifest hash;
-- optimizer and scheduler topology;
+- ordered optimizer parameter names, shapes, dtypes, and uniqueness;
+- scheduler type, warmup/max steps, ordered base/current learning rates, and
+  logical scheduler step;
 - exact distributed training cursor and RNG state.
 
 Old TA-Tok checkpoints are rejected by the continuous loader. Existing legacy
@@ -475,10 +481,12 @@ loaders remain available for their original branches.
 - One Stage-2 GE-Act step with teacher features.
 - One Stage-3 GE-Act step with predicted features.
 - Two-rank distributed gradient and exact-resume smoke.
+- Persistent-worker resume with adapter-local Python/NumPy/Torch RNG derived
+  from sampler seed, epoch, and source index.
 - Launcher and environment preflight that validates Qwen3.5 and SigLIP2
   artifacts before allocating either large model.
 
-Live 4B or eight-GPU success is reported only when those executions actually
+Live 2B or eight-GPU success is reported only when those executions actually
 run.
 
 ## 15. Migration

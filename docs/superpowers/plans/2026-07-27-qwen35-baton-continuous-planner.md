@@ -2,16 +2,19 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a Baton-style Qwen3.5-4B planner that predicts two independent cameras × four future keyframes × 256 continuous SigLIP2 patch features, then train GE-Act first with teacher features and then with frozen planner predictions.
+**Goal:** Build a Baton-style `Qwen/Qwen3.5-2B` planner that predicts two independent cameras × four future keyframes × 256 continuous SigLIP2 patch features, then train GE-Act first with teacher features and then with frozen planner predictions.
 
 **Architecture:** A new `qwen35_baton` package owns the continuous planner, online frozen SigLIP2 teacher, block-causal Query Tower, losses, checkpointing, and inference provider. The existing `qwen35_planx` and Qwen3-VL-2B packages remain untouched. GE-Act receives full `[B,2,4,256,1024]` grids through its existing same-camera semantic cross-attention, with explicit patch-center coordinates and no relevance bias or token compression.
 
-**Tech Stack:** Python 3.11, PyTorch 2.x, Transformers Qwen3.5-4B and SigLIP2, Accelerate/DeepSpeed ZeRO-2, HDF5, Diffusers LTX, pytest, YAML.
+**Tech Stack:** Python 3.11, PyTorch 2.x, Transformers Qwen3.5-2B and SigLIP2, Accelerate/DeepSpeed ZeRO-2, HDF5, Diffusers LTX, pytest, YAML.
 
 ## Global Constraints
 
 - The approved design is `docs/superpowers/specs/2026-07-27-qwen35-baton-continuous-planner-design.md`.
-- The Qwen backbone is the dense Qwen3.5-4B vision-language model.
+- The Qwen backbone is dense `Qwen/Qwen3.5-2B`: outer model type `qwen3_5`,
+  architecture `Qwen3_5ForConditionalGeneration`, text model type
+  `qwen3_5_text`, 24 text layers, hidden width `2048`, intermediate width
+  `6144`, and vision depth/hidden/output widths `24/1024/2048`.
 - The teacher is frozen `SigLIP2-large-patch16-256`, with `256 x 256` inputs, penultimate vision-layer patch output, a `16 x 16` grid, and feature width `1024`.
 - Camera order is exactly `("main", "wrist")`, flattened sample-major as `sample 0 main`, `sample 0 wrist`, `sample 1 main`, `sample 1 wrist`.
 - Future keyframe indices are exactly `(0, 3, 5, 8)`.
@@ -20,7 +23,9 @@
 - Query self-attention and query-to-Qwen cross-attention are block-causal by future frame.
 - The Sem-MLP is exactly `Linear(1024,2048) -> GELU -> Linear(2048,1024)` with no output normalization.
 - Stage-1 loss weights are MSE `1.0`, cosine `0.5`, delta `0.5`, and instruction counterfactual `0.2`, with counterfactual margin `0.1`.
-- Stage 1 trains the Query Tower, Sem-MLP, plan-token adapter, Qwen vision tower, and top eight Qwen language layers; the base token embedding and all other Qwen parameters remain frozen.
+- Stage 1 trains the Query Tower, Sem-MLP, plan-token adapter, Qwen vision
+  tower, and Qwen language layers `16..23`; the base token embedding and all
+  other Qwen parameters remain frozen.
 - Stage-1 learning rates are `5e-5` for planner modules, `1e-6` for Qwen top-eight language layers, and `5e-7` for the Qwen vision tower.
 - Stage 1 runs `30,000` optimizer steps, Stage 2 runs `20,000`, and Stage 3 runs `30,000`; all save every `5,000` optimizer steps.
 - Effective global batch is exactly `128` in all stages.
@@ -132,7 +137,7 @@ class BatonLossWeights:
     counterfactual_margin: float = 0.1
 ```
 
-`BatonCheckpointMetadata` must serialize and validate the following exact contract: format version, architecture kind `qwen35_baton_continuous`, Qwen/tokenizer/processor/template hashes, added tokens and IDs, camera order, SigLIP2 artifact and preprocessing hashes, teacher layer `-2`, target shape `[2,4,256,1024]`, future indices, Query Tower dimensions and mask version, trainable Qwen layer indices, loss weights, HDF5 manifest hash, optimizer topology hash, scheduler topology hash, global step, distributed cursor, and RNG-state hash.
+`BatonCheckpointMetadata` must serialize and validate the following exact contract: format version, architecture kind `qwen35_baton_continuous`, Qwen/tokenizer/processor/template hashes, added tokens and IDs, camera order, pinned SigLIP2 config/artifact and preprocessing hashes, teacher layer `-2`, target shape `[2,4,256,1024]`, future indices, Query Tower dimensions and mask version, trainable Qwen layer indices, loss weights, HDF5 manifest hash, optimizer topology hash, scheduler topology hash, global step, distributed cursor, and RNG-state hash.
 
 - [ ] **Step 4: Run focused tests**
 
@@ -855,18 +860,22 @@ def load_baton_checkpoint(
     optimizer: torch.optim.Optimizer | None,
     scheduler: Any | None,
     expected_contract: BatonCheckpointMetadata,
+    expected_sampler_seed: int,
+    expected_microbatches_per_epoch: int,
 ) -> BatonResumeState:
     """Validate metadata before loading any tensor state and restore exact resume state."""
 ```
 
 The implementations write into a sibling temporary directory, fsync files, and atomically rename only after every rank has published its RNG state. The loader validates metadata, file hashes, topology, and cursor consistency before mutating planner/optimizer/scheduler objects.
 
-Load local Qwen3.5-4B with its persisted processor/tokenizer and local SigLIP2 with `local_files_only=True`. Before GPU allocation, validate:
+Load local `Qwen/Qwen3.5-2B` with its persisted processor/tokenizer and local SigLIP2 with `local_files_only=True`. Before GPU allocation, validate:
 
 - all model and processor paths exist;
-- the Qwen config is dense Qwen3.5-4B;
+- the Qwen config matches the exact dense Qwen3.5-2B text/vision geometry;
 - all seven added tokens map to unique IDs;
-- SigLIP2 reports image size `256`, patch size `16`, and hidden width `1024`;
+- Transformers `AutoConfig` resolves SigLIP2 image size `256`, default patch
+  size `16`, and hidden width `1024`, and its pinned config/artifact hashes
+  match;
 - the HDF5 manifest hash matches runtime metadata;
 - world size, per-device batch, and accumulation multiply to `128`;
 - no output directory is an ancestor of the model or dataset paths.
@@ -878,7 +887,9 @@ The preflight command is:
 ```bash
 python -m qwen35_baton.cli.preflight \
   --config qwen35_baton/configs/libero_stage1.json \
-  --world-size 8
+  --world-size 8 \
+  --per-device-batch 2 \
+  --gradient-accumulation-steps 8
 ```
 
 - [ ] **Step 5: Implement the Stage-1 training loop**
@@ -891,19 +902,30 @@ with torch.no_grad():
     future_teacher = teacher.encode_future(batch.future_images)
     current_teacher = teacher.encode_current(batch.current_images)
 losses = compute_baton_planner_loss(
-    planner_output.positive,
-    planner_output.negative,
-    future_teacher,
-    current_teacher,
+    planner_output.positive.float(),
+    planner_output.negative.float(),
+    future_teacher.float(),
+    current_teacher.float(),
 )
 with accelerator.accumulate(planner):
     accelerator.backward(losses.total)
     optimizer.step()
-    scheduler.step()
+    if accelerator.sync_gradients:
+        scheduler.step()
     optimizer.zero_grad()
 ```
 
-Configure `Accelerator(gradient_accumulation_steps=config.gradient_accumulation_steps)` so loss normalization occurs once inside `accelerator.accumulate`; do not divide the loss manually. Log total loss plus all four components, per-camera/per-keyframe MSE and cosine, counterfactual ranking accuracy, throughput, data time, Qwen time, teacher time, Query Tower time, and backward time. Save model tensors in safetensors plus metadata JSON, optimizer/scheduler states, distributed cursor, and per-rank RNG state every `5,000` optimizer steps.
+Configure a `GradientAccumulationPlugin` with
+`sync_with_dataloader=False`, and keep the raw scheduler outside
+`Accelerator.prepare`, so loss normalization and scheduler advancement each
+occur exactly once per complete optimizer update, including across epoch
+tails. Aggregate and rank-reduce every microbatch in the accumulation window,
+then write rank-zero JSONL metrics with full-window throughput and timings.
+Save model tensors in safetensors plus metadata JSON, optimizer/scheduler
+states, distributed cursor, and per-rank RNG state every `5,000` optimizer
+steps. Validate resume provenance, sampler contract, CUDA RNG restoratability,
+ordered optimizer identity, and exact scheduler contract before model or
+optimizer preparation/mutation.
 
 - [ ] **Step 6: Implement fixed launchers**
 
@@ -1311,7 +1333,7 @@ def test_tiny_pipeline_runs_all_three_stages(tmp_path: Path) -> None:
     assert result.stage3.condition_source == "prediction"
 ```
 
-Use tiny Qwen/SigLIP/LTX modules with production tensor contracts; do not download or claim validation of 4B weights in this unit test.
+Use tiny Qwen/SigLIP/LTX modules with production tensor contracts; do not download or claim validation of 2B weights in this unit test.
 
 - [ ] **Step 2: Add a two-rank smoke entrypoint**
 
@@ -1382,7 +1404,7 @@ python ge_act/scripts/preflight_ltx_siglip2.py \
   --world-size 8
 ```
 
-Expected: all local artifacts and contracts validate. A live 4B forward or eight-GPU run is reported only after it actually executes.
+Expected: all local artifacts and contracts validate. A live 2B forward or eight-GPU run is reported only after it actually executes.
 
 - [ ] **Step 7: Commit the final verification gates**
 
@@ -1404,11 +1426,12 @@ git commit -m "test: verify Baton planner curriculum end to end"
 - [ ] Query self-attention and query-to-Qwen attention are block-causal.
 - [ ] Teacher features are online, penultimate-layer, detached, and never cached.
 - [ ] MSE, cosine, delta, and same-suite instruction counterfactual objectives match the approved equations and weights.
-- [ ] Only Query Tower, Sem-MLP, plan-token adapter, Qwen vision, and top-eight language layers train in Stage 1.
+- [ ] Only Query Tower, Sem-MLP, plan-token adapter, Qwen vision, and language
+      layers `16..23` train in Stage 1.
 - [ ] Stage 2 uses online teacher features and Stage 3 uses frozen predicted features.
 - [ ] GE-Act consumes all `1024` tokens per camera with exact patch-center coordinates and no relevance bias.
 - [ ] Global batch, learning rates, step counts, and `5,000`-step save cadence match the approved design.
 - [ ] Continuous checkpoints reject legacy TA-Tok metadata and validate all provenance fields.
 - [ ] Exact resume passes after a mid-epoch, accumulated-gradient interruption.
 - [ ] Existing Qwen3-VL-2B, `qwen35_planx`, HDF5, and GE-Act no-condition regressions pass.
-- [ ] Live 4B/eight-GPU success is not claimed from tiny or static tests.
+- [ ] Live 2B/eight-GPU success is not claimed from tiny or static tests.

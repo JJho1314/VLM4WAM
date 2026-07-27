@@ -24,10 +24,13 @@ export HF_DATASETS_OFFLINE=1
 
 "${PYTHON_BIN}" -m qwen35_baton.cli.preflight \
   --config "${CONFIG}" \
-  --world-size "${NUM_GPUS}"
+  --world-size "${NUM_GPUS}" \
+  --per-device-batch "${PER_DEVICE_BATCH}" \
+  --gradient-accumulation-steps "${GRAD_ACCUM}"
 "${PYTHON_BIN}" -m torch.distributed.run \
   --standalone \
   --nproc_per_node="${NUM_GPUS}" \
   -m qwen35_baton.cli.train_semantic_planner \
   --config "${CONFIG}" \
+  --per-device-batch "${PER_DEVICE_BATCH}" \
   --gradient-accumulation-steps "${GRAD_ACCUM}"

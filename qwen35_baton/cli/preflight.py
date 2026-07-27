@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 import json
 from pathlib import Path
 from typing import Any
 
-from qwen35_baton.hashing import sha256_file
+from qwen35_baton.hashing import sha256_artifact, sha256_file
 from qwen35_baton.sequence import ADDED_TOKENS
 
 
@@ -39,7 +40,13 @@ def _validate_qwen_config(path: Path) -> None:
         payload.get("model_type") == "qwen3_5"
         and isinstance(text_config, Mapping)
         and text_config.get("model_type") == "qwen3_5_text"
-        and text_config.get("num_hidden_layers") == 36
+        and text_config.get("num_hidden_layers") == 24
+        and text_config.get("hidden_size") == 2048
+        and text_config.get("intermediate_size") == 6144
+        and isinstance(payload.get("vision_config"), Mapping)
+        and payload["vision_config"].get("depth") == 24
+        and payload["vision_config"].get("hidden_size") == 1024
+        and payload["vision_config"].get("out_hidden_size") == 2048
         and isinstance(architecture, list)
         and architecture == ["Qwen3_5ForConditionalGeneration"]
         and "moe" not in json.dumps(payload).lower()
@@ -47,7 +54,7 @@ def _validate_qwen_config(path: Path) -> None:
     )
     if not dense:
         raise ValueError(
-            "local Qwen config must identify the dense Qwen3.5-4B "
+            "local Qwen config must identify the dense Qwen3.5-2B "
             "conditional-generation model"
         )
 
@@ -95,15 +102,23 @@ def _added_token_ids(path: Path) -> tuple[int, ...]:
 
 
 def _siglip_geometry(path: Path) -> dict[str, int]:
-    payload = _load_json(path / "config.json", label="local SigLIP2 config")
-    vision = payload.get("vision_config")
-    if not isinstance(vision, Mapping):
+    try:
+        from transformers import AutoConfig
+
+        resolved = AutoConfig.from_pretrained(path, local_files_only=True)
+    except Exception as error:
+        raise ValueError(f"local SigLIP2 config is invalid: {path}") from error
+    if getattr(resolved, "model_type", None) != "siglip2":
+        raise ValueError("local SigLIP2 config must have model_type 'siglip2'")
+    vision = getattr(resolved, "vision_config", None)
+    if vision is None:
         raise ValueError("local SigLIP2 config is missing vision_config")
     expected = {"image_size": 256, "patch_size": 16, "hidden_size": 1024}
     for name, value in expected.items():
-        if vision.get(name) != value:
+        actual = getattr(vision, name, None)
+        if actual != value:
             raise ValueError(
-                f"local SigLIP2 {name} must be {value}, got {vision.get(name)!r}"
+                f"local SigLIP2 {name} must be {value}, got {actual!r}"
             )
     return expected
 
@@ -168,6 +183,18 @@ def preflight_stage1(
     _validate_processor(processor)
     token_ids = _added_token_ids(tokenizer)
     geometry = _siglip_geometry(siglip)
+    actual_siglip_config_hash = sha256_file(siglip / "config.json")
+    if actual_siglip_config_hash != config.siglip2_config_hash:
+        raise ValueError(
+            "SigLIP2 config hash mismatch: "
+            f"expected {config.siglip2_config_hash}, got {actual_siglip_config_hash}"
+        )
+    actual_siglip_artifact_hash = sha256_artifact(siglip)
+    if actual_siglip_artifact_hash != config.siglip2_artifact_hash:
+        raise ValueError(
+            "SigLIP2 artifact hash mismatch: "
+            f"expected {config.siglip2_artifact_hash}, got {actual_siglip_artifact_hash}"
+        )
     actual_manifest_hash = sha256_file(manifest)
     if actual_manifest_hash != config.hdf5_manifest_hash:
         raise ValueError(
@@ -188,9 +215,11 @@ def preflight_stage1(
     return {
         "tiny_test": False,
         "global_batch": global_batch,
-        "qwen_backbone": "dense Qwen3.5-4B",
+        "qwen_backbone": "dense Qwen3.5-2B",
         "added_token_ids": token_ids,
         "siglip2_geometry": geometry,
+        "siglip2_config_hash": actual_siglip_config_hash,
+        "siglip2_artifact_hash": actual_siglip_artifact_hash,
         "hdf5_manifest_hash": actual_manifest_hash,
     }
 
@@ -199,12 +228,26 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--world-size", type=int, required=True)
+    parser.add_argument("--per-device-batch", type=int)
+    parser.add_argument("--gradient-accumulation-steps", type=int)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    report = preflight_stage1(args.config, world_size=args.world_size)
+    from qwen35_baton.cli.train_semantic_planner import Stage1TrainingConfig
+
+    config = Stage1TrainingConfig.from_json(args.config)
+    overrides = {}
+    if args.per_device_batch is not None:
+        overrides["per_device_batch"] = args.per_device_batch
+    if args.gradient_accumulation_steps is not None:
+        overrides["gradient_accumulation_steps"] = (
+            args.gradient_accumulation_steps
+        )
+    if overrides:
+        config = replace(config, **overrides)
+    report = preflight_stage1(config, world_size=args.world_size)
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 

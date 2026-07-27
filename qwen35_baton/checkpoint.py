@@ -230,6 +230,25 @@ def restore_rank_rng_state(state: Mapping[str, Any]) -> None:
     )
 
 
+def _validate_cuda_rng_runtime(state: Mapping[str, Any]) -> None:
+    """Prove saved CUDA streams are restorable without mutating global RNG."""
+
+    cuda_states = state["torch_cuda"]
+    if cuda_states and not torch.cuda.is_available():
+        raise ValueError("checkpoint contains CUDA RNG streams but CUDA is unavailable")
+    runtime_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if len(cuda_states) != runtime_count:
+        raise ValueError("checkpoint CUDA RNG stream count differs from runtime")
+    for index, saved_state in enumerate(cuda_states):
+        try:
+            temporary = torch.Generator(device=f"cuda:{index}")
+            temporary.set_state(saved_state)
+        except Exception as error:
+            raise ValueError(
+                f"checkpoint CUDA RNG state is invalid for runtime device {index}"
+            ) from error
+
+
 def _json_write(path: Path, payload: Any) -> None:
     with path.open("w", encoding="utf-8") as stream:
         json.dump(payload, stream, indent=2, sort_keys=True, allow_nan=False)
@@ -253,8 +272,6 @@ def _fsync_directory(path: Path) -> None:
 
 def _optimizer_topology(
     optimizer_state: Mapping[str, Any],
-    *,
-    runtime_groups: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     groups = optimizer_state.get("param_groups")
     slots = optimizer_state.get("state")
@@ -264,27 +281,24 @@ def _optimizer_topology(
     for index, group in enumerate(groups):
         if not isinstance(group, Mapping) or not isinstance(group.get("params"), list):
             raise ValueError("optimizer state topology is invalid")
-        runtime_group = None if runtime_groups is None else runtime_groups[index]
         parameter_shapes = []
         for position, identifier in enumerate(group["params"]):
-            shape = None
-            if runtime_group is not None:
-                parameters = runtime_group.get("params")
-                if not isinstance(parameters, list) or position >= len(parameters):
-                    raise ValueError("optimizer group topology differs from runtime")
-                parameter = parameters[position]
-                if not isinstance(parameter, torch.Tensor):
-                    raise ValueError("optimizer runtime group contains a non-tensor")
-                shape = list(parameter.shape)
+            names = group.get("parameter_names")
+            shapes = group.get("parameter_shapes")
+            dtypes = group.get("parameter_dtypes")
+            if (
+                not isinstance(names, list)
+                or not isinstance(shapes, list)
+                or not isinstance(dtypes, list)
+                or not len(names) == len(shapes) == len(dtypes) == len(group["params"])
+            ):
+                raise ValueError(
+                    "optimizer parameter names/shapes/dtypes topology is invalid"
+                )
+            shape = shapes[position]
             slot = slots.get(identifier, {})
             if not isinstance(slot, Mapping):
                 raise ValueError("optimizer slot topology is invalid")
-            if shape is None:
-                for slot_name in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
-                    value = slot.get(slot_name)
-                    if isinstance(value, torch.Tensor):
-                        shape = list(value.shape)
-                        break
             slot_shapes = {
                 name: (
                     {"shape": list(value.shape), "dtype": str(value.dtype)}
@@ -293,7 +307,14 @@ def _optimizer_topology(
                 )
                 for name, value in sorted(slot.items())
             }
-            parameter_shapes.append({"shape": shape, "slots": slot_shapes})
+            parameter_shapes.append(
+                {
+                    "name": names[position],
+                    "shape": shape,
+                    "dtype": dtypes[position],
+                    "slots": slot_shapes,
+                }
+            )
         topology.append(
             {
                 "name": group.get("name"),
@@ -302,7 +323,72 @@ def _optimizer_topology(
                 "parameters": parameter_shapes,
             }
         )
+    names = [
+        parameter["name"]
+        for group in topology
+        for parameter in group["parameters"]
+    ]
+    if (
+        any(not isinstance(name, str) or not name for name in names)
+        or len(names) != len(set(names))
+    ):
+        raise ValueError("optimizer parameter names must be canonical and unique")
     return topology
+
+
+def _optimizer_parameter_contract(
+    planner: nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> list[dict[str, list[Any]]]:
+    aliases: dict[int, list[str]] = {}
+    for name, parameter in planner.named_parameters(remove_duplicate=False):
+        aliases.setdefault(id(parameter), []).append(name)
+    contracts: list[dict[str, list[Any]]] = []
+    seen: set[int] = set()
+    for group in optimizer.param_groups:
+        names: list[str] = []
+        shapes: list[list[int]] = []
+        dtypes: list[str] = []
+        for parameter in group["params"]:
+            if not isinstance(parameter, nn.Parameter):
+                raise ValueError("optimizer runtime group contains a non-parameter")
+            identifier = id(parameter)
+            if identifier in seen:
+                raise ValueError("optimizer parameters must be unique across groups")
+            seen.add(identifier)
+            parameter_aliases = aliases.get(identifier, [])
+            if len(parameter_aliases) != 1:
+                raise ValueError(
+                    "optimizer parameter names must be canonical and unique"
+                )
+            names.append(parameter_aliases[0])
+            shapes.append(list(parameter.shape))
+            dtypes.append(str(parameter.dtype))
+        contracts.append(
+            {
+                "parameter_names": names,
+                "parameter_shapes": shapes,
+                "parameter_dtypes": dtypes,
+            }
+        )
+    return contracts
+
+
+def _annotate_optimizer_state(
+    optimizer_state: dict[str, Any],
+    *,
+    planner: nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> None:
+    groups = optimizer_state.get("param_groups")
+    if not isinstance(groups, list) or len(groups) != len(optimizer.param_groups):
+        raise ValueError("optimizer group topology differs from runtime")
+    contracts = _optimizer_parameter_contract(planner, optimizer)
+    for group, live_group, contract in zip(
+        groups, optimizer.param_groups, contracts
+    ):
+        group.update(contract)
+        live_group.update(contract)
 
 
 def _scheduler_topology(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -318,9 +404,63 @@ def _scheduler_topology(state: Mapping[str, Any]) -> dict[str, Any]:
             return {"tuple": [describe(item) for item in value]}
         if isinstance(value, Mapping):
             return {str(key): describe(item) for key, item in sorted(value.items())}
-        return type(value).__name__
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        return {"type": type(value).__name__}
 
     return {str(key): describe(value) for key, value in sorted(state.items())}
+
+
+def _validate_scheduler_state_values(state: Mapping[str, Any]) -> None:
+    contract = state.get("baton_contract")
+    if not isinstance(contract, Mapping) or set(contract) != {
+        "schedule_type",
+        "warmup_steps",
+        "max_steps",
+        "base_lrs",
+    }:
+        raise ValueError("scheduler contract is missing or invalid")
+    warmup_steps = contract["warmup_steps"]
+    max_steps = contract["max_steps"]
+    base_lrs = contract["base_lrs"]
+    last_epoch = state.get("last_epoch")
+    current_lrs = state.get("_last_lr")
+    if (
+        contract["schedule_type"] != "linear_warmup_cosine_v1"
+        or type(warmup_steps) is not int
+        or type(max_steps) is not int
+        or warmup_steps < 0
+        or max_steps <= warmup_steps
+        or not isinstance(base_lrs, list)
+        or not base_lrs
+        or any(type(value) not in (int, float) or value <= 0 for value in base_lrs)
+        or state.get("base_lrs") != base_lrs
+        or type(last_epoch) is not int
+        or last_epoch < 0
+        or not isinstance(current_lrs, list)
+        or len(current_lrs) != len(base_lrs)
+    ):
+        raise ValueError("scheduler contract or current LR state is invalid")
+    if warmup_steps and last_epoch <= warmup_steps:
+        multiplier = float(last_epoch) / float(warmup_steps)
+    else:
+        progress = min(
+            1.0,
+            max(
+                0.0,
+                float(last_epoch - warmup_steps)
+                / float(max_steps - warmup_steps),
+            ),
+        )
+        multiplier = 0.5 * (1.0 + math.cos(math.pi * progress))
+    for base_lr, current_lr in zip(base_lrs, current_lrs):
+        if not math.isclose(
+            float(current_lr),
+            float(base_lr) * multiplier,
+            rel_tol=1e-12,
+            abs_tol=1e-15,
+        ):
+            raise ValueError("scheduler current LR differs from its saved contract")
 
 
 def _normalized_rank_states(
@@ -410,7 +550,13 @@ def save_baton_checkpoint(
             metadata={"format": BatonCheckpointMetadata.ARCHITECTURE_KIND},
         )
         optimizer_state = optimizer.state_dict()
+        _annotate_optimizer_state(
+            optimizer_state,
+            planner=planner,
+            optimizer=optimizer,
+        )
         scheduler_state = scheduler.state_dict()
+        _validate_scheduler_state_values(scheduler_state)
         torch.save(optimizer_state, staging / "optimizer.pt")
         torch.save(scheduler_state, staging / "scheduler.pt")
         torch.save(
@@ -533,6 +679,7 @@ def _validate_optimizer_runtime(
     saved: Mapping[str, Any],
     optimizer: torch.optim.Optimizer,
     *,
+    planner: nn.Module,
     expected_hash: str,
 ) -> None:
     runtime_state = optimizer.state_dict()
@@ -545,8 +692,12 @@ def _validate_optimizer_runtime(
         or len(saved_groups) != len(optimizer.param_groups)
     ):
         raise ValueError("optimizer group topology differs from runtime")
-    for saved_group, runtime_group, live_group in zip(
-        saved_groups, runtime_groups, optimizer.param_groups
+    runtime_contracts = _optimizer_parameter_contract(planner, optimizer)
+    for saved_group, runtime_group, live_group, runtime_contract in zip(
+        saved_groups,
+        runtime_groups,
+        optimizer.param_groups,
+        runtime_contracts,
     ):
         if (
             saved_group.get("name") != runtime_group.get("name")
@@ -556,6 +707,16 @@ def _validate_optimizer_runtime(
             != float(runtime_group.get("initial_lr", runtime_group.get("lr", 0.0)))
         ):
             raise ValueError("optimizer group topology differs from runtime")
+        for field in (
+            "parameter_names",
+            "parameter_shapes",
+            "parameter_dtypes",
+        ):
+            if saved_group.get(field) != runtime_contract[field]:
+                raise ValueError(
+                    "optimizer parameter names, order, shape, or dtype "
+                    "differs from runtime"
+                )
     actual_hash = sha256_json(_optimizer_topology(saved))
     if actual_hash != expected_hash:
         raise ValueError("optimizer topology hash differs from checkpoint metadata")
@@ -586,10 +747,14 @@ def _validate_scheduler_runtime(
     *,
     expected_hash: str,
 ) -> None:
+    _validate_scheduler_state_values(saved)
     if sha256_json(_scheduler_topology(saved)) != expected_hash:
         raise ValueError("scheduler topology hash differs from checkpoint metadata")
     runtime = scheduler.state_dict()
-    if _scheduler_topology(saved) != _scheduler_topology(runtime):
+    _validate_scheduler_state_values(runtime)
+    if saved.get("baton_contract") != runtime.get("baton_contract"):
+        raise ValueError("scheduler contract differs from runtime")
+    if set(saved) != set(runtime):
         raise ValueError("scheduler state topology differs from runtime")
 
 
@@ -646,6 +811,8 @@ def load_baton_checkpoint(
     optimizer: torch.optim.Optimizer | None,
     scheduler: Any | None,
     expected_contract: BatonCheckpointMetadata,
+    expected_sampler_seed: int,
+    expected_microbatches_per_epoch: int,
     scaler: Any | None = None,
     distributed_rank: int | None = None,
     world_size: int | None = None,
@@ -688,6 +855,14 @@ def load_baton_checkpoint(
     cursor = BatonTrainingCursor.from_dict(
         _load_json(checkpoint / "cursor.json", label="cursor")
     )
+    if cursor.sampler_seed != expected_sampler_seed:
+        raise ValueError(
+            "checkpoint sampler seed differs from runtime data contract"
+        )
+    if cursor.microbatches_per_epoch != expected_microbatches_per_epoch:
+        raise ValueError(
+            "checkpoint microbatches per epoch differs from runtime data contract"
+        )
     rng_payload = torch.load(
         checkpoint / "rank_rng.pt", weights_only=True, map_location="cpu"
     )
@@ -719,6 +894,8 @@ def load_baton_checkpoint(
         or not 0 <= distributed_rank < world_size
     ):
         raise ValueError("checkpoint RNG world-size/rank coverage mismatch")
+    selected_rng = rng_payload["states"][distributed_rank]
+    _validate_cuda_rng_runtime(selected_rng)
 
     optimizer_state = torch.load(
         checkpoint / "optimizer.pt", weights_only=True, map_location="cpu"
@@ -733,6 +910,7 @@ def load_baton_checkpoint(
         raise ValueError("optimizer state topology is invalid")
     if not isinstance(scheduler_state, Mapping):
         raise ValueError("scheduler state topology is invalid")
+    _validate_persisted_steps(optimizer_state, scheduler_state, cursor)
     optimizer_hash = sha256_json(
         _optimizer_topology(optimizer_state)
     )
@@ -743,7 +921,6 @@ def load_baton_checkpoint(
         != metadata.scheduler_topology_hash
     ):
         raise ValueError("scheduler topology hash differs from checkpoint metadata")
-    _validate_persisted_steps(optimizer_state, scheduler_state, cursor)
     _validate_model_topology(checkpoint, planner)
     if optimizer is None:
         if optimizer_state.get("state") or optimizer_state.get("param_groups"):
@@ -752,6 +929,7 @@ def load_baton_checkpoint(
         _validate_optimizer_runtime(
             optimizer_state,
             optimizer,
+            planner=planner,
             expected_hash=metadata.optimizer_topology_hash,
         )
     if scheduler is not None:
@@ -770,7 +948,6 @@ def load_baton_checkpoint(
         scheduler.load_state_dict(scheduler_state)
     if scaler is not None:
         scaler.load_state_dict(scaler_state["state_dict"])
-    selected_rng = rng_payload["states"][distributed_rank]
     restore_rank_rng_state(selected_rng)
     return BatonResumeState(
         metadata=metadata,

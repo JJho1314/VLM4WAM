@@ -106,7 +106,7 @@ class BatonCheckpointMetadata:
 
     FORMAT_VERSION: ClassVar[int] = 1
     ARCHITECTURE_KIND: ClassVar[str] = "qwen35_baton_continuous"
-    QWEN_BACKBONE: ClassVar[str] = "dense Qwen3.5-4B"
+    QWEN_BACKBONE: ClassVar[str] = "dense Qwen3.5-2B"
     SIGLIP2_MODEL: ClassVar[str] = "SigLIP2-large-patch16-256"
     QUERY_NORM_STYLE: ClassVar[str] = "pre_norm"
     _REQUIRED_FIELDS: ClassVar[tuple[str, ...]] = (
@@ -122,6 +122,7 @@ class BatonCheckpointMetadata:
         "camera_names",
         "camera_flattening",
         "siglip2_model",
+        "siglip2_config_hash",
         "siglip2_artifact_hash",
         "teacher_image_size",
         "teacher_patch_size",
@@ -151,6 +152,7 @@ class BatonCheckpointMetadata:
         "tokenizer_hash",
         "processor_hash",
         "input_template_hash",
+        "siglip2_config_hash",
         "siglip2_artifact_hash",
         "teacher_preprocessing_hash",
         "hdf5_manifest_hash",
@@ -171,6 +173,7 @@ class BatonCheckpointMetadata:
     camera_names: tuple[str, ...]
     camera_flattening: str
     siglip2_model: str
+    siglip2_config_hash: str
     siglip2_artifact_hash: str
     teacher_image_size: int
     teacher_patch_size: int
@@ -231,7 +234,11 @@ class BatonCheckpointMetadata:
         _require_equal("query_dropout", self.query_dropout, geometry.query_dropout)
         _require_equal("query_norm_style", self.query_norm_style, self.QUERY_NORM_STYLE)
         _require_equal("query_mask_version", self.query_mask_version, "block_causal_v1")
-        _require_equal("trainable_qwen_layer_indices", self.trainable_qwen_layer_indices, tuple(range(28, 36)))
+        _require_equal(
+            "trainable_qwen_layer_indices",
+            self.trainable_qwen_layer_indices,
+            tuple(range(16, 24)),
+        )
         if not isinstance(self.loss_weights, BatonLossWeights):
             raise ValueError("loss_weights must be BatonLossWeights")
         if self.global_step < 0:
@@ -268,6 +275,7 @@ class BatonCheckpointMetadata:
             camera_names=geometry.camera_names,
             camera_flattening="sample_major",
             siglip2_model=cls.SIGLIP2_MODEL,
+            siglip2_config_hash=_example_sha256("siglip2-config"),
             siglip2_artifact_hash=_example_sha256("siglip2-artifact"),
             teacher_image_size=geometry.image_size,
             teacher_patch_size=geometry.patch_size,
@@ -283,7 +291,7 @@ class BatonCheckpointMetadata:
             query_dropout=geometry.query_dropout,
             query_norm_style=cls.QUERY_NORM_STYLE,
             query_mask_version="block_causal_v1",
-            trainable_qwen_layer_indices=tuple(range(28, 36)),
+            trainable_qwen_layer_indices=tuple(range(16, 24)),
             loss_weights=BatonLossWeights(),
             hdf5_manifest_hash=_example_sha256("hdf5-manifest"),
             optimizer_topology_hash=_example_sha256("optimizer-topology"),

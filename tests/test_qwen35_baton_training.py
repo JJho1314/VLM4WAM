@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import random
 import subprocess
 from types import SimpleNamespace
 from typing import Any
@@ -72,23 +73,29 @@ class _TinyPlanner(nn.Module):
 
 
 class _TinyTeacher:
-    def __init__(self, *, nonfinite: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        nonfinite: bool = False,
+        output_dtype: torch.dtype = torch.float32,
+    ) -> None:
         self.model = nn.Linear(1, 1)
         with torch.no_grad():
             self.model.weight.fill_(1)
             self.model.bias.zero_()
         self.model.requires_grad_(False)
         self.nonfinite = nonfinite
+        self.output_dtype = output_dtype
 
     def encode_future(self, images: torch.Tensor) -> torch.Tensor:
         result = self.model(images)
         if self.nonfinite:
             result = result.clone()
             result.flatten()[0] = float("inf")
-        return result
+        return result.to(self.output_dtype)
 
     def encode_current(self, images: torch.Tensor) -> torch.Tensor:
-        return self.model(images)
+        return self.model(images).to(self.output_dtype)
 
 
 @dataclass(frozen=True)
@@ -124,6 +131,8 @@ def _config(
         qwen_processor_path="unused",
         qwen_tokenizer_path="unused",
         siglip2_model_path="unused",
+        siglip2_config_hash="0" * 64,
+        siglip2_artifact_hash="0" * 64,
         hdf5_manifest_path="unused",
         hdf5_manifest_hash="0" * 64,
         dataset_statistics_path="unused",
@@ -140,7 +149,12 @@ def _config(
     )
 
 
-def _artifacts(config: Stage1TrainingConfig, *, nonfinite: bool = False):
+def _artifacts(
+    config: Stage1TrainingConfig,
+    *,
+    nonfinite: bool = False,
+    teacher_dtype: torch.dtype = torch.float32,
+):
     torch.manual_seed(2026)
     planner = _TinyPlanner()
     ownership = configure_stage1_trainable_modules(planner)
@@ -149,7 +163,7 @@ def _artifacts(config: Stage1TrainingConfig, *, nonfinite: bool = False):
     scheduler = build_cosine_warmup_scheduler(optimizer, config)
     return Stage1TrainingArtifacts(
         planner=planner,
-        teacher=_TinyTeacher(nonfinite=nonfinite),
+        teacher=_TinyTeacher(nonfinite=nonfinite, output_dtype=teacher_dtype),
         train_batches=_tiny_batches(),
         optimizer=optimizer,
         scheduler=scheduler,
@@ -199,6 +213,19 @@ def test_stage1_optimizer_groups_are_exact_and_exhaustive(tmp_path: Path) -> Non
     ]
     assert len(grouped_ids) == len(set(grouped_ids))
     assert set(grouped_ids) == set(trainable_ids)
+    canonical_names = {
+        id(parameter): name for name, parameter in planner.named_parameters()
+    }
+    for group in groups:
+        assert group["parameter_names"] == [
+            canonical_names[id(parameter)] for parameter in group["params"]
+        ]
+        assert group["parameter_shapes"] == [
+            list(parameter.shape) for parameter in group["params"]
+        ]
+        assert group["parameter_dtypes"] == [
+            str(parameter.dtype) for parameter in group["params"]
+        ]
 
 
 def test_one_tiny_stage1_step_updates_only_owned_parameters(tmp_path: Path) -> None:
@@ -307,6 +334,22 @@ def test_cosine_scheduler_uses_linear_warmup_then_reaches_zero(
     assert multipliers[-1] == pytest.approx(0.0)
 
 
+def test_scheduler_state_carries_the_exact_schedule_contract(tmp_path: Path) -> None:
+    config = _config(tmp_path, max_steps=10)
+    config = Stage1TrainingConfig(**{**config.to_dict(), "warmup_steps": 2})
+    parameter = nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.AdamW([{"params": [parameter], "lr": 5e-5}])
+
+    scheduler = build_cosine_warmup_scheduler(optimizer, config)
+
+    assert scheduler.state_dict()["baton_contract"] == {
+        "schedule_type": "linear_warmup_cosine_v1",
+        "warmup_steps": 2,
+        "max_steps": 10,
+        "base_lrs": [5e-5],
+    }
+
+
 def test_nonfinite_loss_fails_before_optimizer_step(tmp_path: Path) -> None:
     config = _config(tmp_path)
     artifacts = _artifacts(config, nonfinite=True)
@@ -317,6 +360,18 @@ def test_nonfinite_loss_fails_before_optimizer_step(tmp_path: Path) -> None:
 
     for name, parameter in artifacts.planner.named_parameters():
         torch.testing.assert_close(parameter.detach(), before[name], rtol=0, atol=0)
+
+
+def test_training_promotes_bf16_teacher_targets_for_fp32_planner_loss(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    artifacts = _artifacts(config, teacher_dtype=torch.bfloat16)
+
+    result = run_training(config, artifacts=artifacts)
+
+    assert result.global_step == 1
+    assert torch.isfinite(torch.tensor(result.last_metrics["loss/total"]))
 
 
 def test_training_prepares_the_dataloader_for_distributed_rank_sharding(
@@ -331,14 +386,42 @@ def test_training_prepares_the_dataloader_for_distributed_rank_sharding(
         batch_size=None,
         collate_fn=lambda sample: sample,
     )
-    original_prepare = Accelerator.prepare
+    original_prepare_data_loader = Accelerator.prepare_data_loader
     prepared_dataloader = []
 
+    def recording_prepare_data_loader(
+        self: Accelerator,
+        data_loader: torch.utils.data.DataLoader,
+        *args: Any,
+        **kwargs: Any,
+    ):
+        prepared_dataloader.append(data_loader)
+        return original_prepare_data_loader(self, data_loader, *args, **kwargs)
+
+    monkeypatch.setattr(
+        Accelerator, "prepare_data_loader", recording_prepare_data_loader
+    )
+
+    run_training(config, artifacts=artifacts)
+
+    assert prepared_dataloader == [artifacts.train_batches]
+
+
+def test_training_keeps_scheduler_outside_accelerate_prepare(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from accelerate import Accelerator
+
+    config = _config(tmp_path)
+    artifacts = _artifacts(config)
+    original_prepare = Accelerator.prepare
+    prepared_schedulers = []
+
     def recording_prepare(self: Accelerator, *args: Any, **kwargs: Any):
-        prepared_dataloader.extend(
+        prepared_schedulers.extend(
             value
             for value in args
-            if isinstance(value, torch.utils.data.DataLoader)
+            if isinstance(value, torch.optim.lr_scheduler.LRScheduler)
         )
         return original_prepare(self, *args, **kwargs)
 
@@ -346,7 +429,61 @@ def test_training_prepares_the_dataloader_for_distributed_rank_sharding(
 
     run_training(config, artifacts=artifacts)
 
-    assert prepared_dataloader == [artifacts.train_batches]
+    assert prepared_schedulers == []
+    assert artifacts.scheduler.last_epoch == 1
+
+
+def test_epoch_tail_does_not_force_a_partial_accumulation_update(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, max_steps=2, save_every=2)
+    artifacts = _artifacts(config)
+    artifacts.train_batches = torch.utils.data.DataLoader(
+        _tiny_batches(5),
+        batch_size=None,
+        collate_fn=lambda sample: sample,
+    )
+
+    result = run_training(config, artifacts=artifacts)
+
+    assert result.cursor == __import__(
+        "qwen35_baton.checkpoint", fromlist=["BatonTrainingCursor"]
+    ).BatonTrainingCursor(
+        global_step=2,
+        epoch=1,
+        consumed_microbatches=3,
+        microbatches_per_epoch=5,
+        sampler_seed=config.seed,
+    )
+    assert artifacts.scheduler.last_epoch == 2
+
+
+def test_rank_zero_jsonl_metrics_cover_the_full_accumulation_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from accelerate import Accelerator
+
+    config = _config(tmp_path)
+    artifacts = _artifacts(config)
+
+    def unexpected_tracker_log(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("training must not call an unconfigured tracker")
+
+    monkeypatch.setattr(Accelerator, "log", unexpected_tracker_log)
+
+    result = run_training(config, artifacts=artifacts)
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "training_metrics.jsonl").read_text().splitlines()
+    ]
+    assert len(records) == 1
+    assert records[0]["step"] == 1
+    assert records[0]["microbatches"] == 4.0
+    assert records[0]["loss/total"] == pytest.approx(
+        result.last_metrics["loss/total"]
+    )
+    assert records[0]["throughput"] > 0
 
 
 def test_interrupted_non_epoch_boundary_resume_matches_uninterrupted_training(
@@ -406,7 +543,14 @@ def _write_preflight_fixture(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
                 "architectures": ["Qwen3_5ForConditionalGeneration"],
                 "text_config": {
                     "model_type": "qwen3_5_text",
-                    "num_hidden_layers": 36,
+                    "num_hidden_layers": 24,
+                    "hidden_size": 2048,
+                    "intermediate_size": 6144,
+                },
+                "vision_config": {
+                    "depth": 24,
+                    "hidden_size": 1024,
+                    "out_hidden_size": 2048,
                 },
             }
         )
@@ -430,7 +574,6 @@ def _write_preflight_fixture(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
                 "model_type": "siglip2",
                 "vision_config": {
                     "image_size": 256,
-                    "patch_size": 16,
                     "hidden_size": 1024,
                 },
             }
@@ -446,6 +589,10 @@ def _write_preflight_fixture(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
         "qwen_processor_path": str(processor),
         "qwen_tokenizer_path": str(tokenizer),
         "siglip2_model_path": str(siglip),
+        "siglip2_config_hash": sha256_file(siglip / "config.json"),
+        "siglip2_artifact_hash": __import__(
+            "qwen35_baton.hashing", fromlist=["sha256_artifact"]
+        ).sha256_artifact(siglip),
         "hdf5_manifest_path": str(manifest),
         "hdf5_manifest_hash": sha256_file(manifest),
         "dataset_statistics_path": str(dataset / "stats.json"),
@@ -471,7 +618,7 @@ def test_preflight_is_cpu_side_and_validates_local_artifact_contracts(
 
     assert torch.cuda.is_initialized() is cuda_was_initialized
     assert report["global_batch"] == 128
-    assert report["qwen_backbone"] == "dense Qwen3.5-4B"
+    assert report["qwen_backbone"] == "dense Qwen3.5-2B"
     assert report["siglip2_geometry"] == {
         "image_size": 256,
         "patch_size": 16,
@@ -508,7 +655,7 @@ def test_preflight_rejects_dense_qwen_or_siglip_geometry_mismatch(
     qwen_payload = json.loads(qwen_config.read_text())
     qwen_payload["model_type"] = "qwen3_5_moe"
     qwen_config.write_text(json.dumps(qwen_payload))
-    with pytest.raises(ValueError, match="dense Qwen3.5-4B"):
+    with pytest.raises(ValueError, match="dense Qwen3.5-2B"):
         preflight_stage1(config, world_size=8)
 
     qwen_payload["model_type"] = "qwen3_5"
@@ -518,6 +665,17 @@ def test_preflight_rejects_dense_qwen_or_siglip_geometry_mismatch(
     siglip_payload["vision_config"]["patch_size"] = 14
     siglip_config.write_text(json.dumps(siglip_payload))
     with pytest.raises(ValueError, match="patch_size.*16"):
+        preflight_stage1(config, world_size=8)
+
+
+def test_preflight_rejects_siglip_lookalikes_by_exact_hash(
+    tmp_path: Path,
+) -> None:
+    config, payload = _write_preflight_fixture(tmp_path)
+    siglip = Path(payload["siglip2_model_path"])
+    (siglip / "lookalike.bin").write_bytes(b"different artifact")
+
+    with pytest.raises(ValueError, match="SigLIP2 artifact hash mismatch"):
         preflight_stage1(config, world_size=8)
 
 
@@ -623,9 +781,44 @@ def test_stage1_recipe_requirements_and_launchers_are_fixed(tmp_path: Path) -> N
 
     calls = log.read_text().splitlines()
     assert calls[0].startswith("-m qwen35_baton.cli.preflight ")
+    assert "--per-device-batch 32" in calls[0]
+    assert "--gradient-accumulation-steps 2" in calls[0]
     assert calls[1].startswith("-m torch.distributed.run ")
+    assert "--per-device-batch 32" in calls[1]
     assert "--gradient-accumulation-steps 2" in calls[1]
     assert environment["GLOBAL_BATCH"] == "128"
+
+
+def test_production_artifacts_are_constructed_after_global_seeding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import qwen35_baton.cli.preflight as preflight_module
+    import qwen35_baton.cli.train_semantic_planner as training_module
+
+    draws: list[tuple[float, float, float]] = []
+
+    def fake_loader(config: Stage1TrainingConfig) -> Stage1TrainingArtifacts:
+        draws.append(
+            (random.random(), float(__import__("numpy").random.random()), float(torch.rand(())))
+        )
+        return _artifacts(config)
+
+    monkeypatch.setattr(preflight_module, "preflight_stage1", lambda *args, **kwargs: {})
+    monkeypatch.setattr(training_module, "load_local_artifacts", fake_loader)
+    first_config = _config(tmp_path / "first")
+    second_config = Stage1TrainingConfig(
+        **{**first_config.to_dict(), "output_dir": str(tmp_path / "second")}
+    )
+    random.seed(1)
+    __import__("numpy").random.seed(2)
+    torch.manual_seed(3)
+    run_training(first_config)
+    random.seed(101)
+    __import__("numpy").random.seed(102)
+    torch.manual_seed(103)
+    run_training(second_config)
+
+    assert draws[0] == draws[1]
 
 
 def test_launcher_rejects_nondivisible_global_batch_before_preflight(

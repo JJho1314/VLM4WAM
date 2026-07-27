@@ -14,9 +14,10 @@ import torch.nn as nn
 from qwen35_baton.checkpoint import (
     BatonTrainingCursor,
     capture_rank_rng_state,
-    load_baton_checkpoint,
+    load_baton_checkpoint as _load_baton_checkpoint,
     save_baton_checkpoint,
 )
+from qwen35_baton.cli.train_semantic_planner import BatonCosineWarmupScheduler
 from qwen35_baton.config import BatonCheckpointMetadata
 
 
@@ -31,14 +32,20 @@ class _Scaler:
         self.scale = float(state["scale"])
 
 
+def load_baton_checkpoint(*args: Any, **kwargs: Any):
+    kwargs.setdefault("expected_sampler_seed", 41)
+    kwargs.setdefault("expected_microbatches_per_epoch", 11)
+    return _load_baton_checkpoint(*args, **kwargs)
+
+
 def _runtime(seed: int = 7):
     torch.manual_seed(seed)
     planner = nn.Sequential(nn.Linear(2, 3), nn.Dropout(0.2), nn.Linear(3, 1))
     optimizer = torch.optim.AdamW(
         [{"name": "planner", "params": list(planner.parameters()), "lr": 5e-5}]
     )
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda step: 1.0 - min(step, 10) / 10
+    scheduler = BatonCosineWarmupScheduler(
+        optimizer, warmup_steps=0, max_steps=10
     )
     value = planner(torch.tensor([[1.0, -2.0]])).square().mean()
     value.backward()
@@ -127,7 +134,9 @@ def test_zero_step_checkpoint_supports_validated_model_only_loading(
     torch.manual_seed(7)
     planner = nn.Linear(2, 1)
     optimizer = torch.optim.AdamW(planner.parameters(), lr=5e-5)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    scheduler = BatonCosineWarmupScheduler(
+        optimizer, warmup_steps=0, max_steps=10
+    )
     checkpoint = tmp_path / "step_000000"
     cursor = BatonTrainingCursor(
         global_step=0,
@@ -378,6 +387,175 @@ def test_loader_rejects_runtime_rank_or_world_size_mismatch(tmp_path: Path) -> N
             distributed_rank=0,
             world_size=1,
         )
+
+
+def test_loader_rejects_runtime_sampler_contract_before_tensor_loading(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    checkpoint = tmp_path / "step_000001"
+    _save_valid_checkpoint(checkpoint)
+    planner, optimizer, scheduler = _runtime(seed=99)
+    before = _clone_state(planner)
+
+    with pytest.raises(ValueError, match="sampler seed"):
+        _load_baton_checkpoint(
+            checkpoint,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            expected_contract=BatonCheckpointMetadata.example(),
+            expected_sampler_seed=99,
+            expected_microbatches_per_epoch=11,
+        )
+
+    _assert_state_equal(planner.state_dict(), before)
+
+
+def test_loader_rejects_cuda_rng_runtime_before_model_mutation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    checkpoint = tmp_path / "step_000001"
+    planner, optimizer, scheduler = _runtime()
+    rank_state = capture_rank_rng_state(distributed_rank=0)
+    rank_state["torch_cuda"] = [torch.tensor([1, 2, 3], dtype=torch.uint8)]
+    save_baton_checkpoint(
+        checkpoint,
+        planner=planner,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        metadata=BatonCheckpointMetadata.example(),
+        cursor=_cursor(),
+        rank_rng_state={0: rank_state},
+    )
+    runtime, runtime_optimizer, runtime_scheduler = _runtime(seed=99)
+    before = _clone_state(runtime)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    with pytest.raises(ValueError, match="CUDA.*unavailable"):
+        load_baton_checkpoint(
+            checkpoint,
+            planner=runtime,
+            optimizer=runtime_optimizer,
+            scheduler=runtime_scheduler,
+            expected_contract=BatonCheckpointMetadata.example(),
+        )
+
+    _assert_state_equal(runtime.state_dict(), before)
+
+
+def test_loader_rejects_scheduler_recipe_mismatch_before_model_mutation(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step_000001"
+    _save_valid_checkpoint(checkpoint)
+    planner, optimizer, _ = _runtime(seed=99)
+    scheduler = BatonCosineWarmupScheduler(
+        optimizer, warmup_steps=1, max_steps=10
+    )
+    before = _clone_state(planner)
+
+    with pytest.raises(ValueError, match="scheduler contract"):
+        load_baton_checkpoint(
+            checkpoint,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            expected_contract=BatonCheckpointMetadata.example(),
+        )
+
+    _assert_state_equal(planner.state_dict(), before)
+
+
+def test_loader_rejects_scheduler_current_lr_inconsistent_with_recipe(
+    tmp_path: Path,
+) -> None:
+    from qwen35_baton.checkpoint import _scheduler_topology
+    from qwen35_baton.hashing import sha256_file, sha256_json
+
+    checkpoint = tmp_path / "step_000001"
+    _save_valid_checkpoint(checkpoint)
+    scheduler_state = torch.load(
+        checkpoint / "scheduler.pt", weights_only=True, map_location="cpu"
+    )
+    scheduler_state["_last_lr"][0] *= 0.5
+    torch.save(scheduler_state, checkpoint / "scheduler.pt")
+    metadata = json.loads((checkpoint / "metadata.json").read_text())
+    metadata["scheduler_topology_hash"] = sha256_json(
+        _scheduler_topology(scheduler_state)
+    )
+    (checkpoint / "metadata.json").write_text(json.dumps(metadata))
+    manifest = json.loads((checkpoint / "manifest.json").read_text())
+    manifest["files"]["scheduler.pt"] = sha256_file(checkpoint / "scheduler.pt")
+    manifest["files"]["metadata.json"] = sha256_file(checkpoint / "metadata.json")
+    (checkpoint / "manifest.json").write_text(json.dumps(manifest))
+    planner, optimizer, scheduler = _runtime(seed=99)
+    before = _clone_state(planner)
+
+    with pytest.raises(ValueError, match="scheduler current LR"):
+        load_baton_checkpoint(
+            checkpoint,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            expected_contract=BatonCheckpointMetadata.example(),
+        )
+
+    _assert_state_equal(planner.state_dict(), before)
+
+
+def test_loader_rejects_same_shaped_optimizer_parameter_reordering(
+    tmp_path: Path,
+) -> None:
+    class _SameShapePlanner(nn.Module):
+        def __init__(self, seed: int) -> None:
+            super().__init__()
+            generator = torch.Generator().manual_seed(seed)
+            self.first = nn.Parameter(torch.randn(2, generator=generator))
+            self.second = nn.Parameter(torch.randn(2, generator=generator))
+
+        def forward(self) -> torch.Tensor:
+            return (self.first + self.second).square().mean()
+
+    checkpoint = tmp_path / "step_000001"
+    source = _SameShapePlanner(1)
+    source_optimizer = torch.optim.AdamW(
+        [{"name": "planner", "params": [source.first, source.second], "lr": 5e-5}]
+    )
+    source_scheduler = BatonCosineWarmupScheduler(
+        source_optimizer, warmup_steps=0, max_steps=10
+    )
+    source().backward()
+    source_optimizer.step()
+    source_scheduler.step()
+    source_optimizer.zero_grad(set_to_none=True)
+    save_baton_checkpoint(
+        checkpoint,
+        planner=source,
+        optimizer=source_optimizer,
+        scheduler=source_scheduler,
+        metadata=BatonCheckpointMetadata.example(),
+        cursor=_cursor(),
+        rank_rng_state={0: capture_rank_rng_state(distributed_rank=0)},
+    )
+    runtime = _SameShapePlanner(2)
+    runtime_optimizer = torch.optim.AdamW(
+        [{"name": "planner", "params": [runtime.second, runtime.first], "lr": 5e-5}]
+    )
+    runtime_scheduler = BatonCosineWarmupScheduler(
+        runtime_optimizer, warmup_steps=0, max_steps=10
+    )
+    before = _clone_state(runtime)
+
+    with pytest.raises(ValueError, match="parameter names|parameter order"):
+        load_baton_checkpoint(
+            checkpoint,
+            planner=runtime,
+            optimizer=runtime_optimizer,
+            scheduler=runtime_scheduler,
+            expected_contract=BatonCheckpointMetadata.example(),
+        )
+
+    _assert_state_equal(runtime.state_dict(), before)
 
 
 def test_loader_rejects_cursor_metadata_inconsistency_before_mutation(

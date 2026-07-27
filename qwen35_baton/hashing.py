@@ -33,3 +33,25 @@ def sha256_file(path: str | PathLike[str], chunk_size: int = 1024 * 1024) -> str
         for chunk in iter(lambda: handle.read(chunk_size), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def sha256_artifact(path: str | PathLike[str]) -> str:
+    """Hash a file or an immutable directory tree including relative paths."""
+
+    artifact = Path(path)
+    if artifact.is_file():
+        return sha256_file(artifact)
+    if not artifact.is_dir():
+        raise FileNotFoundError(artifact)
+    entries = [
+        (
+            child.relative_to(artifact).as_posix(),
+            child.stat().st_size,
+            sha256_file(child),
+        )
+        for child in sorted(artifact.rglob("*"))
+        if child.is_file()
+    ]
+    if not entries:
+        raise ValueError(f"artifact directory is empty: {artifact}")
+    return sha256_json(entries)

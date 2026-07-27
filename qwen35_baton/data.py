@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import random
 from typing import Any, Mapping, Sequence
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
@@ -87,11 +89,19 @@ class BatonLiberoDataset(Dataset[dict[str, Any]]):
         self.seed = seed
         self.geometry = geometry
         self.n_previous = n_previous
+        self._shared_epoch = torch.zeros((), dtype=torch.int64).share_memory_()
 
     def __len__(self) -> int:
         return len(self.base_dataset)
 
-    def _record_for_index(self, index: int) -> Any:
+    def set_epoch(self, epoch: int) -> None:
+        """Publish the current sampler epoch to persistent worker processes."""
+
+        if type(epoch) is not int or epoch < 0:
+            raise ValueError("dataset epoch must be a non-negative integer")
+        self._shared_epoch.fill_(epoch)
+
+    def _source_index(self, index: int) -> int:
         selected = getattr(self.base_dataset, "fix_epiidx", None)
         if selected is None:
             selected = index
@@ -101,7 +111,10 @@ class BatonLiberoDataset(Dataset[dict[str, Any]]):
             selected += len(self.records)
         if selected < 0 or selected >= len(self.records):
             raise IndexError("base dataset selected index is outside manifest records")
-        return self.records[selected]
+        return selected
+
+    def _record_for_index(self, index: int) -> Any:
+        return self.records[self._source_index(index)]
 
     def _negative_instruction(self, record: Any) -> str:
         candidates = tuple(
@@ -119,8 +132,34 @@ class BatonLiberoDataset(Dataset[dict[str, Any]]):
         choice = int.from_bytes(hashlib.sha256(payload).digest(), "big")
         return candidates[choice % len(candidates)]
 
+    def _load_base_sample(self, index: int) -> Any:
+        """Run legacy stochastic transforms in an epoch/index-local RNG scope."""
+
+        source_index = self._source_index(index)
+        epoch = int(self._shared_epoch.item())
+        seed_payload = json.dumps(
+            (self.seed, epoch, source_index),
+            separators=(",", ":"),
+        ).encode("utf-8")
+        sample_seed = int.from_bytes(
+            hashlib.sha256(seed_payload).digest()[:8], "big"
+        )
+        python_state = random.getstate()
+        numpy_state = np.random.get_state()
+        torch_state = torch.random.get_rng_state()
+        try:
+            random.seed(sample_seed)
+            np.random.seed(sample_seed % (2**32))
+            torch.manual_seed(sample_seed)
+            sample = self.base_dataset[index]
+        finally:
+            random.setstate(python_state)
+            np.random.set_state(numpy_state)
+            torch.random.set_rng_state(torch_state)
+        return sample
+
     def __getitem__(self, index: int) -> dict[str, Any]:
-        sample = self.base_dataset[index]
+        sample = self._load_base_sample(index)
         if not isinstance(sample, Mapping):
             raise TypeError("base dataset samples must be mappings")
         video = sample.get("video")

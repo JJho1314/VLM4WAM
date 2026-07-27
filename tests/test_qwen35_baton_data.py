@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import re
+import random
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -229,3 +231,79 @@ def test_batch_contract_exposes_fixed_geometry(dataset) -> None:
         geometry.image_size,
     )
     assert batch.future_images.shape[1:3] == (2, len(geometry.future_indices))
+
+
+def test_persistent_worker_samples_match_a_fresh_epoch_resume() -> None:
+    from qwen35_baton.cli.train_semantic_planner import EpochSeededRandomSampler
+    from qwen35_baton.data import BatonLiberoDataset
+
+    class _RandomizedBase(_BaseDataset):
+        def __init__(self) -> None:
+            self.records = (
+                SimpleNamespace(
+                    key="libero_object:000000",
+                    caption="put the red mug on the plate",
+                    domain="libero_object",
+                ),
+                SimpleNamespace(
+                    key="libero_object:000001",
+                    caption="put the blue bowl in the drawer",
+                    domain="libero_object",
+                ),
+            )
+
+        def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+            return {
+                "probe": (
+                int(random.random() * 10_000)
+                + int(np.random.random() * 10_000)
+                + int(torch.rand(()).item() * 10_000)
+                )
+                % 256
+            }
+
+    def _loader() -> tuple[
+        BatonLiberoDataset, EpochSeededRandomSampler, torch.utils.data.DataLoader
+    ]:
+        adapted = BatonLiberoDataset(_RandomizedBase(), seed=23)
+
+        class _RngProbe(torch.utils.data.Dataset):
+            def __len__(self) -> int:
+                return len(adapted)
+
+            def __getitem__(self, index: int) -> int:
+                return int(adapted._load_base_sample(index)["probe"])
+
+        probe = _RngProbe()
+        sampler = EpochSeededRandomSampler(probe, seed=23)
+        generator = torch.Generator().manual_seed(23)
+        return (
+            adapted,
+            sampler,
+            torch.utils.data.DataLoader(
+                probe,
+                batch_size=None,
+                sampler=sampler,
+                num_workers=2,
+                persistent_workers=True,
+                generator=generator,
+            ),
+        )
+
+    def _values(loader: torch.utils.data.DataLoader) -> list[int]:
+        return [int(sample) for sample in loader]
+
+    continuous_dataset, continuous_sampler, continuous_loader = _loader()
+    continuous_dataset.set_epoch(0)
+    continuous_sampler.set_epoch(0)
+    _values(continuous_loader)
+    continuous_dataset.set_epoch(1)
+    continuous_sampler.set_epoch(1)
+    expected_epoch_one = _values(continuous_loader)
+
+    resumed_dataset, resumed_sampler, resumed_loader = _loader()
+    resumed_dataset.set_epoch(1)
+    resumed_sampler.set_epoch(1)
+    resumed_epoch_one = _values(resumed_loader)
+
+    assert resumed_epoch_one == expected_epoch_one
