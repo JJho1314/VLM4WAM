@@ -1707,6 +1707,20 @@ _BATON_PREDICTION_PROVENANCE_FIELDS = {
 } | _BATON_SAMPLING_PROVENANCE_FIELDS
 
 
+@dataclass(frozen=True)
+class _LoadedBatonTrainingCheckpoint:
+    """One fully verified, immutable view of a Baton checkpoint envelope."""
+
+    checkpoint: Path
+    source: str
+    topology_hash: str
+    snapshot_topology_hash: str
+    cursor: TrainingCursor
+    diffusion_model_dir: Path
+    diffusion_files: Mapping[str, str]
+    training_provenance: Mapping[str, Any]
+
+
 def _is_concrete_sha256(value: Any) -> bool:
     return (
         type(value) is str
@@ -1767,7 +1781,7 @@ def _accelerator_state_files(checkpoint: Path) -> dict[str, str]:
 
 def _load_baton_training_metadata(
     checkpoint_dir: str | Path,
-) -> tuple[Path, dict[str, Any], TrainingCursor]:
+) -> _LoadedBatonTrainingCheckpoint:
     checkpoint = Path(checkpoint_dir)
     metadata_path = checkpoint / "baton_state.json"
     if not metadata_path.is_file():
@@ -1845,7 +1859,16 @@ def _load_baton_training_metadata(
         raise ValueError("Baton checkpoint snapshot topology is invalid") from error
     if snapshot_topology_hash != metadata["snapshot_topology_hash"]:
         raise ValueError("Baton checkpoint snapshot topology mismatch")
-    return checkpoint, metadata, cursor
+    return _LoadedBatonTrainingCheckpoint(
+        checkpoint=checkpoint,
+        source=metadata["source"],
+        topology_hash=metadata["topology_hash"],
+        snapshot_topology_hash=metadata["snapshot_topology_hash"],
+        cursor=cursor,
+        diffusion_model_dir=diffusion_dir,
+        diffusion_files=MappingProxyType(dict(expected_files)),
+        training_provenance=MappingProxyType(dict(provenance)),
+    )
 
 
 def save_baton_training_checkpoint(
@@ -1942,27 +1965,84 @@ def load_baton_training_checkpoint(
 ) -> TrainingCursor:
     """Validate the complete Baton envelope before restoring Accelerate state."""
 
-    checkpoint, metadata, cursor = _load_baton_training_metadata(
-        checkpoint_dir
-    )
-    if metadata["source"] != expected_source:
+    loaded = _load_baton_training_metadata(checkpoint_dir)
+    if loaded.source != expected_source:
         raise ValueError("Baton checkpoint conditioning source mismatch")
-    if metadata["topology_hash"] != _module_topology_hash(diffusion_model):
+    if loaded.topology_hash != _module_topology_hash(diffusion_model):
         raise ValueError("Baton checkpoint runtime topology mismatch")
     expected_provenance = _validated_baton_training_provenance(
         expected_source,
         dict(expected_training_provenance),
     )
-    if metadata["training_provenance"] != expected_provenance:
+    if loaded.training_provenance != expected_provenance:
         raise ValueError("Baton checkpoint training provenance mismatch")
     if (
-        cursor.microbatches_per_epoch != expected_microbatches_per_epoch
-        or cursor.sampler_seed != expected_sampler_seed
+        loaded.cursor.microbatches_per_epoch
+        != expected_microbatches_per_epoch
+        or loaded.cursor.sampler_seed != expected_sampler_seed
     ):
         raise ValueError("Baton checkpoint data cursor mismatch")
-    accelerator.load_state(str(checkpoint))
+    accelerator.load_state(str(loaded.checkpoint))
     accelerator.wait_for_everyone()
-    return cursor
+    return loaded.cursor
+
+
+def _validate_loaded_baton_stage2_checkpoint(
+    loaded: _LoadedBatonTrainingCheckpoint,
+    *,
+    expected_topology_hash: str,
+    expected_hdf5_manifest_hash: str,
+    expected_semantic_provenance: Mapping[str, str] | None = None,
+) -> _LoadedBatonTrainingCheckpoint:
+    """Purely validate every Stage-2 invariant on one sealed load result."""
+
+    if not isinstance(loaded, _LoadedBatonTrainingCheckpoint):
+        raise TypeError("Stage-2 validation requires one loaded Baton envelope")
+    if loaded.source != BATON_TEACHER_SOURCE:
+        raise ValueError(
+            "Stage-3 initialization requires a Stage-2 teacher checkpoint"
+        )
+    if loaded.cursor.global_step != 20_000:
+        raise ValueError("Stage-2 initialization checkpoint must be step 20000")
+    if loaded.snapshot_topology_hash != expected_topology_hash:
+        raise ValueError("Stage-2 initialization topology mismatch")
+    provenance = loaded.training_provenance
+    if provenance.get("hdf5_manifest_hash") != expected_hdf5_manifest_hash:
+        raise ValueError("Stage-2 initialization dataset provenance mismatch")
+    semantic_fields = (
+        "siglip2_config_hash",
+        "siglip2_artifact_hash",
+        "teacher_preprocessing_hash",
+    )
+    if expected_semantic_provenance is not None:
+        if set(expected_semantic_provenance) != set(semantic_fields):
+            raise ValueError(
+                "Stage-2 expected semantic provenance is incomplete"
+            )
+        for field in semantic_fields:
+            if provenance.get(field) != expected_semantic_provenance[field]:
+                raise ValueError(
+                    f"Stage-1/Stage-2 semantic target mismatch for {field}"
+                )
+    else:
+        for field in semantic_fields:
+            if not _is_concrete_sha256(provenance.get(field)):
+                raise ValueError(
+                    f"Stage-2 initialization provenance is missing {field}"
+                )
+    if (
+        loaded.diffusion_model_dir
+        != loaded.checkpoint / "diffusion_model"
+        or not loaded.diffusion_files
+        or not all(
+            type(name) is str
+            and name
+            and _is_concrete_sha256(digest)
+            for name, digest in loaded.diffusion_files.items()
+        )
+    ):
+        raise ValueError("Stage-2 diffusion file envelope is invalid")
+    return loaded
 
 
 def validate_baton_stage2_checkpoint_envelope(
@@ -1973,29 +2053,12 @@ def validate_baton_stage2_checkpoint_envelope(
 ) -> Path:
     """Validate a completed teacher curriculum before Stage-3 allocation."""
 
-    checkpoint, metadata, cursor = _load_baton_training_metadata(
-        checkpoint_dir
-    )
-    if metadata["source"] != BATON_TEACHER_SOURCE:
-        raise ValueError("Stage-3 initialization requires a Stage-2 teacher checkpoint")
-    if cursor.global_step != 20_000:
-        raise ValueError("Stage-2 initialization checkpoint must be step 20000")
-    if metadata["snapshot_topology_hash"] != expected_topology_hash:
-        raise ValueError("Stage-2 initialization topology mismatch")
-    provenance = metadata["training_provenance"]
-    if provenance.get("hdf5_manifest_hash") != expected_hdf5_manifest_hash:
-        raise ValueError("Stage-2 initialization dataset provenance mismatch")
-    for field in (
-        "siglip2_config_hash",
-        "siglip2_artifact_hash",
-        "teacher_preprocessing_hash",
-    ):
-        value = provenance.get(field)
-        if type(value) is not str or len(value) != 64:
-            raise ValueError(
-                f"Stage-2 initialization provenance is missing {field}"
-            )
-    return checkpoint / "diffusion_model"
+    loaded = _load_baton_training_metadata(checkpoint_dir)
+    return _validate_loaded_baton_stage2_checkpoint(
+        loaded,
+        expected_topology_hash=expected_topology_hash,
+        expected_hdf5_manifest_hash=expected_hdf5_manifest_hash,
+    ).diffusion_model_dir
 
 
 @dataclass(frozen=True)
@@ -2005,7 +2068,7 @@ class BatonStage3ArtifactChain:
     diffusion_model_dir: Path
     diffusion_files: Mapping[str, str]
     stage1_metadata: Any
-    stage2_training_provenance: dict[str, Any]
+    stage2_training_provenance: Mapping[str, Any]
 
 
 def validate_baton_stage3_artifact_chain(
@@ -2030,35 +2093,31 @@ def validate_baton_stage3_artifact_chain(
         checkpoint=planner_path,
         expected=expected_planner_topology,
     )
-    diffusion_model_dir = validate_baton_stage2_checkpoint_envelope(
-        stage2_checkpoint,
-        expected_topology_hash=expected_stage2_topology_hash,
-        expected_hdf5_manifest_hash=expected_hdf5_manifest_hash,
-    )
-    _, stage2_metadata, _ = _load_baton_training_metadata(
-        stage2_checkpoint
-    )
-    stage2_provenance = stage2_metadata["training_provenance"]
     if stage1_metadata.hdf5_manifest_hash != expected_hdf5_manifest_hash:
         raise ValueError(
             "Stage-1 planner checkpoint dataset provenance mismatch"
         )
-    for field in (
-        "siglip2_config_hash",
-        "siglip2_artifact_hash",
-        "teacher_preprocessing_hash",
-    ):
-        if getattr(stage1_metadata, field) != stage2_provenance[field]:
-            raise ValueError(
-                f"Stage-1/Stage-2 semantic target mismatch for {field}"
+    loaded_stage2 = _load_baton_training_metadata(stage2_checkpoint)
+    validated_stage2 = _validate_loaded_baton_stage2_checkpoint(
+        loaded_stage2,
+        expected_topology_hash=expected_stage2_topology_hash,
+        expected_hdf5_manifest_hash=expected_hdf5_manifest_hash,
+        expected_semantic_provenance={
+            field: getattr(stage1_metadata, field)
+            for field in (
+                "siglip2_config_hash",
+                "siglip2_artifact_hash",
+                "teacher_preprocessing_hash",
             )
+        },
+    )
     return BatonStage3ArtifactChain(
-        diffusion_model_dir=diffusion_model_dir,
-        diffusion_files=MappingProxyType(
-            dict(stage2_metadata["diffusion_files"])
-        ),
+        diffusion_model_dir=validated_stage2.diffusion_model_dir,
+        diffusion_files=validated_stage2.diffusion_files,
         stage1_metadata=stage1_metadata,
-        stage2_training_provenance=dict(stage2_provenance),
+        stage2_training_provenance=(
+            validated_stage2.training_provenance
+        ),
     )
 
 

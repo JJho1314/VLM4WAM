@@ -231,3 +231,40 @@ HDF5 functional/protected gate: 80 passed, 228 deselected
 `compileall`, `bash -n` on all four Baton launchers, and `git diff --check`
 pass. Round 3 likewise made no package, GPU, live-weight, training,
 distributed, or launcher execution changes or claims.
+
+## Round 4 Single Stage-2 Envelope
+
+Stage-3 artifact-chain construction now loads and verifies the Stage-2
+checkpoint envelope exactly once. That operation returns a frozen sealed view
+containing the checkpoint identity, cursor, source/topology, diffusion
+directory, immutable diffusion-file manifest, and immutable training
+provenance. A pure helper applies all Stage-2 requirements to that same view:
+teacher source, final step 20000, expected topology, exact HDF5 provenance,
+exact Stage-1 SigLIP2 configuration/artifact/preprocessing hashes, and the
+already hash-verified diffusion file envelope.
+
+The artifact-chain path no longer calls the public Stage-2 path validator and
+then reloads `baton_state.json`; its diffusion directory, manifest, and
+provenance all come from the single validated result. The strict same-byte
+snapshot loader from round 3 is unchanged.
+
+The focused regression swapped `baton_state.json` after the first real load.
+Envelope A had mismatched Stage-1 semantic provenance while envelope B matched.
+It was RED on `d6c5027`:
+
+```text
+Failed: DID NOT RAISE ValueError
+assert 2 == 1
+```
+
+It is GREEN with one load: envelope A is rejected and B is never parsed.
+
+```text
+Focused checkpoint/Stage-2/Stage-3 gate: 16 passed
+Required combined gate: 128 passed, 4 warnings
+HDF5 functional/protected gate: 80 passed, 228 deselected
+```
+
+`compileall`, `bash -n` on all four Baton launchers, and `git diff --check`
+pass. Round 4 made no package, GPU, live-weight, training, distributed, or
+launcher execution changes or claims.

@@ -1668,6 +1668,55 @@ def test_stage3_artifact_chain_accepts_one_validated_semantic_target_space(
     }
 
 
+def test_stage3_artifact_chain_uses_one_stage2_envelope_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stage1, trusted_topology, _ = _write_stage1_checkpoint_envelope(
+        tmp_path / "planner"
+    )
+    stage2 = _write_stage2_checkpoint_envelope(
+        tmp_path / "teacher",
+        provenance_updates={"siglip2_config_hash": "b" * 64},
+    )
+    metadata_path = stage2 / "baton_state.json"
+    envelope_a = json.loads(metadata_path.read_text(encoding="utf-8"))
+    envelope_b = deepcopy(envelope_a)
+    envelope_b["training_provenance"]["siglip2_config_hash"] = "1" * 64
+    real_load = ge_trainer_module._load_baton_training_metadata
+    load_count = 0
+
+    def load_then_swap(checkpoint_dir):
+        nonlocal load_count
+        loaded = real_load(checkpoint_dir)
+        load_count += 1
+        if load_count == 1:
+            metadata_path.write_text(
+                json.dumps(envelope_b),
+                encoding="utf-8",
+            )
+        return loaded
+
+    monkeypatch.setattr(
+        ge_trainer_module,
+        "_load_baton_training_metadata",
+        load_then_swap,
+    )
+    try:
+        with pytest.raises(ValueError, match="semantic.*siglip2_config_hash"):
+            ge_trainer_module.validate_baton_stage3_artifact_chain(
+                stage2_checkpoint=stage2,
+                expected_stage2_topology_hash=envelope_a[
+                    "snapshot_topology_hash"
+                ],
+                planner_checkpoint=stage1,
+                expected_planner_topology=trusted_topology,
+                expected_hdf5_manifest_hash="4" * 64,
+            )
+    finally:
+        assert load_count == 1
+
+
 @pytest.mark.parametrize(
     "field",
     (
