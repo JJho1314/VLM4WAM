@@ -1,0 +1,911 @@
+"""Resumable Accelerate Stage-1 training for the continuous Baton planner."""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Iterable, Mapping, Sequence
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass, fields, replace
+import json
+import math
+import os
+from pathlib import Path
+import random
+import time
+from typing import Any
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from qwen35_baton.checkpoint import (
+    BatonTrainingCursor,
+    capture_rank_rng_state,
+    load_baton_checkpoint,
+    restore_rank_rng_state,
+    save_baton_checkpoint,
+)
+from qwen35_baton.config import BatonCheckpointMetadata
+from qwen35_baton.hashing import sha256_file, sha256_json
+from qwen35_baton.losses import BatonPlannerLoss, compute_baton_planner_loss
+from qwen35_baton.ownership import (
+    Stage1Ownership,
+    configure_stage1_trainable_modules,
+)
+from qwen35_baton.sequence import ADDED_TOKENS, build_plan_text
+
+
+_APPROVED_LRS = {
+    "planner": 5e-5,
+    "qwen_top8": 1e-6,
+    "qwen_vision": 5e-7,
+}
+
+
+@dataclass(frozen=True)
+class Stage1TrainingConfig:
+    """Validated Stage-1 schedule and immutable local artifact locations."""
+
+    output_dir: str
+    qwen_model_path: str
+    qwen_processor_path: str
+    qwen_tokenizer_path: str
+    siglip2_model_path: str
+    hdf5_manifest_path: str
+    hdf5_manifest_hash: str
+    dataset_statistics_path: str
+    per_device_batch: int = 2
+    gradient_accumulation_steps: int = 8
+    max_steps: int = 30_000
+    warmup_steps: int = 1_000
+    save_every: int = 5_000
+    log_every: int = 20
+    planner_lr: float = 5e-5
+    qwen_top8_lr: float = 1e-6
+    qwen_vision_lr: float = 5e-7
+    weight_decay: float = 0.01
+    gradient_clip_norm: float = 1.0
+    mixed_precision: str = "bf16"
+    num_workers: int = 4
+    seed: int = 42
+    resume_from: str | None = None
+    tiny_test: bool = False
+
+    def __post_init__(self) -> None:
+        for name in (
+            "output_dir",
+            "qwen_model_path",
+            "qwen_processor_path",
+            "qwen_tokenizer_path",
+            "siglip2_model_path",
+            "hdf5_manifest_path",
+            "hdf5_manifest_hash",
+            "dataset_statistics_path",
+        ):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"{name} must be a nonempty string")
+        for name in (
+            "per_device_batch",
+            "gradient_accumulation_steps",
+            "max_steps",
+            "save_every",
+            "log_every",
+        ):
+            if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if (
+            type(self.warmup_steps) is not int
+            or self.warmup_steps < 0
+            or self.warmup_steps >= self.max_steps
+        ):
+            raise ValueError("warmup_steps must be in [0,max_steps)")
+        if type(self.num_workers) is not int or self.num_workers < 0:
+            raise ValueError("num_workers must be a non-negative integer")
+        if type(self.seed) is not int or self.seed < 0:
+            raise ValueError("seed must be a non-negative integer")
+        if self.mixed_precision not in ({"no", "bf16"} if self.tiny_test else {"bf16"}):
+            raise ValueError("production Stage-1 mixed_precision must be bf16")
+        if self.gradient_clip_norm != 1.0:
+            raise ValueError("Stage-1 gradient clipping norm must be exactly 1.0")
+        if not self.tiny_test and (
+            self.max_steps != 30_000 or self.save_every != 5_000
+        ):
+            raise ValueError(
+                "production Stage-1 cadence must be 30000 steps with saves every 5000"
+            )
+        if {
+            "planner": self.planner_lr,
+            "qwen_top8": self.qwen_top8_lr,
+            "qwen_vision": self.qwen_vision_lr,
+        } != _APPROVED_LRS:
+            raise ValueError("Stage-1 optimizer learning rates differ from the contract")
+        if (
+            len(self.hdf5_manifest_hash) != 64
+            or any(character not in "0123456789abcdef" for character in self.hdf5_manifest_hash)
+        ):
+            raise ValueError("hdf5_manifest_hash must be a lowercase SHA-256 digest")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "Stage1TrainingConfig":
+        if not isinstance(payload, Mapping):
+            raise TypeError("Stage-1 config must contain an object")
+        known = {field.name for field in fields(cls)}
+        unknown = sorted(set(payload).difference(known))
+        if unknown:
+            raise ValueError(
+                "unknown Stage-1 config fields: " + ", ".join(unknown)
+            )
+        return cls(**dict(payload))
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> "Stage1TrainingConfig":
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"Stage-1 config is invalid: {path}") from error
+        return cls.from_mapping(payload)
+
+
+@dataclass
+class Stage1TrainingArtifacts:
+    """Injected or production planner, teacher, data, and mutable optimizer state."""
+
+    planner: nn.Module
+    teacher: Any
+    train_batches: Iterable[Any]
+    optimizer: torch.optim.Optimizer
+    scheduler: Any
+    metadata: BatonCheckpointMetadata
+    ownership: Stage1Ownership
+
+
+@dataclass(frozen=True)
+class Stage1TrainingResult:
+    global_step: int
+    cursor: BatonTrainingCursor
+    checkpoint: Path | None
+    last_metrics: Mapping[str, float]
+
+
+def validate_global_batch(
+    *,
+    per_device_batch: int,
+    world_size: int,
+    gradient_accumulation_steps: int,
+) -> int:
+    """Require the approved effective global batch, with no silent adjustment."""
+
+    values = {
+        "per_device_batch": per_device_batch,
+        "world_size": world_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+    }
+    if any(type(value) is not int or value <= 0 for value in values.values()):
+        raise ValueError("global batch factors must be positive integers")
+    effective = per_device_batch * world_size * gradient_accumulation_steps
+    if effective != 128:
+        raise ValueError(
+            "Stage-1 effective global batch must be exactly 128, "
+            f"got {per_device_batch} * {world_size} * "
+            f"{gradient_accumulation_steps} = {effective}"
+        )
+    return effective
+
+
+def checkpoint_steps(*, max_steps: int, save_every: int) -> tuple[int, ...]:
+    if type(max_steps) is not int or type(save_every) is not int:
+        raise TypeError("checkpoint cadence values must be integers")
+    if max_steps <= 0 or save_every <= 0 or max_steps % save_every:
+        raise ValueError("max_steps must be a positive multiple of save_every")
+    return tuple(range(save_every, max_steps + 1, save_every))
+
+
+def _owned_parameters(modules: tuple[nn.Module, ...]) -> list[nn.Parameter]:
+    parameters: list[nn.Parameter] = []
+    seen: set[int] = set()
+    for module in modules:
+        for parameter in module.parameters():
+            if id(parameter) in seen:
+                raise ValueError("Stage-1 optimizer ownership contains overlap")
+            seen.add(id(parameter))
+            if not parameter.requires_grad:
+                raise ValueError("Stage-1 owned parameter is unexpectedly frozen")
+            parameters.append(parameter)
+    if not parameters:
+        raise ValueError("Stage-1 optimizer groups must be nonempty")
+    return parameters
+
+
+def build_stage1_optimizer_groups(
+    planner: nn.Module,
+    ownership: Stage1Ownership,
+    config: Stage1TrainingConfig,
+) -> list[dict[str, Any]]:
+    """Build the exact three nonoverlapping groups covering all trainable state."""
+
+    if not isinstance(planner, nn.Module):
+        raise TypeError("planner must be a torch module")
+    if not isinstance(ownership, Stage1Ownership):
+        raise TypeError("ownership must be Stage1Ownership")
+    groups = [
+        {
+            "name": "planner",
+            "params": _owned_parameters(ownership.planner_modules),
+            "lr": config.planner_lr,
+            "initial_lr": config.planner_lr,
+        },
+        {
+            "name": "qwen_top8",
+            "params": _owned_parameters(ownership.qwen_top_layers),
+            "lr": config.qwen_top8_lr,
+            "initial_lr": config.qwen_top8_lr,
+        },
+        {
+            "name": "qwen_vision",
+            "params": _owned_parameters(ownership.qwen_vision_modules),
+            "lr": config.qwen_vision_lr,
+            "initial_lr": config.qwen_vision_lr,
+        },
+    ]
+    grouped = [id(parameter) for group in groups for parameter in group["params"]]
+    trainable = [
+        id(parameter) for parameter in planner.parameters() if parameter.requires_grad
+    ]
+    if len(grouped) != len(set(grouped)) or set(grouped) != set(trainable):
+        raise ValueError(
+            "Stage-1 optimizer ownership must be duplicate-free and exhaustive"
+        )
+    return groups
+
+
+def _cosine_warmup_multiplier(
+    step: int, *, warmup_steps: int, max_steps: int
+) -> float:
+    if warmup_steps and step <= warmup_steps:
+        return float(step) / float(warmup_steps)
+    progress = min(
+        1.0,
+        max(0.0, float(step - warmup_steps) / float(max_steps - warmup_steps)),
+    )
+    return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def build_cosine_warmup_scheduler(
+    optimizer: torch.optim.Optimizer,
+    config: Stage1TrainingConfig,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda step: _cosine_warmup_multiplier(
+            step,
+            warmup_steps=config.warmup_steps,
+            max_steps=config.max_steps,
+        ),
+    )
+
+
+class EpochSeededRandomSampler(torch.utils.data.Sampler[int]):
+    """Reconstruct every sample permutation from the saved seed and epoch."""
+
+    def __init__(self, data_source: Any, *, seed: int) -> None:
+        self.data_source = data_source
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        if type(epoch) is not int or epoch < 0:
+            raise ValueError("sampler epoch must be non-negative")
+        self.epoch = epoch
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        return iter(torch.randperm(len(self.data_source), generator=generator).tolist())
+
+    def __len__(self) -> int:
+        return len(self.data_source)
+
+
+def _artifact_hash(path: Path) -> str:
+    if path.is_file():
+        return sha256_file(path)
+    if not path.is_dir():
+        raise FileNotFoundError(path)
+    entries = [
+        (
+            child.relative_to(path).as_posix(),
+            child.stat().st_size,
+            sha256_file(child),
+        )
+        for child in sorted(path.rglob("*"))
+        if child.is_file()
+    ]
+    if not entries:
+        raise ValueError(f"artifact directory is empty: {path}")
+    return sha256_json(entries)
+
+
+def _load_transformer_components(config: Stage1TrainingConfig) -> dict[str, Any]:
+    from transformers import (
+        AutoImageProcessor,
+        AutoModel,
+        AutoModelForImageTextToText,
+        AutoProcessor,
+        AutoTokenizer,
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.qwen_tokenizer_path, local_files_only=True
+    )
+    processor = AutoProcessor.from_pretrained(
+        config.qwen_processor_path, local_files_only=True
+    )
+    qwen = AutoModelForImageTextToText.from_pretrained(
+        config.qwen_model_path,
+        local_files_only=True,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+    )
+    siglip_processor = AutoImageProcessor.from_pretrained(
+        config.siglip2_model_path,
+        local_files_only=True,
+        use_fast=False,
+    )
+    siglip = AutoModel.from_pretrained(
+        config.siglip2_model_path,
+        local_files_only=True,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+    )
+    return {
+        "tokenizer": tokenizer,
+        "processor": processor,
+        "qwen": qwen,
+        "siglip_processor": siglip_processor,
+        "siglip": siglip,
+    }
+
+
+def load_local_artifacts(
+    config: Stage1TrainingConfig,
+    *,
+    models_only: bool = False,
+) -> Stage1TrainingArtifacts | Mapping[str, Any]:
+    """Load only persisted local artifacts; no Hub/network fallback is permitted."""
+
+    components = _load_transformer_components(config)
+    if models_only:
+        return components
+    from qwen35_baton.data import BatonLiberoDataset, BatonPlannerCollator
+    from qwen35_baton.model import BatonQwen35Planner
+    from qwen35_baton.teacher import FrozenSiglip2Teacher
+    from ge_act.data.libero_fastwam_hdf5_dataset import (
+        LiberoFastWAMHDF5Dataset,
+    )
+
+    tokenizer = components["tokenizer"]
+    processor = components["processor"]
+    try:
+        processor.tokenizer = tokenizer
+    except (AttributeError, TypeError):
+        if getattr(processor, "tokenizer", None) is not tokenizer:
+            raise ValueError("persisted Qwen processor did not accept its tokenizer")
+    token_ids = tuple(
+        int(tokenizer.convert_tokens_to_ids(token)) for token in ADDED_TOKENS
+    )
+    if len(set(token_ids)) != len(ADDED_TOKENS) or min(token_ids) < 0:
+        raise ValueError("persisted Baton tokens do not map to seven unique IDs")
+    planner = BatonQwen35Planner(components["qwen"], added_token_ids=token_ids)
+    siglip = components["siglip"]
+    vision_model = getattr(siglip, "vision_model", None)
+    if not isinstance(vision_model, nn.Module):
+        raise ValueError("local SigLIP2 artifact does not expose vision_model")
+    teacher = FrozenSiglip2Teacher.from_components(
+        processor=components["siglip_processor"],
+        vision_model=vision_model,
+        dtype=torch.bfloat16,
+    )
+    base_dataset = LiberoFastWAMHDF5Dataset(
+        config.hdf5_manifest_path,
+        config.dataset_statistics_path,
+        train_dataset=True,
+    )
+    dataset = BatonLiberoDataset(base_dataset, seed=config.seed)
+    sampler = EpochSeededRandomSampler(dataset, seed=config.seed)
+    generator = torch.Generator()
+    generator.manual_seed(config.seed)
+    train_batches = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=config.per_device_batch,
+        sampler=sampler,
+        collate_fn=BatonPlannerCollator(processor),
+        num_workers=config.num_workers,
+        drop_last=True,
+        generator=generator,
+        persistent_workers=config.num_workers > 0,
+    )
+    if len(train_batches) <= 0:
+        raise ValueError("Stage-1 dataset must yield at least one complete microbatch")
+    ownership = configure_stage1_trainable_modules(planner)
+    optimizer = torch.optim.AdamW(
+        build_stage1_optimizer_groups(planner, ownership, config),
+        weight_decay=config.weight_decay,
+    )
+    scheduler = build_cosine_warmup_scheduler(optimizer, config)
+    example = BatonCheckpointMetadata.example()
+    metadata = replace(
+        example,
+        qwen_config_hash=sha256_file(Path(config.qwen_model_path) / "config.json"),
+        tokenizer_hash=_artifact_hash(Path(config.qwen_tokenizer_path)),
+        processor_hash=_artifact_hash(Path(config.qwen_processor_path)),
+        input_template_hash=sha256_json(build_plan_text("{instruction}")),
+        added_token_ids=token_ids,
+        siglip2_artifact_hash=_artifact_hash(Path(config.siglip2_model_path)),
+        teacher_preprocessing_hash=_artifact_hash(Path(config.siglip2_model_path)),
+        hdf5_manifest_hash=config.hdf5_manifest_hash,
+    )
+    return Stage1TrainingArtifacts(
+        planner=planner,
+        teacher=teacher,
+        train_batches=train_batches,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        metadata=metadata,
+        ownership=ownership,
+    )
+
+
+def _move_batch(batch: Any, device: torch.device) -> Any:
+    if isinstance(batch, torch.Tensor):
+        return batch.to(device)
+    if isinstance(batch, Mapping):
+        return type(batch)(
+            (key, _move_batch(value, device)) for key, value in batch.items()
+        )
+    if isinstance(batch, tuple) and hasattr(batch, "_fields"):
+        return type(batch)(*(_move_batch(value, device) for value in batch))
+    if isinstance(batch, tuple):
+        return tuple(_move_batch(value, device) for value in batch)
+    if isinstance(batch, list):
+        return [_move_batch(value, device) for value in batch]
+    if hasattr(batch, "__dataclass_fields__"):
+        return type(batch)(
+            **{
+                name: _move_batch(getattr(batch, name), device)
+                for name in batch.__dataclass_fields__
+            }
+        )
+    return batch
+
+
+def _set_dataloader_epoch(batches: Any, *, epoch: int, sampler_seed: int) -> None:
+    set_epoch = getattr(batches, "set_epoch", None)
+    if callable(set_epoch):
+        set_epoch(epoch)
+    sampler = getattr(batches, "sampler", None)
+    sampler_set_epoch = getattr(sampler, "set_epoch", None)
+    if callable(sampler_set_epoch):
+        sampler_set_epoch(epoch)
+    generator = getattr(batches, "generator", None)
+    if isinstance(generator, torch.Generator):
+        generator.manual_seed(sampler_seed + epoch)
+
+
+def _advance_cursor(
+    cursor: BatonTrainingCursor,
+    *,
+    epoch: int,
+    consumed_microbatches: int,
+    global_step: int,
+) -> BatonTrainingCursor:
+    if consumed_microbatches == cursor.microbatches_per_epoch:
+        epoch += 1
+        consumed_microbatches = 0
+    return BatonTrainingCursor(
+        global_step=global_step,
+        epoch=epoch,
+        consumed_microbatches=consumed_microbatches,
+        microbatches_per_epoch=cursor.microbatches_per_epoch,
+        sampler_seed=cursor.sampler_seed,
+    )
+
+
+def _optimizer_for_checkpoint(optimizer: Any) -> torch.optim.Optimizer:
+    inner = getattr(optimizer, "optimizer", optimizer)
+    if not isinstance(inner, torch.optim.Optimizer):
+        raise TypeError("prepared optimizer does not expose a torch optimizer")
+    return inner
+
+
+def _scheduler_for_checkpoint(scheduler: Any) -> Any:
+    return getattr(scheduler, "scheduler", scheduler)
+
+
+def _rank_states(accelerator: Any) -> dict[int, Mapping[str, Any]]:
+    local = capture_rank_rng_state(distributed_rank=accelerator.process_index)
+    if accelerator.num_processes == 1:
+        return {0: local}
+    from accelerate.utils import gather_object
+
+    gathered = gather_object([local])
+    states = {
+        int(state["distributed_rank"]): state
+        for state in gathered
+        if isinstance(state, Mapping)
+    }
+    if sorted(states) != list(range(accelerator.num_processes)):
+        raise RuntimeError("not every distributed rank published its RNG state")
+    return states
+
+
+def _save_training_checkpoint(
+    *,
+    accelerator: Any,
+    config: Stage1TrainingConfig,
+    artifacts: Stage1TrainingArtifacts,
+    planner: nn.Module,
+    optimizer: Any,
+    scheduler: Any,
+    cursor: BatonTrainingCursor,
+) -> Path:
+    accelerator.wait_for_everyone()
+    states = _rank_states(accelerator)
+    destination = Path(config.output_dir) / f"step_{cursor.global_step:06d}"
+    if accelerator.is_main_process:
+        save_baton_checkpoint(
+            destination,
+            planner=accelerator.unwrap_model(planner),
+            optimizer=_optimizer_for_checkpoint(optimizer),
+            scheduler=_scheduler_for_checkpoint(scheduler),
+            scaler=getattr(accelerator, "scaler", None),
+            metadata=artifacts.metadata,
+            cursor=cursor,
+            rank_rng_state=states,
+        )
+    accelerator.wait_for_everyone()
+    return destination
+
+
+def _loss_metrics(
+    losses: BatonPlannerLoss,
+    *,
+    positive: torch.Tensor,
+    negative: torch.Tensor,
+    target: torch.Tensor,
+) -> dict[str, float]:
+    metrics = {
+        "loss/total": float(losses.total.detach().float().cpu()),
+        "loss/mse": float(losses.mse.detach().float().cpu()),
+        "loss/cosine": float(losses.cosine.detach().float().cpu()),
+        "loss/delta": float(losses.delta.detach().float().cpu()),
+        "loss/instruction_counterfactual": float(
+            losses.instruction_counterfactual.detach().float().cpu()
+        ),
+    }
+    positive_math = positive.detach().float()
+    negative_math = negative.detach().float()
+    target_math = target.detach().float()
+    correct = 1.0 - F.cosine_similarity(positive_math, target_math, dim=-1)
+    wrong = 1.0 - F.cosine_similarity(negative_math, target_math, dim=-1)
+    metrics["counterfactual_ranking_accuracy"] = float(
+        (correct.flatten(1).mean(1) < wrong.flatten(1).mean(1))
+        .float()
+        .mean()
+        .cpu()
+    )
+    camera_names = ("main", "wrist")
+    for camera in range(positive.shape[1]):
+        camera_name = (
+            camera_names[camera] if camera < len(camera_names) else f"camera_{camera}"
+        )
+        for frame in range(positive.shape[2]):
+            predicted = positive_math[:, camera, frame]
+            teacher = target_math[:, camera, frame]
+            metrics[f"mse/{camera_name}/frame_{frame}"] = float(
+                (predicted - teacher).square().mean().cpu()
+            )
+            metrics[f"cosine/{camera_name}/frame_{frame}"] = float(
+                F.cosine_similarity(predicted, teacher, dim=-1).mean().cpu()
+            )
+    return metrics
+
+
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+
+
+def run_training(
+    config: Stage1TrainingConfig,
+    *,
+    artifacts: Stage1TrainingArtifacts | None = None,
+    stop_at_step: int | None = None,
+) -> Stage1TrainingResult:
+    """Run optimizer steps without manually dividing the loss under Accelerate."""
+
+    if not isinstance(config, Stage1TrainingConfig):
+        raise TypeError("config must be Stage1TrainingConfig")
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if artifacts is None:
+        # This CPU-only preflight is deliberately before Accelerator/GPU setup.
+        from qwen35_baton.cli.preflight import preflight_stage1
+
+        preflight_stage1(config, world_size=world_size)
+        artifacts = load_local_artifacts(config)
+        assert isinstance(artifacts, Stage1TrainingArtifacts)
+    _seed_everything(config.seed)
+
+    from accelerate import Accelerator
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        mixed_precision=config.mixed_precision,
+        cpu=config.tiny_test,
+    )
+    validate_global_batch(
+        per_device_batch=config.per_device_batch,
+        world_size=accelerator.num_processes,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+    )
+    train_batches = artifacts.train_batches
+    if isinstance(train_batches, torch.utils.data.DataLoader):
+        planner, optimizer, train_batches, scheduler = accelerator.prepare(
+            artifacts.planner,
+            artifacts.optimizer,
+            train_batches,
+            artifacts.scheduler,
+        )
+    else:
+        planner, optimizer, scheduler = accelerator.prepare(
+            artifacts.planner,
+            artifacts.optimizer,
+            artifacts.scheduler,
+        )
+    teacher_model = getattr(artifacts.teacher, "model", None)
+    if isinstance(teacher_model, nn.Module):
+        teacher_model.to(accelerator.device)
+        teacher_model.requires_grad_(False)
+        teacher_model.eval()
+    microbatches_per_epoch = len(train_batches)  # type: ignore[arg-type]
+    if microbatches_per_epoch <= 0:
+        raise ValueError("Stage-1 training requires a nonempty loader")
+    cursor = BatonTrainingCursor(
+        global_step=0,
+        epoch=0,
+        consumed_microbatches=0,
+        microbatches_per_epoch=microbatches_per_epoch,
+        sampler_seed=config.seed,
+    )
+    if config.resume_from is not None:
+        resumed = load_baton_checkpoint(
+            Path(config.resume_from),
+            planner=accelerator.unwrap_model(planner),
+            optimizer=_optimizer_for_checkpoint(optimizer),
+            scheduler=_scheduler_for_checkpoint(scheduler),
+            scaler=getattr(accelerator, "scaler", None),
+            expected_contract=artifacts.metadata,
+            distributed_rank=accelerator.process_index,
+            world_size=accelerator.num_processes,
+        )
+        cursor = resumed.cursor
+        if (
+            cursor.microbatches_per_epoch != microbatches_per_epoch
+            or cursor.sampler_seed != config.seed
+        ):
+            raise ValueError("resume sampler cursor differs from runtime data")
+    target_step = config.max_steps if stop_at_step is None else stop_at_step
+    if (
+        type(target_step) is not int
+        or target_step <= cursor.global_step
+        or target_step > config.max_steps
+    ):
+        raise ValueError("stop_at_step must be above resume and at most max_steps")
+
+    planner.train()
+    last_checkpoint: Path | None = None
+    last_metrics: dict[str, float] = {}
+    last_batch_end = time.perf_counter()
+    while cursor.global_step < target_step:
+        epoch = cursor.epoch
+        _set_dataloader_epoch(
+            train_batches,
+            epoch=epoch,
+            sampler_seed=cursor.sampler_seed,
+        )
+        iterator = iter(train_batches)
+        skipped = cursor.consumed_microbatches
+        if skipped:
+            restored_rng = capture_rank_rng_state(
+                distributed_rank=accelerator.process_index
+            )
+            for _ in range(skipped):
+                try:
+                    next(iterator)
+                except StopIteration as error:
+                    raise ValueError("resume cursor exceeds the training loader") from error
+            restore_rank_rng_state(restored_rng)
+        for offset, raw_batch in enumerate(iterator, start=skipped + 1):
+            if cursor.global_step >= target_step:
+                break
+            data_ready = time.perf_counter()
+            batch = _move_batch(raw_batch, accelerator.device)
+            data_time = data_ready - last_batch_end
+            with accelerator.accumulate(planner):
+                planner_start = time.perf_counter()
+                query_elapsed = [0.0]
+                query_started = [0.0]
+                query_tower = getattr(
+                    accelerator.unwrap_model(planner), "query_tower", None
+                )
+                handles = []
+                if isinstance(query_tower, nn.Module):
+                    handles = [
+                        query_tower.register_forward_pre_hook(
+                            lambda _module, _inputs: query_started.__setitem__(
+                                0, time.perf_counter()
+                            )
+                        ),
+                        query_tower.register_forward_hook(
+                            lambda _module, _inputs, _output: query_elapsed.__setitem__(
+                                0, time.perf_counter() - query_started[0]
+                            )
+                        ),
+                    ]
+                try:
+                    planner_output = planner(batch)
+                finally:
+                    for handle in handles:
+                        handle.remove()
+                planner_time = time.perf_counter() - planner_start
+                teacher_start = time.perf_counter()
+                with torch.no_grad():
+                    future_teacher = artifacts.teacher.encode_future(
+                        batch.future_images
+                    )
+                    current_teacher = artifacts.teacher.encode_current(
+                        batch.current_images
+                    )
+                teacher_time = time.perf_counter() - teacher_start
+                negative = getattr(planner_output, "negative", None)
+                if not isinstance(negative, torch.Tensor):
+                    raise RuntimeError(
+                        "Stage-1 planner must return counterfactual predictions"
+                    )
+                if not all(
+                    bool(torch.isfinite(value).all())
+                    for value in (
+                        planner_output.positive,
+                        negative,
+                        future_teacher,
+                        current_teacher,
+                    )
+                ):
+                    raise FloatingPointError(
+                        "Stage-1 predictions or teacher targets are nonfinite"
+                    )
+                losses = compute_baton_planner_loss(
+                    planner_output.positive,
+                    negative,
+                    future_teacher,
+                    current_teacher,
+                )
+                if not all(
+                    bool(torch.isfinite(value).all())
+                    for value in (
+                        losses.total,
+                        losses.mse,
+                        losses.cosine,
+                        losses.delta,
+                        losses.instruction_counterfactual,
+                    )
+                ):
+                    raise FloatingPointError("Stage-1 loss is nonfinite")
+                backward_start = time.perf_counter()
+                # Accelerate performs accumulation normalization exactly once.
+                accelerator.backward(losses.total)
+                backward_time = time.perf_counter() - backward_start
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(
+                        planner.parameters(), config.gradient_clip_norm
+                    )
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+            next_step = cursor.global_step + int(accelerator.sync_gradients)
+            cursor = _advance_cursor(
+                cursor,
+                epoch=epoch,
+                consumed_microbatches=offset,
+                global_step=next_step,
+            )
+            if accelerator.sync_gradients:
+                elapsed = max(time.perf_counter() - last_batch_end, 1e-12)
+                last_metrics = _loss_metrics(
+                    losses,
+                    positive=planner_output.positive,
+                    negative=negative,
+                    target=future_teacher,
+                )
+                last_metrics.update(
+                    {
+                        "throughput": (
+                            config.per_device_batch
+                            * accelerator.num_processes
+                            * config.gradient_accumulation_steps
+                            / elapsed
+                        ),
+                        "data_time": data_time,
+                        "qwen_time": max(planner_time - query_elapsed[0], 0.0),
+                        "teacher_time": teacher_time,
+                        "query_tower_time": query_elapsed[0],
+                        "backward_time": backward_time,
+                    }
+                )
+                if cursor.global_step % config.log_every == 0:
+                    accelerator.log(last_metrics, step=cursor.global_step)
+                if cursor.global_step % config.save_every == 0:
+                    last_checkpoint = _save_training_checkpoint(
+                        accelerator=accelerator,
+                        config=config,
+                        artifacts=artifacts,
+                        planner=planner,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        cursor=cursor,
+                    )
+            last_batch_end = time.perf_counter()
+            if cursor.global_step >= target_step:
+                break
+        else:
+            continue
+    return Stage1TrainingResult(
+        global_step=cursor.global_step,
+        cursor=cursor,
+        checkpoint=last_checkpoint,
+        last_metrics=last_metrics,
+    )
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--gradient-accumulation-steps", type=int)
+    parser.add_argument("--resume-from", type=str)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    config = Stage1TrainingConfig.from_json(args.config)
+    overrides = {}
+    if args.gradient_accumulation_steps is not None:
+        overrides["gradient_accumulation_steps"] = args.gradient_accumulation_steps
+    if args.resume_from is not None:
+        overrides["resume_from"] = args.resume_from
+    if overrides:
+        config = replace(config, **overrides)
+    result = run_training(config)
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(
+            json.dumps(
+                {
+                    "global_step": result.global_step,
+                    "checkpoint": (
+                        None if result.checkpoint is None else str(result.checkpoint)
+                    ),
+                    "cursor": result.cursor.to_dict(),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,2 @@
+# Reuse the single pinned GE-Act/Qwen3.5 environment contract without overrides.
+-r requirements.txt
