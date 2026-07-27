@@ -22,9 +22,14 @@ class FrozenSiglip2Teacher:
     ) -> None:
         from transformers import AutoImageProcessor, AutoModel
 
-        processor = AutoImageProcessor.from_pretrained(str(model_name_or_path), use_fast=False)
+        processor = AutoImageProcessor.from_pretrained(
+            str(model_name_or_path),
+            use_fast=False,
+            local_files_only=True,
+        )
         full_model = AutoModel.from_pretrained(
             str(model_name_or_path),
+            local_files_only=True,
             torch_dtype=dtype,
             low_cpu_mem_usage=True,
         )

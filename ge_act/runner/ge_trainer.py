@@ -6,7 +6,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, Sequence
 
 from datetime import datetime, timedelta
 import argparse
@@ -59,19 +59,431 @@ from utils.data_utils import get_latents, get_text_conditions, gen_noise_from_co
 from utils.extra_utils import act_metric
 from models.ltx_models.semantic_conditioning import (
     OnlineSiglip2SemanticEncoder,
+    build_patch_center_positions,
     build_semantic_plan_times,
     select_future_keyframes,
+)
+from models.ltx_models.baton_semantic_planner import (
+    FrozenDualCameraBatonPlanner,
 )
 from models.ltx_models.vlm_semantic_planner import (
     FrozenDualCameraVLMPlanner,
     configure_qwen_top_layers_for_joint_training,
     load_qwen35_grounded_provider,
 )
+from qwen35_baton.hashing import sha256_artifact, sha256_file
+from qwen35_baton.teacher import FrozenSiglip2Teacher
 
 LOG_LEVEL = "INFO"
 # LOG_LEVEL = "DEBUG"
 logger = get_logger("wm_runner")
 logger.setLevel(LOG_LEVEL)
+
+
+BATON_TEACHER_SOURCE = "qwen35_baton_teacher"
+BATON_PREDICTION_SOURCE = "qwen35_baton_prediction"
+BATON_SOURCES = frozenset(
+    (BATON_TEACHER_SOURCE, BATON_PREDICTION_SOURCE)
+)
+BATON_FUTURE_INDICES = (0, 3, 5, 8)
+
+
+@dataclass(frozen=True)
+class BatonConditioningComponents:
+    """Mutually exclusive frozen condition provider owned outside GE-Act."""
+
+    source: str
+    teacher: FrozenSiglip2Teacher | None
+    planner: FrozenDualCameraBatonPlanner | None
+
+    def __post_init__(self) -> None:
+        if self.source not in BATON_SOURCES:
+            raise ValueError(f"unknown Baton conditioning source: {self.source!r}")
+        expected_teacher = self.source == BATON_TEACHER_SOURCE
+        if (self.teacher is not None) != expected_teacher:
+            raise ValueError("Baton teacher ownership does not match source")
+        if (self.planner is not None) == expected_teacher:
+            raise ValueError("Baton planner ownership does not match source")
+
+
+@dataclass(frozen=True)
+class BatonSemanticCondition:
+    """Complete full-grid Baton tensors passed to one GE-Act forward."""
+
+    tokens: torch.Tensor
+    times: torch.Tensor
+    positions: torch.Tensor
+    mask: None = None
+    relevance: None = None
+
+
+@dataclass(frozen=True)
+class BatonValidationSelection:
+    source: str
+    mode: str
+    tokens: torch.Tensor
+    condition_mask: torch.Tensor
+
+
+_BATON_FORBIDDEN_FIELD_KINDS = {
+    "hindsight_cache": "hindsight cache",
+    "cache_dir": "hindsight cache",
+    "cache_path": "hindsight cache",
+    "cached_targets": "hindsight cache",
+    "planner_aux_loss": "planner auxiliary loss",
+    "planner_aux_weight": "planner auxiliary loss",
+    "qwen_ge_gradient_scale": "planner auxiliary loss",
+    "qwen_top_lr": "planner auxiliary loss",
+    "qwen_vision_lr": "planner auxiliary loss",
+    "relevance": "relevance",
+    "semantic_plan_relevance": "relevance",
+    "use_relevance": "relevance",
+    "mask": "mask",
+    "semantic_plan_mask": "mask",
+    "token_mask": "mask",
+}
+
+
+def _config_mapping(config: Any) -> Mapping[str, Any]:
+    if isinstance(config, argparse.Namespace):
+        return vars(config)
+    if not isinstance(config, Mapping):
+        raise TypeError("Baton config must be a mapping or argparse namespace")
+    return config
+
+
+def _walk_config_fields(
+    value: Any,
+    *,
+    prefix: str = "",
+):
+    if not isinstance(value, Mapping):
+        return
+    for key, child in value.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        yield path, str(key), child
+        yield from _walk_config_fields(child, prefix=path)
+
+
+def _reject_forbidden_baton_fields(config: Mapping[str, Any]) -> None:
+    for path, key, value in _walk_config_fields(config):
+        key_lower = key.lower()
+        kind = _BATON_FORBIDDEN_FIELD_KINDS.get(key_lower)
+        if kind is None and "hindsight" in key_lower:
+            kind = "hindsight cache"
+        if kind is None and "aux" in key_lower and "planner" in key_lower:
+            kind = "planner auxiliary loss"
+        if kind is not None and value is not None:
+            raise ValueError(f"Baton configs reject {kind} field {path}")
+
+
+def _validated_baton_semantic_config(
+    config: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], str]:
+    _reject_forbidden_baton_fields(config)
+    semantic = config.get("semantic_plan", config)
+    if not isinstance(semantic, Mapping):
+        raise TypeError("semantic_plan must be a mapping")
+    source = semantic.get("source")
+    if source not in BATON_SOURCES:
+        raise ValueError(
+            "Baton semantic_plan.source must be exactly "
+            "qwen35_baton_teacher or qwen35_baton_prediction"
+        )
+    if semantic.get("enabled", True) is not True:
+        raise ValueError("Baton semantic_plan.enabled must be true")
+    if semantic.get("keyframe_indices") != list(BATON_FUTURE_INDICES):
+        raise ValueError("Baton keyframe_indices must be [0, 3, 5, 8]")
+    if semantic.get("tokens_per_frame") != 256:
+        raise ValueError("Baton tokens_per_frame must be 256")
+    if semantic.get("feature_dim") != 1024:
+        raise ValueError("Baton feature_dim must be 1024")
+
+    teacher_only = {"frame_microbatch_size"}
+    planner_only = {
+        "planner_checkpoint",
+        "expected_planner_topology",
+        "qwen_model_path",
+        "qwen_tokenizer_path",
+        "qwen_processor_path",
+    }
+    if source == BATON_TEACHER_SOURCE:
+        ambiguous = sorted(planner_only.intersection(semantic))
+        if ambiguous:
+            raise ValueError(
+                "Baton teacher source rejects planner fields: "
+                + ", ".join(ambiguous)
+            )
+        required = {
+            "siglip2_model_path",
+            "siglip2_config_hash",
+            "siglip2_artifact_hash",
+            "teacher_preprocessing_hash",
+        }
+    else:
+        ambiguous = sorted(teacher_only.intersection(semantic))
+        if ambiguous:
+            raise ValueError(
+                "Baton prediction source rejects teacher fields: "
+                + ", ".join(ambiguous)
+            )
+        required = planner_only | {"siglip2_model_path"}
+    missing = sorted(
+        field
+        for field in required
+        if not isinstance(semantic.get(field), str)
+        or not semantic[field].strip()
+    )
+    if missing:
+        raise ValueError(
+            f"{source} is missing required local artifact fields: "
+            + ", ".join(missing)
+        )
+    return semantic, source
+
+
+def validate_baton_siglip2_provenance(
+    semantic: Mapping[str, Any],
+) -> None:
+    """Validate Stage-2's local SigLIP tree before constructing its teacher."""
+
+    model_path = Path(str(semantic["siglip2_model_path"])).expanduser().resolve()
+    if not model_path.is_dir():
+        raise FileNotFoundError(
+            f"local SigLIP2 model directory does not exist: {model_path}"
+        )
+    from qwen35_baton.cli.preflight import _siglip_geometry
+
+    geometry = _siglip_geometry(model_path)
+    if geometry != {"image_size": 256, "patch_size": 16, "hidden_size": 1024}:
+        raise ValueError("SigLIP2 geometry differs from the 256/16/1024 contract")
+    config_hash = sha256_file(model_path / "config.json")
+    artifact_hash = sha256_artifact(model_path)
+    if config_hash != semantic["siglip2_config_hash"]:
+        raise ValueError("SigLIP2 config hash mismatch")
+    if artifact_hash != semantic["siglip2_artifact_hash"]:
+        raise ValueError("SigLIP2 artifact hash mismatch")
+    if artifact_hash != semantic["teacher_preprocessing_hash"]:
+        raise ValueError("SigLIP2 preprocessing hash mismatch")
+
+
+def prepare_baton_conditioning(
+    config: Mapping[str, Any] | argparse.Namespace,
+    dataset: Any,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> BatonConditioningComponents:
+    """Construct exactly one frozen Baton source after fail-closed validation."""
+
+    config_mapping = _config_mapping(config)
+    semantic, source = _validated_baton_semantic_config(config_mapping)
+    if getattr(dataset, "hindsight_cache", None) is not None:
+        raise ValueError("Baton conditioning rejects hindsight cache datasets")
+    target_device = torch.device(device)
+    if dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError("Baton conditioning dtype must be float32 or bfloat16")
+
+    if source == BATON_TEACHER_SOURCE:
+        validate_baton_siglip2_provenance(semantic)
+        teacher = FrozenSiglip2Teacher(
+            semantic["siglip2_model_path"],
+            device=target_device,
+            dtype=dtype,
+            frame_microbatch_size=int(
+                semantic.get("frame_microbatch_size", 32)
+            ),
+        )
+        freeze_conditioning_modules(teacher)
+        return BatonConditioningComponents(
+            source=source,
+            teacher=teacher,
+            planner=None,
+        )
+
+    planner = FrozenDualCameraBatonPlanner.from_checkpoint(
+        semantic["planner_checkpoint"],
+        qwen_model_path=semantic["qwen_model_path"],
+        qwen_tokenizer_path=semantic["qwen_tokenizer_path"],
+        qwen_processor_path=semantic["qwen_processor_path"],
+        siglip2_model_path=semantic["siglip2_model_path"],
+        expected_planner_topology=semantic["expected_planner_topology"],
+        device=target_device,
+        torch_dtype=dtype,
+    )
+    freeze_conditioning_modules(planner)
+    return BatonConditioningComponents(
+        source=source,
+        teacher=None,
+        planner=planner,
+    )
+
+
+def _normalized_video_to_uint8(images: torch.Tensor) -> torch.Tensor:
+    if not images.dtype.is_floating_point:
+        if images.dtype != torch.uint8:
+            raise TypeError("Baton RGB must be uint8 or normalized floating point")
+        return images
+    if not bool(torch.isfinite(images).all()):
+        raise ValueError("Baton RGB must be finite")
+    if bool(((images < -1) | (images > 1)).any()):
+        raise ValueError("normalized Baton RGB must be in [-1,1]")
+    return images.add(1).mul(127.5).round().clamp(0, 255).to(torch.uint8)
+
+
+def build_baton_semantic_condition(
+    components: BatonConditioningComponents,
+    semantic_config: Mapping[str, Any],
+    video: torch.Tensor,
+    instructions: Sequence[str],
+    *,
+    n_previous: int,
+    num_future_frames: int,
+    num_latent_frames: int,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> BatonSemanticCondition:
+    """Build teacher or predicted full grids with exact times and positions."""
+
+    if not isinstance(components, BatonConditioningComponents):
+        raise TypeError("components must be BatonConditioningComponents")
+    semantic, source = _validated_baton_semantic_config(semantic_config)
+    if source != components.source:
+        raise ValueError("Baton components and semantic config source differ")
+    if (
+        not isinstance(video, torch.Tensor)
+        or video.ndim != 6
+        or tuple(video.shape[1:3]) != (3, 2)
+    ):
+        raise ValueError("video must have shape [B,3,2,T,H,W]")
+    batch_size = int(video.shape[0])
+    if (
+        isinstance(instructions, (str, bytes))
+        or not isinstance(instructions, Sequence)
+        or len(instructions) != batch_size
+        or any(type(value) is not str or not value.strip() for value in instructions)
+    ):
+        raise ValueError("instructions must be one nonblank string per sample")
+    if type(n_previous) is not int or n_previous <= 0:
+        raise ValueError("n_previous must be a positive integer")
+
+    target_device = torch.device(device)
+    if source == BATON_TEACHER_SOURCE:
+        if video.shape[3] < n_previous + num_future_frames:
+            raise ValueError("teacher video does not contain the full future clip")
+        future = video[:, :, :, n_previous : n_previous + num_future_frames]
+        keyframes = select_future_keyframes(
+            rearrange(future, "b c v t h w -> b v t c h w"),
+            indices=BATON_FUTURE_INDICES,
+        ).contiguous()
+        if components.teacher is None:
+            raise RuntimeError("Baton teacher component is missing")
+        with torch.no_grad():
+            tokens = components.teacher.encode_future(keyframes)
+        positions = build_patch_center_positions(
+            batch_size,
+            2,
+            4,
+            device=tokens.device,
+        )
+    else:
+        if video.shape[3] <= n_previous - 1:
+            raise ValueError("video does not contain the last current observation")
+        if components.planner is None:
+            raise RuntimeError("Baton planner component is missing")
+        current = video[:, :, :, n_previous - 1].permute(0, 2, 1, 3, 4)
+        current = _normalized_video_to_uint8(current).contiguous()
+        with torch.no_grad():
+            plan = components.planner.predict(current, tuple(instructions))
+        if getattr(plan, "future_indices", None) != BATON_FUTURE_INDICES:
+            raise ValueError("Baton provider future_indices must be (0, 3, 5, 8)")
+        if getattr(plan, "relevance", None) is not None:
+            raise ValueError("Baton provider must not return relevance")
+        for field in ("mask", "token_mask", "key_mask"):
+            if getattr(plan, field, None) is not None:
+                raise ValueError("Baton provider must not return token masks")
+        tokens = getattr(plan, "tokens", None)
+        positions = getattr(plan, "positions_xy", None)
+
+    expected_tokens = (batch_size, 2, 4, 256, 1024)
+    if (
+        not isinstance(tokens, torch.Tensor)
+        or tuple(tokens.shape) != expected_tokens
+        or not tokens.dtype.is_floating_point
+        or not bool(torch.isfinite(tokens).all())
+    ):
+        raise ValueError("Baton tokens must be finite floating [B,2,4,256,1024]")
+    expected_positions = build_patch_center_positions(
+        batch_size,
+        2,
+        4,
+        device=positions.device if isinstance(positions, torch.Tensor) else None,
+    )
+    if (
+        not isinstance(positions, torch.Tensor)
+        or positions.dtype != torch.float32
+        or not torch.equal(positions, expected_positions)
+    ):
+        raise ValueError("Baton positions must be exact float32 patch centers")
+    tokens = tokens.detach().to(device=target_device, dtype=dtype)
+    positions = positions.detach().to(device=target_device, dtype=torch.float32)
+    times = build_semantic_plan_times(
+        batch_size=batch_size,
+        n_view=2,
+        n_previous=n_previous,
+        num_future_frames=num_future_frames,
+        num_latent_frames=num_latent_frames,
+        indices=BATON_FUTURE_INDICES,
+        device=target_device,
+        dtype=torch.float32,
+    )
+    return BatonSemanticCondition(
+        tokens=tokens,
+        times=times,
+        positions=positions,
+    )
+
+
+def apply_baton_validation_mode(
+    components: BatonConditioningComponents,
+    *,
+    tokens: torch.Tensor,
+    mode: str,
+    batch_size: int,
+    n_view: int,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> BatonValidationSelection:
+    expected = (
+        "teacher"
+        if components.source == BATON_TEACHER_SOURCE
+        else "prediction"
+    )
+    if mode not in (expected, "semantic_disabled"):
+        raise ValueError(
+            f"{components.source} validation mode must be {expected} "
+            "or semantic_disabled"
+        )
+    value = 0.0 if mode == "semantic_disabled" else 1.0
+    condition_mask = torch.full(
+        (batch_size * n_view,),
+        value,
+        device=device,
+        dtype=dtype,
+    )
+    return BatonValidationSelection(
+        source=components.source,
+        mode=mode,
+        tokens=tokens,
+        condition_mask=condition_mask,
+    )
+
+
+def baton_validation_metric_name(source: str, mode: str, metric: str) -> str:
+    if source not in BATON_SOURCES:
+        raise ValueError(f"unknown Baton metric source: {source}")
+    if metric not in {"video", "action"}:
+        raise ValueError("Baton validation metric must be video or action")
+    return f"validation/{source}/{mode}/{metric}"
 
 
 def compute_effective_video_fps(data_config: Dict[str, Any], default_source_fps: float = 30.0) -> float:
@@ -209,8 +621,92 @@ def build_optimizer_parameter_groups(
     qwen_top_lr: float | None = None,
     qwen_vision_lr: float | None = None,
     qwen_ownership: Any | None = None,
+    baton_source: str | None = None,
 ) -> List[Dict[str, Any]]:
     """Apply GE-Act train-mode filtering and split semantic parameters by LR."""
+
+    if baton_source is not None:
+        if baton_source not in BATON_SOURCES:
+            raise ValueError(f"unknown Baton optimizer source: {baton_source}")
+        if provider is not None or qwen_ownership is not None:
+            raise ValueError("frozen Baton conditioning cannot own optimizer state")
+        if train_mode not in ("all", "action_full"):
+            raise ValueError("Baton curricula require video and action training")
+        if action_lr is None:
+            raise ValueError("Baton optimizer requires action_lr")
+
+        by_identifier: dict[int, tuple[str, torch.nn.Parameter]] = {}
+        named_parameters = model.named_parameters
+        try:
+            aliases = named_parameters(remove_duplicate=False)
+        except TypeError:
+            aliases = named_parameters()
+        for name, parameter in aliases:
+            if "action_" in name:
+                owner = "action_expert"
+            elif _is_semantic_parameter(name):
+                owner = "semantic_adapter"
+            else:
+                owner = "ltx_video"
+            previous = by_identifier.get(id(parameter))
+            if previous is not None and previous[0] != owner:
+                raise RuntimeError(
+                    "tied GE-Act parameter aliases cross optimizer owners: "
+                    f"{previous[0]} and {owner}"
+                )
+            by_identifier[id(parameter)] = (owner, parameter)
+            parameter.requires_grad_(True)
+
+        grouped_parameters = {
+            "ltx_video": [],
+            "action_expert": [],
+            "semantic_adapter": [],
+        }
+        for owner, parameter in by_identifier.values():
+            grouped_parameters[owner].append(parameter)
+        empty = [
+            name
+            for name, parameters in grouped_parameters.items()
+            if not parameters
+        ]
+        if empty:
+            raise ValueError(
+                "Baton optimizer groups must all be nonempty: "
+                + ", ".join(empty)
+            )
+        grouped_ids = [
+            id(parameter)
+            for parameters in grouped_parameters.values()
+            for parameter in parameters
+        ]
+        trainable_ids = {
+            id(parameter)
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        }
+        if len(grouped_ids) != len(set(grouped_ids)):
+            raise RuntimeError("Baton optimizer parameter groups contain duplicates")
+        if set(grouped_ids) != trainable_ids:
+            raise RuntimeError(
+                "Baton optimizer groups do not exhaust trainable GE-Act parameters"
+            )
+        learning_rates = {
+            "ltx_video": float(base_lr),
+            "action_expert": float(action_lr),
+            "semantic_adapter": float(semantic_lr),
+        }
+        return [
+            {
+                "name": name,
+                "params": grouped_parameters[name],
+                "lr": learning_rates[name],
+            }
+            for name in (
+                "ltx_video",
+                "action_expert",
+                "semantic_adapter",
+            )
+        ]
 
     if provider is None:
         base_parameters = []
@@ -853,6 +1349,7 @@ class Trainer:
     def __init__(self, config_file, to_log=True, output_dir=None) -> None:
         
         cd = load(open(config_file, "r"), Loader=Loader)
+        self.raw_config = deepcopy(cd)
         args = argparse.Namespace(**cd)
         args.lr = float(args.lr)
         args.semantic_lr = float(getattr(args, "semantic_lr", args.lr))
@@ -885,6 +1382,7 @@ class Trainer:
         self.scheduler = None
         self.semantic_encoder = None
         self.semantic_planner = None
+        self.baton_components = None
         self.grounded_provider = None
         self.grounded_training_enabled = False
         self.qwen_ownership = None
@@ -1080,6 +1578,17 @@ class Trainer:
         logger.info("Initializing models")
         device = self.state.accelerator.device
         dtype = self.state.weight_dtype
+        semantic_config = getattr(self.args, "semantic_plan", {})
+        semantic_source = semantic_config.get("source")
+        if semantic_source in BATON_SOURCES:
+            # Baton provenance and source ownership fail closed before any
+            # tokenizer, VAE, or LTX allocation in direct Trainer use.
+            self.baton_components = prepare_baton_conditioning(
+                self.raw_config,
+                self.train_dataset,
+                device=device,
+                dtype=dtype,
+            )
 
         ### Load Tokenizer
         tokenizer_class = import_custom_class(
@@ -1137,10 +1646,12 @@ class Trainer:
         total_params = count_model_parameters(self.diffusion_model)
         logger.info(f'Total parameters for transformer model:{total_params}')
 
-        semantic_config = getattr(self.args, "semantic_plan", {})
         if semantic_config.get("enabled", False):
             semantic_source = semantic_config.get("source", "gt_siglip2")
-            if semantic_source == "gt_siglip2":
+            if semantic_source in BATON_SOURCES:
+                if self.baton_components is None:
+                    raise RuntimeError("Baton conditioning was lost before LTX setup")
+            elif semantic_source == "gt_siglip2":
                 self.semantic_encoder = OnlineSiglip2SemanticEncoder(
                     semantic_config["model_name_or_path"],
                     device=device,
@@ -1209,6 +1720,8 @@ class Trainer:
             self.vae,
             self.semantic_encoder,
             getattr(self.semantic_planner, "wrapper", None),
+            getattr(self.baton_components, "teacher", None),
+            getattr(self.baton_components, "planner", None),
         )
 
         if torch.backends.mps.is_available() and self.state.weight_dtype == torch.bfloat16:
@@ -1287,6 +1800,11 @@ class Trainer:
             qwen_top_lr=qwen_top_learning_rate,
             qwen_vision_lr=qwen_vision_learning_rate,
             qwen_ownership=self.qwen_ownership,
+            baton_source=(
+                self.baton_components.source
+                if self.baton_components is not None
+                else None
+            ),
         )
         trainable_params = [
             parameter for group in params_to_optimize for parameter in group["params"]
@@ -1477,6 +1995,11 @@ class Trainer:
                     video = video.to(accelerator.device, dtype=weight_dtype).contiguous()
                     batch_size, c, n_view, _, h, w = video.shape
                     mem_size = self.args.data['train']['n_previous']
+                    baton_video = (
+                        video
+                        if self.baton_components is not None
+                        else None
+                    )
                     semantic_keyframes = None
                     planner_semantic_plan = None
                     planner_semantic_times = None
@@ -1532,7 +2055,24 @@ class Trainer:
                     semantic_plan_mask = None
                     semantic_plan_relevance = None
                     semantic_condition_mask = None
-                    if self.semantic_encoder is not None:
+                    if self.baton_components is not None:
+                        baton_condition = build_baton_semantic_condition(
+                            self.baton_components,
+                            self.args.semantic_plan,
+                            baton_video,
+                            batch["caption"],
+                            n_previous=mem_size,
+                            num_future_frames=raw_frames,
+                            num_latent_frames=latent_frames,
+                            device=accelerator.device,
+                            dtype=weight_dtype,
+                        )
+                        semantic_plan = baton_condition.tokens
+                        semantic_plan_times = baton_condition.times
+                        semantic_plan_positions = baton_condition.positions
+                        semantic_plan_mask = baton_condition.mask
+                        semantic_plan_relevance = baton_condition.relevance
+                    elif self.semantic_encoder is not None:
                         semantic_plan = self.semantic_encoder.encode(semantic_keyframes)
                         semantic_plan_times = build_semantic_plan_times(
                             batch_size=batch_size,
@@ -1789,6 +2329,20 @@ class Trainer:
                 self.current_cursor = cursor
 
                 logs = {"loss": loss.detach().item(), "lr": self.lr_scheduler.get_last_lr()[0]}
+                if self.baton_components is not None:
+                    train_mode_label = (
+                        "teacher"
+                        if self.baton_components.source == BATON_TEACHER_SOURCE
+                        else "prediction"
+                    )
+                    logs[
+                        f"train/{self.baton_components.source}/"
+                        f"{train_mode_label}/video"
+                    ] = loss_video.detach().item()
+                    logs[
+                        f"train/{self.baton_components.source}/"
+                        f"{train_mode_label}/action"
+                    ] = loss_action.detach().item()
                 progress_bar.set_postfix(logs)
                 accelerator.log(logs, step=global_step)
 
@@ -1810,7 +2364,24 @@ class Trainer:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         model_save_dir = os.path.join(self.save_folder,f'Validation_step_{global_step}')
-                        self.validate(accelerator, model_save_dir, global_step, n_view=n_view, n_chunk=1)
+                        if self.baton_components is None:
+                            self.validate(accelerator, model_save_dir, global_step, n_view=n_view, n_chunk=1)
+                        else:
+                            for validation_mode in self.args.semantic_plan.get(
+                                "validation_modes",
+                                [self.args.semantic_plan["validation_mode"]],
+                            ):
+                                self.validate(
+                                    accelerator,
+                                    os.path.join(
+                                        model_save_dir,
+                                        str(validation_mode),
+                                    ),
+                                    global_step,
+                                    n_view=n_view,
+                                    n_chunk=1,
+                                    semantic_mode=str(validation_mode),
+                                )
 
                 
                 if accelerator.sync_gradients and should_save_checkpoint(global_step, self.args):
@@ -1916,12 +2487,47 @@ class Trainer:
         image = image[:batch_size]
 
         if (
-            self.semantic_encoder is not None
+            self.baton_components is not None
+            or self.semantic_encoder is not None
             or self.semantic_planner is not None
             or self.grounded_training_enabled
         ):
             semantic_mode = semantic_mode or self.args.semantic_plan.get("validation_mode", "gt")
-            if semantic_mode == "gt":
+            if self.baton_components is not None:
+                mem_size = self.args.data['train']['n_previous']
+                raw_future_frames = self.args.data['train']['chunk']
+                latent_num_frames = compute_ltx_latent_frames(
+                    raw_future_frames,
+                    temporal_compression_ratio=self.TEMPORAL_DOWN_RATIO,
+                    n_previous=mem_size,
+                )
+                baton_condition = build_baton_semantic_condition(
+                    self.baton_components,
+                    self.args.semantic_plan,
+                    gt_video[:batch_size],
+                    prompt[:batch_size],
+                    n_previous=mem_size,
+                    num_future_frames=raw_future_frames,
+                    num_latent_frames=latent_num_frames,
+                    device=accelerator.device,
+                    dtype=self.state.weight_dtype,
+                )
+                selection = apply_baton_validation_mode(
+                    self.baton_components,
+                    tokens=baton_condition.tokens,
+                    mode=semantic_mode,
+                    batch_size=batch_size,
+                    n_view=v,
+                    device=accelerator.device,
+                    dtype=self.state.weight_dtype,
+                )
+                semantic_plan = selection.tokens
+                semantic_plan_times = baton_condition.times
+                semantic_plan_positions = baton_condition.positions
+                semantic_plan_mask = baton_condition.mask
+                semantic_plan_relevance = baton_condition.relevance
+                semantic_condition_mask = selection.condition_mask
+            elif semantic_mode == "gt":
                 if self.semantic_encoder is None:
                     raise ValueError(
                         "GT semantic validation requires semantic_plan.source=gt_siglip2"
@@ -2097,13 +2703,46 @@ class Trainer:
             semantic_condition_mask=semantic_condition_mask,
         )[0]
 
-        cap = 'Validation'
+        if self.baton_components is None:
+            cap = 'Validation'
+        else:
+            cap = (
+                f"Validation_{self.baton_components.source}_"
+                f"{semantic_mode}"
+            )
         fps = int(getattr(self.args, "basic_fps", 30) / (self.args.data['train']['action_chunk'] // self.args.data['train']['chunk']))
         save_video(rearrange(gt_video[0].data.cpu(), 'c v t h w -> c t h (v w)', v=n_view), os.path.join(model_save_dir, f'{cap}_gt.mp4'), fps=fps)
 
         if self.args.return_video:
             video = preds['video'].data.cpu()
             save_video(rearrange(video, '(b v) c t h w -> b c t h (v w)', v=n_view)[0], os.path.join(model_save_dir, f'{cap}.mp4'), fps=fps)
+            if self.baton_components is not None and to_log:
+                predicted = rearrange(
+                    video,
+                    "(b v) c t h w -> b c v t h w",
+                    b=batch_size,
+                    v=n_view,
+                )
+                target = gt_video[
+                    :batch_size,
+                    :,
+                    :,
+                    self.args.data['train']['n_previous'] :,
+                ].float().cpu()
+                common_frames = min(predicted.shape[3], target.shape[3])
+                video_mse = (
+                    predicted[:, :, :, :common_frames].float()
+                    - target[:, :, :, :common_frames]
+                ).square().mean()
+                self.writer.add_scalar(
+                    baton_validation_metric_name(
+                        self.baton_components.source,
+                        str(semantic_mode),
+                        "video",
+                    ),
+                    video_mse.item(),
+                    global_step,
+                )
 
         if to_log:
             self.writer.add_text(f'step_{global_step}/{cap} prompt:', prompt[0], global_step)
@@ -2116,7 +2755,15 @@ class Trainer:
             action_logs = act_metric(
                 preds['action'][:,:,:action_dim].detach().cpu().to(torch.float).numpy()[:batch_size],
                 gt_actions[:,:,:action_dim].detach().cpu().to(torch.float).numpy()[:batch_size],
-                prefix=cap,
+                prefix=(
+                    baton_validation_metric_name(
+                        self.baton_components.source,
+                        str(semantic_mode),
+                        "action",
+                    )
+                    if self.baton_components is not None
+                    else cap
+                ),
                 start_stop_interval=[(0,1),(1,9),(9,25),(25,self.args.data['train']['action_chunk'])]
             )
 
