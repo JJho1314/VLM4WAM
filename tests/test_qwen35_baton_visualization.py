@@ -7,6 +7,7 @@ from PIL import Image
 import pytest
 import torch
 
+import qwen35_baton.provider as provider_module
 from qwen35_baton.cli.visualize_attention import (
     _parser as visualization_parser,
     main as visualize_main,
@@ -309,3 +310,53 @@ def test_visualization_cli_rejects_float16_dtype_choice(
         )
 
     assert "invalid choice" in capsys.readouterr().err
+
+
+def test_visualization_cli_rejects_indexed_cpu_before_checkpoint_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.npz"
+    np.savez_compressed(
+        input_path,
+        current_images=np.zeros((1, 2, 3, 8, 8), dtype=np.uint8),
+    )
+    instructions = tmp_path / "instructions.json"
+    counterfactuals = tmp_path / "counterfactuals.json"
+    instructions.write_text('["pick"]')
+    counterfactuals.write_text('["place"]')
+    monkeypatch.setattr(
+        provider_module,
+        "_validate_checkpoint_envelope",
+        lambda _: (_ for _ in ()).throw(
+            AssertionError("CLI device validation must precede checkpoint access")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="canonical CPU device"):
+        visualize_main(
+            [
+                "--checkpoint",
+                str(tmp_path / "checkpoint"),
+                "--qwen-model-path",
+                str(tmp_path / "qwen"),
+                "--qwen-tokenizer-path",
+                str(tmp_path / "tokenizer"),
+                "--qwen-processor-path",
+                str(tmp_path / "processor"),
+                "--siglip2-model-path",
+                str(tmp_path / "siglip2"),
+                "--input-npz",
+                str(input_path),
+                "--instructions-json",
+                str(instructions),
+                "--counterfactual-instructions-json",
+                str(counterfactuals),
+                "--output-dir",
+                str(tmp_path / "output"),
+                "--device",
+                "cpu:0",
+                "--dtype",
+                "fp32",
+            ]
+        )

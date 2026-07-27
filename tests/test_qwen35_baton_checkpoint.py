@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import multiprocessing
 from pathlib import Path
 import random
 from typing import Any
@@ -16,8 +17,10 @@ from qwen35_baton.checkpoint import (
     BatonTrainingCursor,
     capture_rank_rng_state,
     load_baton_checkpoint as _load_baton_checkpoint,
+    load_trusted_planner_topology,
     planner_module_topology,
     planner_safetensors_topology,
+    publish_trusted_planner_topology,
     save_baton_checkpoint,
 )
 from qwen35_baton.cli.train_semantic_planner import BatonCosineWarmupScheduler
@@ -34,6 +37,56 @@ class _Scaler:
 
     def load_state_dict(self, state: dict[str, float]) -> None:
         self.scale = float(state["scale"])
+
+
+def _race_topology(width: int) -> dict[str, Any]:
+    return {
+        "format_version": 1,
+        "tensors": [
+            {"name": "weight", "shape": [width], "dtype": "F32"},
+        ],
+        "aliases": {},
+    }
+
+
+def _publish_topology_worker(
+    barrier: Any,
+    destination: str,
+    topology: dict[str, Any],
+    results: Any,
+) -> None:
+    try:
+        barrier.wait(timeout=10)
+        published_hash = publish_trusted_planner_topology(
+            destination,
+            topology,
+        )
+        results.put(("ok", published_hash))
+    except Exception as error:
+        results.put(("error", type(error).__name__, str(error)))
+
+
+def _run_concurrent_publications(
+    destination: Path,
+    topologies: tuple[dict[str, Any], dict[str, Any]],
+) -> list[tuple[Any, ...]]:
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(len(topologies))
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_publish_topology_worker,
+            args=(barrier, str(destination), topology, results),
+        )
+        for topology in topologies
+    ]
+    for process in processes:
+        process.start()
+    publications = [results.get(timeout=20) for _ in processes]
+    for process in processes:
+        process.join(timeout=20)
+        assert process.exitcode == 0
+    return publications
 
 
 def load_baton_checkpoint(*args: Any, **kwargs: Any):
@@ -746,6 +799,57 @@ def test_checkpoint_save_rejects_untrusted_all_zero_planner_topology(
         )
 
     assert not checkpoint.exists()
+
+
+def test_distinct_concurrent_topology_publishers_create_exactly_one_anchor(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "planner_topology.json"
+    first = _race_topology(1)
+    second = _race_topology(2)
+
+    results = _run_concurrent_publications(destination, (first, second))
+
+    successes = [result for result in results if result[0] == "ok"]
+    failures = [result for result in results if result[0] == "error"]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    anchored, anchored_hash = load_trusted_planner_topology(destination)
+    assert anchored in (first, second)
+    assert anchored_hash == successes[0][1]
+    assert not list(tmp_path.glob(".planner_topology.json.incomplete-*"))
+
+
+def test_identical_concurrent_topology_publishers_are_idempotent(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "planner_topology.json"
+    topology = _race_topology(3)
+
+    results = _run_concurrent_publications(
+        destination,
+        (topology, topology),
+    )
+
+    assert [result[0] for result in results] == ["ok", "ok"]
+    anchored, anchored_hash = load_trusted_planner_topology(destination)
+    assert anchored == topology
+    assert {result[1] for result in results} == {anchored_hash}
+    assert not list(tmp_path.glob(".planner_topology.json.incomplete-*"))
+
+
+def test_corrupt_preexisting_topology_anchor_is_never_overwritten(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "planner_topology.json"
+    corrupt = b'{"format_version": 1, "topology": '
+    destination.write_bytes(corrupt)
+
+    with pytest.raises(ValueError, match="trusted planner topology JSON"):
+        publish_trusted_planner_topology(destination, _race_topology(4))
+
+    assert destination.read_bytes() == corrupt
+    assert not list(tmp_path.glob(".planner_topology.json.incomplete-*"))
 
 
 def test_loader_rejects_refreshed_all_zero_metadata_topology_before_mutation(

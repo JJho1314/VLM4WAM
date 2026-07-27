@@ -649,11 +649,22 @@ def publish_trusted_planner_topology(
     temporary = Path(temporary_name)
     try:
         _json_write(temporary, payload)
-        os.replace(temporary, destination)
+        try:
+            os.link(temporary, destination)
+        except FileExistsError:
+            anchored, anchored_hash = load_trusted_planner_topology(destination)
+            if (
+                anchored != payload["topology"]
+                or anchored_hash != payload["sha256"]
+            ):
+                raise ValueError(
+                    "existing trusted planner topology differs from publisher"
+                )
         _fsync_directory(destination.parent)
     finally:
         if temporary.exists():
             temporary.unlink()
+            _fsync_directory(destination.parent)
     return str(payload["sha256"])
 
 

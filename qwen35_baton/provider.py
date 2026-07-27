@@ -33,6 +33,55 @@ _CHECKPOINT_FILES = (
 )
 
 
+def _validated_provider_device(
+    device: torch.device | str,
+    *,
+    torch_dtype: torch.dtype,
+) -> torch.device:
+    try:
+        target = torch.device(device)
+    except (TypeError, RuntimeError) as error:
+        raise ValueError(f"unsupported provider device: {device!r}") from error
+    if target.type == "cpu":
+        if target.index is not None:
+            raise ValueError("provider requires the canonical CPU device without an index")
+        return torch.device("cpu")
+    if target.type != "cuda":
+        raise ValueError("provider device must support CPU/CUDA autocast semantics")
+    if not torch.cuda.is_available():
+        raise ValueError("CUDA provider device requested but CUDA is unavailable")
+    try:
+        device_count = torch.cuda.device_count()
+        ordinal = (
+            torch.cuda.current_device()
+            if target.index is None
+            else target.index
+        )
+    except (RuntimeError, AssertionError) as error:
+        raise ValueError("CUDA device ordinal could not be resolved") from error
+    if (
+        type(device_count) is not int
+        or type(ordinal) is not int
+        or not 0 <= ordinal < device_count
+    ):
+        raise ValueError(
+            f"CUDA device ordinal {ordinal!r} is outside [0, {device_count})"
+        )
+    if torch_dtype is torch.bfloat16:
+        try:
+            with torch.cuda.device(ordinal):
+                bf16_supported = torch.cuda.is_bf16_supported()
+        except (RuntimeError, AssertionError) as error:
+            raise ValueError(
+                f"CUDA device ordinal {ordinal} could not validate bfloat16 support"
+            ) from error
+        if not bf16_supported:
+            raise ValueError(
+                f"CUDA device ordinal {ordinal} does not support bfloat16"
+            )
+    return torch.device("cuda", ordinal)
+
+
 @dataclass(frozen=True)
 class BatonSemanticPlan:
     """Detached full-grid planner output consumed by downstream GE-Act."""
@@ -501,22 +550,10 @@ class FrozenBatonPlanner(nn.Module):
 
         if torch_dtype not in (torch.bfloat16, torch.float32):
             raise ValueError("torch_dtype must be torch.bfloat16 or torch.float32")
-        try:
-            target_device = torch.device(device)
-        except (TypeError, RuntimeError) as error:
-            raise ValueError(f"unsupported provider device: {device!r}") from error
-        if target_device.type not in {"cpu", "cuda"}:
-            raise ValueError(
-                "provider device must support CPU/CUDA autocast semantics"
-            )
-        if target_device.type == "cuda" and not torch.cuda.is_available():
-            raise ValueError("CUDA provider device requested but CUDA is unavailable")
-        if (
-            target_device.type == "cuda"
-            and torch_dtype is torch.bfloat16
-            and not torch.cuda.is_bf16_supported()
-        ):
-            raise ValueError("CUDA provider device does not support bfloat16")
+        target_device = _validated_provider_device(
+            device,
+            torch_dtype=torch_dtype,
+        )
 
         checkpoint = Path(checkpoint_dir).expanduser().resolve()
         model_path = Path(qwen_model_path).expanduser().resolve()

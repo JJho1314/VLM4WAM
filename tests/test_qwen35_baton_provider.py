@@ -10,6 +10,7 @@ from safetensors.torch import save_model
 import torch
 import torch.nn as nn
 
+import qwen35_baton.provider as provider_module
 from qwen35_baton.checkpoint import (
     BatonTrainingCursor,
     capture_rank_rng_state,
@@ -785,6 +786,96 @@ def test_unsupported_device_is_rejected_before_checkpoint_or_component_loading(
         )
 
     assert calls == 0
+
+
+@pytest.mark.parametrize(
+    ("device", "current_device"),
+    (("cuda:2", 0), ("cuda", 2)),
+)
+def test_out_of_range_cuda_ordinal_fails_before_checkpoint_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    device: str,
+    current_device: int,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current_device)
+    monkeypatch.setattr(
+        provider_module,
+        "_validate_checkpoint_envelope",
+        lambda _: (_ for _ in ()).throw(
+            AssertionError("invalid device must fail before checkpoint access")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="CUDA device ordinal"):
+        FrozenBatonPlanner.from_checkpoint(
+            tmp_path / "missing-checkpoint",
+            qwen_model_path=tmp_path / "qwen",
+            qwen_tokenizer_path=tmp_path / "tokenizer",
+            qwen_processor_path=tmp_path / "processor",
+            siglip2_model_path=tmp_path / "siglip2",
+            device=device,
+            torch_dtype=torch.float32,
+            _component_loader=lambda **_: (_Processor(), _FakePlanner()),
+        )
+
+
+def test_indexed_cpu_device_fails_before_checkpoint_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        provider_module,
+        "_validate_checkpoint_envelope",
+        lambda _: (_ for _ in ()).throw(
+            AssertionError("indexed CPU must fail before checkpoint access")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="canonical CPU device"):
+        FrozenBatonPlanner.from_checkpoint(
+            tmp_path / "missing-checkpoint",
+            qwen_model_path=tmp_path / "qwen",
+            qwen_tokenizer_path=tmp_path / "tokenizer",
+            qwen_processor_path=tmp_path / "processor",
+            siglip2_model_path=tmp_path / "siglip2",
+            device="cpu:0",
+            torch_dtype=torch.float32,
+            _component_loader=lambda **_: (_Processor(), _FakePlanner()),
+        )
+
+
+@pytest.mark.parametrize("device", ("cuda", "cuda:0"))
+def test_canonical_cuda_device_reaches_checkpoint_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    device: str,
+) -> None:
+    class CheckpointBoundaryReached(Exception):
+        pass
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        provider_module,
+        "_validate_checkpoint_envelope",
+        lambda _: (_ for _ in ()).throw(CheckpointBoundaryReached),
+    )
+
+    with pytest.raises(CheckpointBoundaryReached):
+        FrozenBatonPlanner.from_checkpoint(
+            tmp_path / "missing-checkpoint",
+            qwen_model_path=tmp_path / "qwen",
+            qwen_tokenizer_path=tmp_path / "tokenizer",
+            qwen_processor_path=tmp_path / "processor",
+            siglip2_model_path=tmp_path / "siglip2",
+            device=device,
+            torch_dtype=torch.float32,
+            _component_loader=lambda **_: (_Processor(), _FakePlanner()),
+        )
 
 
 def test_provider_discovers_output_root_topology_by_default(
