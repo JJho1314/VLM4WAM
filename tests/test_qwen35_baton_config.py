@@ -69,6 +69,7 @@ def test_continuous_metadata_round_trips_the_complete_contract() -> None:
         "trainable_qwen_layer_indices",
         "loss_weights",
         "hdf5_manifest_hash",
+        "planner_topology_hash",
         "optimizer_topology_hash",
         "scheduler_topology_hash",
         "global_step",

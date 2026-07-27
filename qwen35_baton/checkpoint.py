@@ -33,6 +33,7 @@ _CHECKPOINT_FILES = (
     "metadata.json",
 )
 _RUNTIME_METADATA_FIELDS = {
+    "planner_topology_hash",
     "optimizer_topology_hash",
     "scheduler_topology_hash",
     "global_step",
@@ -497,12 +498,14 @@ def _metadata_cursor(
     cursor: BatonTrainingCursor,
     *,
     world_size: int,
+    planner_hash: str,
     optimizer_hash: str,
     scheduler_hash: str,
     rng_hash: str,
 ) -> BatonCheckpointMetadata:
     return replace(
         metadata,
+        planner_topology_hash=planner_hash,
         optimizer_topology_hash=optimizer_hash,
         scheduler_topology_hash=scheduler_hash,
         global_step=cursor.global_step,
@@ -515,6 +518,74 @@ def _metadata_cursor(
         ),
         rng_state_hash=rng_hash,
     )
+
+
+def planner_safetensors_topology(path: str | Path) -> dict[str, Any]:
+    """Read ordered tensor shape/dtype and alias policy from a safe header."""
+
+    artifact = Path(path)
+    with safe_open(artifact, framework="pt", device="cpu") as handle:
+        names = tuple(handle.keys())
+        metadata = dict(handle.metadata() or {})
+        tensors = [
+            {
+                "name": name,
+                "shape": list(handle.get_slice(name).get_shape()),
+                "dtype": handle.get_slice(name).get_dtype(),
+            }
+            for name in names
+        ]
+    aliases = {
+        name: target
+        for name, target in sorted(metadata.items())
+        if name != "format" and name not in names and target in names
+    }
+    contract = {
+        "format_version": 1,
+        "tensors": tensors,
+        "aliases": aliases,
+    }
+    validate_planner_topology_contract(contract)
+    return contract
+
+
+def validate_planner_topology_contract(payload: Any) -> None:
+    """Reject incomplete, unordered, duplicate, or malformed topology records."""
+
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != {"format_version", "tensors", "aliases"}
+        or payload["format_version"] != 1
+        or not isinstance(payload["tensors"], list)
+        or not payload["tensors"]
+        or not isinstance(payload["aliases"], Mapping)
+    ):
+        raise ValueError("planner topology contract is invalid")
+    names: list[str] = []
+    for tensor in payload["tensors"]:
+        if (
+            not isinstance(tensor, Mapping)
+            or set(tensor) != {"name", "shape", "dtype"}
+            or not isinstance(tensor["name"], str)
+            or not tensor["name"]
+            or not isinstance(tensor["shape"], list)
+            or any(type(value) is not int or value < 0 for value in tensor["shape"])
+            or not isinstance(tensor["dtype"], str)
+            or not tensor["dtype"]
+        ):
+            raise ValueError("planner topology tensor entry is invalid")
+        names.append(tensor["name"])
+    if len(names) != len(set(names)):
+        raise ValueError("planner topology tensor names must be unique")
+    for alias, target in payload["aliases"].items():
+        if (
+            not isinstance(alias, str)
+            or not alias
+            or alias in names
+            or not isinstance(target, str)
+            or target not in names
+        ):
+            raise ValueError("planner topology alias policy is invalid")
 
 
 def save_baton_checkpoint(
@@ -594,6 +665,9 @@ def save_baton_checkpoint(
             metadata,
             cursor,
             world_size=len(states),
+            planner_hash=sha256_json(
+                planner_safetensors_topology(staging / "planner.safetensors")
+            ),
             optimizer_hash=sha256_json(
                 _optimizer_topology(optimizer_state)
             ),

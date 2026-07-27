@@ -141,6 +141,7 @@ class BatonCheckpointMetadata:
         "trainable_qwen_layer_indices",
         "loss_weights",
         "hdf5_manifest_hash",
+        "planner_topology_hash",
         "optimizer_topology_hash",
         "scheduler_topology_hash",
         "global_step",
@@ -156,6 +157,7 @@ class BatonCheckpointMetadata:
         "siglip2_artifact_hash",
         "teacher_preprocessing_hash",
         "hdf5_manifest_hash",
+        "planner_topology_hash",
         "optimizer_topology_hash",
         "scheduler_topology_hash",
         "rng_state_hash",
@@ -192,6 +194,7 @@ class BatonCheckpointMetadata:
     trainable_qwen_layer_indices: tuple[int, ...]
     loss_weights: BatonLossWeights
     hdf5_manifest_hash: str
+    planner_topology_hash: str
     optimizer_topology_hash: str
     scheduler_topology_hash: str
     global_step: int
@@ -225,6 +228,7 @@ class BatonCheckpointMetadata:
         _require_equal("teacher_image_size", self.teacher_image_size, geometry.image_size)
         _require_equal("teacher_patch_size", self.teacher_patch_size, geometry.patch_size)
         _require_equal("teacher_feature_layer", self.teacher_feature_layer, -2)
+        _require_equal("teacher_dtype", self.teacher_dtype, "bfloat16")
         _require_equal("target_shape", self.target_shape, (2, 4, 256, 1024))
         _require_equal("future_indices", self.future_indices, geometry.future_indices)
         _require_equal("query_dim", self.query_dim, geometry.query_dim)
@@ -294,6 +298,7 @@ class BatonCheckpointMetadata:
             trainable_qwen_layer_indices=tuple(range(16, 24)),
             loss_weights=BatonLossWeights(),
             hdf5_manifest_hash=_example_sha256("hdf5-manifest"),
+            planner_topology_hash=_example_sha256("planner-topology"),
             optimizer_topology_hash=_example_sha256("optimizer-topology"),
             scheduler_topology_hash=_example_sha256("scheduler-topology"),
             global_step=0,

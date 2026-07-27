@@ -211,6 +211,59 @@ def test_visualization_cli_fails_closed_before_checkpoint_load_on_bad_batch(
                 str(tmp_path / "tokenizer"),
                 "--qwen-processor-path",
                 str(tmp_path / "processor"),
+                "--siglip2-model-path",
+                str(tmp_path / "siglip2"),
+                "--expected-planner-topology",
+                str(tmp_path / "topology.json"),
+                "--input-npz",
+                str(input_path),
+                "--instructions-json",
+                str(instructions),
+                "--counterfactual-instructions-json",
+                str(counterfactuals),
+                "--output-dir",
+                str(tmp_path / "output"),
+            ]
+        )
+
+
+def test_visualization_cli_rejects_equal_counterfactual_before_checkpoint_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.npz"
+    np.savez_compressed(
+        input_path,
+        current_images=np.zeros((1, 2, 3, 8, 8), dtype=np.uint8),
+    )
+    instructions = tmp_path / "instructions.json"
+    counterfactuals = tmp_path / "counterfactuals.json"
+    instructions.write_text('["pick"]')
+    counterfactuals.write_text('["pick"]')
+
+    def forbidden_load(*args: object, **kwargs: object) -> object:
+        raise AssertionError("checkpoint loading must follow instruction validation")
+
+    monkeypatch.setattr(
+        "qwen35_baton.cli.visualize_attention.FrozenBatonPlanner.from_checkpoint",
+        forbidden_load,
+    )
+
+    with pytest.raises(ValueError, match="must differ"):
+        visualize_main(
+            [
+                "--checkpoint",
+                str(tmp_path / "checkpoint"),
+                "--qwen-model-path",
+                str(tmp_path / "qwen"),
+                "--qwen-tokenizer-path",
+                str(tmp_path / "tokenizer"),
+                "--qwen-processor-path",
+                str(tmp_path / "processor"),
+                "--siglip2-model-path",
+                str(tmp_path / "siglip2"),
+                "--expected-planner-topology",
+                str(tmp_path / "topology.json"),
                 "--input-npz",
                 str(input_path),
                 "--instructions-json",

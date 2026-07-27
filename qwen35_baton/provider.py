@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -318,6 +319,71 @@ def _validate_local_artifact_contract(
         )
 
 
+def _validate_siglip2_artifact_contract(
+    metadata: BatonCheckpointMetadata,
+    *,
+    siglip2_model_path: Path,
+) -> None:
+    if not siglip2_model_path.is_dir():
+        raise FileNotFoundError(
+            f"SigLIP2 model directory does not exist: {siglip2_model_path}"
+        )
+    config_hash = sha256_file(siglip2_model_path / "config.json")
+    if config_hash != metadata.siglip2_config_hash:
+        raise ValueError(
+            "SigLIP2 config hash mismatch: "
+            f"expected {metadata.siglip2_config_hash}, got {config_hash}"
+        )
+    artifact_hash = sha256_artifact(siglip2_model_path)
+    if artifact_hash != metadata.siglip2_artifact_hash:
+        raise ValueError(
+            "SigLIP2 artifact hash mismatch: "
+            f"expected {metadata.siglip2_artifact_hash}, got {artifact_hash}"
+        )
+    if artifact_hash != metadata.teacher_preprocessing_hash:
+        raise ValueError(
+            "SigLIP2 preprocessing hash differs from checkpoint metadata"
+        )
+    from qwen35_baton.cli.preflight import _siglip_geometry
+
+    geometry = _siglip_geometry(siglip2_model_path)
+    if geometry != {"image_size": 256, "patch_size": 16, "hidden_size": 1024}:
+        raise ValueError("SigLIP2 geometry differs from the 256/16/1024 contract")
+    if metadata.teacher_feature_layer != -2 or metadata.teacher_dtype != "bfloat16":
+        raise ValueError("SigLIP2 teacher layer/dtype contract must be -2/bfloat16")
+
+
+def _validate_trusted_planner_topology(
+    metadata: BatonCheckpointMetadata,
+    *,
+    checkpoint: Path,
+    expected: str | Path | Mapping[str, Any],
+) -> None:
+    from qwen35_baton.checkpoint import (
+        planner_safetensors_topology,
+        validate_planner_topology_contract,
+    )
+
+    if isinstance(expected, Mapping):
+        trusted = dict(expected)
+    else:
+        trusted = dict(
+            _read_json(
+                Path(expected).expanduser().resolve(),
+                label="trusted planner topology",
+            )
+        )
+    validate_planner_topology_contract(trusted)
+    trusted_hash = sha256_json(trusted)
+    if trusted_hash != metadata.planner_topology_hash:
+        raise ValueError(
+            "trusted planner topology hash differs from checkpoint metadata"
+        )
+    actual = planner_safetensors_topology(checkpoint / "planner.safetensors")
+    if actual != trusted:
+        raise ValueError("planner safetensors topology differs from trusted contract")
+
+
 def _load_local_components(
     *,
     qwen_model_path: Path,
@@ -431,6 +497,8 @@ class FrozenBatonPlanner(nn.Module):
         qwen_model_path: str | Path,
         qwen_tokenizer_path: str | Path,
         qwen_processor_path: str | Path,
+        siglip2_model_path: str | Path,
+        expected_planner_topology: str | Path | Mapping[str, Any],
         device: torch.device | str = "cpu",
         torch_dtype: torch.dtype = torch.bfloat16,
         _component_loader: Callable[..., tuple[Any, nn.Module]] | None = None,
@@ -441,15 +509,25 @@ class FrozenBatonPlanner(nn.Module):
         model_path = Path(qwen_model_path).expanduser().resolve()
         tokenizer_path = Path(qwen_tokenizer_path).expanduser().resolve()
         processor_path = Path(qwen_processor_path).expanduser().resolve()
+        siglip_path = Path(siglip2_model_path).expanduser().resolve()
 
         # Everything through the artifact checks is read-only and precedes both
         # Transformers construction and safetensors state mutation.
         metadata = _validate_checkpoint_envelope(checkpoint)
+        _validate_trusted_planner_topology(
+            metadata,
+            checkpoint=checkpoint,
+            expected=expected_planner_topology,
+        )
         _validate_local_artifact_contract(
             metadata,
             qwen_model_path=model_path,
             qwen_tokenizer_path=tokenizer_path,
             qwen_processor_path=processor_path,
+        )
+        _validate_siglip2_artifact_contract(
+            metadata,
+            siglip2_model_path=siglip_path,
         )
         if not isinstance(torch_dtype, torch.dtype):
             raise TypeError("torch_dtype must be a torch dtype")
@@ -510,19 +588,29 @@ class FrozenBatonPlanner(nn.Module):
         if current_images.dtype != torch.uint8:
             raise TypeError("current_images must contain uint8 RGB")
         batch_size = int(current_images.shape[0])
+        if isinstance(instructions, (str, bytes)) or not isinstance(
+            instructions, Sequence
+        ):
+            raise TypeError("instructions must be an outer sequence of strings")
         if batch_size <= 0 or len(instructions) != batch_size:
             raise ValueError("images and instructions batch sizes must match")
         positive = tuple(instructions)
-        if any(type(value) is not str or not value for value in positive):
-            raise ValueError("instructions must contain nonempty strings")
+        if any(type(value) is not str or not value.strip() for value in positive):
+            raise ValueError("instructions must contain nonblank strings")
         negative = None
         if counterfactual_instructions is not None:
+            if isinstance(counterfactual_instructions, (str, bytes)) or not isinstance(
+                counterfactual_instructions, Sequence
+            ):
+                raise TypeError(
+                    "counterfactual instructions must be an outer sequence of strings"
+                )
             negative = tuple(counterfactual_instructions)
             if len(negative) != batch_size:
                 raise ValueError(
                     "images and counterfactual instructions batch sizes must match"
                 )
-            if any(type(value) is not str or not value for value in negative):
+            if any(type(value) is not str or not value.strip() for value in negative):
                 raise ValueError(
                     "counterfactual instructions must contain nonempty strings"
                 )
@@ -531,6 +619,27 @@ class FrozenBatonPlanner(nn.Module):
                     "counterfactual instructions must differ from positives"
                 )
         return batch_size, positive, negative
+
+    def _autocast_context(self) -> Any:
+        backbone = getattr(self.planner, "backbone", None)
+        if not isinstance(backbone, nn.Module):
+            return nullcontext()
+        dtype = next(
+            (
+                parameter.dtype
+                for parameter in backbone.parameters()
+                if parameter.dtype.is_floating_point
+            ),
+            None,
+        )
+        device_type = self._device().type
+        if dtype == torch.bfloat16 and device_type in {"cpu", "cuda"}:
+            return torch.autocast(
+                device_type=device_type,
+                dtype=torch.bfloat16,
+                enabled=True,
+            )
+        return nullcontext()
 
     def _build_rows(
         self,
@@ -665,12 +774,13 @@ class FrozenBatonPlanner(nn.Module):
             instruction_sets,
         )
         rows = batch_size * 2 * len(instruction_sets)
-        output = self.planner.forward_rows(
-            qwen_inputs,
-            plan_positions,
-            camera_ids,
-            return_attention_maps=return_attention,
-        )
+        with self._autocast_context():
+            output = self.planner.forward_rows(
+                qwen_inputs,
+                plan_positions,
+                camera_ids,
+                return_attention_maps=return_attention,
+            )
         flat, raw_maps = self._validate_output(
             output,
             rows=rows,

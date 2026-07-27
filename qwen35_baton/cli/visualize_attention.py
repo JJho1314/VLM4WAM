@@ -23,7 +23,7 @@ def _string_list(path: Path, *, label: str) -> tuple[str, ...]:
     if (
         not isinstance(payload, list)
         or not payload
-        or any(type(value) is not str or not value for value in payload)
+        or any(type(value) is not str or not value.strip() for value in payload)
     ):
         raise ValueError(f"{label} must be a nonempty JSON list of nonempty strings")
     return tuple(payload)
@@ -59,6 +59,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--qwen-model-path", type=Path, required=True)
     parser.add_argument("--qwen-tokenizer-path", type=Path, required=True)
     parser.add_argument("--qwen-processor-path", type=Path, required=True)
+    parser.add_argument("--siglip2-model-path", type=Path, required=True)
+    parser.add_argument("--expected-planner-topology", type=Path, required=True)
     parser.add_argument("--input-npz", type=Path, required=True)
     parser.add_argument("--instructions-json", type=Path, required=True)
     parser.add_argument(
@@ -88,11 +90,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(
             "image, instruction, and counterfactual batch sizes must match"
         )
+    if any(
+        positive == counterfactual
+        for positive, counterfactual in zip(
+            instructions,
+            counterfactuals,
+            strict=True,
+        )
+    ):
+        raise ValueError("counterfactual instructions must differ from positives")
     provider = FrozenBatonPlanner.from_checkpoint(
         args.checkpoint,
         qwen_model_path=args.qwen_model_path,
         qwen_tokenizer_path=args.qwen_tokenizer_path,
         qwen_processor_path=args.qwen_processor_path,
+        siglip2_model_path=args.siglip2_model_path,
+        expected_planner_topology=args.expected_planner_topology,
         device=args.device,
     )
     plan = provider.predict(
