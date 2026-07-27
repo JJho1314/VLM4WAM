@@ -453,8 +453,6 @@ def _validate_grounded_training_config(
         errors.append(
             "train and validation must use the same normalization statistics"
         )
-
-
 def _validate_baton_training_config(
     config: dict[str, Any],
     *,
@@ -589,6 +587,21 @@ def _validate_baton_training_config(
         errors.append(
             "train and validation must use the same normalization statistics"
         )
+    sampling_contract = {
+        "baton_sampling_algorithm": (
+            "libero_fastwam_hdf5_stateless_sha256"
+        ),
+        "baton_sampling_version": 1,
+        "baton_sampling_seed": config.get("seed"),
+    }
+    for split, split_data in (("train", train_data), ("val", val_data)):
+        for field, expected in sampling_contract.items():
+            _append_exact_error(
+                errors,
+                f"data.{split}.{field}",
+                split_data.get(field),
+                expected,
+            )
 
 
 def _resolve_ge_act_path(raw_path: str, ge_act_root: Path) -> Path:

@@ -139,6 +139,9 @@ data:
     action_chunk: 36
     n_previous: 4
     previous_pick_mode: random
+    baton_sampling_algorithm: libero_fastwam_hdf5_stateless_sha256
+    baton_sampling_version: 1
+    baton_sampling_seed: 42
     action_type: absolute
     action_space: eef
     train_dataset: true
@@ -152,6 +155,9 @@ data:
     action_chunk: 36
     n_previous: 4
     previous_pick_mode: random
+    baton_sampling_algorithm: libero_fastwam_hdf5_stateless_sha256
+    baton_sampling_version: 1
+    baton_sampling_seed: 42
     action_type: absolute
     action_space: eef
     train_dataset: false

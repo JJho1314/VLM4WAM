@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -25,6 +26,8 @@ FIXED_CAMERAS = [
     "observation.images.image",
     "observation.images.wrist_image",
 ]
+BATON_SAMPLING_ALGORITHM = "libero_fastwam_hdf5_stateless_sha256"
+BATON_SAMPLING_VERSION = 1
 
 
 def _clip_integer_indexes(
@@ -95,6 +98,9 @@ class LiberoFastWAMHDF5Dataset(Dataset):
         fix_mem_idx: Sequence[int] | None = None,
         max_open_shards: int = 8,
         ignore_seek: bool = False,
+        baton_sampling_algorithm: str | None = None,
+        baton_sampling_version: int | None = None,
+        baton_sampling_seed: int | None = None,
     ) -> None:
         self._validate_fixed_arguments(
             source_fps=source_fps,
@@ -117,6 +123,32 @@ class LiberoFastWAMHDF5Dataset(Dataset):
         self._validate_fixed_indexes(fix_sidx, fix_mem_idx)
         if fix_epiidx is not None and type(fix_epiidx) is not int:
             raise ValueError("fix_epiidx must be an integer or None")
+        sampling_values = (
+            baton_sampling_algorithm,
+            baton_sampling_version,
+            baton_sampling_seed,
+        )
+        if any(value is not None for value in sampling_values):
+            if not all(value is not None for value in sampling_values):
+                raise ValueError(
+                    "Baton stateless sampling fields must be provided together"
+                )
+            if baton_sampling_algorithm != BATON_SAMPLING_ALGORITHM:
+                raise ValueError(
+                    "baton_sampling_algorithm must be "
+                    f"{BATON_SAMPLING_ALGORITHM!r}"
+                )
+            if (
+                type(baton_sampling_version) is not int
+                or baton_sampling_version != BATON_SAMPLING_VERSION
+            ):
+                raise ValueError(
+                    f"baton_sampling_version must be {BATON_SAMPLING_VERSION}"
+                )
+            if type(baton_sampling_seed) is not int or baton_sampling_seed < 0:
+                raise ValueError(
+                    "baton_sampling_seed must be a non-negative integer"
+                )
 
         self.manifest_path = Path(manifest_path)
         self.manifest, self.records = load_manifest(self.manifest_path)
@@ -141,6 +173,20 @@ class LiberoFastWAMHDF5Dataset(Dataset):
         self.fix_mem_idx = None if fix_mem_idx is None else list(fix_mem_idx)
         self.max_open_shards = max_open_shards
         self.ignore_seek = ignore_seek
+        self._baton_sampling_contract = (
+            None
+            if baton_sampling_algorithm is None
+            else {
+                "algorithm": baton_sampling_algorithm,
+                "version": baton_sampling_version,
+                "seed": baton_sampling_seed,
+            }
+        )
+        self._baton_sampling_epoch = (
+            None
+            if self._baton_sampling_contract is None
+            else torch.zeros((), dtype=torch.int64).share_memory_()
+        )
 
         self._handles: OrderedDict[Path, h5py.File] = OrderedDict()
         self._handle_pid: int | None = os.getpid()
@@ -253,7 +299,70 @@ class LiberoFastWAMHDF5Dataset(Dataset):
             raise IndexError(f"dataset index out of range: {index}")
         return index
 
-    def get_frame_indexes(self, total_frames: int) -> tuple[list[int], list[int]]:
+    @property
+    def baton_sampling_contract(self) -> dict[str, Any] | None:
+        if self._baton_sampling_contract is None:
+            return None
+        return dict(self._baton_sampling_contract)
+
+    @property
+    def baton_sampling_epoch(self) -> int | None:
+        if self._baton_sampling_epoch is None:
+            return None
+        return int(self._baton_sampling_epoch.item())
+
+    def set_epoch(self, epoch: int) -> None:
+        if self._baton_sampling_epoch is None:
+            return
+        if type(epoch) is not int or epoch < 0:
+            raise ValueError("Baton sampling epoch must be a non-negative integer")
+        self._baton_sampling_epoch.fill_(epoch)
+
+    def _item_rngs(
+        self,
+        *,
+        index: int,
+        record: EpisodeRecord,
+    ) -> tuple[random.Random, np.random.Generator]:
+        contract = self._baton_sampling_contract
+        epoch = self.baton_sampling_epoch
+        if contract is None or epoch is None:
+            raise RuntimeError("Baton stateless sampling contract is disabled")
+        identity = {
+            "algorithm": contract["algorithm"],
+            "version": contract["version"],
+            "seed": contract["seed"],
+            "epoch": epoch,
+            "dataset_index": index,
+            "record_key": record.key,
+            "domain": record.domain,
+            "episode_index": record.episode_index,
+            "length": record.length,
+        }
+        material = json.dumps(
+            identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        python_seed = int.from_bytes(
+            hashlib.sha256(material + b"\\0python").digest(),
+            byteorder="big",
+        )
+        numpy_seed = int.from_bytes(
+            hashlib.sha256(material + b"\\0numpy").digest(),
+            byteorder="big",
+        )
+        return random.Random(python_seed), np.random.default_rng(numpy_seed)
+
+    def get_frame_indexes(
+        self,
+        total_frames: int,
+        *,
+        python_rng: random.Random | None = None,
+        numpy_rng: np.random.Generator | None = None,
+    ) -> tuple[list[int], list[int]]:
         """Match the fixed LIBERO history/future sampling contract."""
         if type(total_frames) is not int or total_frames < 2:
             raise ValueError("total_frames must be an integer of at least 2")
@@ -268,7 +377,14 @@ class LiberoFastWAMHDF5Dataset(Dataset):
             memories = np.clip(self.fix_mem_idx, 0, total_frames - 1).tolist()
             return memories + frame_future, memories + action_future
 
-        chunk_end = random.randint(self.action_chunk, total_frames + self.action_chunk)
+        chunk_end = (
+            random.randint(self.action_chunk, total_frames + self.action_chunk)
+            if python_rng is None
+            else python_rng.randint(
+                self.action_chunk,
+                total_frames + self.action_chunk,
+            )
+        )
         indexes_start = max(-self.n_previous, chunk_end - self.sample_n_frames)
         indexes = np.arange(indexes_start, chunk_end)
         indexes = np.clip(indexes, 1, total_frames - 1).tolist()
@@ -285,7 +401,8 @@ class LiberoFastWAMHDF5Dataset(Dataset):
                 ).tolist()
             ]
         else:
-            choices = np.random.choice(
+            choice_rng = np.random if numpy_rng is None else numpy_rng
+            choices = choice_rng.choice(
                 list(range(0, len(memory_candidates) - 1)),
                 size=self.n_previous - 1,
                 replace=False,
@@ -304,7 +421,18 @@ class LiberoFastWAMHDF5Dataset(Dataset):
         selected = self.fix_epiidx if self.fix_epiidx is not None else index
         selected = self._resolve_index(selected)
         record = self.records[selected]
-        frame_indexes, action_indexes = self.get_frame_indexes(record.length)
+        if self._baton_sampling_contract is None:
+            frame_indexes, action_indexes = self.get_frame_indexes(record.length)
+        else:
+            python_rng, numpy_rng = self._item_rngs(
+                index=selected,
+                record=record,
+            )
+            frame_indexes, action_indexes = self.get_frame_indexes(
+                record.length,
+                python_rng=python_rng,
+                numpy_rng=numpy_rng,
+            )
         return self.read_by_indexes(selected, frame_indexes, action_indexes)
 
     def read_by_indexes(

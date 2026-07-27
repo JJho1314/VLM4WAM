@@ -123,3 +123,76 @@ PyTorch optimizer/scheduler/RNG state.
 - No hindsight cache, planner auxiliary loss, Qwen training group, relevance,
   ordinary-training semantic mask, or silent unconditioned deployment path is
   accepted.
+
+## Round 2 Formal Fixes
+
+The second formal review is fully addressed:
+
+- Baton HDF5 window selection is now an opt-in stateless function of the
+  immutable algorithm/version/seed, epoch, dataset index, and episode identity.
+  It uses local Python and NumPy RNG streams and a shared epoch scalar, so worker
+  assignment and prefetch timing cannot change selected windows. Wrapped and
+  subset datasets receive the same epoch, and Baton training fails closed when
+  a leaf dataset lacks the exact sampling contract.
+- Resume requires the caller's complete immutable source-specific provenance.
+  The checkpoint and runtime mappings must have exactly the same fields and
+  values before `accelerator.load_state` is called. The mapping includes the
+  HDF5 manifest, semantic source artifacts, planner/Qwen/template artifacts
+  where applicable, and the stateless sampling contract.
+- Stage 3 validates the complete trusted Stage-1 planner checkpoint and the
+  final Stage-2 teacher checkpoint as one artifact chain. The HDF5 manifest and
+  SigLIP2 configuration, artifact, and preprocessing hashes must match exactly
+  before LTX construction.
+- Stage-3 LTX is instantiated without weights, checked for exact key/shape/dtype
+  topology parity with the Stage-2 snapshot, and loaded with strict state-dict
+  semantics. Missing, extra, and runtime-incompatible tensors fail without
+  partially mutating the runtime module.
+
+Round-2 RED evidence was observed before each production change:
+
+```text
+stateless sampling contract: 3 failed (unknown constructor fields/missing API)
+exact resume provenance: 4 failed (missing required expected-provenance API)
+Stage-1/Stage-2 binding: 5 failed (missing artifact-chain validator)
+strict Stage-3 loading: 4 failed (missing strict loader)
+```
+
+Final round-2 Task 10 suite:
+
+```text
+tests/test_ge_act_baton_training_contract.py
+73 passed, 4 warnings
+```
+
+Final required combined gate:
+
+```text
+tests/test_ge_act_baton_training_contract.py
+tests/test_ge_act_baton_semantic_guidance.py
+tests/test_ge_act_semantic_training_contract.py
+tests/test_ge_act_siglip2_config.py
+
+126 passed, 4 warnings
+```
+
+Protected and functional HDF5 gate:
+
+```text
+tests/test_libero_fastwam_hdf5.py -k 'hdf5_dataset or preflight or protected'
+80 passed, 228 deselected
+```
+
+The only protected hash update is again the intentional
+`ge_act/scripts/preflight_ltx_siglip2.py` digest. `git diff --check`,
+`compileall` on all changed Python paths, and `bash -n` on all four Baton
+launchers pass.
+
+The real resume regression uses a real PyTorch `DataLoader`, HDF5 dataset
+window implementation, multiprocessing workers, prefetching, an interrupted
+prefix, Accelerate batch skipping, and a different worker count after resume.
+It was run outside the restricted filesystem sandbox because PyTorch worker
+tensor IPC opens a local Unix-domain socket; no network service or package
+change was involved.
+
+No GPU, live SigLIP2/Qwen/LTX weights, real training run, distributed training,
+or launcher submission was run or claimed in round 2.

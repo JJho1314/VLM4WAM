@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
@@ -17,7 +17,22 @@ import pytest
 import torch
 import torch.nn as nn
 import yaml
+from accelerate.data_loader import skip_first_batches
 from safetensors.torch import save_file
+from torch.utils.data import DataLoader, Subset
+from qwen35_baton.checkpoint import (
+    BatonTrainingCursor,
+    capture_rank_rng_state,
+    planner_module_topology,
+    planner_safetensors_topology,
+    publish_trusted_planner_topology,
+    save_baton_checkpoint,
+)
+from qwen35_baton.cli.train_semantic_planner import (
+    BatonCosineWarmupScheduler,
+)
+from qwen35_baton.config import BatonCheckpointMetadata
+from qwen35_baton.hashing import sha256_json
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +44,10 @@ for path in (REPOSITORY_ROOT, GE_ACT_ROOT):
 from models.ltx_models.semantic_conditioning import (  # noqa: E402
     build_patch_center_positions,
 )
+from data.libero_fastwam_hdf5_dataset import (  # noqa: E402
+    LiberoFastWAMHDF5Dataset,
+)
+from data.libero_fastwam_hdf5_schema import EpisodeRecord  # noqa: E402
 from runner import ge_inferencer as ge_inferencer_module  # noqa: E402
 from runner import ge_trainer as ge_trainer_module  # noqa: E402
 from runner.ge_trainer import (  # noqa: E402
@@ -65,6 +84,283 @@ STAGE3_LAUNCHER = GE_ACT_ROOT / "scripts/train_ltx_baton_stage3.sh"
 STAGE2_SBATCH = GE_ACT_ROOT / "scripts/sbatch_train_ltx_baton_stage2_hpc3.sh"
 STAGE3_SBATCH = GE_ACT_ROOT / "scripts/sbatch_train_ltx_baton_stage3_hpc3.sh"
 FUTURE_INDICES = (0, 3, 5, 8)
+BATON_SAMPLING_ALGORITHM = "libero_fastwam_hdf5_stateless_sha256"
+BATON_SAMPLING_VERSION = 1
+
+
+class _CompactWindowDataset(LiberoFastWAMHDF5Dataset):
+    """Exercise the production sampler while keeping worker IPC payloads tiny."""
+
+    def read_by_indexes(
+        self,
+        index: int,
+        frame_indexes: Sequence[int],
+        action_indexes: Sequence[int],
+    ) -> dict[str, torch.Tensor | str]:
+        record = self.records[self._resolve_index(index)]
+        return {
+            "video": torch.tensor(frame_indexes, dtype=torch.int64),
+            "actions": torch.tensor(action_indexes, dtype=torch.int64),
+            "state": torch.tensor([index], dtype=torch.int64),
+            "caption": record.key,
+        }
+
+
+def _write_compact_window_fixture(
+    root: Path,
+    *,
+    episodes: int = 12,
+) -> tuple[Path, Path]:
+    root.mkdir(parents=True)
+    shard = root / "shard_00000.h5"
+    shard.touch()
+    records = [
+        {
+            "key": f"domain:{index:06d}",
+            "shard": shard.name,
+            "group": f"episodes/domain:{index:06d}",
+            "caption": f"caption {index}",
+            "domain": "domain",
+            "episode_index": index,
+            "length": 80 + index,
+        }
+        for index in range(episodes)
+    ]
+    manifest = {
+        "schema_version": 1,
+        "camera_names": ["main", "wrist"],
+        "image_size": [256, 256],
+        "source_fps": 20,
+        "n_previous": 4,
+        "chunk": 9,
+        "action_chunk": 36,
+        "action_type": "absolute",
+        "action_space": "eef",
+        "compression": "none",
+        "source_roots": [str(root / "source")],
+        "datasets": {
+            "rgb_main": {
+                "shape_tail": [256, 256, 3],
+                "dtype": "uint8",
+            },
+            "rgb_wrist": {
+                "shape_tail": [256, 256, 3],
+                "dtype": "uint8",
+            },
+            "action": {"width": 7, "dtype": "float32"},
+            "state": {"width": 8, "dtype": "float32"},
+        },
+        "converter_fingerprint": "a" * 64,
+        "episodes": records,
+    }
+    manifest_path = root / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    statistics_path = root / "stats.json"
+    statistics_path.write_text(
+        json.dumps(
+            {
+                "domain_eef": {
+                    "mean": [0.0] * 7,
+                    "std": [1.0] * 7,
+                },
+                "domain_state_eef": {
+                    "mean": [0.0] * 8,
+                    "std": [1.0] * 8,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest_path, statistics_path
+
+
+def _compact_window_dataset(
+    root: Path,
+    *,
+    seed: int = 42,
+) -> _CompactWindowDataset:
+    manifest, statistics = _write_compact_window_fixture(root)
+    return _CompactWindowDataset(
+        manifest_path=manifest,
+        stat_file=statistics,
+        baton_sampling_algorithm=BATON_SAMPLING_ALGORITHM,
+        baton_sampling_version=BATON_SAMPLING_VERSION,
+        baton_sampling_seed=seed,
+    )
+
+
+def _compact_window_loader(
+    dataset: torch.utils.data.Dataset,
+    *,
+    num_workers: int,
+    sampler_seed: int = 42,
+) -> DataLoader:
+    return DataLoader(
+        dataset,
+        sampler=ge_trainer_module.EpochSeededRandomSampler(
+            dataset,
+            seed=sampler_seed,
+        ),
+        batch_size=2,
+        num_workers=num_workers,
+        persistent_workers=True,
+        prefetch_factor=2,
+        generator=torch.Generator().manual_seed(sampler_seed),
+    )
+
+
+def _collect_compact_batches(loader: DataLoader) -> list[dict[str, Any]]:
+    batches = []
+    try:
+        for batch in loader:
+            batches.append(
+                {
+                    "video": batch["video"].clone(),
+                    "actions": batch["actions"].clone(),
+                    "state": batch["state"].clone(),
+                    "caption": tuple(batch["caption"]),
+                }
+            )
+    finally:
+        iterator = getattr(loader, "_iterator", None)
+        shutdown = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown):
+            shutdown()
+    return batches
+
+
+def _assert_compact_batches_equal(
+    actual: Sequence[dict[str, Any]],
+    expected: Sequence[dict[str, Any]],
+) -> None:
+    assert len(actual) == len(expected)
+    for actual_batch, expected_batch in zip(actual, expected, strict=True):
+        assert actual_batch["caption"] == expected_batch["caption"]
+        for field in ("video", "actions", "state"):
+            torch.testing.assert_close(
+                actual_batch[field],
+                expected_batch[field],
+                rtol=0,
+                atol=0,
+            )
+
+
+def test_baton_stateless_windows_resume_exactly_across_worker_assignments(
+    tmp_path: Path,
+) -> None:
+    epoch = 7
+    interrupted_batches = 3
+    baseline_dataset = _compact_window_dataset(tmp_path / "baseline")
+    baseline_loader = _compact_window_loader(
+        baseline_dataset,
+        num_workers=2,
+    )
+    ge_trainer_module.set_dataloader_epoch(
+        baseline_loader,
+        epoch=epoch,
+        sampler_seed=42,
+    )
+    baseline = _collect_compact_batches(baseline_loader)
+
+    interrupted_dataset = _compact_window_dataset(tmp_path / "interrupted")
+    interrupted_loader = _compact_window_loader(
+        interrupted_dataset,
+        num_workers=1,
+    )
+    ge_trainer_module.set_dataloader_epoch(
+        interrupted_loader,
+        epoch=epoch,
+        sampler_seed=42,
+    )
+    interrupted = []
+    iterator = iter(interrupted_loader)
+    try:
+        for _ in range(interrupted_batches):
+            batch = next(iterator)
+            interrupted.append(
+                {
+                    "video": batch["video"].clone(),
+                    "actions": batch["actions"].clone(),
+                    "state": batch["state"].clone(),
+                    "caption": tuple(batch["caption"]),
+                }
+            )
+    finally:
+        shutdown = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown):
+            shutdown()
+    _assert_compact_batches_equal(
+        interrupted,
+        baseline[:interrupted_batches],
+    )
+
+    resumed_dataset = _compact_window_dataset(tmp_path / "resumed")
+    resumed_loader = _compact_window_loader(
+        resumed_dataset,
+        num_workers=3,
+    )
+    ge_trainer_module.set_dataloader_epoch(
+        resumed_loader,
+        epoch=epoch,
+        sampler_seed=42,
+    )
+    remaining_loader = skip_first_batches(
+        resumed_loader,
+        num_batches=interrupted_batches,
+    )
+    remaining = _collect_compact_batches(remaining_loader)
+
+    _assert_compact_batches_equal(
+        remaining,
+        baseline[interrupted_batches:],
+    )
+
+
+def test_baton_epoch_reaches_subset_workers_and_item_rng_is_local(
+    tmp_path: Path,
+) -> None:
+    dataset = _compact_window_dataset(tmp_path / "dataset")
+    subset = Subset(dataset, [0, 1, 2, 3])
+    loader = _compact_window_loader(subset, num_workers=1)
+
+    random.seed(123)
+    np.random.seed(123)
+    expected_python = random.Random(123).random()
+    expected_numpy = np.random.RandomState(123).rand()
+    ge_trainer_module.set_dataloader_epoch(
+        loader,
+        epoch=9,
+        sampler_seed=42,
+    )
+    first = dataset[0]
+    second = dataset[0]
+
+    assert dataset.baton_sampling_epoch == 9
+    torch.testing.assert_close(first["video"], second["video"], rtol=0, atol=0)
+    torch.testing.assert_close(
+        first["actions"],
+        second["actions"],
+        rtol=0,
+        atol=0,
+    )
+    assert random.random() == expected_python
+    assert float(np.random.rand()) == expected_numpy
+
+
+def test_baton_dataset_without_stateless_sampling_contract_fails_closed(
+    tmp_path: Path,
+) -> None:
+    manifest, statistics = _write_compact_window_fixture(tmp_path / "legacy")
+    legacy_dataset = _CompactWindowDataset(
+        manifest_path=manifest,
+        stat_file=statistics,
+    )
+
+    with pytest.raises(ValueError, match="stateless.*sampling contract"):
+        ge_trainer_module.validate_baton_dataset_sampling_contract(
+            legacy_dataset,
+            expected_seed=42,
+        )
 
 
 def _semantic_config(source: str) -> dict[str, Any]:
@@ -698,6 +994,14 @@ def test_baton_recipe_matches_approved_training_contract(
     assert model["semantic_plan_num_views"] == 2
     assert model["semantic_plan_cross_attention_blocks"] == list(range(28))
     assert config["data"]["train"]["manifest_path"] == config["data"]["val"]["manifest_path"]
+    for split in ("train", "val"):
+        assert config["data"][split]["baton_sampling_algorithm"] == (
+            BATON_SAMPLING_ALGORITHM
+        )
+        assert config["data"][split]["baton_sampling_version"] == (
+            BATON_SAMPLING_VERSION
+        )
+        assert config["data"][split]["baton_sampling_seed"] == config["seed"]
 
 
 @pytest.mark.parametrize("path", [STAGE2_CONFIG, STAGE3_CONFIG])
@@ -746,6 +1050,13 @@ def test_baton_recipe_passes_hdf5_static_preflight(path: Path) -> None:
                 {"valid_cam": ["observation.images.image"]}
             ),
             "valid_cam",
+        ),
+        (
+            STAGE2_CONFIG,
+            lambda config: config["data"]["train"].update(
+                {"baton_sampling_seed": 7}
+            ),
+            "baton_sampling_seed",
         ),
     ],
 )
@@ -1091,12 +1402,118 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _teacher_training_provenance(
+    **updates: Any,
+) -> dict[str, str | int]:
+    provenance: dict[str, str | int] = {
+        "hdf5_manifest_hash": "4" * 64,
+        "siglip2_config_hash": "1" * 64,
+        "siglip2_artifact_hash": "2" * 64,
+        "teacher_preprocessing_hash": "2" * 64,
+        "window_sampling_algorithm": BATON_SAMPLING_ALGORITHM,
+        "window_sampling_version": BATON_SAMPLING_VERSION,
+        "window_sampling_seed": 42,
+        "window_sampling_topology_hash": (
+            "e98a7afcd00fda75192014b1104b89016e4d78ca5eee27b6d60a9e65626feb5a"
+        ),
+    }
+    provenance.update(updates)
+    return provenance
+
+
+def _prediction_training_provenance(
+    **updates: Any,
+) -> dict[str, str | int]:
+    provenance = {
+        **_teacher_training_provenance(),
+        "planner_manifest_hash": "5" * 64,
+        "planner_topology_hash": "6" * 64,
+        "qwen_config_hash": "7" * 64,
+        "tokenizer_hash": "8" * 64,
+        "processor_hash": "9" * 64,
+        "input_template_hash": "a" * 64,
+    }
+    provenance.update(updates)
+    return provenance
+
+
+class _Stage1TinyPlanner(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(2, 2))
+
+
+def _write_stage1_checkpoint_envelope(
+    root: Path,
+    *,
+    hdf5_manifest_hash: str = "4" * 64,
+    siglip2_config_hash: str = "1" * 64,
+    siglip2_artifact_hash: str = "2" * 64,
+    teacher_preprocessing_hash: str = "2" * 64,
+) -> tuple[Path, Path, BatonCheckpointMetadata]:
+    checkpoint = root / "stage1"
+    planner = _Stage1TinyPlanner()
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "name": "planner",
+                "params": list(planner.parameters()),
+                "lr": 5e-5,
+            }
+        ]
+    )
+    scheduler = BatonCosineWarmupScheduler(
+        optimizer,
+        warmup_steps=0,
+        max_steps=10,
+    )
+    metadata = replace(
+        BatonCheckpointMetadata.example(),
+        hdf5_manifest_hash=hdf5_manifest_hash,
+        siglip2_config_hash=siglip2_config_hash,
+        siglip2_artifact_hash=siglip2_artifact_hash,
+        teacher_preprocessing_hash=teacher_preprocessing_hash,
+        planner_topology_hash=sha256_json(
+            planner_module_topology(planner)
+        ),
+    )
+    save_baton_checkpoint(
+        checkpoint,
+        planner=planner,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        metadata=metadata,
+        cursor=BatonTrainingCursor(
+            global_step=0,
+            epoch=0,
+            consumed_microbatches=0,
+            microbatches_per_epoch=1,
+            sampler_seed=0,
+        ),
+        rank_rng_state={0: capture_rank_rng_state(distributed_rank=0)},
+    )
+    trusted_topology = root / "stage1-trusted-topology.json"
+    publish_trusted_planner_topology(
+        trusted_topology,
+        planner_safetensors_topology(
+            checkpoint / "planner.safetensors"
+        ),
+    )
+    persisted_metadata = BatonCheckpointMetadata.from_dict(
+        json.loads(
+            (checkpoint / "metadata.json").read_text(encoding="utf-8")
+        )
+    )
+    return checkpoint, trusted_topology, persisted_metadata
+
+
 def _write_stage2_checkpoint_envelope(
     root: Path,
     *,
     source: str = "qwen35_baton_teacher",
     topology_hash: str = "3" * 64,
     global_step: int = 20_000,
+    provenance_updates: dict[str, Any] | None = None,
 ) -> Path:
     checkpoint = root / "step_020000"
     diffusion = checkpoint / "diffusion_model"
@@ -1141,12 +1558,9 @@ def _write_stage2_checkpoint_envelope(
         "diffusion_files": {
             "diffusion_pytorch_model.safetensors": _sha256(model_path),
         },
-        "training_provenance": {
-            "hdf5_manifest_hash": "4" * 64,
-            "siglip2_config_hash": "1" * 64,
-            "siglip2_artifact_hash": "2" * 64,
-            "teacher_preprocessing_hash": "2" * 64,
-        },
+        "training_provenance": _teacher_training_provenance(
+            **(provenance_updates or {})
+        ),
     }
     (checkpoint / "baton_state.json").write_text(
         json.dumps(metadata),
@@ -1219,6 +1633,70 @@ def test_stage3_init_rejects_wrong_source_topology_step_or_artifact(
         )
 
 
+def test_stage3_artifact_chain_accepts_one_validated_semantic_target_space(
+    tmp_path: Path,
+) -> None:
+    stage1, trusted_topology, stage1_metadata = (
+        _write_stage1_checkpoint_envelope(tmp_path / "planner")
+    )
+    stage2 = _write_stage2_checkpoint_envelope(tmp_path / "teacher")
+    stage2_metadata = json.loads(
+        (stage2 / "baton_state.json").read_text(encoding="utf-8")
+    )
+
+    chain = ge_trainer_module.validate_baton_stage3_artifact_chain(
+        stage2_checkpoint=stage2,
+        expected_stage2_topology_hash=stage2_metadata[
+            "snapshot_topology_hash"
+        ],
+        planner_checkpoint=stage1,
+        expected_planner_topology=trusted_topology,
+        expected_hdf5_manifest_hash="4" * 64,
+    )
+
+    assert chain.diffusion_model_dir == stage2 / "diffusion_model"
+    assert chain.stage1_metadata == stage1_metadata
+    assert chain.stage2_training_provenance == (
+        _teacher_training_provenance()
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "siglip2_config_hash",
+        "siglip2_artifact_hash",
+        "teacher_preprocessing_hash",
+        "hdf5_manifest_hash",
+    ),
+)
+def test_stage3_artifact_chain_rejects_stage1_stage2_target_mismatch(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    stage1, trusted_topology, _ = _write_stage1_checkpoint_envelope(
+        tmp_path / "planner"
+    )
+    stage2 = _write_stage2_checkpoint_envelope(
+        tmp_path / "teacher",
+        provenance_updates={field: "b" * 64},
+    )
+    stage2_metadata = json.loads(
+        (stage2 / "baton_state.json").read_text(encoding="utf-8")
+    )
+
+    with pytest.raises(ValueError, match=f"{field}|dataset provenance"):
+        ge_trainer_module.validate_baton_stage3_artifact_chain(
+            stage2_checkpoint=stage2,
+            expected_stage2_topology_hash=stage2_metadata[
+                "snapshot_topology_hash"
+            ],
+            planner_checkpoint=stage1,
+            expected_planner_topology=trusted_topology,
+            expected_hdf5_manifest_hash="4" * 64,
+        )
+
+
 class _TinyDiffusion(nn.Linear):
     def save_pretrained(
         self,
@@ -1233,6 +1711,90 @@ class _TinyDiffusion(nn.Linear):
             {name: value.detach().cpu() for name, value in self.state_dict().items()},
             str(output / "diffusion_pytorch_model.safetensors"),
         )
+
+
+def test_stage3_strict_loader_requires_exact_runtime_topology_before_loading(
+    tmp_path: Path,
+) -> None:
+    source = _TinyDiffusion(1, 1, bias=False)
+    snapshot = tmp_path / "snapshot"
+    source.save_pretrained(snapshot, safe_serialization=True)
+    expected_topology = (
+        ge_trainer_module._diffusion_snapshot_topology_hash(snapshot)
+    )
+    runtime = _TinyDiffusion(2, 1, bias=False)
+    before = runtime.weight.detach().clone()
+
+    with pytest.raises(ValueError, match="runtime.*topology"):
+        ge_trainer_module.strict_load_baton_stage3_diffusion_model(
+            runtime,
+            snapshot,
+            expected_snapshot_topology_hash=expected_topology,
+        )
+
+    torch.testing.assert_close(runtime.weight, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mutation", ("missing", "extra"))
+def test_stage3_strict_loader_rejects_incomplete_tensor_set_without_partial_init(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    runtime = _TinyDiffusion(1, 1, bias=False)
+    runtime.weight.data.zero_()
+    before = runtime.weight.detach().clone()
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    tensors = (
+        {"unexpected": torch.ones(1)}
+        if mutation == "missing"
+        else {
+            "weight": torch.full((1, 1), 3.0),
+            "unexpected": torch.ones(1),
+        }
+    )
+    save_file(
+        tensors,
+        str(snapshot / "diffusion_pytorch_model.safetensors"),
+    )
+
+    with pytest.raises(ValueError, match="snapshot.*topology|strict"):
+        ge_trainer_module.strict_load_baton_stage3_diffusion_model(
+            runtime,
+            snapshot,
+            expected_snapshot_topology_hash=(
+                ge_trainer_module._module_topology_hash(runtime)
+            ),
+        )
+
+    torch.testing.assert_close(runtime.weight, before, rtol=0, atol=0)
+
+
+def test_stage3_strict_loader_loads_complete_exact_snapshot(
+    tmp_path: Path,
+) -> None:
+    source = _TinyDiffusion(1, 1, bias=False)
+    source.weight.data.fill_(3.0)
+    snapshot = tmp_path / "snapshot"
+    source.save_pretrained(snapshot, safe_serialization=True)
+    runtime = _TinyDiffusion(1, 1, bias=False)
+    runtime.weight.data.zero_()
+
+    loaded = ge_trainer_module.strict_load_baton_stage3_diffusion_model(
+        runtime,
+        snapshot,
+        expected_snapshot_topology_hash=(
+            ge_trainer_module._diffusion_snapshot_topology_hash(snapshot)
+        ),
+    )
+
+    assert loaded is runtime
+    torch.testing.assert_close(
+        runtime.weight,
+        torch.full((1, 1), 3.0),
+        rtol=0,
+        atol=0,
+    )
 
 
 class _StateAccelerator:
@@ -1345,12 +1907,7 @@ def test_baton_resume_matches_uninterrupted_optimizer_scheduler_and_rng(
         cursor=cursor,
         diffusion_model=first_model,
         source="qwen35_baton_teacher",
-        training_provenance={
-            "hdf5_manifest_hash": "4" * 64,
-            "siglip2_config_hash": "1" * 64,
-            "siglip2_artifact_hash": "2" * 64,
-            "teacher_preprocessing_hash": "2" * 64,
-        },
+        training_provenance=_teacher_training_provenance(),
     )
 
     random.seed(99)
@@ -1371,6 +1928,7 @@ def test_baton_resume_matches_uninterrupted_optimizer_scheduler_and_rng(
         expected_source="qwen35_baton_teacher",
         expected_microbatches_per_epoch=4,
         expected_sampler_seed=42,
+        expected_training_provenance=_teacher_training_provenance(),
     )
     for _ in range(2):
         _tiny_step(resumed_model, resumed_optimizer, resumed_scheduler)
@@ -1394,6 +1952,63 @@ def test_baton_resume_matches_uninterrupted_optimizer_scheduler_and_rng(
         (checkpoint / "baton_state.json").read_text(encoding="utf-8")
     )
     assert metadata["model_children"] == ["diffusion_model"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("mismatch", "missing", "extra", "alternate_digest"),
+)
+def test_baton_resume_rejects_any_runtime_provenance_difference_before_load(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    model, optimizer, scheduler = _tiny_training_state()
+    accelerator = _StateAccelerator(model, optimizer, scheduler)
+    stored_provenance = _teacher_training_provenance()
+    checkpoint = save_baton_training_checkpoint(
+        accelerator,
+        tmp_path / "run",
+        cursor=TrainingCursor(
+            global_step=2,
+            epoch=0,
+            consumed_microbatches=2,
+            microbatches_per_epoch=4,
+            sampler_seed=42,
+        ),
+        diffusion_model=model,
+        source="qwen35_baton_teacher",
+        training_provenance=stored_provenance,
+    )
+    expected_provenance = dict(stored_provenance)
+    if mutation == "mismatch":
+        expected_provenance["teacher_preprocessing_hash"] = "3" * 64
+    elif mutation == "missing":
+        del expected_provenance["teacher_preprocessing_hash"]
+    elif mutation == "extra":
+        expected_provenance["undeclared_hash"] = "8" * 64
+    else:
+        expected_provenance["hdf5_manifest_hash"] = "9" * 64
+    resumed_model, resumed_optimizer, resumed_scheduler = (
+        _tiny_training_state()
+    )
+    resumed_accelerator = _StateAccelerator(
+        resumed_model,
+        resumed_optimizer,
+        resumed_scheduler,
+    )
+
+    with pytest.raises(ValueError, match="training provenance"):
+        load_baton_training_checkpoint(
+            resumed_accelerator,
+            checkpoint,
+            diffusion_model=resumed_model,
+            expected_source="qwen35_baton_teacher",
+            expected_microbatches_per_epoch=4,
+            expected_sampler_seed=42,
+            expected_training_provenance=expected_provenance,
+        )
+
+    assert resumed_accelerator.loaded is None
 
 
 @pytest.mark.parametrize(
@@ -1425,12 +2040,7 @@ def test_baton_resume_rejects_partial_source_topology_or_cursor_mismatch(
         ),
         diffusion_model=model,
         source="qwen35_baton_teacher",
-        training_provenance={
-            "hdf5_manifest_hash": "4" * 64,
-            "siglip2_config_hash": "1" * 64,
-            "siglip2_artifact_hash": "2" * 64,
-            "teacher_preprocessing_hash": "2" * 64,
-        },
+        training_provenance=_teacher_training_provenance(),
     )
     metadata_path = checkpoint / "baton_state.json"
     if mutation == "partial":
@@ -1441,12 +2051,9 @@ def test_baton_resume_rejects_partial_source_topology_or_cursor_mismatch(
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         if mutation == "source":
             metadata["source"] = "qwen35_baton_prediction"
-            metadata["training_provenance"] = {
-                "hdf5_manifest_hash": "4" * 64,
-                "planner_manifest_hash": "5" * 64,
-                "planner_topology_hash": "6" * 64,
-                "siglip2_artifact_hash": "2" * 64,
-            }
+            metadata["training_provenance"] = (
+                _prediction_training_provenance()
+            )
         elif mutation == "topology":
             metadata["topology_hash"] = "7" * 64
         else:
@@ -1469,6 +2076,7 @@ def test_baton_resume_rejects_partial_source_topology_or_cursor_mismatch(
             expected_source="qwen35_baton_teacher",
             expected_microbatches_per_epoch=4,
             expected_sampler_seed=42,
+            expected_training_provenance=_teacher_training_provenance(),
         )
 
 
@@ -1494,12 +2102,7 @@ def test_trainer_prepares_baton_resume_without_registering_frozen_source(
         cursor=cursor,
         diffusion_model=first_model,
         source="qwen35_baton_teacher",
-        training_provenance={
-            "hdf5_manifest_hash": "4" * 64,
-            "siglip2_config_hash": "1" * 64,
-            "siglip2_artifact_hash": "2" * 64,
-            "teacher_preprocessing_hash": "2" * 64,
-        },
+        training_provenance=_teacher_training_provenance(),
     )
 
     resumed_model, resumed_optimizer, resumed_scheduler = (
@@ -1525,6 +2128,7 @@ def test_trainer_prepares_baton_resume_without_registering_frozen_source(
     trainer.state = SimpleNamespace(accelerator=accelerator)
     trainer.args = SimpleNamespace(resume_from_checkpoint=str(checkpoint))
     trainer.sampler_seed = 42
+    trainer.baton_training_provenance = _teacher_training_provenance()
     trainer.resume_cursor = None
     trainer.current_cursor = None
 

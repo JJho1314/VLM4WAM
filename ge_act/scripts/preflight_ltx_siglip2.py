@@ -313,6 +313,23 @@ def collect_preflight_errors(
             errors.append("training HDF5 manifest is missing")
         if train_manifest != val_manifest:
             errors.append("train and validation must use the same HDF5 manifest")
+        if semantic_source in BATON_SOURCES:
+            expected_sampling = {
+                "baton_sampling_algorithm": (
+                    "libero_fastwam_hdf5_stateless_sha256"
+                ),
+                "baton_sampling_version": 1,
+                "baton_sampling_seed": config.get("seed"),
+            }
+            for split_name, split_data in (
+                ("train", train_data),
+                ("val", val_data),
+            ):
+                for field, expected in expected_sampling.items():
+                    if split_data.get(field) != expected:
+                        errors.append(
+                            f"data.{split_name}.{field} must be {expected!r}"
+                        )
     else:
         if not train_data.get("require_predecoded", False):
             errors.append("training must require predecoded RGB caches")
@@ -474,13 +491,17 @@ def collect_preflight_errors(
             ):
                 errors.append("Baton planner checkpoint differs from HDF5 manifest")
             from runner.ge_trainer import (
-                validate_baton_stage2_checkpoint_envelope,
+                validate_baton_stage3_artifact_chain,
             )
 
-            stage2_model_dir = validate_baton_stage2_checkpoint_envelope(
-                config["stage2_init_checkpoint"],
-                expected_topology_hash=config[
+            artifact_chain = validate_baton_stage3_artifact_chain(
+                stage2_checkpoint=config["stage2_init_checkpoint"],
+                expected_stage2_topology_hash=config[
                     "stage2_init_topology_hash"
+                ],
+                planner_checkpoint=semantic["planner_checkpoint"],
+                expected_planner_topology=semantic[
+                    "expected_planner_topology"
                 ],
                 expected_hdf5_manifest_hash=(
                     sha256_file(Path(manifest_path))
@@ -489,7 +510,10 @@ def collect_preflight_errors(
                     else ""
                 ),
             )
-            if Path(config["diffusion_model"]["model_path"]) != stage2_model_dir:
+            if (
+                Path(config["diffusion_model"]["model_path"])
+                != artifact_chain.diffusion_model_dir
+            ):
                 errors.append(
                     "Stage-3 diffusion model path differs from validated "
                     "Stage-2 checkpoint"

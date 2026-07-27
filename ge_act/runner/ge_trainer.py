@@ -71,6 +71,10 @@ from models.ltx_models.vlm_semantic_planner import (
     configure_qwen_top_layers_for_joint_training,
     load_qwen35_grounded_provider,
 )
+from data.libero_fastwam_hdf5_dataset import (
+    BATON_SAMPLING_ALGORITHM,
+    BATON_SAMPLING_VERSION,
+)
 from qwen35_baton.hashing import sha256_artifact, sha256_file, sha256_json
 from qwen35_baton.teacher import FrozenSiglip2Teacher
 
@@ -1215,6 +1219,93 @@ def set_dataloader_epoch(
     generator = getattr(dataloader, "generator", None)
     if isinstance(generator, torch.Generator):
         generator.manual_seed(sampler_seed + epoch)
+    dataset = getattr(dataloader, "dataset", None)
+    if dataset is not None:
+        _set_wrapped_dataset_epoch(dataset, epoch=epoch)
+
+
+def _dataset_children(dataset: Any) -> tuple[Any, ...]:
+    children: list[Any] = []
+    child = getattr(dataset, "dataset", None)
+    if child is not None and child is not dataset:
+        children.append(child)
+    base = getattr(dataset, "base", None)
+    if (
+        base is not None
+        and base is not dataset
+        and all(base is not existing for existing in children)
+    ):
+        children.append(base)
+    nested = getattr(dataset, "datasets", None)
+    if isinstance(nested, (list, tuple)):
+        children.extend(
+            item
+            for item in nested
+            if item is not dataset
+            and all(item is not existing for existing in children)
+        )
+    return tuple(children)
+
+
+def _set_wrapped_dataset_epoch(
+    dataset: Any,
+    *,
+    epoch: int,
+    _seen: set[int] | None = None,
+) -> None:
+    seen = set() if _seen is None else _seen
+    identifier = id(dataset)
+    if identifier in seen:
+        return
+    seen.add(identifier)
+    set_epoch = getattr(dataset, "set_epoch", None)
+    if callable(set_epoch):
+        set_epoch(epoch)
+    for child in _dataset_children(dataset):
+        _set_wrapped_dataset_epoch(child, epoch=epoch, _seen=seen)
+
+
+def _baton_dataset_sampling_contracts(
+    dataset: Any,
+    *,
+    _seen: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    seen = set() if _seen is None else _seen
+    identifier = id(dataset)
+    if identifier in seen:
+        return []
+    seen.add(identifier)
+    children = _dataset_children(dataset)
+    if children:
+        contracts: list[dict[str, Any]] = []
+        for child in children:
+            contracts.extend(
+                _baton_dataset_sampling_contracts(child, _seen=seen)
+            )
+        return contracts
+    contract = getattr(dataset, "baton_sampling_contract", None)
+    return [contract] if isinstance(contract, dict) else []
+
+
+def validate_baton_dataset_sampling_contract(
+    dataset: Any,
+    *,
+    expected_seed: int,
+) -> dict[str, Any]:
+    """Require every wrapped Baton dataset leaf to share one stateless contract."""
+
+    expected = {
+        "algorithm": BATON_SAMPLING_ALGORITHM,
+        "version": BATON_SAMPLING_VERSION,
+        "seed": expected_seed,
+    }
+    contracts = _baton_dataset_sampling_contracts(dataset)
+    if not contracts or any(contract != expected for contract in contracts):
+        raise ValueError(
+            "Baton training requires the exact stateless window sampling "
+            f"contract {expected!r}"
+        )
+    return expected
 
 
 def prepare_joint_training_components(
@@ -1376,7 +1467,7 @@ def _module_topology_hash(model: torch.nn.Module) -> str:
                 "shape": list(value.shape),
                 "dtype": str(value.dtype),
             }
-            for name, value in model.state_dict().items()
+            for name, value in sorted(model.state_dict().items())
         ]
     )
 
@@ -1438,6 +1529,47 @@ def _diffusion_snapshot_files(diffusion_dir: Path) -> dict[str, str]:
     return files
 
 
+def strict_load_baton_stage3_diffusion_model(
+    diffusion_model: torch.nn.Module,
+    diffusion_dir: str | Path,
+    *,
+    expected_snapshot_topology_hash: str,
+) -> torch.nn.Module:
+    """Strictly initialize Stage-3 only after runtime/snapshot topology parity."""
+
+    if not isinstance(diffusion_model, torch.nn.Module):
+        raise TypeError("Stage-3 diffusion model must be a torch module")
+    if not _is_concrete_sha256(expected_snapshot_topology_hash):
+        raise ValueError("Stage-3 expected snapshot topology hash is invalid")
+    snapshot_path = Path(diffusion_dir)
+    try:
+        snapshot_topology_hash = _diffusion_snapshot_topology_hash(
+            snapshot_path
+        )
+    except (OSError, ValueError) as error:
+        raise ValueError("Stage-3 snapshot topology is invalid") from error
+    if snapshot_topology_hash != expected_snapshot_topology_hash:
+        raise ValueError("Stage-3 snapshot topology differs from its envelope")
+    if _module_topology_hash(diffusion_model) != expected_snapshot_topology_hash:
+        raise ValueError(
+            "Stage-3 runtime model topology differs from the Stage-2 snapshot"
+        )
+    from utils.model_utils import load_checkpoints
+
+    try:
+        load_checkpoints(
+            diffusion_model,
+            pretrained_ckpt=snapshot_path,
+            strict=True,
+            ignore_mismatched_sizes=False,
+        )
+    except (KeyError, RuntimeError, ValueError) as error:
+        raise ValueError(
+            "Stage-3 strict diffusion state loading failed"
+        ) from error
+    return diffusion_model
+
+
 _BATON_STATE_FIELDS = {
     "format_version",
     "checkpoint_kind",
@@ -1451,6 +1583,75 @@ _BATON_STATE_FIELDS = {
     "diffusion_files",
     "training_provenance",
 }
+_BATON_SAMPLING_PROVENANCE_FIELDS = {
+    "window_sampling_algorithm",
+    "window_sampling_version",
+    "window_sampling_seed",
+    "window_sampling_topology_hash",
+}
+_BATON_TEACHER_PROVENANCE_FIELDS = {
+    "hdf5_manifest_hash",
+    "siglip2_config_hash",
+    "siglip2_artifact_hash",
+    "teacher_preprocessing_hash",
+} | _BATON_SAMPLING_PROVENANCE_FIELDS
+_BATON_PREDICTION_PROVENANCE_FIELDS = {
+    "hdf5_manifest_hash",
+    "planner_manifest_hash",
+    "planner_topology_hash",
+    "qwen_config_hash",
+    "tokenizer_hash",
+    "processor_hash",
+    "input_template_hash",
+    "siglip2_config_hash",
+    "siglip2_artifact_hash",
+    "teacher_preprocessing_hash",
+} | _BATON_SAMPLING_PROVENANCE_FIELDS
+
+
+def _is_concrete_sha256(value: Any) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and value != "0" * 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _validated_baton_training_provenance(
+    source: str,
+    provenance: Any,
+) -> dict[str, Any]:
+    expected_fields = (
+        _BATON_TEACHER_PROVENANCE_FIELDS
+        if source == BATON_TEACHER_SOURCE
+        else _BATON_PREDICTION_PROVENANCE_FIELDS
+    )
+    if type(provenance) is not dict or set(provenance) != expected_fields:
+        raise ValueError("Baton checkpoint training provenance is invalid")
+    hash_fields = expected_fields - {
+        "window_sampling_algorithm",
+        "window_sampling_version",
+        "window_sampling_seed",
+    }
+    if not all(_is_concrete_sha256(provenance[field]) for field in hash_fields):
+        raise ValueError("Baton checkpoint training provenance is invalid")
+    sampling_contract = {
+        "algorithm": provenance["window_sampling_algorithm"],
+        "version": provenance["window_sampling_version"],
+        "seed": provenance["window_sampling_seed"],
+    }
+    if (
+        sampling_contract["algorithm"] != BATON_SAMPLING_ALGORITHM
+        or type(sampling_contract["version"]) is not int
+        or sampling_contract["version"] != BATON_SAMPLING_VERSION
+        or type(sampling_contract["seed"]) is not int
+        or sampling_contract["seed"] < 0
+        or provenance["window_sampling_topology_hash"]
+        != sha256_json(sampling_contract)
+    ):
+        raise ValueError("Baton checkpoint training provenance is invalid")
+    return dict(provenance)
 
 
 def _accelerator_state_files(checkpoint: Path) -> dict[str, str]:
@@ -1492,34 +1693,18 @@ def _load_baton_training_metadata(
         or type(metadata["training_provenance"]) is not dict
     ):
         raise ValueError("Baton checkpoint envelope is incompatible")
-    provenance = metadata["training_provenance"]
-    expected_provenance_fields = (
-        {
-            "hdf5_manifest_hash",
-            "siglip2_config_hash",
-            "siglip2_artifact_hash",
-            "teacher_preprocessing_hash",
-        }
-        if metadata["source"] == BATON_TEACHER_SOURCE
-        else {
-            "hdf5_manifest_hash",
-            "planner_manifest_hash",
-            "planner_topology_hash",
-            "siglip2_artifact_hash",
-        }
+    provenance = _validated_baton_training_provenance(
+        metadata["source"],
+        metadata["training_provenance"],
     )
-    if set(provenance) != expected_provenance_fields or not all(
-        type(value) is str
-        and len(value) == 64
-        and value != "0" * 64
-        and all(character in "0123456789abcdef" for character in value)
-        for value in provenance.values()
-    ):
-        raise ValueError("Baton checkpoint training provenance is invalid")
     try:
         cursor = TrainingCursor.from_dict(metadata["cursor"])
     except (TypeError, ValueError) as error:
         raise ValueError("Baton checkpoint training cursor is invalid") from error
+    if provenance["window_sampling_seed"] != cursor.sampler_seed:
+        raise ValueError(
+            "Baton checkpoint sampling provenance differs from training cursor"
+        )
     expected_accelerator_files = metadata["accelerator_files"]
     if (
         type(expected_accelerator_files) is not dict
@@ -1572,7 +1757,7 @@ def save_baton_training_checkpoint(
     cursor: TrainingCursor,
     diffusion_model: torch.nn.Module,
     source: str,
-    training_provenance: Mapping[str, str],
+    training_provenance: Mapping[str, Any],
 ) -> Path:
     """Atomically save mutable GE-Act state and a deployable diffusion snapshot."""
 
@@ -1580,8 +1765,14 @@ def save_baton_training_checkpoint(
         raise TypeError("Baton checkpoint requires a TrainingCursor")
     if source not in BATON_SOURCES:
         raise ValueError("Baton checkpoint source is invalid")
-    if type(training_provenance) is not dict or not training_provenance:
-        raise ValueError("Baton checkpoint training provenance is required")
+    validated_provenance = _validated_baton_training_provenance(
+        source,
+        training_provenance,
+    )
+    if validated_provenance["window_sampling_seed"] != cursor.sampler_seed:
+        raise ValueError(
+            "Baton checkpoint sampling provenance differs from training cursor"
+        )
     root = Path(output_dir)
     destination = root / f"step_{cursor.global_step:06d}"
     staging = root / f".{destination.name}.incomplete"
@@ -1620,7 +1811,7 @@ def save_baton_training_checkpoint(
                 "accelerator_files": _accelerator_state_files(staging),
                 "diffusion_subdir": "diffusion_model",
                 "diffusion_files": _diffusion_snapshot_files(diffusion_dir),
-                "training_provenance": dict(training_provenance),
+                "training_provenance": validated_provenance,
             }
             (staging / "baton_state.json").write_text(
                 json.dumps(
@@ -1649,6 +1840,7 @@ def load_baton_training_checkpoint(
     expected_source: str,
     expected_microbatches_per_epoch: int,
     expected_sampler_seed: int,
+    expected_training_provenance: Mapping[str, Any],
 ) -> TrainingCursor:
     """Validate the complete Baton envelope before restoring Accelerate state."""
 
@@ -1659,6 +1851,12 @@ def load_baton_training_checkpoint(
         raise ValueError("Baton checkpoint conditioning source mismatch")
     if metadata["topology_hash"] != _module_topology_hash(diffusion_model):
         raise ValueError("Baton checkpoint runtime topology mismatch")
+    expected_provenance = _validated_baton_training_provenance(
+        expected_source,
+        dict(expected_training_provenance),
+    )
+    if metadata["training_provenance"] != expected_provenance:
+        raise ValueError("Baton checkpoint training provenance mismatch")
     if (
         cursor.microbatches_per_epoch != expected_microbatches_per_epoch
         or cursor.sampler_seed != expected_sampler_seed
@@ -1702,9 +1900,71 @@ def validate_baton_stage2_checkpoint_envelope(
     return checkpoint / "diffusion_model"
 
 
+@dataclass(frozen=True)
+class BatonStage3ArtifactChain:
+    """Validated immutable Stage-1/Stage-2 boundary for Stage-3 allocation."""
+
+    diffusion_model_dir: Path
+    stage1_metadata: Any
+    stage2_training_provenance: dict[str, Any]
+
+
+def validate_baton_stage3_artifact_chain(
+    *,
+    stage2_checkpoint: str | Path,
+    expected_stage2_topology_hash: str,
+    planner_checkpoint: str | Path,
+    expected_planner_topology: str | Path | Mapping[str, Any],
+    expected_hdf5_manifest_hash: str,
+) -> BatonStage3ArtifactChain:
+    """Bind Stage-2 teacher targets exactly to trusted Stage-1 metadata."""
+
+    from qwen35_baton.provider import (
+        _validate_checkpoint_envelope,
+        _validate_trusted_planner_topology,
+    )
+
+    planner_path = Path(planner_checkpoint).expanduser().resolve()
+    stage1_metadata = _validate_checkpoint_envelope(planner_path)
+    _validate_trusted_planner_topology(
+        stage1_metadata,
+        checkpoint=planner_path,
+        expected=expected_planner_topology,
+    )
+    diffusion_model_dir = validate_baton_stage2_checkpoint_envelope(
+        stage2_checkpoint,
+        expected_topology_hash=expected_stage2_topology_hash,
+        expected_hdf5_manifest_hash=expected_hdf5_manifest_hash,
+    )
+    _, stage2_metadata, _ = _load_baton_training_metadata(
+        stage2_checkpoint
+    )
+    stage2_provenance = stage2_metadata["training_provenance"]
+    if stage1_metadata.hdf5_manifest_hash != expected_hdf5_manifest_hash:
+        raise ValueError(
+            "Stage-1 planner checkpoint dataset provenance mismatch"
+        )
+    for field in (
+        "siglip2_config_hash",
+        "siglip2_artifact_hash",
+        "teacher_preprocessing_hash",
+    ):
+        if getattr(stage1_metadata, field) != stage2_provenance[field]:
+            raise ValueError(
+                f"Stage-1/Stage-2 semantic target mismatch for {field}"
+            )
+    return BatonStage3ArtifactChain(
+        diffusion_model_dir=diffusion_model_dir,
+        stage1_metadata=stage1_metadata,
+        stage2_training_provenance=dict(stage2_provenance),
+    )
+
+
 def build_baton_training_provenance(
     config: Mapping[str, Any],
-) -> dict[str, str]:
+    *,
+    stage1_metadata: Any | None = None,
+) -> dict[str, Any]:
     """Bind a Baton checkpoint to its local dataset and frozen source."""
 
     config_mapping = _config_mapping(config)
@@ -1721,6 +1981,28 @@ def build_baton_training_provenance(
     provenance = {
         "hdf5_manifest_hash": sha256_file(manifest_path),
     }
+    train_data = config_mapping.get("data", {}).get("train", {})
+    sampling_contract = {
+        "algorithm": train_data.get("baton_sampling_algorithm"),
+        "version": train_data.get("baton_sampling_version"),
+        "seed": train_data.get("baton_sampling_seed"),
+    }
+    if sampling_contract != {
+        "algorithm": BATON_SAMPLING_ALGORITHM,
+        "version": BATON_SAMPLING_VERSION,
+        "seed": config_mapping.get("seed"),
+    }:
+        raise ValueError("Baton stateless window sampling config is invalid")
+    provenance.update(
+        {
+            "window_sampling_algorithm": sampling_contract["algorithm"],
+            "window_sampling_version": sampling_contract["version"],
+            "window_sampling_seed": sampling_contract["seed"],
+            "window_sampling_topology_hash": sha256_json(
+                sampling_contract
+            ),
+        }
+    )
     if source == BATON_TEACHER_SOURCE:
         provenance.update(
             {
@@ -1735,15 +2017,38 @@ def build_baton_training_provenance(
         return provenance
     planner_checkpoint = Path(semantic["planner_checkpoint"])
     planner_manifest = planner_checkpoint / "manifest.json"
-    planner_topology = Path(semantic["expected_planner_topology"])
-    if not planner_manifest.is_file() or not planner_topology.is_file():
+    if not planner_manifest.is_file():
         raise ValueError("Baton planner provenance files are missing")
+    if stage1_metadata is None:
+        from qwen35_baton.provider import (
+            _validate_checkpoint_envelope,
+            _validate_trusted_planner_topology,
+        )
+
+        stage1_metadata = _validate_checkpoint_envelope(
+            planner_checkpoint.resolve()
+        )
+        _validate_trusted_planner_topology(
+            stage1_metadata,
+            checkpoint=planner_checkpoint.resolve(),
+            expected=semantic["expected_planner_topology"],
+        )
+    if stage1_metadata.hdf5_manifest_hash != provenance[
+        "hdf5_manifest_hash"
+    ]:
+        raise ValueError("Baton planner checkpoint differs from HDF5 manifest")
     provenance.update(
         {
             "planner_manifest_hash": sha256_file(planner_manifest),
-            "planner_topology_hash": sha256_file(planner_topology),
-            "siglip2_artifact_hash": sha256_artifact(
-                semantic["siglip2_model_path"]
+            "planner_topology_hash": stage1_metadata.planner_topology_hash,
+            "qwen_config_hash": stage1_metadata.qwen_config_hash,
+            "tokenizer_hash": stage1_metadata.tokenizer_hash,
+            "processor_hash": stage1_metadata.processor_hash,
+            "input_template_hash": stage1_metadata.input_template_hash,
+            "siglip2_config_hash": stage1_metadata.siglip2_config_hash,
+            "siglip2_artifact_hash": stage1_metadata.siglip2_artifact_hash,
+            "teacher_preprocessing_hash": (
+                stage1_metadata.teacher_preprocessing_hash
             ),
         }
     )
@@ -1818,6 +2123,7 @@ class Trainer:
         self.semantic_planner = None
         self.baton_components = None
         self.baton_training_provenance = None
+        self.baton_stage3_artifact_chain = None
         self.grounded_provider = None
         self.grounded_training_enabled = False
         self.qwen_ownership = None
@@ -2018,6 +2324,10 @@ class Trainer:
         if semantic_source in BATON_SOURCES:
             # Baton provenance and source ownership fail closed before any
             # tokenizer, VAE, or LTX allocation in direct Trainer use.
+            validate_baton_dataset_sampling_contract(
+                self.train_dataset,
+                expected_seed=self.sampler_seed,
+            )
             if semantic_source == BATON_PREDICTION_SOURCE:
                 manifest_path = Path(
                     self.raw_config["data"]["train"]["manifest_path"]
@@ -2026,13 +2336,31 @@ class Trainer:
                     raise ValueError(
                         f"Stage-3 HDF5 manifest is missing: {manifest_path}"
                     )
-                stage2_model_dir = validate_baton_stage2_checkpoint_envelope(
-                    self.raw_config.get("stage2_init_checkpoint", ""),
-                    expected_topology_hash=self.raw_config.get(
-                        "stage2_init_topology_hash",
-                        "",
-                    ),
-                    expected_hdf5_manifest_hash=sha256_file(manifest_path),
+                self.baton_stage3_artifact_chain = (
+                    validate_baton_stage3_artifact_chain(
+                        stage2_checkpoint=self.raw_config.get(
+                            "stage2_init_checkpoint",
+                            "",
+                        ),
+                        expected_stage2_topology_hash=self.raw_config.get(
+                            "stage2_init_topology_hash",
+                            "",
+                        ),
+                        planner_checkpoint=semantic_config.get(
+                            "planner_checkpoint",
+                            "",
+                        ),
+                        expected_planner_topology=semantic_config.get(
+                            "expected_planner_topology",
+                            "",
+                        ),
+                        expected_hdf5_manifest_hash=sha256_file(
+                            manifest_path
+                        ),
+                    )
+                )
+                stage2_model_dir = (
+                    self.baton_stage3_artifact_chain.diffusion_model_dir
                 )
                 configured_model_path = Path(
                     self.raw_config["diffusion_model"]["model_path"]
@@ -2050,7 +2378,14 @@ class Trainer:
                 dtype=dtype,
             )
             self.baton_training_provenance = (
-                build_baton_training_provenance(self.raw_config)
+                build_baton_training_provenance(
+                    self.raw_config,
+                    stage1_metadata=(
+                        self.baton_stage3_artifact_chain.stage1_metadata
+                        if self.baton_stage3_artifact_chain is not None
+                        else None
+                    ),
+                )
             )
 
         ### Load Tokenizer
@@ -2100,12 +2435,28 @@ class Trainer:
         diffusion_model_class = import_custom_class(
             self.args.diffusion_model_class, getattr(self.args, "diffusion_model_class_path", "transformers")
         )
-        self.diffusion_model = load_diffusion_model(
-            model_cls=diffusion_model_class,
-            model_dir=self.args.diffusion_model['model_path'],
-            load_weights=self.args.load_weights and getattr(self.args, "load_diffusion_model_weights", True),
-            **self.args.diffusion_model['config']
-        ).to(device, dtype=dtype)
+        if semantic_source == BATON_PREDICTION_SOURCE:
+            if self.baton_stage3_artifact_chain is None:
+                raise RuntimeError(
+                    "Stage-3 artifact chain was lost before LTX allocation"
+                )
+            self.diffusion_model = diffusion_model_class(
+                **self.args.diffusion_model["config"]
+            ).to(device=device, dtype=dtype)
+            strict_load_baton_stage3_diffusion_model(
+                self.diffusion_model,
+                self.baton_stage3_artifact_chain.diffusion_model_dir,
+                expected_snapshot_topology_hash=self.raw_config[
+                    "stage2_init_topology_hash"
+                ],
+            )
+        else:
+            self.diffusion_model = load_diffusion_model(
+                model_cls=diffusion_model_class,
+                model_dir=self.args.diffusion_model['model_path'],
+                load_weights=self.args.load_weights and getattr(self.args, "load_diffusion_model_weights", True),
+                **self.args.diffusion_model['config']
+            ).to(device, dtype=dtype)
         total_params = count_model_parameters(self.diffusion_model)
         logger.info(f'Total parameters for transformer model:{total_params}')
 
@@ -2336,6 +2687,9 @@ class Trainer:
                             microbatches_per_epoch
                         ),
                         expected_sampler_seed=self.sampler_seed,
+                        expected_training_provenance=(
+                            self.baton_training_provenance
+                        ),
                     )
                 else:
                     self.resume_cursor = TrainingCursor(
