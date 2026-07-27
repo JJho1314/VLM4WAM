@@ -101,6 +101,14 @@ def test_continuous_metadata_rejects_wrong_backbone_identity() -> None:
         BatonCheckpointMetadata.from_dict(payload)
 
 
+def test_format_v1_metadata_is_explicitly_incompatible_with_v2() -> None:
+    payload = BatonCheckpointMetadata.example().to_dict()
+    payload["format_version"] = 1
+
+    with pytest.raises(ValueError, match="format version 1.*incompatible.*version 2"):
+        BatonCheckpointMetadata.from_dict(payload)
+
+
 def test_continuous_metadata_rejects_wrong_teacher_identity() -> None:
     payload = BatonCheckpointMetadata.example().to_dict()
 

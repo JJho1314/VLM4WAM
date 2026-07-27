@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Iterable, Mapping, Sequence
-from contextlib import nullcontext
 from dataclasses import asdict, dataclass, fields, replace
 import json
 import math
@@ -24,6 +23,9 @@ from qwen35_baton.checkpoint import (
     BatonTrainingCursor,
     capture_rank_rng_state,
     load_baton_checkpoint,
+    load_trusted_planner_topology,
+    planner_module_topology,
+    publish_trusted_planner_topology,
     restore_rank_rng_state,
     save_baton_checkpoint,
 )
@@ -904,6 +906,46 @@ def run_training(
         world_size=accelerator.num_processes,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
     )
+    planner_topology = planner_module_topology(artifacts.planner)
+    planner_topology_hash = sha256_json(planner_topology)
+    output_topology_path = Path(config.output_dir) / "planner_topology.json"
+    resume_topology_path = (
+        None
+        if config.resume_from is None
+        else Path(config.resume_from).parent / "planner_topology.json"
+    )
+    if resume_topology_path is not None:
+        resumed_topology, resumed_hash = load_trusted_planner_topology(
+            resume_topology_path
+        )
+        if resumed_topology != planner_topology:
+            raise ValueError(
+                "resume root trusted planner topology differs from runtime planner"
+            )
+        if resumed_hash != planner_topology_hash:
+            raise ValueError("resume root planner topology hash is invalid")
+    if accelerator.is_main_process:
+        if output_topology_path.is_file():
+            output_topology, output_hash = load_trusted_planner_topology(
+                output_topology_path
+            )
+            if (
+                output_topology != planner_topology
+                or output_hash != planner_topology_hash
+            ):
+                raise ValueError(
+                    "output root trusted planner topology differs from runtime planner"
+                )
+        else:
+            publish_trusted_planner_topology(
+                output_topology_path,
+                planner_topology,
+            )
+    accelerator.wait_for_everyone()
+    artifacts.metadata = replace(
+        artifacts.metadata,
+        planner_topology_hash=planner_topology_hash,
+    )
     train_batches = artifacts.train_batches
     if isinstance(train_batches, torch.utils.data.DataLoader):
         train_batches = accelerator.prepare_data_loader(train_batches)
@@ -928,6 +970,7 @@ def run_training(
             expected_contract=artifacts.metadata,
             expected_sampler_seed=config.seed,
             expected_microbatches_per_epoch=microbatches_per_epoch,
+            expected_planner_topology=resume_topology_path,
             distributed_rank=accelerator.process_index,
             world_size=accelerator.num_processes,
         )

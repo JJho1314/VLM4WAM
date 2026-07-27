@@ -104,7 +104,7 @@ class BatonLossWeights:
 class BatonCheckpointMetadata:
     """Serialized compatibility contract for a continuous Baton checkpoint."""
 
-    FORMAT_VERSION: ClassVar[int] = 1
+    FORMAT_VERSION: ClassVar[int] = 2
     ARCHITECTURE_KIND: ClassVar[str] = "qwen35_baton_continuous"
     QWEN_BACKBONE: ClassVar[str] = "dense Qwen3.5-2B"
     SIGLIP2_MODEL: ClassVar[str] = "SigLIP2-large-patch16-256"
@@ -319,6 +319,10 @@ class BatonCheckpointMetadata:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> BatonCheckpointMetadata:
+        if isinstance(payload, Mapping) and payload.get("format_version") == 1:
+            raise ValueError(
+                "Baton checkpoint format version 1 is incompatible with version 2"
+            )
         _require_keys(payload, cls._REQUIRED_FIELDS)
         values = {name: payload[name] for name in cls._REQUIRED_FIELDS}
         values["added_tokens"] = tuple(values["added_tokens"])

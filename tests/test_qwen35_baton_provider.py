@@ -13,6 +13,8 @@ import torch.nn as nn
 from qwen35_baton.checkpoint import (
     BatonTrainingCursor,
     capture_rank_rng_state,
+    planner_module_topology,
+    publish_trusted_planner_topology,
     save_baton_checkpoint,
 )
 from qwen35_baton.cli.train_semantic_planner import BatonCosineWarmupScheduler
@@ -465,7 +467,10 @@ def _write_checkpoint(
         planner=planner,
         optimizer=optimizer,
         scheduler=scheduler,
-        metadata=metadata,
+        metadata=replace(
+            metadata,
+            planner_topology_hash=sha256_json(planner_module_topology(planner)),
+        ),
         cursor=BatonTrainingCursor(
             global_step=0,
             epoch=0,
@@ -536,8 +541,9 @@ def _topology_contract(path: Path) -> dict[str, Any]:
 
 def _write_expected_topology(checkpoint: Path) -> Path:
     path = checkpoint.parent / f"{checkpoint.name}-trusted-topology.json"
-    path.write_text(
-        json.dumps(_topology_contract(checkpoint / "planner.safetensors"))
+    publish_trusted_planner_topology(
+        path,
+        _topology_contract(checkpoint / "planner.safetensors"),
     )
     return path
 
@@ -678,9 +684,11 @@ def test_checkpoint_topology_hash_tamper_fails_before_component_loading(
     assert calls == 0
 
 
+@pytest.mark.parametrize("torch_dtype", [torch.bfloat16, torch.float32])
 def test_valid_checkpoint_loads_state_then_returns_frozen_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    torch_dtype: torch.dtype,
 ) -> None:
     model_path, tokenizer_path, processor_path = _write_artifacts(tmp_path)
     siglip_path = _write_siglip_artifact(tmp_path)
@@ -709,6 +717,7 @@ def test_valid_checkpoint_loads_state_then_returns_frozen_provider(
         assert kwargs["qwen_model_path"] == model_path
         assert kwargs["qwen_tokenizer_path"] == tokenizer_path
         assert kwargs["qwen_processor_path"] == processor_path
+        assert kwargs["torch_dtype"] == torch_dtype
         return _Processor(), runtime
 
     provider = FrozenBatonPlanner.from_checkpoint(
@@ -718,6 +727,7 @@ def test_valid_checkpoint_loads_state_then_returns_frozen_provider(
         qwen_processor_path=processor_path,
         siglip2_model_path=siglip_path,
         expected_planner_topology=topology_path,
+        torch_dtype=torch_dtype,
         _component_loader=component_loader,
     )
 
@@ -725,6 +735,91 @@ def test_valid_checkpoint_loads_state_then_returns_frozen_provider(
     assert provider.planner.weight.item() == 3.0
     assert all(not module.training for module in provider.modules())
     assert all(not parameter.requires_grad for parameter in provider.parameters())
+
+
+def test_float16_is_rejected_before_checkpoint_or_component_loading(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def forbidden_loader(**_: Any) -> tuple[Any, nn.Module]:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("unsupported dtype must fail before component loading")
+
+    with pytest.raises(ValueError, match="bfloat16.*float32"):
+        FrozenBatonPlanner.from_checkpoint(
+            tmp_path / "missing-checkpoint",
+            qwen_model_path=tmp_path / "qwen",
+            qwen_tokenizer_path=tmp_path / "tokenizer",
+            qwen_processor_path=tmp_path / "processor",
+            siglip2_model_path=tmp_path / "siglip2",
+            expected_planner_topology=tmp_path / "planner_topology.json",
+            torch_dtype=torch.float16,
+            _component_loader=forbidden_loader,
+        )
+
+    assert calls == 0
+
+
+def test_unsupported_device_is_rejected_before_checkpoint_or_component_loading(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def forbidden_loader(**_: Any) -> tuple[Any, nn.Module]:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("unsupported device must fail before component loading")
+
+    with pytest.raises(ValueError, match="device.*autocast"):
+        FrozenBatonPlanner.from_checkpoint(
+            tmp_path / "missing-checkpoint",
+            qwen_model_path=tmp_path / "qwen",
+            qwen_tokenizer_path=tmp_path / "tokenizer",
+            qwen_processor_path=tmp_path / "processor",
+            siglip2_model_path=tmp_path / "siglip2",
+            device="meta",
+            torch_dtype=torch.float32,
+            _component_loader=forbidden_loader,
+        )
+
+    assert calls == 0
+
+
+def test_provider_discovers_output_root_topology_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path, tokenizer_path, processor_path = _write_artifacts(tmp_path)
+    siglip_path = _write_siglip_artifact(tmp_path)
+    checkpoint = tmp_path / "step_000000"
+    source = _FakePlanner()
+    _write_checkpoint(
+        checkpoint,
+        metadata=_metadata_for_artifacts(
+            model_path,
+            tokenizer_path,
+            processor_path,
+            siglip_path,
+        ),
+        planner=source,
+    )
+    trusted = _write_expected_topology(checkpoint)
+    trusted.rename(tmp_path / "planner_topology.json")
+    _trust_siglip_geometry(monkeypatch)
+
+    provider = FrozenBatonPlanner.from_checkpoint(
+        checkpoint,
+        qwen_model_path=model_path,
+        qwen_tokenizer_path=tokenizer_path,
+        qwen_processor_path=processor_path,
+        siglip2_model_path=siglip_path,
+        torch_dtype=torch.float32,
+        _component_loader=lambda **_: (_Processor(), _FakePlanner()),
+    )
+
+    assert isinstance(provider, FrozenBatonPlanner)
 
 
 def test_siglip_artifact_tamper_fails_before_component_loading(

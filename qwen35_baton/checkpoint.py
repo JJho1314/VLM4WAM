@@ -15,7 +15,12 @@ from typing import Any
 
 import numpy as np
 from safetensors import safe_open
-from safetensors.torch import load_model, save_model
+from safetensors.torch import (
+    _TYPES,
+    _remove_duplicate_names,
+    load_model,
+    save_model,
+)
 import torch
 import torch.nn as nn
 
@@ -33,7 +38,6 @@ _CHECKPOINT_FILES = (
     "metadata.json",
 )
 _RUNTIME_METADATA_FIELDS = {
-    "planner_topology_hash",
     "optimizer_topology_hash",
     "scheduler_topology_hash",
     "global_step",
@@ -498,14 +502,12 @@ def _metadata_cursor(
     cursor: BatonTrainingCursor,
     *,
     world_size: int,
-    planner_hash: str,
     optimizer_hash: str,
     scheduler_hash: str,
     rng_hash: str,
 ) -> BatonCheckpointMetadata:
     return replace(
         metadata,
-        planner_topology_hash=planner_hash,
         optimizer_topology_hash=optimizer_hash,
         scheduler_topology_hash=scheduler_hash,
         global_step=cursor.global_step,
@@ -549,6 +551,112 @@ def planner_safetensors_topology(path: str | Path) -> dict[str, Any]:
     return contract
 
 
+def planner_module_topology(planner: nn.Module) -> dict[str, Any]:
+    """Derive the exact safe-model header topology without writing a checkpoint."""
+
+    if not isinstance(planner, nn.Module):
+        raise TypeError("planner must be a torch module")
+    state = planner.state_dict()
+    removals = _remove_duplicate_names(state)
+    aliases = {
+        removed: kept
+        for kept, removed_names in removals.items()
+        for removed in removed_names
+    }
+    removed = set(aliases)
+    dtype_names = {dtype: name for name, dtype in _TYPES.items()}
+    tensors = []
+    for name in sorted(set(state).difference(removed)):
+        value = state[name]
+        dtype = dtype_names.get(value.dtype)
+        if dtype is None:
+            raise ValueError(
+                f"planner tensor {name} has unsupported safetensors dtype {value.dtype}"
+            )
+        tensors.append(
+            {"name": name, "shape": list(value.shape), "dtype": dtype}
+        )
+    contract = {
+        "format_version": 1,
+        "tensors": tensors,
+        "aliases": dict(sorted(aliases.items())),
+    }
+    validate_planner_topology_contract(contract)
+    return contract
+
+
+def trusted_planner_topology_payload(
+    topology: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Wrap a canonical topology in its independently verifiable root envelope."""
+
+    validate_planner_topology_contract(topology)
+    canonical = json.loads(
+        json.dumps(topology, sort_keys=True, allow_nan=False)
+    )
+    return {
+        "format_version": 1,
+        "topology": canonical,
+        "sha256": sha256_json(canonical),
+    }
+
+
+def load_trusted_planner_topology(
+    source: str | Path | Mapping[str, Any],
+) -> tuple[dict[str, Any], str]:
+    """Load and validate a root topology envelope or an injected raw contract."""
+
+    if isinstance(source, Mapping):
+        payload = dict(source)
+    else:
+        path = Path(source).expanduser().resolve()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"trusted planner topology JSON is invalid: {path}") from error
+        if not isinstance(payload, Mapping):
+            raise ValueError("trusted planner topology must contain a JSON object")
+        payload = dict(payload)
+    if set(payload) == {"format_version", "topology", "sha256"}:
+        if payload["format_version"] != 1 or not isinstance(
+            payload["topology"], Mapping
+        ):
+            raise ValueError("trusted planner topology envelope is invalid")
+        topology = dict(payload["topology"])
+        validate_planner_topology_contract(topology)
+        actual_hash = sha256_json(topology)
+        if payload["sha256"] != actual_hash:
+            raise ValueError("trusted planner topology envelope hash is invalid")
+        return topology, actual_hash
+    validate_planner_topology_contract(payload)
+    return payload, sha256_json(payload)
+
+
+def publish_trusted_planner_topology(
+    path: str | Path,
+    topology: Mapping[str, Any],
+) -> str:
+    """Atomically publish a fsynced topology contract outside checkpoints."""
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    payload = trusted_planner_topology_payload(topology)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.incomplete-",
+        dir=destination.parent,
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        _json_write(temporary, payload)
+        os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return str(payload["sha256"])
+
+
 def validate_planner_topology_contract(payload: Any) -> None:
     """Reject incomplete, unordered, duplicate, or malformed topology records."""
 
@@ -577,6 +685,8 @@ def validate_planner_topology_contract(payload: Any) -> None:
         names.append(tensor["name"])
     if len(names) != len(set(names)):
         raise ValueError("planner topology tensor names must be unique")
+    if names != sorted(names):
+        raise ValueError("planner topology tensor names must be ordered")
     for alias, target in payload["aliases"].items():
         if (
             not isinstance(alias, str)
@@ -612,6 +722,12 @@ def save_baton_checkpoint(
         raise TypeError("cursor must be BatonTrainingCursor")
     if destination.exists():
         raise FileExistsError(f"checkpoint already exists: {destination}")
+    trusted_topology = planner_module_topology(planner)
+    trusted_hash = sha256_json(trusted_topology)
+    if trusted_hash != metadata.planner_topology_hash:
+        raise ValueError(
+            "planner topology hash differs from trusted checkpoint metadata"
+        )
     states = _normalized_rank_states(rank_rng_state)
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(
@@ -626,6 +742,13 @@ def save_baton_checkpoint(
             str(staging / "planner.safetensors"),
             metadata={"format": BatonCheckpointMetadata.ARCHITECTURE_KIND},
         )
+        written_topology = planner_safetensors_topology(
+            staging / "planner.safetensors"
+        )
+        if written_topology != trusted_topology:
+            raise ValueError(
+                "written planner safetensors topology differs from trusted metadata"
+            )
         optimizer_state = optimizer.state_dict()
         _annotate_optimizer_state(
             optimizer_state,
@@ -665,9 +788,6 @@ def save_baton_checkpoint(
             metadata,
             cursor,
             world_size=len(states),
-            planner_hash=sha256_json(
-                planner_safetensors_topology(staging / "planner.safetensors")
-            ),
             optimizer_hash=sha256_json(
                 _optimizer_topology(optimizer_state)
             ),
@@ -680,7 +800,7 @@ def save_baton_checkpoint(
         }
         _json_write(
             staging / "manifest.json",
-            {"format_version": 1, "files": hashes},
+            {"format_version": 2, "files": hashes},
         )
         _fsync_directory(staging)
         os.replace(staging, destination)
@@ -945,6 +1065,7 @@ def load_baton_checkpoint(
     expected_contract: BatonCheckpointMetadata,
     expected_sampler_seed: int,
     expected_microbatches_per_epoch: int,
+    expected_planner_topology: str | Path | Mapping[str, Any],
     scaler: Any | None = None,
     distributed_rank: int | None = None,
     world_size: int | None = None,
@@ -974,7 +1095,7 @@ def load_baton_checkpoint(
     manifest = _load_json(checkpoint / "manifest.json", label="manifest")
     hashes = manifest.get("files")
     if (
-        manifest.get("format_version") != 1
+        manifest.get("format_version") != 2
         or not isinstance(hashes, Mapping)
         or set(hashes) != set(_CHECKPOINT_FILES)
     ):
@@ -983,6 +1104,25 @@ def load_baton_checkpoint(
         actual_hash = sha256_file(checkpoint / name)
         if hashes[name] != actual_hash:
             raise ValueError(f"checkpoint hash mismatch for {name}")
+
+    trusted_topology, trusted_hash = load_trusted_planner_topology(
+        expected_planner_topology
+    )
+    if trusted_hash != metadata.planner_topology_hash:
+        raise ValueError(
+            "trusted planner topology hash differs from checkpoint metadata"
+        )
+    actual_topology = planner_safetensors_topology(
+        checkpoint / "planner.safetensors"
+    )
+    if sha256_json(actual_topology) != metadata.planner_topology_hash:
+        raise ValueError(
+            "planner safetensors topology hash differs from checkpoint metadata"
+        )
+    if actual_topology != trusted_topology:
+        raise ValueError(
+            "planner safetensors topology differs from trusted planner topology"
+        )
 
     cursor = BatonTrainingCursor.from_dict(
         _load_json(checkpoint / "cursor.json", label="cursor")

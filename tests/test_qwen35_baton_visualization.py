@@ -7,7 +7,10 @@ from PIL import Image
 import pytest
 import torch
 
-from qwen35_baton.cli.visualize_attention import main as visualize_main
+from qwen35_baton.cli.visualize_attention import (
+    _parser as visualization_parser,
+    main as visualize_main,
+)
 from qwen35_baton.provider import BatonSemanticPlan
 from qwen35_baton.visualization import (
     render_attention_panels,
@@ -274,3 +277,35 @@ def test_visualization_cli_rejects_equal_counterfactual_before_checkpoint_load(
                 str(tmp_path / "output"),
             ]
         )
+
+
+def test_visualization_cli_rejects_float16_dtype_choice(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        visualization_parser().parse_args(
+            [
+                "--checkpoint",
+                "checkpoint",
+                "--qwen-model-path",
+                "qwen",
+                "--qwen-tokenizer-path",
+                "tokenizer",
+                "--qwen-processor-path",
+                "processor",
+                "--siglip2-model-path",
+                "siglip2",
+                "--input-npz",
+                "input.npz",
+                "--instructions-json",
+                "instructions.json",
+                "--counterfactual-instructions-json",
+                "counterfactuals.json",
+                "--output-dir",
+                "output",
+                "--dtype",
+                "float16",
+            ]
+        )
+
+    assert "invalid choice" in capsys.readouterr().err

@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+from safetensors.torch import save_model
 import torch
 import torch.nn as nn
 
@@ -15,10 +16,13 @@ from qwen35_baton.checkpoint import (
     BatonTrainingCursor,
     capture_rank_rng_state,
     load_baton_checkpoint as _load_baton_checkpoint,
+    planner_module_topology,
+    planner_safetensors_topology,
     save_baton_checkpoint,
 )
 from qwen35_baton.cli.train_semantic_planner import BatonCosineWarmupScheduler
 from qwen35_baton.config import BatonCheckpointMetadata
+from qwen35_baton.hashing import sha256_json
 
 
 class _Scaler:
@@ -35,7 +39,25 @@ class _Scaler:
 def load_baton_checkpoint(*args: Any, **kwargs: Any):
     kwargs.setdefault("expected_sampler_seed", 41)
     kwargs.setdefault("expected_microbatches_per_epoch", 11)
+    topology = planner_safetensors_topology(
+        Path(args[0]) / "planner.safetensors"
+    )
+    kwargs.setdefault("expected_planner_topology", topology)
+    kwargs["expected_contract"] = replace(
+        kwargs["expected_contract"],
+        planner_topology_hash=sha256_json(topology),
+    )
     return _load_baton_checkpoint(*args, **kwargs)
+
+
+def _metadata_for_planner(
+    planner: nn.Module,
+    metadata: BatonCheckpointMetadata | None = None,
+) -> BatonCheckpointMetadata:
+    return replace(
+        BatonCheckpointMetadata.example() if metadata is None else metadata,
+        planner_topology_hash=sha256_json(planner_module_topology(planner)),
+    )
 
 
 def _runtime(seed: int = 7):
@@ -82,7 +104,7 @@ def _save_valid_checkpoint(
         optimizer=optimizer,
         scheduler=scheduler,
         scaler=scaler,
-        metadata=BatonCheckpointMetadata.example(),
+        metadata=_metadata_for_planner(planner),
         cursor=_cursor(),
         rank_rng_state=rank_states,
     )
@@ -152,7 +174,7 @@ def test_zero_step_checkpoint_supports_validated_model_only_loading(
         planner=planner,
         optimizer=optimizer,
         scheduler=scheduler,
-        metadata=BatonCheckpointMetadata.example(),
+        metadata=_metadata_for_planner(planner),
         cursor=cursor,
         rank_rng_state={0: capture_rank_rng_state(distributed_rank=0)},
     )
@@ -209,7 +231,7 @@ def test_checkpoint_save_requires_every_contiguous_rank_publication(
             planner=planner,
             optimizer=optimizer,
             scheduler=scheduler,
-            metadata=BatonCheckpointMetadata.example(),
+            metadata=_metadata_for_planner(planner),
             cursor=_cursor(),
             rank_rng_state=states,
         )
@@ -233,7 +255,7 @@ def test_checkpoint_save_rejects_unnamed_optimizer_lr_groups(
             planner=planner,
             optimizer=optimizer,
             scheduler=scheduler,
-            metadata=BatonCheckpointMetadata.example(),
+            metadata=_metadata_for_planner(planner),
             cursor=BatonTrainingCursor(
                 global_step=0,
                 epoch=0,
@@ -379,7 +401,7 @@ def test_rank_rng_state_restores_python_numpy_cpu_and_all_cuda_streams(
         planner=planner,
         optimizer=optimizer,
         scheduler=scheduler,
-        metadata=BatonCheckpointMetadata.example(),
+        metadata=_metadata_for_planner(planner),
         cursor=_cursor(),
         rank_rng_state={0: saved},
     )
@@ -428,6 +450,7 @@ def test_loader_rejects_runtime_sampler_contract_before_tensor_loading(
     _save_valid_checkpoint(checkpoint)
     planner, optimizer, scheduler = _runtime(seed=99)
     before = _clone_state(planner)
+    trusted_topology = planner_module_topology(planner)
 
     with pytest.raises(ValueError, match="sampler seed"):
         _load_baton_checkpoint(
@@ -435,9 +458,10 @@ def test_loader_rejects_runtime_sampler_contract_before_tensor_loading(
             planner=planner,
             optimizer=optimizer,
             scheduler=scheduler,
-            expected_contract=BatonCheckpointMetadata.example(),
+            expected_contract=_metadata_for_planner(planner),
             expected_sampler_seed=99,
             expected_microbatches_per_epoch=11,
+            expected_planner_topology=trusted_topology,
         )
 
     _assert_state_equal(planner.state_dict(), before)
@@ -455,7 +479,7 @@ def test_loader_rejects_cuda_rng_runtime_before_model_mutation(
         planner=planner,
         optimizer=optimizer,
         scheduler=scheduler,
-        metadata=BatonCheckpointMetadata.example(),
+        metadata=_metadata_for_planner(planner),
         cursor=_cursor(),
         rank_rng_state={0: rank_state},
     )
@@ -602,7 +626,7 @@ def test_loader_rejects_same_shaped_optimizer_parameter_reordering(
         planner=source,
         optimizer=source_optimizer,
         scheduler=source_scheduler,
-        metadata=BatonCheckpointMetadata.example(),
+        metadata=_metadata_for_planner(source),
         cursor=_cursor(),
         rank_rng_state={0: capture_rank_rng_state(distributed_rank=0)},
     )
@@ -690,6 +714,155 @@ def test_loader_rejects_persisted_step_that_differs_from_cursor_before_mutation(
     before = _clone_state(planner)
 
     with pytest.raises(ValueError, match=message):
+        load_baton_checkpoint(
+            checkpoint,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            expected_contract=BatonCheckpointMetadata.example(),
+        )
+
+    _assert_state_equal(planner.state_dict(), before)
+
+
+def test_checkpoint_save_rejects_untrusted_all_zero_planner_topology(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step_000001"
+    planner, optimizer, scheduler = _runtime()
+
+    with pytest.raises(ValueError, match="planner topology hash"):
+        save_baton_checkpoint(
+            checkpoint,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            metadata=replace(
+                BatonCheckpointMetadata.example(),
+                planner_topology_hash="0" * 64,
+            ),
+            cursor=_cursor(),
+            rank_rng_state={0: capture_rank_rng_state(distributed_rank=0)},
+        )
+
+    assert not checkpoint.exists()
+
+
+def test_loader_rejects_refreshed_all_zero_metadata_topology_before_mutation(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step_000001"
+    _save_valid_checkpoint(checkpoint)
+    metadata = json.loads((checkpoint / "metadata.json").read_text())
+    metadata["planner_topology_hash"] = "0" * 64
+    (checkpoint / "metadata.json").write_text(json.dumps(metadata))
+    manifest = json.loads((checkpoint / "manifest.json").read_text())
+    from qwen35_baton.hashing import sha256_file
+
+    manifest["files"]["metadata.json"] = sha256_file(checkpoint / "metadata.json")
+    (checkpoint / "manifest.json").write_text(json.dumps(manifest))
+    planner, optimizer, scheduler = _runtime(seed=99)
+    before = _clone_state(planner)
+
+    with pytest.raises(ValueError, match="planner_topology_hash"):
+        load_baton_checkpoint(
+            checkpoint,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            expected_contract=BatonCheckpointMetadata.example(),
+        )
+
+    _assert_state_equal(planner.state_dict(), before)
+
+
+def test_loader_rejects_refreshed_wrong_planner_dtype_before_mutation(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step_000001"
+    source, _, _ = _save_valid_checkpoint(checkpoint)
+    trusted_topology = planner_safetensors_topology(
+        checkpoint / "planner.safetensors"
+    )
+    expected_contract = replace(
+        BatonCheckpointMetadata.example(),
+        planner_topology_hash=sha256_json(trusted_topology),
+    )
+    source.double()
+    save_model(source, checkpoint / "planner.safetensors")
+    manifest = json.loads((checkpoint / "manifest.json").read_text())
+    from qwen35_baton.hashing import sha256_file
+
+    manifest["files"]["planner.safetensors"] = sha256_file(
+        checkpoint / "planner.safetensors"
+    )
+    (checkpoint / "manifest.json").write_text(json.dumps(manifest))
+    planner, optimizer, scheduler = _runtime(seed=99)
+    before = _clone_state(planner)
+
+    with pytest.raises(ValueError, match="planner.*topology"):
+        _load_baton_checkpoint(
+            checkpoint,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            expected_contract=expected_contract,
+            expected_sampler_seed=41,
+            expected_microbatches_per_epoch=11,
+            expected_planner_topology=trusted_topology,
+        )
+
+    _assert_state_equal(planner.state_dict(), before)
+
+
+def test_loader_rejects_wrong_external_topology_before_mutation(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step_000001"
+    _save_valid_checkpoint(checkpoint)
+    trusted_topology = planner_safetensors_topology(
+        checkpoint / "planner.safetensors"
+    )
+    expected_contract = replace(
+        BatonCheckpointMetadata.example(),
+        planner_topology_hash=sha256_json(trusted_topology),
+    )
+    trusted_topology["tensors"][0]["dtype"] = "F64"
+    planner, optimizer, scheduler = _runtime(seed=99)
+    before = _clone_state(planner)
+
+    with pytest.raises(ValueError, match="trusted planner topology"):
+        _load_baton_checkpoint(
+            checkpoint,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            expected_contract=expected_contract,
+            expected_sampler_seed=41,
+            expected_microbatches_per_epoch=11,
+            expected_planner_topology=trusted_topology,
+        )
+
+    _assert_state_equal(planner.state_dict(), before)
+
+
+def test_loader_rejects_format_v1_checkpoint_before_mutation(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step_000001"
+    _save_valid_checkpoint(checkpoint)
+    metadata = json.loads((checkpoint / "metadata.json").read_text())
+    metadata["format_version"] = 1
+    (checkpoint / "metadata.json").write_text(json.dumps(metadata))
+    manifest = json.loads((checkpoint / "manifest.json").read_text())
+    from qwen35_baton.hashing import sha256_file
+
+    manifest["files"]["metadata.json"] = sha256_file(checkpoint / "metadata.json")
+    (checkpoint / "manifest.json").write_text(json.dumps(manifest))
+    planner, optimizer, scheduler = _runtime(seed=99)
+    before = _clone_state(planner)
+
+    with pytest.raises(ValueError, match="format version 1.*incompatible.*version 2"):
         load_baton_checkpoint(
             checkpoint,
             planner=planner,

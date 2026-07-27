@@ -60,7 +60,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--qwen-tokenizer-path", type=Path, required=True)
     parser.add_argument("--qwen-processor-path", type=Path, required=True)
     parser.add_argument("--siglip2-model-path", type=Path, required=True)
-    parser.add_argument("--expected-planner-topology", type=Path, required=True)
+    parser.add_argument(
+        "--expected-planner-topology",
+        type=Path,
+        help=(
+            "trusted topology override; defaults to planner_topology.json beside "
+            "the checkpoint directory and is required after independent relocation"
+        ),
+    )
     parser.add_argument("--input-npz", type=Path, required=True)
     parser.add_argument("--instructions-json", type=Path, required=True)
     parser.add_argument(
@@ -70,6 +77,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--dtype",
+        choices=("bf16", "fp32"),
+        default="bf16",
+    )
     return parser
 
 
@@ -107,6 +119,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         siglip2_model_path=args.siglip2_model_path,
         expected_planner_topology=args.expected_planner_topology,
         device=args.device,
+        torch_dtype=(
+            torch.bfloat16 if args.dtype == "bf16" else torch.float32
+        ),
     )
     plan = provider.predict(
         images,

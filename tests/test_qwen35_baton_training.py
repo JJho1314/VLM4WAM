@@ -864,6 +864,22 @@ def test_fresh_training_rejects_a_stale_metrics_file(tmp_path: Path) -> None:
     assert metrics_path.read_text() == '{"step": 99, "loss/total": 0.0}\n'
 
 
+def test_fresh_training_atomically_publishes_trusted_planner_topology(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+
+    result = run_training(config, artifacts=_artifacts(config))
+
+    topology_path = tmp_path / "planner_topology.json"
+    payload = json.loads(topology_path.read_text())
+    metadata = json.loads((result.checkpoint / "metadata.json").read_text())
+    assert set(payload) == {"format_version", "topology", "sha256"}
+    assert payload["format_version"] == 1
+    assert payload["sha256"] == metadata["planner_topology_hash"]
+    assert not list(tmp_path.glob(".planner_topology.json.incomplete-*"))
+
+
 def test_interrupted_non_epoch_boundary_resume_matches_uninterrupted_training(
     tmp_path: Path,
 ) -> None:

@@ -183,7 +183,7 @@ def _validate_checkpoint_envelope(checkpoint: Path) -> BatonCheckpointMetadata:
     )
     hashes = manifest.get("files")
     if (
-        manifest.get("format_version") != 1
+        manifest.get("format_version") != 2
         or not isinstance(hashes, Mapping)
         or set(hashes) != set(_CHECKPOINT_FILES)
         or any(
@@ -360,26 +360,20 @@ def _validate_trusted_planner_topology(
     expected: str | Path | Mapping[str, Any],
 ) -> None:
     from qwen35_baton.checkpoint import (
+        load_trusted_planner_topology,
         planner_safetensors_topology,
-        validate_planner_topology_contract,
     )
 
-    if isinstance(expected, Mapping):
-        trusted = dict(expected)
-    else:
-        trusted = dict(
-            _read_json(
-                Path(expected).expanduser().resolve(),
-                label="trusted planner topology",
-            )
-        )
-    validate_planner_topology_contract(trusted)
-    trusted_hash = sha256_json(trusted)
+    trusted, trusted_hash = load_trusted_planner_topology(expected)
     if trusted_hash != metadata.planner_topology_hash:
         raise ValueError(
             "trusted planner topology hash differs from checkpoint metadata"
         )
     actual = planner_safetensors_topology(checkpoint / "planner.safetensors")
+    if sha256_json(actual) != metadata.planner_topology_hash:
+        raise ValueError(
+            "planner safetensors topology hash differs from checkpoint metadata"
+        )
     if actual != trusted:
         raise ValueError("planner safetensors topology differs from trusted contract")
 
@@ -498,12 +492,31 @@ class FrozenBatonPlanner(nn.Module):
         qwen_tokenizer_path: str | Path,
         qwen_processor_path: str | Path,
         siglip2_model_path: str | Path,
-        expected_planner_topology: str | Path | Mapping[str, Any],
+        expected_planner_topology: str | Path | Mapping[str, Any] | None = None,
         device: torch.device | str = "cpu",
         torch_dtype: torch.dtype = torch.bfloat16,
         _component_loader: Callable[..., tuple[Any, nn.Module]] | None = None,
     ) -> "FrozenBatonPlanner":
         """Validate all metadata/hashes before loading or mutating model state."""
+
+        if torch_dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError("torch_dtype must be torch.bfloat16 or torch.float32")
+        try:
+            target_device = torch.device(device)
+        except (TypeError, RuntimeError) as error:
+            raise ValueError(f"unsupported provider device: {device!r}") from error
+        if target_device.type not in {"cpu", "cuda"}:
+            raise ValueError(
+                "provider device must support CPU/CUDA autocast semantics"
+            )
+        if target_device.type == "cuda" and not torch.cuda.is_available():
+            raise ValueError("CUDA provider device requested but CUDA is unavailable")
+        if (
+            target_device.type == "cuda"
+            and torch_dtype is torch.bfloat16
+            and not torch.cuda.is_bf16_supported()
+        ):
+            raise ValueError("CUDA provider device does not support bfloat16")
 
         checkpoint = Path(checkpoint_dir).expanduser().resolve()
         model_path = Path(qwen_model_path).expanduser().resolve()
@@ -514,10 +527,15 @@ class FrozenBatonPlanner(nn.Module):
         # Everything through the artifact checks is read-only and precedes both
         # Transformers construction and safetensors state mutation.
         metadata = _validate_checkpoint_envelope(checkpoint)
+        trusted_topology = (
+            checkpoint.parent / "planner_topology.json"
+            if expected_planner_topology is None
+            else expected_planner_topology
+        )
         _validate_trusted_planner_topology(
             metadata,
             checkpoint=checkpoint,
-            expected=expected_planner_topology,
+            expected=trusted_topology,
         )
         _validate_local_artifact_contract(
             metadata,
@@ -529,9 +547,6 @@ class FrozenBatonPlanner(nn.Module):
             metadata,
             siglip2_model_path=siglip_path,
         )
-        if not isinstance(torch_dtype, torch.dtype):
-            raise TypeError("torch_dtype must be a torch dtype")
-        target_device = torch.device(device)
         loader = _load_local_components if _component_loader is None else _component_loader
         processor, planner = loader(
             qwen_model_path=model_path,
