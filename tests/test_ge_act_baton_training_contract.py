@@ -1659,6 +1659,13 @@ def test_stage3_artifact_chain_accepts_one_validated_semantic_target_space(
     assert chain.stage2_training_provenance == (
         _teacher_training_provenance()
     )
+    assert chain.diffusion_files == {
+        "diffusion_pytorch_model.safetensors": _sha256(
+            stage2
+            / "diffusion_model"
+            / "diffusion_pytorch_model.safetensors"
+        )
+    }
 
 
 @pytest.mark.parametrize(
@@ -1697,6 +1704,58 @@ def test_stage3_artifact_chain_rejects_stage1_stage2_target_mismatch(
         )
 
 
+class _Stage2EnvelopeDiffusion(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.video = nn.Module()
+        self.video.register_parameter(
+            "weight",
+            nn.Parameter(torch.zeros(1)),
+        )
+
+
+def test_stage3_strict_loader_rejects_same_topology_byte_replacement(
+    tmp_path: Path,
+) -> None:
+    stage1, trusted_topology, _ = _write_stage1_checkpoint_envelope(
+        tmp_path / "planner"
+    )
+    stage2 = _write_stage2_checkpoint_envelope(tmp_path / "teacher")
+    stage2_metadata = json.loads(
+        (stage2 / "baton_state.json").read_text(encoding="utf-8")
+    )
+    chain = ge_trainer_module.validate_baton_stage3_artifact_chain(
+        stage2_checkpoint=stage2,
+        expected_stage2_topology_hash=stage2_metadata[
+            "snapshot_topology_hash"
+        ],
+        planner_checkpoint=stage1,
+        expected_planner_topology=trusted_topology,
+        expected_hdf5_manifest_hash="4" * 64,
+    )
+    save_file(
+        {"video.weight": torch.full((1,), 9.0)},
+        str(
+            chain.diffusion_model_dir
+            / "diffusion_pytorch_model.safetensors"
+        ),
+    )
+    runtime = _Stage2EnvelopeDiffusion()
+    before = runtime.video.weight.detach().clone()
+
+    with pytest.raises(ValueError, match="artifact|hash|manifest"):
+        ge_trainer_module.strict_load_baton_stage3_diffusion_model(
+            runtime,
+            chain.diffusion_model_dir,
+            expected_snapshot_topology_hash=stage2_metadata[
+                "snapshot_topology_hash"
+            ],
+            expected_diffusion_files=chain.diffusion_files,
+        )
+
+    torch.testing.assert_close(runtime.video.weight, before, rtol=0, atol=0)
+
+
 class _TinyDiffusion(nn.Linear):
     def save_pretrained(
         self,
@@ -1730,6 +1789,11 @@ def test_stage3_strict_loader_requires_exact_runtime_topology_before_loading(
             runtime,
             snapshot,
             expected_snapshot_topology_hash=expected_topology,
+            expected_diffusion_files={
+                "diffusion_pytorch_model.safetensors": _sha256(
+                    snapshot / "diffusion_pytorch_model.safetensors"
+                ),
+            },
         )
 
     torch.testing.assert_close(runtime.weight, before, rtol=0, atol=0)
@@ -1765,6 +1829,11 @@ def test_stage3_strict_loader_rejects_incomplete_tensor_set_without_partial_init
             expected_snapshot_topology_hash=(
                 ge_trainer_module._module_topology_hash(runtime)
             ),
+            expected_diffusion_files={
+                "diffusion_pytorch_model.safetensors": _sha256(
+                    snapshot / "diffusion_pytorch_model.safetensors"
+                ),
+            },
         )
 
     torch.testing.assert_close(runtime.weight, before, rtol=0, atol=0)
@@ -1786,6 +1855,11 @@ def test_stage3_strict_loader_loads_complete_exact_snapshot(
         expected_snapshot_topology_hash=(
             ge_trainer_module._diffusion_snapshot_topology_hash(snapshot)
         ),
+        expected_diffusion_files={
+            "diffusion_pytorch_model.safetensors": _sha256(
+                snapshot / "diffusion_pytorch_model.safetensors"
+            ),
+        },
     )
 
     assert loaded is runtime

@@ -1,11 +1,14 @@
+import hashlib
 import math
 import os
 import random
+import stat
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, Sequence
 
 from datetime import datetime, timedelta
@@ -1460,6 +1463,12 @@ def load_joint_training_checkpoint(
 def _module_topology_hash(model: torch.nn.Module) -> str:
     if not isinstance(model, torch.nn.Module):
         raise TypeError("diffusion_model must be a torch module")
+    return _state_dict_topology_hash(model.state_dict())
+
+
+def _state_dict_topology_hash(
+    state_dict: Mapping[str, torch.Tensor],
+) -> str:
     return sha256_json(
         [
             {
@@ -1467,7 +1476,7 @@ def _module_topology_hash(model: torch.nn.Module) -> str:
                 "shape": list(value.shape),
                 "dtype": str(value.dtype),
             }
-            for name, value in sorted(model.state_dict().items())
+            for name, value in sorted(state_dict.items())
         ]
     )
 
@@ -1529,44 +1538,133 @@ def _diffusion_snapshot_files(diffusion_dir: Path) -> dict[str, str]:
     return files
 
 
+def _validated_diffusion_file_manifest(
+    manifest: Mapping[str, str],
+) -> dict[str, str]:
+    if not isinstance(manifest, Mapping) or not manifest:
+        raise ValueError("Stage-3 diffusion file manifest is invalid")
+    validated: dict[str, str] = {}
+    for name, digest in manifest.items():
+        relative = Path(name) if type(name) is str else None
+        if (
+            relative is None
+            or not name
+            or relative.is_absolute()
+            or name != relative.as_posix()
+            or any(part in ("", ".", "..") for part in relative.parts)
+            or not _is_concrete_sha256(digest)
+        ):
+            raise ValueError("Stage-3 diffusion file manifest is invalid")
+        validated[name] = digest
+    if not any(name.endswith(".safetensors") for name in validated):
+        raise ValueError("Stage-3 diffusion manifest has no tensor snapshot")
+    return validated
+
+
+def _regular_snapshot_file_set(snapshot_path: Path) -> set[str]:
+    if snapshot_path.is_symlink() or not snapshot_path.is_dir():
+        raise ValueError("Stage-3 snapshot root must be a regular directory")
+    names: set[str] = set()
+    for directory, child_directories, filenames in os.walk(
+        snapshot_path,
+        topdown=True,
+        followlinks=False,
+    ):
+        directory_path = Path(directory)
+        for child in child_directories:
+            child_path = directory_path / child
+            if child_path.is_symlink() or not child_path.is_dir():
+                raise ValueError(
+                    "Stage-3 snapshot contains a non-regular directory"
+                )
+        for filename in filenames:
+            file_path = directory_path / filename
+            if file_path.is_symlink() or not file_path.is_file():
+                raise ValueError(
+                    "Stage-3 snapshot contains a non-regular file"
+                )
+            names.add(file_path.relative_to(snapshot_path).as_posix())
+    return names
+
+
+def _read_regular_snapshot_file(path: Path) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("Stage-3 snapshot contains a non-regular file")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            return handle.read()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def strict_load_baton_stage3_diffusion_model(
     diffusion_model: torch.nn.Module,
     diffusion_dir: str | Path,
     *,
     expected_snapshot_topology_hash: str,
+    expected_diffusion_files: Mapping[str, str],
 ) -> torch.nn.Module:
-    """Strictly initialize Stage-3 only after runtime/snapshot topology parity."""
+    """Hash and deserialize identical snapshot bytes before one strict mutation."""
 
     if not isinstance(diffusion_model, torch.nn.Module):
         raise TypeError("Stage-3 diffusion model must be a torch module")
     if not _is_concrete_sha256(expected_snapshot_topology_hash):
         raise ValueError("Stage-3 expected snapshot topology hash is invalid")
+    expected_files = _validated_diffusion_file_manifest(
+        expected_diffusion_files
+    )
     snapshot_path = Path(diffusion_dir)
-    try:
-        snapshot_topology_hash = _diffusion_snapshot_topology_hash(
-            snapshot_path
-        )
-    except (OSError, ValueError) as error:
-        raise ValueError("Stage-3 snapshot topology is invalid") from error
-    if snapshot_topology_hash != expected_snapshot_topology_hash:
-        raise ValueError("Stage-3 snapshot topology differs from its envelope")
     if _module_topology_hash(diffusion_model) != expected_snapshot_topology_hash:
         raise ValueError(
             "Stage-3 runtime model topology differs from the Stage-2 snapshot"
         )
-    from utils.model_utils import load_checkpoints
+    if _regular_snapshot_file_set(snapshot_path) != set(expected_files):
+        raise ValueError("Stage-3 snapshot file set differs from its manifest")
+    from safetensors import SafetensorError
+    from safetensors.torch import load as load_safetensors
 
+    state_dict: dict[str, torch.Tensor] = {}
     try:
-        load_checkpoints(
-            diffusion_model,
-            pretrained_ckpt=snapshot_path,
-            strict=True,
-            ignore_mismatched_sizes=False,
-        )
-    except (KeyError, RuntimeError, ValueError) as error:
-        raise ValueError(
-            "Stage-3 strict diffusion state loading failed"
-        ) from error
+        for relative_name, expected_digest in sorted(expected_files.items()):
+            payload = _read_regular_snapshot_file(
+                snapshot_path / relative_name
+            )
+            if hashlib.sha256(payload).hexdigest() != expected_digest:
+                raise ValueError(
+                    "Stage-3 snapshot artifact hash differs from its manifest"
+                )
+            if not relative_name.endswith(".safetensors"):
+                continue
+            shard = load_safetensors(payload)
+            duplicate_keys = set(state_dict).intersection(shard)
+            if duplicate_keys:
+                raise ValueError(
+                    "Stage-3 snapshot contains duplicate tensor keys"
+                )
+            state_dict.update(
+                {
+                    name: value.clone()
+                    for name, value in shard.items()
+                }
+            )
+            del shard
+            del payload
+    except (OSError, SafetensorError) as error:
+        raise ValueError("Stage-3 snapshot artifact is invalid") from error
+    if _regular_snapshot_file_set(snapshot_path) != set(expected_files):
+        raise ValueError("Stage-3 snapshot file set changed during loading")
+    if _state_dict_topology_hash(state_dict) != expected_snapshot_topology_hash:
+        raise ValueError("Stage-3 snapshot topology differs from its envelope")
+    try:
+        diffusion_model.load_state_dict(state_dict, strict=True)
+    except RuntimeError as error:
+        raise ValueError("Stage-3 strict diffusion state loading failed") from error
     return diffusion_model
 
 
@@ -1905,6 +2003,7 @@ class BatonStage3ArtifactChain:
     """Validated immutable Stage-1/Stage-2 boundary for Stage-3 allocation."""
 
     diffusion_model_dir: Path
+    diffusion_files: Mapping[str, str]
     stage1_metadata: Any
     stage2_training_provenance: dict[str, Any]
 
@@ -1955,6 +2054,9 @@ def validate_baton_stage3_artifact_chain(
             )
     return BatonStage3ArtifactChain(
         diffusion_model_dir=diffusion_model_dir,
+        diffusion_files=MappingProxyType(
+            dict(stage2_metadata["diffusion_files"])
+        ),
         stage1_metadata=stage1_metadata,
         stage2_training_provenance=dict(stage2_provenance),
     )
@@ -2449,6 +2551,9 @@ class Trainer:
                 expected_snapshot_topology_hash=self.raw_config[
                     "stage2_init_topology_hash"
                 ],
+                expected_diffusion_files=(
+                    self.baton_stage3_artifact_chain.diffusion_files
+                ),
             )
         else:
             self.diffusion_model = load_diffusion_model(

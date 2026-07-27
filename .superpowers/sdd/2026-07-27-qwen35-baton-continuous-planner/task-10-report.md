@@ -196,3 +196,38 @@ change was involved.
 
 No GPU, live SigLIP2/Qwen/LTX weights, real training run, distributed training,
 or launcher submission was run or claimed in round 2.
+
+## Round 3 Snapshot Byte Binding
+
+Stage 3 no longer trusts a pathname after early artifact validation. The
+artifact chain carries an immutable copy of the validated relative-file SHA-256
+manifest. The strict loader requires the exact regular-file set, rejects
+symlinks and non-regular files, opens each file without following symlinks, and
+hashes and deserializes the same bytes. Safetensors shards are processed
+sequentially and cloned into the assembled CPU state so retained raw-byte
+overhead is bounded to one shard.
+
+Duplicate tensor keys, manifest hash changes, missing/extra files or tensors,
+and snapshot/runtime key, shape, or dtype topology differences fail before the
+single strict `load_state_dict` mutation.
+
+The regression test was RED against `e6df762` after replacing a validated
+safetensors file with different values but identical key/shape/dtype:
+
+```text
+Failed: DID NOT RAISE ValueError
+>>> Loaded weights from pretrained checkpoint: .../diffusion_model
+```
+
+It is GREEN with the byte-bound loader, and the runtime tensor is asserted
+unchanged on rejection:
+
+```text
+Stage-3 artifact-chain/strict-loader focus: 10 passed
+Required combined gate: 127 passed, 4 warnings
+HDF5 functional/protected gate: 80 passed, 228 deselected
+```
+
+`compileall`, `bash -n` on all four Baton launchers, and `git diff --check`
+pass. Round 3 likewise made no package, GPU, live-weight, training,
+distributed, or launcher execution changes or claims.
