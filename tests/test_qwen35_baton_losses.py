@@ -148,3 +148,34 @@ def test_loss_rejects_incompatible_or_nonfinite_feature_tensors(
             replacements.get("future_teacher", future_teacher),
             replacements.get("current_teacher", current_teacher),
         )
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+def test_low_precision_boundary_inputs_produce_finite_outputs_and_gradients(
+    dtype: torch.dtype,
+) -> None:
+    current_teacher = torch.full((1, 1, 2, 2), -65504.0, dtype=dtype)
+    future_teacher = torch.full((1, 1, 1, 2, 2), 65504.0, dtype=dtype)
+    positive = torch.full_like(future_teacher, 60000.0, requires_grad=True)
+    negative = -future_teacher
+
+    weight = changed_patch_weights(future_teacher, current_teacher)
+    loss = compute_baton_planner_loss(
+        positive, negative, future_teacher, current_teacher
+    )
+
+    assert weight.dtype == torch.float32
+    assert bool(torch.isfinite(weight).all())
+    for component in (
+        loss.mse,
+        loss.cosine,
+        loss.delta,
+        loss.instruction_counterfactual,
+        loss.total,
+    ):
+        assert component.dtype == torch.float32
+        assert bool(torch.isfinite(component))
+    loss.total.backward()
+    assert positive.grad is not None
+    assert bool(torch.isfinite(positive.grad).all())
+    assert bool(positive.grad.ne(0).any())

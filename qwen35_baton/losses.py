@@ -21,6 +21,13 @@ class BatonPlannerLoss:
     total: torch.Tensor
 
 
+def _loss_math_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Promote low-precision features before overflow-prone loss arithmetic."""
+    if tensor.dtype in (torch.float16, torch.bfloat16):
+        return tensor.float()
+    return tensor
+
+
 def _validate_tensor(name: str, tensor: torch.Tensor) -> None:
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
@@ -86,6 +93,8 @@ def changed_patch_weights(
 ) -> torch.Tensor:
     """Weight patches by normalized within-frame teacher-feature change."""
     _validate_teacher_features(future_teacher, current_teacher)
+    future_teacher = _loss_math_tensor(future_teacher)
+    current_teacher = _loss_math_tensor(current_teacher)
     change = torch.linalg.vector_norm(
         future_teacher - current_teacher[:, :, None],
         dim=-1,
@@ -109,6 +118,10 @@ def compute_baton_planner_loss(
     _validate_loss_inputs(
         positive, negative, future_teacher, current_teacher, loss_weights
     )
+    positive = _loss_math_tensor(positive)
+    negative = _loss_math_tensor(negative)
+    future_teacher = _loss_math_tensor(future_teacher)
+    current_teacher = _loss_math_tensor(current_teacher)
     patch_weight = changed_patch_weights(future_teacher, current_teacher)
     patch_mse = (positive - future_teacher).square().mean(dim=-1)
     mse_per_sample = (patch_mse * patch_weight).flatten(1).sum(
