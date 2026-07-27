@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import random
 import shutil
+import stat
 import tempfile
 from typing import Any
 
@@ -648,6 +649,7 @@ def publish_trusted_planner_topology(
     os.close(descriptor)
     temporary = Path(temporary_name)
     try:
+        os.chmod(temporary, 0o644)
         _json_write(temporary, payload)
         try:
             os.link(temporary, destination)
@@ -660,6 +662,12 @@ def publish_trusted_planner_topology(
                 raise ValueError(
                     "existing trusted planner topology differs from publisher"
                 )
+        published_mode = stat.S_IMODE(destination.stat().st_mode)
+        if published_mode != 0o644:
+            raise PermissionError(
+                "trusted planner topology mode must be 0644, "
+                f"got {published_mode:04o}"
+            )
         _fsync_directory(destination.parent)
     finally:
         if temporary.exists():

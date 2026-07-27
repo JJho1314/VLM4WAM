@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 import multiprocessing
+import os
 from pathlib import Path
 import random
+import stat
 from typing import Any
 
 import numpy as np
@@ -13,6 +15,7 @@ from safetensors.torch import save_model
 import torch
 import torch.nn as nn
 
+import qwen35_baton.checkpoint as checkpoint_module
 from qwen35_baton.checkpoint import (
     BatonTrainingCursor,
     capture_rank_rng_state,
@@ -22,6 +25,7 @@ from qwen35_baton.checkpoint import (
     planner_safetensors_topology,
     publish_trusted_planner_topology,
     save_baton_checkpoint,
+    trusted_planner_topology_payload,
 )
 from qwen35_baton.cli.train_semantic_planner import BatonCosineWarmupScheduler
 from qwen35_baton.config import BatonCheckpointMetadata
@@ -849,6 +853,98 @@ def test_corrupt_preexisting_topology_anchor_is_never_overwritten(
         publish_trusted_planner_topology(destination, _race_topology(4))
 
     assert destination.read_bytes() == corrupt
+    assert not list(tmp_path.glob(".planner_topology.json.incomplete-*"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="hard-link publication is POSIX-only")
+def test_published_topology_anchor_has_canonical_shared_read_mode(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "planner_topology.json"
+
+    publish_trusted_planner_topology(destination, _race_topology(5))
+
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o644
+
+
+def test_topology_chmod_failure_leaves_no_target_or_temporary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "planner_topology.json"
+
+    def fail_chmod(path: Path, mode: int) -> None:
+        del path, mode
+        raise PermissionError("chmod denied")
+
+    monkeypatch.setattr(checkpoint_module.os, "chmod", fail_chmod)
+
+    with pytest.raises(PermissionError, match="chmod denied"):
+        publish_trusted_planner_topology(destination, _race_topology(6))
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".planner_topology.json.incomplete-*"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="hard-link publication is POSIX-only")
+def test_identical_preexisting_anchor_with_noncanonical_mode_fails_closed(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "planner_topology.json"
+    topology = _race_topology(9)
+    destination.write_text(
+        json.dumps(trusted_planner_topology_payload(topology))
+    )
+    destination.chmod(0o600)
+
+    with pytest.raises(PermissionError, match="mode.*0644"):
+        publish_trusted_planner_topology(destination, topology)
+
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+    assert not list(tmp_path.glob(".planner_topology.json.incomplete-*"))
+
+
+def test_topology_link_failure_leaves_no_target_or_temporary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "planner_topology.json"
+
+    def fail_link(source: Path, target: Path) -> None:
+        del source, target
+        raise PermissionError("hard link denied")
+
+    monkeypatch.setattr(checkpoint_module.os, "link", fail_link)
+
+    with pytest.raises(PermissionError, match="hard link denied"):
+        publish_trusted_planner_topology(destination, _race_topology(7))
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".planner_topology.json.incomplete-*"))
+
+
+def test_topology_directory_fsync_failure_leaves_only_complete_anchor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "planner_topology.json"
+
+    def fail_directory_fsync(path: Path) -> None:
+        del path
+        raise OSError("directory fsync denied")
+
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_fsync_directory",
+        fail_directory_fsync,
+    )
+
+    with pytest.raises(OSError, match="directory fsync denied"):
+        publish_trusted_planner_topology(destination, _race_topology(8))
+
+    anchored, _ = load_trusted_planner_topology(destination)
+    assert anchored == _race_topology(8)
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o644
     assert not list(tmp_path.glob(".planner_topology.json.incomplete-*"))
 
 
