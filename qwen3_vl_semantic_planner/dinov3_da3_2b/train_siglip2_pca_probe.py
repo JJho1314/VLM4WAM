@@ -35,6 +35,11 @@ EPISODE_PATTERN = re.compile(r"episode_(\d{6})\.npy$")
 VALIDATION_MODULUS = 10
 EXPECTED_MODEL_NAME = "siglip2-large-patch16-256"
 EXPECTED_FEATURE_DIM = 1024
+OPTIMIZER_CLASS = torch.optim.AdamW
+WEIGHT_DECAY = 0.01
+SCHEDULER_CLASS = torch.optim.lr_scheduler.CosineAnnealingLR
+SCHEDULER_ETA_MIN = 0.0
+SCHEDULER_LAST_EPOCH = -1
 
 
 def discover_episode_files(cache_root: Path) -> list[Path]:
@@ -140,6 +145,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     return parser
+
+
+def training_metadata(
+    *,
+    steps: int,
+    batch_size: int,
+    learning_rate: float,
+    seed: int,
+) -> dict[str, Any]:
+    """Return the complete optimizer and schedule recipe for a run."""
+    return {
+        "steps": steps,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "seed": seed,
+        "optimizer": {
+            "type": OPTIMIZER_CLASS.__name__,
+            "weight_decay": WEIGHT_DECAY,
+        },
+        "scheduler": {
+            "type": SCHEDULER_CLASS.__name__,
+            "T_max": steps,
+            "eta_min": SCHEDULER_ETA_MIN,
+            "last_epoch": SCHEDULER_LAST_EPOCH,
+        },
+    }
 
 
 def make_teachers(
@@ -266,14 +297,16 @@ def _train_probe(
     steps: int,
     learning_rate: float,
 ) -> None:
-    optimizer = torch.optim.AdamW(
+    optimizer = OPTIMIZER_CLASS(
         probe.parameters(),
         lr=learning_rate,
-        weight_decay=0.01,
+        weight_decay=WEIGHT_DECAY,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    scheduler = SCHEDULER_CLASS(
         optimizer,
         T_max=steps,
+        eta_min=SCHEDULER_ETA_MIN,
+        last_epoch=SCHEDULER_LAST_EPOCH,
     )
     probe.train()
     step_count = 0
@@ -487,12 +520,12 @@ def run(args: argparse.Namespace) -> Path:
             ],
             "validation_modulus": VALIDATION_MODULUS,
         },
-        "training": {
-            "steps": args.steps,
-            "batch_size": args.batch_size,
-            "learning_rate": args.learning_rate,
-            "seed": args.seed,
-        },
+        "training": training_metadata(
+            steps=args.steps,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            seed=args.seed,
+        ),
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     filename = (

@@ -166,6 +166,32 @@ def test_probe_training_parser_uses_approved_recipe() -> None:
     assert args.seed == 0
 
 
+def test_probe_training_metadata_records_exact_optimizer_recipe() -> None:
+    metadata = train_probe.training_metadata(
+        steps=5000,
+        batch_size=8,
+        learning_rate=2e-4,
+        seed=0,
+    )
+
+    assert metadata == {
+        "steps": 5000,
+        "batch_size": 8,
+        "learning_rate": 2e-4,
+        "seed": 0,
+        "optimizer": {
+            "type": "AdamW",
+            "weight_decay": 0.01,
+        },
+        "scheduler": {
+            "type": "CosineAnnealingLR",
+            "T_max": 5000,
+            "eta_min": 0.0,
+            "last_epoch": -1,
+        },
+    }
+
+
 @pytest.mark.parametrize(
     ("model_name", "feature_dim", "error"),
     [
