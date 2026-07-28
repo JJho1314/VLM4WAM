@@ -298,6 +298,8 @@ def load_validated_probe(
         or config.get("output_size") != 256
     ):
         raise ValueError("probe checkpoint feature contract is incompatible")
+    if not validation_gate_passed(payload["validation_metrics"]):
+        raise ValueError("probe checkpoint did not pass the validation gate")
     required_pca = {
         "mean",
         "components",
@@ -306,16 +308,28 @@ def load_validated_probe(
         "feature_dim",
         "component_sign_rule",
         "max_tokens",
+        "seed",
+        "sampled_token_count",
     }
-    missing_pca = sorted(required_pca.difference(payload["pca_state"]))
+    pca_state = payload["pca_state"]
+    missing_pca = sorted(required_pca.difference(pca_state))
     if missing_pca:
         raise ValueError(f"probe PCA state is missing: {missing_pca}")
     if (
-        payload["pca_state"]["feature_dim"] != 1024
-        or payload["pca_state"]["component_sign_rule"]
+        pca_state["feature_dim"] != 1024
+        or pca_state["component_sign_rule"]
         != "largest_absolute_loading_positive"
     ):
         raise ValueError("probe PCA feature contract is incompatible")
+    if (
+        type(pca_state["seed"]) is not int
+        or type(pca_state["max_tokens"]) is not int
+        or type(pca_state["sampled_token_count"]) is not int
+        or pca_state["max_tokens"] <= 0
+        or pca_state["sampled_token_count"] <= 0
+        or pca_state["sampled_token_count"] > pca_state["max_tokens"]
+    ):
+        raise ValueError("probe PCA metadata is incompatible")
     probe = SiglipPCAUpsampler(**config).to(device).eval()
     probe.load_state_dict(payload["state_dict"])
     probe.requires_grad_(False)

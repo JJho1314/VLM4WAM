@@ -17,6 +17,41 @@ from qwen3_vl_semantic_planner.dinov3_da3_2b.siglip2_pca_probe import (
 )
 
 
+def _valid_probe_payload() -> dict[str, object]:
+    return {
+        "accepted": True,
+        "model_name": "siglip2-large-patch16-256",
+        "feature_layer": "penultimate_spatial",
+        "low_input_size": 256,
+        "high_input_size": 512,
+        "high_grid_size": 32,
+        "state_dict": {},
+        "config": {
+            "in_dim": 1024,
+            "hidden_dim": 32,
+            "grid_size": 16,
+            "output_size": 256,
+        },
+        "pca_state": {
+            "mean": torch.zeros(1024),
+            "components": torch.eye(1024)[:3],
+            "display_low": torch.zeros(3),
+            "display_high": torch.ones(3),
+            "feature_dim": 1024,
+            "component_sign_rule": "largest_absolute_loading_positive",
+            "max_tokens": 64,
+            "seed": 5,
+            "sampled_token_count": 64,
+        },
+        "validation_metrics": {
+            "probe_l1": 0.1,
+            "baseline_l1": 0.2,
+            "probe_gradient": 0.1,
+            "baseline_gradient": 0.2,
+        },
+    }
+
+
 def test_sample_pca_tokens_is_bounded_and_deterministic() -> None:
     features = torch.arange(8 * 5, dtype=torch.float32).reshape(2, 4, 5)
 
@@ -165,6 +200,72 @@ def test_load_validated_probe_rejects_incompatible_feature_dim(
     )
 
     with pytest.raises(ValueError, match="feature contract"):
+        load_validated_probe(
+            checkpoint,
+            expected_model_name="siglip2-large-patch16-256",
+            device=torch.device("cpu"),
+        )
+
+
+def test_load_validated_probe_rejects_accepted_checkpoint_with_failed_metrics(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "failed_metrics.pt"
+    payload = _valid_probe_payload()
+    payload["validation_metrics"] = {
+        "probe_l1": 0.3,
+        "baseline_l1": 0.2,
+        "probe_gradient": 0.1,
+        "baseline_gradient": 0.2,
+    }
+    torch.save(payload, checkpoint)
+
+    with pytest.raises(ValueError, match="validation gate"):
+        load_validated_probe(
+            checkpoint,
+            expected_model_name="siglip2-large-patch16-256",
+            device=torch.device("cpu"),
+        )
+
+
+@pytest.mark.parametrize("field", ["seed", "sampled_token_count"])
+def test_load_validated_probe_requires_complete_pca_metadata(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    checkpoint = tmp_path / f"missing_{field}.pt"
+    payload = _valid_probe_payload()
+    del payload["pca_state"][field]  # type: ignore[index]
+    torch.save(payload, checkpoint)
+
+    with pytest.raises(ValueError, match="PCA state is missing"):
+        load_validated_probe(
+            checkpoint,
+            expected_model_name="siglip2-large-patch16-256",
+            device=torch.device("cpu"),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("seed", "not-an-integer"),
+        ("max_tokens", 0),
+        ("sampled_token_count", 0),
+        ("sampled_token_count", 65),
+    ],
+)
+def test_load_validated_probe_rejects_invalid_pca_metadata(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    checkpoint = tmp_path / f"invalid_{field}.pt"
+    payload = _valid_probe_payload()
+    payload["pca_state"][field] = value  # type: ignore[index]
+    torch.save(payload, checkpoint)
+
+    with pytest.raises(ValueError, match="PCA metadata"):
         load_validated_probe(
             checkpoint,
             expected_model_name="siglip2-large-patch16-256",
