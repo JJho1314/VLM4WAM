@@ -8,6 +8,7 @@ import hashlib
 import json
 import random
 import re
+import tempfile
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -42,6 +43,12 @@ SCHEDULER_CLASS = torch.optim.lr_scheduler.CosineAnnealingLR
 SCHEDULER_ETA_MIN = 0.0
 SCHEDULER_LAST_EPOCH = -1
 MEMMAP_CACHE_SIZE = 96
+KEEPER_CHECKPOINT_NAME = "siglip2_pca_upsample_probe.pt"
+REJECTED_CHECKPOINT_NAME = "siglip2_pca_upsample_probe_rejected.pt"
+FINAL_CHECKPOINT_NAMES = (
+    KEEPER_CHECKPOINT_NAME,
+    REJECTED_CHECKPOINT_NAME,
+)
 
 
 def discover_episode_files(cache_root: Path) -> list[Path]:
@@ -417,8 +424,42 @@ def _cpu_pca_state(state: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _ensure_final_checkpoints_absent(output_dir: Path) -> None:
+    existing = [
+        output_dir / filename
+        for filename in FINAL_CHECKPOINT_NAMES
+        if (output_dir / filename).exists()
+    ]
+    if existing:
+        names = ", ".join(path.name for path in existing)
+        raise FileExistsError(
+            f"refusing to overwrite existing final checkpoint: {names}"
+        )
+
+
+def _publish_checkpoint_atomic(
+    payload: Mapping[str, Any],
+    checkpoint_path: Path,
+) -> None:
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=checkpoint_path.parent,
+        prefix=f".{checkpoint_path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        temporary_path = Path(handle.name)
+    try:
+        torch.save(payload, temporary_path)
+        temporary_path.replace(checkpoint_path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
 def run(args: argparse.Namespace) -> Path:
     """Run all three deterministic stages and save the gated checkpoint."""
+    _ensure_final_checkpoints_absent(args.output_dir)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -538,12 +579,12 @@ def run(args: argparse.Namespace) -> Path:
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     filename = (
-        "siglip2_pca_upsample_probe.pt"
+        KEEPER_CHECKPOINT_NAME
         if accepted
-        else "siglip2_pca_upsample_probe_rejected.pt"
+        else REJECTED_CHECKPOINT_NAME
     )
     checkpoint_path = args.output_dir / filename
-    torch.save(payload, checkpoint_path)
+    _publish_checkpoint_atomic(payload, checkpoint_path)
     if not accepted:
         raise SystemExit(2)
     return checkpoint_path

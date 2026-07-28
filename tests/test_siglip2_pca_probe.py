@@ -1,4 +1,5 @@
 import inspect
+import pickle
 import warnings
 from pathlib import Path
 
@@ -60,6 +61,25 @@ def _valid_probe_payload() -> dict[str, object]:
             "baseline_gradient": 0.2,
         },
     }
+
+
+def _write_marker_then_return_checkpoint(marker_path: str) -> dict[str, object]:
+    Path(marker_path).write_text("unsafe global executed")
+    return {
+        "accepted": False,
+        "model_name": "siglip2-large-patch16-256",
+    }
+
+
+class _MarkerWritingCheckpoint:
+    def __init__(self, marker_path: Path) -> None:
+        self.marker_path = marker_path
+
+    def __reduce__(self) -> tuple[object, tuple[str]]:
+        return (
+            _write_marker_then_return_checkpoint,
+            (str(self.marker_path),),
+        )
 
 
 def test_split_episode_files_excludes_only_target_episode(
@@ -247,6 +267,91 @@ def test_probe_training_metadata_records_exact_optimizer_recipe() -> None:
             "last_epoch": -1,
         },
     }
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "siglip2_pca_upsample_probe.pt",
+        "siglip2_pca_upsample_probe_rejected.pt",
+    ],
+)
+def test_probe_training_run_rejects_existing_final_checkpoint_before_data_access(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    existing = output_dir / filename
+    existing.write_bytes(b"existing checkpoint")
+    args = build_probe_parser().parse_args(
+        [
+            "--frame-cache-dir",
+            str(tmp_path / "missing-cache"),
+            "--siglip2-model-dir",
+            str(tmp_path / "siglip2-large-patch16-256"),
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            "cpu",
+        ]
+    )
+
+    with pytest.raises(FileExistsError, match=filename):
+        train_probe.run(args)
+
+    assert existing.read_bytes() == b"existing checkpoint"
+
+
+def test_publish_checkpoint_atomic_round_trips_plain_payload(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    unrelated = output_dir / "notes.txt"
+    unrelated.write_text("keep me")
+    checkpoint = output_dir / "siglip2_pca_upsample_probe.pt"
+    payload = {
+        "accepted": True,
+        "steps": 5000,
+        "metrics": [0.1, 0.2],
+        "weights": torch.tensor([1.0, 2.0]),
+    }
+
+    train_probe._publish_checkpoint_atomic(payload, checkpoint)
+
+    assert checkpoint.is_file()
+    assert unrelated.read_text() == "keep me"
+    assert not list(output_dir.glob(f".{checkpoint.name}.*.tmp"))
+    loaded = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    assert loaded["accepted"] is True
+    assert loaded["steps"] == 5000
+    assert loaded["metrics"] == [0.1, 0.2]
+    torch.testing.assert_close(loaded["weights"], torch.tensor([1.0, 2.0]))
+
+
+def test_publish_checkpoint_atomic_removes_partial_temp_on_save_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    checkpoint = output_dir / "siglip2_pca_upsample_probe_rejected.pt"
+
+    def fail_after_partial_write(_: object, path: Path) -> None:
+        Path(path).write_bytes(b"partial checkpoint")
+        raise OSError("simulated save failure")
+
+    monkeypatch.setattr(train_probe.torch, "save", fail_after_partial_write)
+
+    with pytest.raises(OSError, match="simulated save failure"):
+        train_probe._publish_checkpoint_atomic(
+            {"accepted": False},
+            checkpoint,
+        )
+
+    assert not checkpoint.exists()
+    assert not list(output_dir.glob(f".{checkpoint.name}.*.tmp"))
 
 
 def test_train_probe_materializes_teacher_tensors_for_backward() -> None:
@@ -463,6 +568,35 @@ def test_load_validated_probe_rejects_failed_gate(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="validation gate"):
+        load_validated_probe(
+            checkpoint,
+            expected_model_name="siglip2-large-patch16-256",
+            device=torch.device("cpu"),
+        )
+
+
+def test_load_validated_probe_does_not_execute_unsafe_pickle_globals(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "malicious.pt"
+    marker = tmp_path / "executed.txt"
+    torch.save(_MarkerWritingCheckpoint(marker), checkpoint)
+
+    with pytest.raises(pickle.UnpicklingError, match="Weights only load failed"):
+        load_validated_probe(
+            checkpoint,
+            expected_model_name="siglip2-large-patch16-256",
+            device=torch.device("cpu"),
+        )
+
+    assert not marker.exists()
+
+
+def test_load_validated_probe_requires_mapping_root(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "tensor_root.pt"
+    torch.save(torch.tensor([1.0]), checkpoint)
+
+    with pytest.raises(ValueError, match="root must be a mapping"):
         load_validated_probe(
             checkpoint,
             expected_model_name="siglip2-large-patch16-256",

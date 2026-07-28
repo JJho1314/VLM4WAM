@@ -266,7 +266,10 @@ def load_validated_probe(
     expected_model_name: str,
     device: torch.device,
 ) -> tuple[SiglipPCAUpsampler, dict[str, Any]]:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
+    loaded = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(loaded, Mapping):
+        raise ValueError("probe checkpoint root must be a mapping")
+    payload = dict(loaded)
     if not payload.get("accepted", False):
         raise ValueError("probe checkpoint did not pass the validation gate")
     if payload.get("model_name") != expected_model_name:
