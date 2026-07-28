@@ -77,8 +77,8 @@ class Stage1TrainingConfig:
     hdf5_manifest_path: str
     hdf5_manifest_hash: str
     dataset_statistics_path: str
-    per_device_batch: int = 2
-    gradient_accumulation_steps: int = 1
+    per_device_batch: int = 4
+    gradient_accumulation_steps: int = 4
     max_steps: int = 30_000
     warmup_steps: int = 1_000
     save_every: int = 5_000
@@ -128,8 +128,6 @@ class Stage1TrainingConfig:
             raise ValueError("warmup_steps must be in [0,max_steps)")
         if type(self.num_workers) is not int or self.num_workers < 0:
             raise ValueError("num_workers must be a non-negative integer")
-        if self.gradient_accumulation_steps != 1:
-            raise ValueError("gradient_accumulation_steps must be exactly 1")
         if type(self.gradient_checkpointing) is not bool:
             raise ValueError("gradient_checkpointing must be boolean")
         if (
@@ -226,6 +224,26 @@ def validate_global_batch(
     return effective
 
 
+def require_stage1_global_batch(
+    *,
+    per_device_batch: int,
+    world_size: int,
+    gradient_accumulation_steps: int,
+) -> int:
+    """Require the user-selected production Stage-1 global batch."""
+
+    effective = validate_global_batch(
+        per_device_batch=per_device_batch,
+        world_size=world_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+    )
+    if effective != 128:
+        raise ValueError(
+            f"production Stage-1 global batch must be exactly 128, got {effective}"
+        )
+    return effective
+
+
 def checkpoint_steps(*, max_steps: int, save_every: int) -> tuple[int, ...]:
     if type(max_steps) is not int or type(save_every) is not int:
         raise TypeError("checkpoint cadence values must be integers")
@@ -254,8 +272,12 @@ def resolve_deepspeed_runtime_config(
     if not isinstance(payload, dict):
         raise ValueError("DeepSpeed config must contain an object")
     payload["train_micro_batch_size_per_gpu"] = config.per_device_batch
-    payload["gradient_accumulation_steps"] = 1
-    payload["train_batch_size"] = config.per_device_batch * world_size
+    payload["gradient_accumulation_steps"] = config.gradient_accumulation_steps
+    payload["train_batch_size"] = (
+        config.per_device_batch
+        * world_size
+        * config.gradient_accumulation_steps
+    )
     return payload
 
 
@@ -919,7 +941,7 @@ def run_training(
         )
         deepspeed_plugin = DeepSpeedPlugin(
             hf_ds_config=deepspeed_runtime_config,
-            gradient_accumulation_steps=1,
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
             gradient_clipping=config.gradient_clip_norm,
             zero_stage=2,
         )
@@ -934,11 +956,12 @@ def run_training(
         step_scheduler_with_optimizer=False,
         deepspeed_plugin=deepspeed_plugin,
     )
-    validate_global_batch(
-        per_device_batch=config.per_device_batch,
-        world_size=accelerator.num_processes,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-    )
+    if not config.tiny_test:
+        require_stage1_global_batch(
+            per_device_batch=config.per_device_batch,
+            world_size=accelerator.num_processes,
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
+        )
     planner_topology = planner_module_topology(artifacts.planner)
     planner_topology_hash = sha256_json(planner_topology)
     output_topology_path = Path(config.output_dir) / "planner_topology.json"

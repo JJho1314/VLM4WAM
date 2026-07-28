@@ -247,16 +247,17 @@ def preflight_stage1(
         or zero.get("stage") != 2
         or "offload_optimizer" in zero
         or "offload_param" in zero
-        or deepspeed.get("gradient_accumulation_steps") != 1
+        or deepspeed.get("gradient_accumulation_steps") != "auto"
         or deepspeed.get("bf16") != {"enabled": True}
     ):
         raise ValueError(
-            "DeepSpeed config must be BF16 ZeRO-2 with accumulation 1 and no offload"
+            "DeepSpeed config must be BF16 ZeRO-2 with runtime-resolved "
+            "accumulation and no offload"
         )
     fast_path = require_qwen35_fast_path()
-    from qwen35_baton.cli.train_semantic_planner import validate_global_batch
+    from qwen35_baton.cli.train_semantic_planner import require_stage1_global_batch
 
-    global_batch = validate_global_batch(
+    global_batch = require_stage1_global_batch(
         per_device_batch=config.per_device_batch,
         world_size=world_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,

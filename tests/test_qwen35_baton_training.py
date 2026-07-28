@@ -27,6 +27,7 @@ from qwen35_baton.cli.train_semantic_planner import (
     build_stage1_optimizer_groups,
     checkpoint_steps,
     load_local_artifacts,
+    require_stage1_global_batch,
     resolve_deepspeed_runtime_config,
     run_training,
     validate_global_batch,
@@ -388,24 +389,43 @@ def test_one_tiny_stage1_step_updates_only_owned_parameters(tmp_path: Path) -> N
     assert result.last_metrics["query_tower_time"] > 0
 
 
-def test_global_batch_reports_runtime_batch_without_forcing_128() -> None:
+def test_global_batch_uses_microbatch_world_size_and_accumulation() -> None:
     assert (
         validate_global_batch(
-            per_device_batch=3,
+            per_device_batch=4,
             world_size=8,
-            gradient_accumulation_steps=1,
+            gradient_accumulation_steps=4,
         )
-        == 24
+        == 128
     )
 
 
-def test_stage1_rejects_gradient_accumulation(tmp_path: Path) -> None:
+def test_production_stage1_requires_global_batch_128() -> None:
+    assert (
+        require_stage1_global_batch(
+            per_device_batch=4,
+            world_size=8,
+            gradient_accumulation_steps=4,
+        )
+        == 128
+    )
+
+    with pytest.raises(ValueError, match="global batch must be exactly 128"):
+        require_stage1_global_batch(
+            per_device_batch=4,
+            world_size=8,
+            gradient_accumulation_steps=2,
+        )
+
+
+def test_stage1_accepts_positive_gradient_accumulation(tmp_path: Path) -> None:
     config = _config(tmp_path)
 
-    with pytest.raises(ValueError, match="gradient_accumulation_steps.*1"):
-        Stage1TrainingConfig(
-            **{**config.to_dict(), "gradient_accumulation_steps": 2}
-        )
+    accumulated = Stage1TrainingConfig(
+        **{**config.to_dict(), "gradient_accumulation_steps": 4}
+    )
+
+    assert accumulated.gradient_accumulation_steps == 4
 
 
 def test_zero2_runtime_config_is_explicit() -> None:
@@ -415,7 +435,9 @@ def test_zero2_runtime_config_is_explicit() -> None:
 
     assert config["zero_optimization"]["stage"] == 2
     assert config["bf16"]["enabled"] is True
-    assert config["gradient_accumulation_steps"] == 1
+    assert config["train_micro_batch_size_per_gpu"] == "auto"
+    assert config["gradient_accumulation_steps"] == "auto"
+    assert config["train_batch_size"] == "auto"
     assert "offload_optimizer" not in config["zero_optimization"]
     assert "offload_param" not in config["zero_optimization"]
 
@@ -434,6 +456,7 @@ def test_deepspeed_runtime_config_resolves_micro_and_global_batch(
             "warmup_steps": 1_000,
             "save_every": 5_000,
             "per_device_batch": 2,
+            "gradient_accumulation_steps": 4,
             "deepspeed_config_path": str(source),
         }
     )
@@ -441,8 +464,8 @@ def test_deepspeed_runtime_config_resolves_micro_and_global_batch(
     resolved = resolve_deepspeed_runtime_config(config, world_size=8)
 
     assert resolved["train_micro_batch_size_per_gpu"] == 2
-    assert resolved["gradient_accumulation_steps"] == 1
-    assert resolved["train_batch_size"] == 16
+    assert resolved["gradient_accumulation_steps"] == 4
+    assert resolved["train_batch_size"] == 64
     assert resolved["zero_optimization"]["stage"] == 2
 
 
@@ -648,6 +671,31 @@ def test_each_microbatch_is_one_optimizer_update(
         sampler_seed=config.seed,
     )
     assert artifacts.scheduler.last_epoch == 2
+
+
+def test_four_microbatches_make_one_optimizer_and_scheduler_update(
+    tmp_path: Path,
+) -> None:
+    baseline = _config(tmp_path)
+    config = Stage1TrainingConfig(
+        **{
+            **baseline.to_dict(),
+            "gradient_accumulation_steps": 4,
+        }
+    )
+    artifacts = _artifacts(config)
+    before = _clone_parameters(artifacts.planner)
+
+    result = run_training(config, artifacts=artifacts)
+
+    assert result.global_step == 1
+    assert result.cursor.consumed_microbatches == 4
+    assert artifacts.scheduler.last_epoch == 1
+    assert result.last_metrics["microbatches"] == 4.0
+    assert any(
+        not torch.equal(parameter.detach(), before[name])
+        for name, parameter in artifacts.planner.named_parameters()
+    )
 
 
 def test_skipped_optimizer_update_does_not_advance_step_scheduler_or_metrics(
@@ -1089,8 +1137,8 @@ def _write_preflight_fixture(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
         "hdf5_manifest_path": str(manifest),
         "hdf5_manifest_hash": sha256_file(manifest),
         "dataset_statistics_path": str(dataset / "stats.json"),
-        "per_device_batch": 2,
-        "gradient_accumulation_steps": 1,
+        "per_device_batch": 4,
+        "gradient_accumulation_steps": 4,
         "max_steps": 30_000,
         "warmup_steps": 1_000,
         "save_every": 5_000,
@@ -1115,7 +1163,7 @@ def test_preflight_is_cpu_side_and_validates_local_artifact_contracts(
     report = preflight_stage1(config, world_size=8)
 
     assert torch.cuda.is_initialized() is cuda_was_initialized
-    assert report["global_batch"] == 16
+    assert report["global_batch"] == 128
     assert report["qwen35_fast_path"] == {
         "fla": "test",
         "causal_conv1d": "test",
@@ -1127,6 +1175,22 @@ def test_preflight_is_cpu_side_and_validates_local_artifact_contracts(
         "hidden_size": 1024,
     }
     assert len(set(report["added_token_ids"])) == 7
+
+
+def test_preflight_rejects_non_128_production_global_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "qwen35_baton.cli.preflight.require_qwen35_fast_path",
+        lambda: {"fla": "test", "causal_conv1d": "test"},
+    )
+    config, payload = _write_preflight_fixture(tmp_path)
+    payload["gradient_accumulation_steps"] = 2
+    config.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="global batch must be exactly 128"):
+        preflight_stage1(config, world_size=8)
 
 
 def test_preflight_rejects_manifest_hash_mismatch(tmp_path: Path) -> None:
@@ -1246,7 +1310,8 @@ def test_stage1_recipe_requirements_and_launchers_are_fixed(tmp_path: Path) -> N
     assert config["max_steps"] == 30_000
     assert config["save_every"] == 5_000
     assert config["max_consecutive_skipped_updates"] == 8
-    assert config["gradient_accumulation_steps"] == 1
+    assert config["per_device_batch"] == 4
+    assert config["gradient_accumulation_steps"] == 4
     assert config["gradient_checkpointing"] is False
     assert config["learning_rate"] == 1e-5
     assert "planner_lr" not in config
@@ -1279,6 +1344,7 @@ def test_stage1_recipe_requirements_and_launchers_are_fixed(tmp_path: Path) -> N
         "CONFIG": str(tmp_path / "config.json"),
         "NUM_GPUS": "2",
         "PER_DEVICE_BATCH": "32",
+        "GRAD_ACCUM": "4",
         "DEEPSPEED_CONFIG": str(
             REPO_ROOT / "qwen35_baton/configs/deepspeed_zero2.json"
         ),
@@ -1294,10 +1360,10 @@ def test_stage1_recipe_requirements_and_launchers_are_fixed(tmp_path: Path) -> N
     calls = log.read_text().splitlines()
     assert calls[0].startswith("-m qwen35_baton.cli.preflight ")
     assert "--per-device-batch 32" in calls[0]
-    assert "--gradient-accumulation-steps 1" in calls[0]
+    assert "--gradient-accumulation-steps 4" in calls[0]
     assert calls[1].startswith("-m torch.distributed.run ")
     assert "--per-device-batch 32" in calls[1]
-    assert "--gradient-accumulation-steps 1" in calls[1]
+    assert "--gradient-accumulation-steps 4" in calls[1]
 
 
 def test_production_artifacts_are_constructed_after_global_seeding(
@@ -1357,7 +1423,7 @@ def test_run_training_passes_preflight_a_module_stable_mapping(
     assert received[0] == config.to_dict()
 
 
-def test_launcher_rejects_gradient_accumulation_other_than_one(
+def test_launcher_rejects_nonpositive_gradient_accumulation(
     tmp_path: Path,
 ) -> None:
     result = subprocess.run(
@@ -1368,11 +1434,11 @@ def test_launcher_rejects_gradient_accumulation_other_than_one(
             "CONFIG": str(tmp_path / "config.json"),
             "NUM_GPUS": "3",
             "PER_DEVICE_BATCH": "7",
-            "GRAD_ACCUM": "2",
+            "GRAD_ACCUM": "0",
         },
         text=True,
         capture_output=True,
     )
 
     assert result.returncode == 2
-    assert "GRAD_ACCUM=1" in result.stderr
+    assert "GRAD_ACCUM must be positive" in result.stderr

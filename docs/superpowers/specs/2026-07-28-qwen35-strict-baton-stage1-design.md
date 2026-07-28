@@ -90,17 +90,18 @@ The distributed runtime is adapted to the smaller Qwen3.5-2B model on eight
 - install and require the Qwen3.5 fused linear-attention fast path
   (`flash-linear-attention` and `causal-conv1d`) rather than silently accepting
   the current Torch fallback;
-- use no gradient accumulation;
-- benchmark per-device batch `2` without gradient checkpointing first;
-- benchmark per-device batch `4` with selective activation checkpointing only
-  if batch four does not fit directly;
+- use per-device batch `4` without gradient checkpointing, the largest
+  configuration that passed the 200-step H100 stability trial;
+- accumulate four microbatches across eight GPUs for an effective global batch
+  of `4 * 8 * 4 = 128`;
 - select the stable configuration with the highest measured samples/second,
   using average GPU power as a secondary saturation check rather than choosing
   a slower configuration solely for higher watts.
 
-The user-selected run length and save cadence remain `30,000` steps and every
-`5,000` steps because the LIBERO dataset scale is not the paper's 1.5-million
-clip corpus. This schedule change does not alter the Baton method.
+The user-selected run length and save cadence remain `30,000` optimizer steps
+and every `5,000` steps. At global batch `128`, the run processes approximately
+`3.84` million samples, four times the sample count of the earlier global-batch
+32 trial. This schedule change does not alter the Baton method.
 
 ## Validation
 
@@ -118,7 +119,8 @@ Tests must first fail against the current behavior and then prove:
   frozen;
 - the training loader reads the predecoded HDF5 path without source-video
   decoding;
-- the OLA launcher selects ZeRO Stage 2 and accumulation one;
+- the OLA launcher selects ZeRO Stage 2, per-device batch four, accumulation
+  four, and effective global batch `128`;
 - the Qwen3.5 fast path is active rather than the Torch fallback;
 - batch-two and batch-four trials report comparable throughput, peak memory,
   utilization, and average power before the production configuration is
