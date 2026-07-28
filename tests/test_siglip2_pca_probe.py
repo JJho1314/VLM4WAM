@@ -147,6 +147,46 @@ def test_cached_frame_dataset_rejects_ambiguous_channel_axes(
         dataset[0]
 
 
+def test_cached_frame_dataset_bounds_and_closes_lru_memmaps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = [tmp_path / f"episode_{index:06d}.npy" for index in range(97)]
+    for path in paths:
+        np.save(path, np.zeros((1, 4, 4, 3), dtype=np.uint8))
+    selections = iter([*range(96), 0, 96])
+
+    class ScriptedRandom:
+        def __init__(self, _: int) -> None:
+            self.path_index = next(selections)
+            self.calls = 0
+
+        def randrange(self, stop: int) -> int:
+            self.calls += 1
+            if self.calls == 1:
+                assert stop == len(paths)
+                return self.path_index
+            assert self.calls == 2
+            assert stop == 1
+            return 0
+
+    monkeypatch.setattr(train_probe.random, "Random", ScriptedRandom)
+    dataset = CachedFrameDataset(paths, virtual_length=98, seed=17)
+
+    for index in range(96):
+        dataset[index]
+    first = dataset._memmaps[paths[0]]
+    second = dataset._memmaps[paths[1]]
+    dataset[96]
+    dataset[97]
+
+    assert len(dataset._memmaps) == 96
+    assert paths[0] in dataset._memmaps
+    assert paths[1] not in dataset._memmaps
+    assert not first._mmap.closed
+    assert second._mmap.closed
+
+
 def test_probe_training_parser_uses_approved_recipe() -> None:
     args = build_probe_parser().parse_args(
         [

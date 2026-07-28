@@ -8,6 +8,7 @@ import hashlib
 import json
 import random
 import re
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,7 @@ WEIGHT_DECAY = 0.01
 SCHEDULER_CLASS = torch.optim.lr_scheduler.CosineAnnealingLR
 SCHEDULER_ETA_MIN = 0.0
 SCHEDULER_LAST_EPOCH = -1
+MEMMAP_CACHE_SIZE = 96
 
 
 def discover_episode_files(cache_root: Path) -> list[Path]:
@@ -103,7 +105,7 @@ class CachedFrameDataset(torch.utils.data.Dataset):
         self.files = tuple(files)
         self.virtual_length = virtual_length
         self.seed = seed
-        self._memmaps: dict[Path, np.ndarray] = {}
+        self._memmaps: OrderedDict[Path, np.memmap] = OrderedDict()
 
     def __len__(self) -> int:
         return self.virtual_length
@@ -115,6 +117,11 @@ class CachedFrameDataset(torch.utils.data.Dataset):
         if array is None:
             array = np.load(path, mmap_mode="r")
             self._memmaps[path] = array
+            if len(self._memmaps) > MEMMAP_CACHE_SIZE:
+                _, evicted = self._memmaps.popitem(last=False)
+                evicted._mmap.close()
+        else:
+            self._memmaps.move_to_end(path)
         frame = np.ascontiguousarray(
             array[generator.randrange(array.shape[0])]
         )
