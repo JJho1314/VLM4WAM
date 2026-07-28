@@ -234,6 +234,31 @@ def checkpoint_steps(*, max_steps: int, save_every: int) -> tuple[int, ...]:
     return tuple(range(save_every, max_steps + 1, save_every))
 
 
+def resolve_deepspeed_runtime_config(
+    config: Stage1TrainingConfig,
+    *,
+    world_size: int,
+) -> dict[str, Any]:
+    """Resolve Accelerate's ``auto`` batch fields before model preparation."""
+
+    if type(world_size) is not int or world_size <= 0:
+        raise ValueError("world_size must be a positive integer")
+    try:
+        payload = json.loads(
+            Path(config.deepspeed_config_path).read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"DeepSpeed config is invalid: {config.deepspeed_config_path}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise ValueError("DeepSpeed config must contain an object")
+    payload["train_micro_batch_size_per_gpu"] = config.per_device_batch
+    payload["gradient_accumulation_steps"] = 1
+    payload["train_batch_size"] = config.per_device_batch * world_size
+    return payload
+
+
 def _owned_parameters(modules: tuple[nn.Module, ...]) -> list[nn.Parameter]:
     parameters: list[nn.Parameter] = []
     seen: set[int] = set()
@@ -888,8 +913,12 @@ def run_training(
 
     deepspeed_plugin = None
     if not config.tiny_test:
+        deepspeed_runtime_config = resolve_deepspeed_runtime_config(
+            config,
+            world_size=world_size,
+        )
         deepspeed_plugin = DeepSpeedPlugin(
-            hf_ds_config=config.deepspeed_config_path,
+            hf_ds_config=deepspeed_runtime_config,
             gradient_accumulation_steps=1,
             gradient_clipping=config.gradient_clip_norm,
             zero_stage=2,

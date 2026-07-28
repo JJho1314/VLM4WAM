@@ -27,6 +27,7 @@ from qwen35_baton.cli.train_semantic_planner import (
     build_stage1_optimizer_groups,
     checkpoint_steps,
     load_local_artifacts,
+    resolve_deepspeed_runtime_config,
     run_training,
     validate_global_batch,
 )
@@ -417,6 +418,32 @@ def test_zero2_runtime_config_is_explicit() -> None:
     assert config["gradient_accumulation_steps"] == 1
     assert "offload_optimizer" not in config["zero_optimization"]
     assert "offload_param" not in config["zero_optimization"]
+
+
+def test_deepspeed_runtime_config_resolves_micro_and_global_batch(
+    tmp_path: Path,
+) -> None:
+    source = REPO_ROOT / "qwen35_baton/configs/deepspeed_zero2.json"
+    config = _config(tmp_path)
+    config = Stage1TrainingConfig(
+        **{
+            **config.to_dict(),
+            "tiny_test": False,
+            "mixed_precision": "bf16",
+            "max_steps": 30_000,
+            "warmup_steps": 1_000,
+            "save_every": 5_000,
+            "per_device_batch": 2,
+            "deepspeed_config_path": str(source),
+        }
+    )
+
+    resolved = resolve_deepspeed_runtime_config(config, world_size=8)
+
+    assert resolved["train_micro_batch_size_per_gpu"] == 2
+    assert resolved["gradient_accumulation_steps"] == 1
+    assert resolved["train_batch_size"] == 16
+    assert resolved["zero_optimization"]["stage"] == 2
 
 
 def test_qwen35_fast_path_fails_closed_when_compiled_dependency_is_missing(
