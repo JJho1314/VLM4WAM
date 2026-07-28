@@ -974,6 +974,7 @@ def _resume_worker(
     checkpoint: Path,
     result_dir: Path,
 ) -> int:
+    _load_ge_act_interfaces()
     _seed_all(_STEP_SEED)
     (
         accelerator,
