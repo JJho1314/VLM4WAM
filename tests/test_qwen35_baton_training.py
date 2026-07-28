@@ -965,7 +965,7 @@ def _write_preflight_fixture(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
     (siglip / "config.json").write_text(
         json.dumps(
             {
-                "model_type": "siglip2",
+                "model_type": "siglip",
                 "vision_config": {
                     "image_size": 256,
                     "hidden_size": 1024,

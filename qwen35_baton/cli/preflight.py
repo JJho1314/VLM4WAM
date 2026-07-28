@@ -108,8 +108,11 @@ def _siglip_geometry(path: Path) -> dict[str, int]:
         resolved = AutoConfig.from_pretrained(path, local_files_only=True)
     except Exception as error:
         raise ValueError(f"local SigLIP2 config is invalid: {path}") from error
-    if getattr(resolved, "model_type", None) != "siglip2":
-        raise ValueError("local SigLIP2 config must have model_type 'siglip2'")
+    if getattr(resolved, "model_type", None) not in {"siglip", "siglip2"}:
+        raise ValueError(
+            "local SigLIP2 config must use the released 'siglip' or "
+            "'siglip2' configuration class"
+        )
     vision = getattr(resolved, "vision_config", None)
     if vision is None:
         raise ValueError("local SigLIP2 config is missing vision_config")
