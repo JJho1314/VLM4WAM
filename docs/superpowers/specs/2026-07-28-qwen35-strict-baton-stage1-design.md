@@ -72,17 +72,31 @@ cache.
 
 ## Training Configuration
 
-Following Appendix A.5:
+The optimization objective and model ownership follow Appendix A.5:
 
 - train the full MLLM, visual alignment tower, and Sem-MLP;
 - frozen SigLIP2 teacher;
 - AdamW with `β1=0.9`, `β2=0.999`;
 - learning rate `1e-5`;
 - BF16;
-- DeepSpeed Stage 3;
-- per-device batch `1`;
-- no gradient accumulation;
 - query initialization `Normal(0, 0.02)`.
+
+The distributed runtime is adapted to the smaller Qwen3.5-2B model on eight
+80-GB H100 GPUs:
+
+- use DeepSpeed ZeRO Stage 2 rather than the paper's Stage 3 so full parameters
+  remain local and forward/backward do not incur per-layer parameter
+  all-gathers;
+- install and require the Qwen3.5 fused linear-attention fast path
+  (`flash-linear-attention` and `causal-conv1d`) rather than silently accepting
+  the current Torch fallback;
+- use no gradient accumulation;
+- benchmark per-device batch `2` without gradient checkpointing first;
+- benchmark per-device batch `4` with selective activation checkpointing only
+  if batch four does not fit directly;
+- select the stable configuration with the highest measured samples/second,
+  using average GPU power as a secondary saturation check rather than choosing
+  a slower configuration solely for higher watts.
 
 The user-selected run length and save cadence remain `30,000` steps and every
 `5,000` steps because the LIBERO dataset scale is not the paper's 1.5-million
@@ -104,7 +118,11 @@ Tests must first fail against the current behavior and then prove:
   frozen;
 - the training loader reads the predecoded HDF5 path without source-video
   decoding;
-- the OLA launcher selects DeepSpeed Stage 3, batch one, and accumulation one.
+- the OLA launcher selects ZeRO Stage 2 and accumulation one;
+- the Qwen3.5 fast path is active rather than the Torch fallback;
+- batch-two and batch-four trials report comparable throughput, peak memory,
+  utilization, and average power before the production configuration is
+  selected.
 
 After deployment, a fresh OLA output directory will be used. The launch is
 accepted only after all eight ranks enter training without OOM and the first
