@@ -1,14 +1,20 @@
+import json
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
+from PIL import Image
 
 from qwen3_vl_semantic_planner.dinov3_da3_2b.export_libero_episode_siglip2_da3 import (
     artifact_paths,
+    build_parser,
     da3_depth_images,
+    decode_episode_frames,
+    load_episode_record,
     sample_frame_indices,
     siglip_pca_images,
+    write_export,
 )
 
 
@@ -93,3 +99,117 @@ def test_siglip_pca_images_reject_non_square_token_count() -> None:
 def test_da3_depth_images_reject_non_positive_depth() -> None:
     with pytest.raises(ValueError, match="positive"):
         da3_depth_images(torch.zeros(2, 4, 4))
+
+
+def test_load_episode_record_returns_exact_episode(tmp_path: Path) -> None:
+    meta = tmp_path / "suite/meta"
+    meta.mkdir(parents=True)
+    records = [
+        {"episode_index": 7, "tasks": ["task seven"], "length": 9},
+        {"episode_index": 8, "tasks": ["task eight"], "length": 10},
+    ]
+    (meta / "episodes.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    assert load_episode_record(tmp_path, "suite", 8) == records[1]
+
+
+def test_decode_episode_frames_reads_exact_requested_indices(
+    tmp_path: Path,
+) -> None:
+    import av
+
+    video_path = tmp_path / "episode.mp4"
+    with av.open(str(video_path), mode="w") as container:
+        stream = container.add_stream("mpeg4", rate=20)
+        stream.width = 8
+        stream.height = 8
+        stream.pix_fmt = "yuv420p"
+        for value in (0, 50, 100, 150):
+            array = np.full((8, 8, 3), value, dtype=np.uint8)
+            frame = av.VideoFrame.from_ndarray(array, format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+
+    decoded = decode_episode_frames(video_path, [0, 2, 3])
+
+    assert decoded.shape == (3, 8, 8, 3)
+    assert decoded[0].mean() < decoded[1].mean() < decoded[2].mean()
+
+
+def test_decode_episode_frames_rejects_missing_requested_indices(
+    tmp_path: Path,
+) -> None:
+    import av
+
+    video_path = tmp_path / "short.mp4"
+    with av.open(str(video_path), mode="w") as container:
+        stream = container.add_stream("mpeg4", rate=20)
+        stream.width = 8
+        stream.height = 8
+        stream.pix_fmt = "yuv420p"
+        frame = av.VideoFrame.from_ndarray(
+            np.zeros((8, 8, 3), dtype=np.uint8),
+            format="rgb24",
+        )
+        for packet in stream.encode(frame):
+            container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+
+    with pytest.raises(RuntimeError, match="missing requested frames"):
+        decode_episode_frames(video_path, [0, 2])
+
+
+def test_write_export_creates_three_independent_pngs_per_camera_frame(
+    tmp_path: Path,
+) -> None:
+    frames = np.zeros((2, 2, 4, 4, 3), dtype=np.uint8)
+    siglip = np.full((4, 8, 8, 3), 64, dtype=np.uint8)
+    depth = np.full((4, 4, 4, 3), 128, dtype=np.uint8)
+
+    records = write_export(
+        tmp_path,
+        frames=frames,
+        siglip_rgb=siglip,
+        depth_rgb=depth,
+        camera_names=("main", "wrist"),
+        frame_indices=[0, 8],
+        fps=20.0,
+    )
+
+    assert len(records) == 4
+    assert len(list(tmp_path.rglob("*.png"))) == 12
+    assert Image.open(tmp_path / "main/frame_000000/rgb.png").size == (4, 4)
+    assert Image.open(
+        tmp_path / "main/frame_000000/siglip_pca.png"
+    ).size == (8, 8)
+    assert records[-1]["timestamp_seconds"] == pytest.approx(0.4)
+
+
+def test_build_parser_exposes_full_episode_export_contract() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--data-root",
+            "/data/libero",
+            "--siglip2-model-dir",
+            "/models/siglip2",
+            "--da3-ckpt-dir",
+            "/models/da3",
+            "--da3-code-root",
+            "/code/da3",
+            "--output-dir",
+            "/tmp/export",
+        ]
+    )
+
+    assert args.suite == "libero_10_no_noops_lerobot"
+    assert args.episode_index == 288
+    assert args.stride == 16
+    assert args.batch_size == 8
+    assert args.device == "cuda"
