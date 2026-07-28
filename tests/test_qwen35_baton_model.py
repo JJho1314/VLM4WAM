@@ -82,10 +82,8 @@ class TinyQwen(nn.Module):
 
 class TinyQueryTower(nn.Module):
     qwen_dim = 8
-    query_dim = 1024
     num_frames = 4
     tokens_per_frame = 256
-    num_cameras = 2
 
     def __init__(self) -> None:
         super().__init__()
@@ -94,16 +92,12 @@ class TinyQueryTower(nn.Module):
     def forward(
         self,
         qwen_states: torch.Tensor,
-        camera_ids: torch.Tensor,
         *,
         return_attention_maps: bool = False,
     ) -> QueryTowerOutput:
-        signal = (
-            qwen_states[..., :1] * self.scale
-            + camera_ids[:, None, None, None].to(qwen_states) * 1000
-        )
+        signal = qwen_states * self.scale
         return QueryTowerOutput(
-            hidden_states=signal.expand(-1, -1, -1, self.query_dim),
+            hidden_states=signal,
             cross_attention_maps=(
                 (torch.zeros(qwen_states.shape[0], 1024, 1024),)
                 if return_attention_maps
@@ -112,15 +106,19 @@ class TinyQueryTower(nn.Module):
         )
 
 
+class TinySemMLP(nn.Module):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states[..., :1].expand(*hidden_states.shape[:-1], 1024)
+
+
 def make_batch(*, batch_size: int = 2) -> BatonPlannerBatch:
-    rows = batch_size * 4
+    rows = batch_size * 2
     input_ids = torch.full((rows, 1026), PLAN_PAD_TOKEN_ID, dtype=torch.long)
     input_ids[:, 0] = torch.arange(1, rows + 1)
     input_ids[:, -1] = 2
     plan_positions = torch.arange(1, 1025).expand(rows, -1).clone()
     labels = tuple(
-        (condition, sample, camera)
-        for condition in ("positive", "negative")
+        (sample, camera)
         for sample in range(batch_size)
         for camera in ("main", "wrist")
     )
@@ -135,9 +133,6 @@ def make_batch(*, batch_size: int = 2) -> BatonPlannerBatch:
             batch_size, 2, 4, 3, 2, 2, dtype=torch.uint8
         ),
         instructions=tuple(f"task {index}" for index in range(batch_size)),
-        negative_instructions=tuple(
-            f"wrong task {index}" for index in range(batch_size)
-        ),
         row_labels=labels,
     )
 
@@ -149,7 +144,7 @@ def make_planner() -> tuple[BatonQwen35Planner, TinyQwen]:
         added_token_ids=ADDED_TOKEN_IDS,
         query_tower=TinyQueryTower(),
     )
-    planner.sem_mlp = nn.Identity()
+    planner.sem_mlp = TinySemMLP()
     return planner, qwen
 
 
@@ -165,24 +160,23 @@ def make_unmodified_planner() -> tuple[BatonQwen35Planner, TinyQwen]:
     )
 
 
-def test_model_splits_positive_and_negative_predictions() -> None:
+def test_model_returns_only_positive_dual_camera_predictions() -> None:
     planner, qwen = make_planner()
 
     output = planner(make_batch())
 
     assert isinstance(output, BatonPlannerOutput)
     assert output.positive.shape == (2, 2, 4, 256, 1024)
-    assert output.negative is not None
-    assert output.negative.shape == (2, 2, 4, 256, 1024)
-    assert output.flat.shape == (8, 4, 256, 1024)
+    assert not hasattr(output, "negative")
+    assert output.flat.shape == (4, 4, 256, 1024)
     assert qwen.model.forward_calls == 1
 
 
 def test_model_calls_multimodal_base_without_lm_logits_or_cache() -> None:
     planner, qwen = make_planner()
     batch = make_batch(batch_size=1)
-    pixel_values = torch.randn(4, 3, 2, 2)
-    image_grid_thw = torch.ones(4, 3, dtype=torch.long)
+    pixel_values = torch.randn(2, 3, 2, 2)
+    image_grid_thw = torch.ones(2, 3, dtype=torch.long)
     mm_token_type_ids = torch.zeros_like(batch.qwen_inputs["input_ids"])
     qwen_inputs = {
         **batch.qwen_inputs,
@@ -194,7 +188,6 @@ def test_model_calls_multimodal_base_without_lm_logits_or_cache() -> None:
     planner.forward_rows(
         qwen_inputs,
         batch.plan_positions,
-        camera_ids=torch.tensor([0, 1, 0, 1]),
     )
 
     assert qwen.model.forward_calls == 1
@@ -239,7 +232,6 @@ def test_permuting_wrist_rows_changes_only_wrist_predictions() -> None:
         current_images=batch.current_images,
         future_images=batch.future_images,
         instructions=batch.instructions,
-        negative_instructions=batch.negative_instructions,
         row_labels=batch.row_labels,
     )
 
@@ -264,7 +256,6 @@ def test_wrong_plan_pad_count_fails_before_qwen(count: int) -> None:
         current_images=batch.current_images,
         future_images=batch.future_images,
         instructions=batch.instructions,
-        negative_instructions=batch.negative_instructions,
         row_labels=batch.row_labels,
     )
 
@@ -284,7 +275,6 @@ def test_forward_rows_requires_positions_to_match_plan_pad_tokens() -> None:
         planner.forward_rows(
             batch.qwen_inputs,
             positions,
-            camera_ids=torch.tensor([0, 1, 0, 1]),
         )
 
     assert qwen.model.forward_calls == 0
@@ -296,19 +286,19 @@ def test_forward_can_return_flat_query_tower_attention_maps() -> None:
     output = planner(make_batch(batch_size=1), return_attention_maps=True)
 
     assert output.cross_attention_maps is not None
-    assert output.cross_attention_maps[0].shape == (4, 1024, 1024)
+    assert output.cross_attention_maps[0].shape == (2, 1024, 1024)
 
 
-def test_sem_mlp_has_exact_1024_2048_1024_structure_without_output_norm() -> None:
+def test_sem_mlp_maps_qwen_width_to_siglip2_width_without_output_norm() -> None:
     planner, _ = make_unmodified_planner()
 
     assert len(planner.sem_mlp) == 3
     first, activation, output = planner.sem_mlp
     assert isinstance(first, nn.Linear)
-    assert (first.in_features, first.out_features) == (1024, 2048)
+    assert (first.in_features, first.out_features) == (8, 8)
     assert isinstance(activation, nn.GELU)
     assert isinstance(output, nn.Linear)
-    assert (output.in_features, output.out_features) == (2048, 1024)
+    assert (output.in_features, output.out_features) == (8, 1024)
 
 
 def test_planner_state_dict_round_trips_overlay_and_frozen_base() -> None:

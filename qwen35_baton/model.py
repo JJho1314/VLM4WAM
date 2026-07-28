@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from qwen35_baton.data import BatonPlannerBatch
-from qwen35_baton.query_tower import QueryTowerOutput, SpatiotemporalQueryTower
+from qwen35_baton.query_tower import BatonVisualAlignmentTower, QueryTowerOutput
 from qwen35_baton.sequence import ADDED_TOKENS, PLAN_PAD
 
 
@@ -103,7 +103,6 @@ class BatonPlannerOutput:
 
     flat: torch.Tensor
     positive: torch.Tensor
-    negative: torch.Tensor | None
     cross_attention_maps: tuple[torch.Tensor, ...] | None
 
 
@@ -160,24 +159,22 @@ class BatonQwen35Planner(nn.Module):
 
         qwen_dim = adapter.embedding_dim
         if query_tower is None:
-            query_tower = SpatiotemporalQueryTower(qwen_dim)
+            query_tower = BatonVisualAlignmentTower(qwen_dim)
         if not isinstance(query_tower, nn.Module):
             raise TypeError("query_tower must be a torch module")
         expected_geometry = {
             "qwen_dim": qwen_dim,
-            "query_dim": _FEATURE_DIM,
             "num_frames": _NUM_FRAMES,
             "tokens_per_frame": _TOKENS_PER_FRAME,
-            "num_cameras": 2,
         }
         for name, expected in expected_geometry.items():
             if getattr(query_tower, name, None) != expected:
                 raise ValueError(f"query_tower {name} must be {expected}")
         self.query_tower = query_tower
         self.sem_mlp = nn.Sequential(
-            nn.Linear(_FEATURE_DIM, 2048),
+            nn.Linear(qwen_dim, qwen_dim),
             nn.GELU(),
-            nn.Linear(2048, _FEATURE_DIM),
+            nn.Linear(qwen_dim, _FEATURE_DIM),
         )
 
     @property
@@ -191,7 +188,6 @@ class BatonQwen35Planner(nn.Module):
         self,
         qwen_inputs: Mapping[str, torch.Tensor],
         plan_positions: torch.Tensor,
-        camera_ids: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         if not isinstance(qwen_inputs, Mapping):
             raise TypeError("qwen_inputs must be a tensor mapping")
@@ -216,15 +212,6 @@ class BatonQwen35Planner(nn.Module):
             or plan_positions.dtype.is_floating_point
         ):
             raise TypeError("plan_positions must contain integer sequence indices")
-        if (
-            not isinstance(camera_ids, torch.Tensor)
-            or camera_ids.ndim != 1
-            or camera_ids.shape[0] != rows
-            or camera_ids.dtype == torch.bool
-            or camera_ids.dtype.is_floating_point
-        ):
-            raise ValueError("camera_ids must be one integer ID per Qwen row")
-
         positions = plan_positions.to(device=input_ids.device, dtype=torch.long)
         if bool(((positions < 0) | (positions >= sequence_length)).any()):
             raise ValueError("plan_positions contain an out-of-range sequence index")
@@ -258,7 +245,6 @@ class BatonQwen35Planner(nn.Module):
         self,
         qwen_inputs: Mapping[str, torch.Tensor],
         plan_positions: torch.Tensor,
-        camera_ids: torch.Tensor,
         *,
         return_attention_maps: bool = False,
     ) -> BatonPlannerOutput:
@@ -267,7 +253,6 @@ class BatonQwen35Planner(nn.Module):
         forwarded, positions = self._validate_rows(
             qwen_inputs,
             plan_positions,
-            camera_ids,
         )
         forwarded["use_cache"] = False
         forwarded["output_hidden_states"] = False
@@ -299,7 +284,6 @@ class BatonQwen35Planner(nn.Module):
         )
         tower_output = self.query_tower(
             qwen_plan_states,
-            camera_ids,
             return_attention_maps=return_attention_maps,
         )
         if not isinstance(tower_output, QueryTowerOutput):
@@ -318,7 +302,6 @@ class BatonQwen35Planner(nn.Module):
         return BatonPlannerOutput(
             flat=predictions,
             positive=predictions,
-            negative=None,
             cross_attention_maps=tower_output.cross_attention_maps,
         )
 
@@ -331,41 +314,25 @@ class BatonQwen35Planner(nn.Module):
         if not isinstance(batch, BatonPlannerBatch):
             raise TypeError("batch must be BatonPlannerBatch")
         batch_size = batch.batch_size
-        if batch_size <= 0 or len(batch.row_labels) != batch_size * 4:
-            raise ValueError("Baton batch must contain four Qwen rows per sample")
+        if batch_size <= 0 or len(batch.row_labels) != batch_size * 2:
+            raise ValueError("Baton batch must contain two Qwen rows per sample")
         expected_labels = tuple(
-            (condition, sample, camera)
-            for condition in ("positive", "negative")
+            (sample, camera)
             for sample in range(batch_size)
             for camera in ("main", "wrist")
         )
         if batch.row_labels != expected_labels:
             raise ValueError(
-                "Baton rows must be positive-then-negative sample-major main/wrist"
+                "Baton rows must be sample-major main/wrist"
             )
-        camera_ids = torch.tensor(
-            [index % 2 for index in range(batch_size * 4)],
-            dtype=torch.long,
-            device=batch.plan_positions.device,
-        )
         row_output = self.forward_rows(
             batch.qwen_inputs,
             batch.plan_positions,
-            camera_ids,
             return_attention_maps=return_attention_maps,
         )
-        positive_flat = row_output.flat[batch.positive_rows]
-        negative_flat = row_output.flat[batch.negative_rows]
         return BatonPlannerOutput(
             flat=row_output.flat,
-            positive=positive_flat.reshape(
-                batch_size,
-                2,
-                _NUM_FRAMES,
-                _TOKENS_PER_FRAME,
-                _FEATURE_DIM,
-            ),
-            negative=negative_flat.reshape(
+            positive=row_output.flat.reshape(
                 batch_size,
                 2,
                 _NUM_FRAMES,
