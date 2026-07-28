@@ -1,9 +1,14 @@
 import inspect
+import warnings
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
+from qwen3_vl_semantic_planner.dinov3_da3_2b import (
+    train_siglip2_pca_probe as train_probe,
+)
 from qwen3_vl_semantic_planner.dinov3_da3_2b.siglip2_pca_probe import (
     SiglipPCAUpsampler,
     fit_fixed_pca,
@@ -14,6 +19,11 @@ from qwen3_vl_semantic_planner.dinov3_da3_2b.siglip2_pca_probe import (
     sample_pca_tokens,
     validation_gate_passed,
     validation_metrics,
+)
+from qwen3_vl_semantic_planner.dinov3_da3_2b.train_siglip2_pca_probe import (
+    CachedFrameDataset,
+    build_parser as build_probe_parser,
+    split_episode_files,
 )
 
 
@@ -50,6 +60,156 @@ def _valid_probe_payload() -> dict[str, object]:
             "baseline_gradient": 0.2,
         },
     }
+
+
+def test_split_episode_files_excludes_only_target_episode(
+    tmp_path: Path,
+) -> None:
+    relative = [
+        "libero_10_no_noops_lerobot/videos/chunk-000/"
+        "observation.images.image/episode_000288.npy",
+        "libero_10_no_noops_lerobot/videos/chunk-000/"
+        "observation.images.wrist_image/episode_000288.npy",
+        "libero_goal_no_noops_lerobot/videos/chunk-000/"
+        "observation.images.image/episode_000288.npy",
+        "libero_goal_no_noops_lerobot/videos/chunk-000/"
+        "observation.images.wrist_image/episode_000288.npy",
+        "libero_10_no_noops_lerobot/videos/chunk-000/"
+        "observation.images.image/episode_000100.npy",
+        "libero_10_no_noops_lerobot/videos/chunk-000/"
+        "observation.images.wrist_image/episode_000100.npy",
+    ]
+    files = [tmp_path / value for value in relative]
+
+    train, validation = split_episode_files(
+        files,
+        cache_root=tmp_path,
+        validation_modulus=2,
+    )
+    selected = train + validation
+
+    assert all(
+        "libero_10_no_noops_lerobot" not in str(path)
+        or "episode_000288.npy" not in path.name
+        for path in selected
+    )
+    assert sum(path.name == "episode_000288.npy" for path in selected) == 2
+    for suite_episode in {
+        (
+            path.parts[-5],
+            path.name,
+        )
+        for path in selected
+    }:
+        members = [
+            path
+            for path in selected
+            if (path.parts[-5], path.name) == suite_episode
+        ]
+        assert all(path in train for path in members) or all(
+            path in validation for path in members
+        )
+
+
+def test_cached_frame_dataset_reads_nhwc_uint8(tmp_path: Path) -> None:
+    path = tmp_path / "episode_000001.npy"
+    np.save(path, np.full((2, 12, 10, 3), 128, dtype=np.uint8))
+    dataset = CachedFrameDataset([path], virtual_length=2, seed=7)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        frame = dataset[0]
+
+    assert frame.shape == (3, 12, 10)
+    assert frame.dtype == torch.float32
+    assert frame.mean().item() == pytest.approx(128 / 255)
+
+
+def test_cached_frame_dataset_reads_nchw_uint8(tmp_path: Path) -> None:
+    path = tmp_path / "episode_000002.npy"
+    np.save(path, np.full((2, 3, 12, 10), 64, dtype=np.uint8))
+    dataset = CachedFrameDataset([path], virtual_length=1, seed=11)
+
+    frame = dataset[0]
+
+    assert frame.shape == (3, 12, 10)
+    assert frame.mean().item() == pytest.approx(64 / 255)
+
+
+def test_cached_frame_dataset_rejects_ambiguous_channel_axes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "episode_000003.npy"
+    np.save(path, np.zeros((2, 3, 12, 3), dtype=np.uint8))
+    dataset = CachedFrameDataset([path], virtual_length=1, seed=13)
+
+    with pytest.raises(ValueError, match="cannot infer cache layout"):
+        dataset[0]
+
+
+def test_probe_training_parser_uses_approved_recipe() -> None:
+    args = build_probe_parser().parse_args(
+        [
+            "--frame-cache-dir",
+            "/data/cache",
+            "--siglip2-model-dir",
+            "/models/siglip2-large-patch16-256",
+            "--output-dir",
+            "/outputs/probe",
+        ]
+    )
+
+    assert args.steps == 5000
+    assert args.pca_max_tokens == 50_000
+    assert args.pca_batches > 0
+    assert args.validation_batches > 0
+    assert args.seed == 0
+
+
+@pytest.mark.parametrize(
+    ("model_name", "feature_dim", "error"),
+    [
+        ("another-siglip2-model", 1024, "model identity"),
+        ("siglip2-large-patch16-256", 1152, "feature contract"),
+    ],
+)
+def test_make_teachers_rejects_incompatible_model_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    feature_dim: int,
+    error: str,
+) -> None:
+    class FakeConfig:
+        patch_size = 16
+
+    class FakeModel:
+        config = FakeConfig()
+
+    class FakeTeacher:
+        def __init__(
+            self,
+            *,
+            input_size: int,
+            grid_size: int,
+            **_: object,
+        ) -> None:
+            self.input_size = input_size
+            self.grid_size = grid_size
+            self.feature_dim = feature_dim
+            self.native_size = 256
+            self.model = FakeModel()
+
+    monkeypatch.setattr(
+        train_probe,
+        "Siglip2TargetEncoder",
+        FakeTeacher,
+    )
+
+    with pytest.raises(ValueError, match=error):
+        train_probe.make_teachers(
+            Path("/models") / model_name,
+            torch.device("cpu"),
+        )
 
 
 def test_sample_pca_tokens_is_bounded_and_deterministic() -> None:
