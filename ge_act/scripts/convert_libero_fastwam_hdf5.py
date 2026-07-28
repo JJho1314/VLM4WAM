@@ -358,6 +358,13 @@ def _load_rgb_source(episode: SourceEpisode, camera_role: str) -> np.ndarray:
                 f"cannot read {camera_role} camera cache: domain={episode.domain}, "
                 f"episode={episode.episode_index}, path={cache_path}: {error}"
             ) from error
+        if (
+            isinstance(frames, np.ndarray)
+            and frames.ndim == 4
+            and frames.shape[-1] != 3
+            and frames.shape[1] == 3
+        ):
+            frames = np.moveaxis(frames, 1, -1)
         source_path = cache_path
     _validate_rgb(frames, source=str(source_path))
     if len(frames) != episode.length:

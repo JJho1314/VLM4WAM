@@ -725,6 +725,38 @@ def test_resize_rgb_uint8_rejects_invalid_microbatch(microbatch):
         converter.resize_rgb_uint8(_synthetic_rgb(0, 2, 0), microbatch=microbatch)
 
 
+def test_converter_loads_fastwam_chw_predecoded_cache(tmp_path):
+    source = make_tiny_lerobot_domain(
+        tmp_path / "source", "domain", episode_indexes=(0,)
+    )
+    cache = make_tiny_predecoded_cache(
+        tmp_path / "cache", source, "domain", (0,)
+    )
+    for camera in CAMERAS:
+        cache_path = (
+            cache
+            / "domain"
+            / "videos/chunk-000"
+            / camera
+            / "episode_000000.npy"
+        )
+        frames = np.load(cache_path, allow_pickle=False)
+        np.save(
+            cache_path,
+            frames.transpose(0, 3, 1, 2),
+            allow_pickle=False,
+        )
+
+    episode = converter.discover_source_episodes(
+        [source], ["domain"], predecoded_root=cache
+    )[0]
+    actual = converter._load_rgb_source(episode, "main")
+
+    assert actual.shape == (3, 8, 10, 3)
+    assert actual.dtype == np.uint8
+    np.testing.assert_array_equal(actual, _synthetic_rgb(0, 3, 0))
+
+
 def test_discovery_is_deterministic_resolves_captions_and_deduplicates_pairs(
     tmp_path,
 ):
