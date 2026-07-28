@@ -38,14 +38,19 @@ def artifact_paths(
     output_dir: Path,
     camera: str,
     frame_index: int,
+    *,
+    include_siglip_probe: bool = False,
 ) -> dict[str, Path]:
-    """Return the three independent image paths for a camera/frame pair."""
+    """Return image paths for a camera/frame pair and optional probe."""
     frame_dir = output_dir / camera / f"frame_{frame_index:06d}"
-    return {
+    paths = {
         "rgb": frame_dir / "rgb.png",
         "siglip_pca": frame_dir / "siglip_pca.png",
         "da3_depth": frame_dir / "da3_depth.png",
     }
+    if include_siglip_probe:
+        paths["siglip_probe"] = frame_dir / "siglip_probe.png"
+    return paths
 
 
 def _robust_unit_interval(values: torch.Tensor) -> torch.Tensor:
@@ -157,11 +162,12 @@ def write_export(
     frames: np.ndarray,
     siglip_rgb: np.ndarray,
     depth_rgb: np.ndarray,
+    siglip_probe_rgb: np.ndarray | None = None,
     camera_names: tuple[str, ...],
     frame_indices: list[int],
     fps: float,
 ) -> list[dict[str, Any]]:
-    """Write one RGB, SigLIP, and DA3 PNG per camera and sampled frame."""
+    """Write RGB, SigLIP PCA, DA3, and optional probe PNGs per frame."""
     from PIL import Image
 
     if fps <= 0:
@@ -176,18 +182,34 @@ def write_export(
         raise ValueError("siglip_rgb must be flattened in camera-major order")
     if depth_rgb.shape[0] != expected_flat:
         raise ValueError("depth_rgb must be flattened in camera-major order")
+    if (
+        siglip_probe_rgb is not None
+        and siglip_probe_rgb.shape[0] != expected_flat
+    ):
+        raise ValueError(
+            "siglip_probe_rgb must be flattened in camera-major order"
+        )
 
     records: list[dict[str, Any]] = []
     for camera_index, camera_name in enumerate(camera_names):
         for sampled_index, frame_index in enumerate(frame_indices):
             flat_index = camera_index * num_frames + sampled_index
-            paths = artifact_paths(output_dir, camera_name, frame_index)
+            paths = artifact_paths(
+                output_dir,
+                camera_name,
+                frame_index,
+                include_siglip_probe=siglip_probe_rgb is not None,
+            )
             paths["rgb"].parent.mkdir(parents=True, exist_ok=True)
             Image.fromarray(frames[camera_index, sampled_index]).save(
                 paths["rgb"]
             )
             Image.fromarray(siglip_rgb[flat_index]).save(paths["siglip_pca"])
             Image.fromarray(depth_rgb[flat_index]).save(paths["da3_depth"])
+            if siglip_probe_rgb is not None:
+                Image.fromarray(siglip_probe_rgb[flat_index]).save(
+                    paths["siglip_probe"]
+                )
             records.append(
                 {
                     "camera": camera_name,
@@ -218,6 +240,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--episode-index", type=int, default=288)
     parser.add_argument("--stride", type=int, default=16)
     parser.add_argument("--siglip2-model-dir", type=Path, required=True)
+    parser.add_argument("--siglip-pca-probe", type=Path, default=None)
     parser.add_argument("--da3-ckpt-dir", type=Path, required=True)
     parser.add_argument("--da3-code-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -434,6 +457,29 @@ def main() -> None:
         grid_size=16,
         output_size=256,
     )
+    siglip_probe_rgb = None
+    probe_payload = None
+    if args.siglip_pca_probe is not None:
+        from siglip2_pca_probe import load_validated_probe
+
+        probe, probe_payload = load_validated_probe(
+            _required_path(args.siglip_pca_probe, "SigLIP2 PCA probe"),
+            expected_model_name=siglip2_model_dir.name,
+            device=device,
+        )
+        with torch.inference_mode():
+            dense = probe(siglip_features.to(device).float())
+        siglip_probe_rgb = (
+            dense.mul(255)
+            .round()
+            .clamp(0, 255)
+            .to(torch.uint8)
+            .permute(0, 2, 3, 1)
+            .cpu()
+            .numpy()
+        )
+        del probe
+        torch.cuda.empty_cache()
 
     print(
         json.dumps({"status": "encoding_da3"}, sort_keys=True),
@@ -454,6 +500,7 @@ def main() -> None:
         frames=frames,
         siglip_rgb=siglip_rgb,
         depth_rgb=depth_rgb,
+        siglip_probe_rgb=siglip_probe_rgb,
         camera_names=camera_names,
         frame_indices=frame_indices,
         fps=fps,
@@ -474,6 +521,13 @@ def main() -> None:
         },
         "records": records,
     }
+    if probe_payload is not None:
+        manifest["models"]["siglip2_pca_probe"] = str(
+            args.siglip_pca_probe
+        )
+        manifest["siglip2_probe_validation"] = probe_payload[
+            "validation_metrics"
+        ]
     manifest_path = args.output_dir / "manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -481,7 +535,10 @@ def main() -> None:
     )
 
     png_count = len(list(args.output_dir.rglob("*.png")))
-    expected_png_count = len(frame_indices) * len(camera_names) * 3
+    expected_modalities = 4 if siglip_probe_rgb is not None else 3
+    expected_png_count = (
+        len(frame_indices) * len(camera_names) * expected_modalities
+    )
     if png_count != expected_png_count:
         raise RuntimeError(
             f"expected {expected_png_count} PNGs, found {png_count}"

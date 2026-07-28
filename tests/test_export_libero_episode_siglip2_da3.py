@@ -60,6 +60,25 @@ def test_artifact_paths_separates_camera_frame_and_modalities(
     }
 
 
+def test_artifact_paths_optionally_adds_probe_image(tmp_path: Path) -> None:
+    paths = artifact_paths(
+        tmp_path,
+        "main",
+        16,
+        include_siglip_probe=True,
+    )
+
+    assert paths["siglip_probe"] == (
+        tmp_path / "main/frame_000016/siglip_probe.png"
+    )
+    assert set(paths) == {
+        "rgb",
+        "siglip_pca",
+        "siglip_probe",
+        "da3_depth",
+    }
+
+
 def test_siglip_pca_images_use_one_transform_for_all_frames() -> None:
     base = torch.tensor(
         [
@@ -191,6 +210,31 @@ def test_write_export_creates_three_independent_pngs_per_camera_frame(
     assert records[-1]["timestamp_seconds"] == pytest.approx(0.4)
 
 
+def test_write_export_adds_probe_without_replacing_pca(
+    tmp_path: Path,
+) -> None:
+    frames = np.zeros((2, 1, 4, 4, 3), dtype=np.uint8)
+    siglip = np.full((2, 8, 8, 3), 64, dtype=np.uint8)
+    probe = np.full((2, 8, 8, 3), 96, dtype=np.uint8)
+    depth = np.full((2, 4, 4, 3), 128, dtype=np.uint8)
+
+    records = write_export(
+        tmp_path,
+        frames=frames,
+        siglip_rgb=siglip,
+        siglip_probe_rgb=probe,
+        depth_rgb=depth,
+        camera_names=("main", "wrist"),
+        frame_indices=[0],
+        fps=20.0,
+    )
+
+    assert len(records) == 2
+    assert len(list(tmp_path.rglob("*.png"))) == 8
+    assert (tmp_path / "main/frame_000000/siglip_pca.png").is_file()
+    assert (tmp_path / "main/frame_000000/siglip_probe.png").is_file()
+
+
 def test_build_parser_exposes_full_episode_export_contract() -> None:
     parser = build_parser()
     args = parser.parse_args(
@@ -199,6 +243,8 @@ def test_build_parser_exposes_full_episode_export_contract() -> None:
             "/data/libero",
             "--siglip2-model-dir",
             "/models/siglip2",
+            "--siglip-pca-probe",
+            "/probes/siglip.pt",
             "--da3-ckpt-dir",
             "/models/da3",
             "--da3-code-root",
@@ -213,3 +259,4 @@ def test_build_parser_exposes_full_episode_export_contract() -> None:
     assert args.stride == 16
     assert args.batch_size == 8
     assert args.device == "cuda"
+    assert args.siglip_pca_probe == Path("/probes/siglip.pt")
