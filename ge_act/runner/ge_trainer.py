@@ -1901,13 +1901,15 @@ def save_baton_training_checkpoint(
     if is_main:
         root.mkdir(parents=True, exist_ok=True)
     accelerator.wait_for_everyone()
-    if destination.exists():
-        raise FileExistsError(f"Baton checkpoint already exists: {destination}")
-    if staging.exists():
-        raise FileExistsError(
-            f"incomplete Baton checkpoint already exists: {staging}"
-        )
     if is_main:
+        if destination.exists():
+            raise FileExistsError(
+                f"Baton checkpoint already exists: {destination}"
+            )
+        if staging.exists():
+            raise FileExistsError(
+                f"incomplete Baton checkpoint already exists: {staging}"
+            )
         staging.mkdir()
     try:
         accelerator.wait_for_everyone()

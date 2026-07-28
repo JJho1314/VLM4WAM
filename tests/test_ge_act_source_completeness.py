@@ -37,6 +37,18 @@ def test_stable_libero_source_files_are_vendored() -> None:
     assert not missing, f"Missing stable GE-Act files: {missing}"
 
 
+def test_baton_end_to_end_smoke_entrypoints_are_vendored_and_importable() -> None:
+    required = [
+        REPO_ROOT / "qwen35_baton/cli/smoke_pipeline.py",
+        REPO_ROOT / "qwen35_baton/scripts/smoke_two_rank.sh",
+    ]
+
+    assert all(path.is_file() for path in required)
+    module = importlib.import_module("qwen35_baton.cli.smoke_pipeline")
+    assert callable(module.run_tiny_pipeline)
+    assert callable(module.main)
+
+
 def test_lerobot_dataset_keeps_two_camera_video_contract() -> None:
     sys.path.insert(0, str(GE_ACT_ROOT))
     try:
