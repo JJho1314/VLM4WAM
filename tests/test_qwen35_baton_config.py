@@ -11,7 +11,6 @@ import pytest
 from qwen35_baton import (
     BatonCheckpointMetadata,
     BatonGeometry,
-    BatonLossWeights,
     sha256_file,
     sha256_json,
 )
@@ -84,10 +83,6 @@ def test_continuous_metadata_round_trips_the_complete_contract() -> None:
     assert payload["teacher_feature_layer"] == -2
     assert payload["loss_weights"] == {
         "mse": 1.0,
-        "cosine": 0.5,
-        "delta": 0.5,
-        "instruction_counterfactual": 0.2,
-        "counterfactual_margin": 0.1,
     }
     assert BatonCheckpointMetadata.from_dict(payload) == metadata
 
@@ -183,14 +178,8 @@ def test_distributed_cursor_round_trips_without_loss() -> None:
     assert restored.distributed_cursor == metadata.distributed_cursor
 
 
-def test_loss_weights_are_the_approved_stage1_values() -> None:
-    assert BatonLossWeights() == BatonLossWeights(
-        mse=1.0,
-        cosine=0.5,
-        delta=0.5,
-        instruction_counterfactual=0.2,
-        counterfactual_margin=0.1,
-    )
+def test_metadata_carries_only_baton_equation_8_mse() -> None:
+    assert BatonCheckpointMetadata.example().loss_weights == {"mse": 1.0}
 
 
 def test_sha256_helpers_are_stable_and_stream_file_contents(tmp_path: Path) -> None:

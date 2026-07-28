@@ -71,7 +71,7 @@ class _TinyPlanner(nn.Module):
         value = self.sem_mlp(value)
         value = self.plan_token_adapter(value)
         prediction = value.reshape(-1, 1, 1, 1, 1).expand(-1, 2, 4, 1, 1)
-        return SimpleNamespace(positive=prediction, negative=-prediction)
+        return SimpleNamespace(positive=prediction)
 
 
 class _TinyTeacher:
@@ -103,7 +103,7 @@ class _TinyTeacher:
         return result.to(self.output_dtype)
 
     def encode_current(self, images: torch.Tensor) -> torch.Tensor:
-        return self.model(images).to(self.output_dtype)
+        raise AssertionError("strict Baton Stage 1 must not encode current frames")
 
 
 @dataclass(frozen=True)
@@ -356,10 +356,6 @@ def test_one_tiny_stage1_step_updates_only_owned_parameters(tmp_path: Path) -> N
     assert {
         "loss/total",
         "loss/mse",
-        "loss/cosine",
-        "loss/delta",
-        "loss/instruction_counterfactual",
-        "counterfactual_ranking_accuracy",
         "throughput",
         "data_time",
         "qwen_time",
@@ -368,9 +364,9 @@ def test_one_tiny_stage1_step_updates_only_owned_parameters(tmp_path: Path) -> N
         "backward_time",
         "mse/main/frame_0",
         "mse/wrist/frame_0",
-        "cosine/main/frame_0",
-        "cosine/wrist/frame_0",
     }.issubset(result.last_metrics)
+    assert not any("cosine" in name for name in result.last_metrics)
+    assert not any("counterfactual" in name for name in result.last_metrics)
     assert result.last_metrics["qwen_time"] > 0
     assert result.last_metrics["query_tower_time"] > 0
 

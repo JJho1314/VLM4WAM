@@ -83,24 +83,6 @@ class BatonGeometry:
 
 
 @dataclass(frozen=True)
-class BatonLossWeights:
-    """Fixed Stage-1 continuous-feature objective weights."""
-
-    mse: float = 1.0
-    cosine: float = 0.5
-    delta: float = 0.5
-    instruction_counterfactual: float = 0.2
-    counterfactual_margin: float = 0.1
-
-    def __post_init__(self) -> None:
-        _require_equal("mse", self.mse, 1.0)
-        _require_equal("cosine", self.cosine, 0.5)
-        _require_equal("delta", self.delta, 0.5)
-        _require_equal("instruction_counterfactual", self.instruction_counterfactual, 0.2)
-        _require_equal("counterfactual_margin", self.counterfactual_margin, 0.1)
-
-
-@dataclass(frozen=True)
 class BatonCheckpointMetadata:
     """Serialized compatibility contract for a continuous Baton checkpoint."""
 
@@ -192,7 +174,7 @@ class BatonCheckpointMetadata:
     query_norm_style: str
     query_mask_version: str
     trainable_qwen_layer_indices: tuple[int, ...]
-    loss_weights: BatonLossWeights
+    loss_weights: Mapping[str, float]
     hdf5_manifest_hash: str
     planner_topology_hash: str
     optimizer_topology_hash: str
@@ -243,8 +225,8 @@ class BatonCheckpointMetadata:
             self.trainable_qwen_layer_indices,
             tuple(range(16, 24)),
         )
-        if not isinstance(self.loss_weights, BatonLossWeights):
-            raise ValueError("loss_weights must be BatonLossWeights")
+        if dict(self.loss_weights) != {"mse": 1.0}:
+            raise ValueError("loss_weights must contain only Equation-8 MSE weight 1.0")
         if self.global_step < 0:
             raise ValueError("global_step must be non-negative")
         if not self.distributed_cursor:
@@ -296,7 +278,7 @@ class BatonCheckpointMetadata:
             query_norm_style=cls.QUERY_NORM_STYLE,
             query_mask_version="block_causal_v1",
             trainable_qwen_layer_indices=tuple(range(16, 24)),
-            loss_weights=BatonLossWeights(),
+            loss_weights={"mse": 1.0},
             hdf5_manifest_hash=_example_sha256("hdf5-manifest"),
             planner_topology_hash=_example_sha256("planner-topology"),
             optimizer_topology_hash=_example_sha256("optimizer-topology"),
@@ -331,7 +313,7 @@ class BatonCheckpointMetadata:
         values["target_shape"] = tuple(values["target_shape"])
         values["future_indices"] = tuple(values["future_indices"])
         values["trainable_qwen_layer_indices"] = tuple(values["trainable_qwen_layer_indices"])
-        values["loss_weights"] = BatonLossWeights(**values["loss_weights"])
+        values["loss_weights"] = dict(values["loss_weights"])
         values["distributed_cursor"] = tuple(values["distributed_cursor"].items())
         return cls(**values)
 

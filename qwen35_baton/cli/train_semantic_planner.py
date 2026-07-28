@@ -17,7 +17,6 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from qwen35_baton.checkpoint import (
     BatonTrainingCursor,
@@ -52,10 +51,6 @@ _DURABLE_METRIC_NAMES = frozenset(
     {
         "loss/total",
         "loss/mse",
-        "loss/cosine",
-        "loss/delta",
-        "loss/instruction_counterfactual",
-        "counterfactual_ranking_accuracy",
         "data_time",
         "qwen_time",
         "teacher_time",
@@ -64,8 +59,7 @@ _DURABLE_METRIC_NAMES = frozenset(
         "throughput",
         "microbatches",
         *(
-            f"{metric}/{camera}/frame_{frame}"
-            for metric in ("mse", "cosine")
+            f"mse/{camera}/frame_{frame}"
             for camera in ("main", "wrist")
             for frame in range(4)
         ),
@@ -657,29 +651,14 @@ def _loss_metrics(
     losses: BatonPlannerLoss,
     *,
     positive: torch.Tensor,
-    negative: torch.Tensor,
     target: torch.Tensor,
 ) -> dict[str, float]:
     metrics = {
         "loss/total": float(losses.total.detach().float().cpu()),
         "loss/mse": float(losses.mse.detach().float().cpu()),
-        "loss/cosine": float(losses.cosine.detach().float().cpu()),
-        "loss/delta": float(losses.delta.detach().float().cpu()),
-        "loss/instruction_counterfactual": float(
-            losses.instruction_counterfactual.detach().float().cpu()
-        ),
     }
     positive_math = positive.detach().float()
-    negative_math = negative.detach().float()
     target_math = target.detach().float()
-    correct = 1.0 - F.cosine_similarity(positive_math, target_math, dim=-1)
-    wrong = 1.0 - F.cosine_similarity(negative_math, target_math, dim=-1)
-    metrics["counterfactual_ranking_accuracy"] = float(
-        (correct.flatten(1).mean(1) < wrong.flatten(1).mean(1))
-        .float()
-        .mean()
-        .cpu()
-    )
     camera_names = ("main", "wrist")
     for camera in range(positive.shape[1]):
         camera_name = (
@@ -690,9 +669,6 @@ def _loss_metrics(
             teacher = target_math[:, camera, frame]
             metrics[f"mse/{camera_name}/frame_{frame}"] = float(
                 (predicted - teacher).square().mean().cpu()
-            )
-            metrics[f"cosine/{camera_name}/frame_{frame}"] = float(
-                F.cosine_similarity(predicted, teacher, dim=-1).mean().cpu()
             )
     return metrics
 
@@ -1074,23 +1050,13 @@ def run_training(
                     future_teacher = artifacts.teacher.encode_future(
                         batch.future_images
                     )
-                    current_teacher = artifacts.teacher.encode_current(
-                        batch.current_images
-                    )
                 _synchronize_device(accelerator.device)
                 teacher_time = time.perf_counter() - teacher_start
-                negative = getattr(planner_output, "negative", None)
-                if not isinstance(negative, torch.Tensor):
-                    raise RuntimeError(
-                        "Stage-1 planner must return counterfactual predictions"
-                    )
                 if not all(
                     bool(torch.isfinite(value).all())
                     for value in (
                         planner_output.positive,
-                        negative,
                         future_teacher,
-                        current_teacher,
                     )
                 ):
                     raise FloatingPointError(
@@ -1099,23 +1065,16 @@ def run_training(
                 # Keep strict standalone loss validation while doing all Stage-1
                 # regression math in stable fp32 across bf16 model boundaries.
                 positive_for_loss = planner_output.positive.float()
-                negative_for_loss = negative.float()
                 future_for_loss = future_teacher.float()
-                current_for_loss = current_teacher.float()
                 losses = compute_baton_planner_loss(
                     positive_for_loss,
-                    negative_for_loss,
                     future_for_loss,
-                    current_for_loss,
                 )
                 if not all(
                     bool(torch.isfinite(value).all())
                     for value in (
                         losses.total,
                         losses.mse,
-                        losses.cosine,
-                        losses.delta,
-                        losses.instruction_counterfactual,
                     )
                 ):
                     raise FloatingPointError("Stage-1 loss is nonfinite")
@@ -1163,7 +1122,6 @@ def run_training(
             micro_metrics = _loss_metrics(
                 losses,
                 positive=planner_output.positive,
-                negative=negative,
                 target=future_teacher,
             )
             micro_metrics.update(
