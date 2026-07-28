@@ -1,3 +1,5 @@
+import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +13,125 @@ from qwen3_vl_semantic_planner.dinov3_da3_2b.siglip2_target_highlight import (
     SiglipPairGradCAM,
     token_gradcam,
 )
+from qwen3_vl_semantic_planner.dinov3_da3_2b.generate_siglip_target_highlight_comparison import (
+    active_target,
+    combine_target_highlight,
+    generate_comparison,
+    permute_palette,
+)
+
+
+def test_active_target_switches_at_frame_128():
+    assert active_target(112) == "the white textured mug"
+    assert active_target(127) == "the white textured mug"
+    assert active_target(128) == "the yellow and white mug"
+    assert active_target(160) == "the yellow and white mug"
+
+
+def test_palette_candidates_are_exact_channel_permutations():
+    pixel = np.array([[[10, 20, 30]]], dtype=np.uint8)
+    np.testing.assert_array_equal(
+        permute_palette(pixel, (0, 1, 2)),
+        np.array([[[10, 20, 30]]], dtype=np.uint8),
+    )
+    np.testing.assert_array_equal(
+        permute_palette(pixel, (1, 2, 0)),
+        np.array([[[20, 30, 10]]], dtype=np.uint8),
+    )
+    np.testing.assert_array_equal(
+        permute_palette(pixel, (2, 0, 1)),
+        np.array([[[30, 10, 20]]], dtype=np.uint8),
+    )
+
+
+def test_combined_highlight_preserves_shape_and_emphasizes_target():
+    feature = np.full((8, 8, 3), [40, 120, 200], dtype=np.uint8)
+    relevance = np.zeros((8, 8), dtype=np.float32)
+    relevance[2:6, 2:6] = 1.0
+    combined = combine_target_highlight(feature, relevance)
+    assert combined.shape == (8, 8, 3)
+    assert combined.dtype == np.uint8
+    assert combined[3, 3].sum() > combined[0, 0].sum()
+    assert combined[2, 2, 0] > combined[0, 0, 0]
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class _FakeHighlighter:
+    def __init__(self) -> None:
+        self.phrases = None
+
+    def __call__(self, images, phrases):
+        self.phrases = list(phrases)
+        maps = np.zeros((len(images), 256, 256), dtype=np.float32)
+        maps[:, 64:192, 64:192] = 1.0
+        return maps
+
+
+def test_generate_comparison_uses_all_cameras_and_preserves_export_sources(tmp_path):
+    export_root = tmp_path / "export"
+    source_paths = []
+    for frame_index, value in ((112, 40), (160, 160)):
+        for camera_index, camera in enumerate(("main", "wrist")):
+            source_dir = export_root / camera / f"frame_{frame_index:06d}"
+            source_dir.mkdir(parents=True)
+            rgb = source_dir / "rgb.png"
+            probe = source_dir / "siglip_probe.png"
+            Image.fromarray(np.full((256, 256, 3), value, dtype=np.uint8)).save(rgb)
+            Image.fromarray(
+                np.full((256, 256, 3), value + camera_index + 1, dtype=np.uint8)
+            ).save(probe)
+            source_paths.extend((rgb, probe))
+
+    hashes_before = {path: _sha256(path) for path in source_paths}
+    paths_before = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
+    output_dir = tmp_path / "output"
+    highlighter = _FakeHighlighter()
+
+    png_path, json_path = generate_comparison(
+        export_root,
+        tmp_path / "siglip2-model",
+        output_dir,
+        torch.device("cpu"),
+        highlighter=highlighter,
+    )
+
+    assert highlighter.phrases == [
+        "the white textured mug",
+        "the white textured mug",
+        "the yellow and white mug",
+        "the yellow and white mug",
+    ]
+    with Image.open(png_path) as output:
+        assert output.size == (1096, 1104)
+        assert output.mode == "RGB"
+    metadata = json.loads(json_path.read_text())
+    assert metadata["model_path"] == str(tmp_path / "siglip2-model")
+    assert metadata["phase_boundary"] == 128
+    assert metadata["frames"] == [112, 160]
+    assert metadata["cameras"] == ["main", "wrist"]
+    assert metadata["phrases"] == highlighter.phrases
+    assert metadata["quantiles"] == {"low": 0.05, "high": 0.95}
+    assert metadata["palettes"] == {
+        "A_current": [0, 1, 2],
+        "B_warm_balanced": [1, 2, 0],
+        "C_cool_balanced": [2, 0, 1],
+    }
+    assert metadata["panel_order"] == [
+        {"frame": 112, "camera": "main", "phrase": "the white textured mug"},
+        {"frame": 112, "camera": "wrist", "phrase": "the white textured mug"},
+        {"frame": 160, "camera": "main", "phrase": "the yellow and white mug"},
+        {"frame": 160, "camera": "wrist", "phrase": "the yellow and white mug"},
+    ]
+    assert {path: _sha256(path) for path in source_paths} == hashes_before
+    paths_after = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
+    assert set(paths_after) - set(paths_before) == {
+        Path("output"),
+        Path("output/siglip_target_highlight_palettes.png"),
+        Path("output/siglip_target_highlight_palettes.json"),
+    }
 
 
 def test_normalize_relevance_uses_fixed_quantiles_and_handles_zero_range():
