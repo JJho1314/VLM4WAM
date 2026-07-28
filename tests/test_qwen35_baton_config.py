@@ -81,6 +81,12 @@ def test_continuous_metadata_round_trips_the_complete_contract() -> None:
     assert payload["target_shape"] == [2, 4, 256, 1024]
     assert payload["future_indices"] == [0, 3, 5, 8]
     assert payload["teacher_feature_layer"] == -2
+    assert payload["query_dim"] == 2048
+    assert payload["query_layers"] == 1
+    assert payload["query_ffn_dim"] == 0
+    assert payload["query_dropout"] == 0.0
+    assert payload["query_norm_style"] == "none"
+    assert payload["query_mask_version"] == "full_cross_attention_v1"
     assert payload["loss_weights"] == {
         "mse": 1.0,
     }
@@ -100,7 +106,7 @@ def test_format_v1_metadata_is_explicitly_incompatible_with_v2() -> None:
     payload = BatonCheckpointMetadata.example().to_dict()
     payload["format_version"] = 1
 
-    with pytest.raises(ValueError, match="format version 1.*incompatible.*version 2"):
+    with pytest.raises(ValueError, match="versions 1 and 2.*version 3"):
         BatonCheckpointMetadata.from_dict(payload)
 
 

@@ -1738,6 +1738,34 @@ def test_hdf5_dataset_returns_fixed_normalized_sample_in_camera_order(tmp_path):
     )
 
 
+def test_baton_adapter_reads_predecoded_hdf5_without_video_decoder(
+    tmp_path,
+    monkeypatch,
+):
+    from qwen35_baton.data import BatonLiberoDataset
+
+    base = make_reader(
+        tmp_path,
+        fix_epiidx=0,
+        fix_sidx=12,
+        fix_mem_idx=[1, 4, 8, 11],
+    )
+    monkeypatch.setattr(
+        av,
+        "open",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Baton HDF5 path must not open source video")
+        ),
+    )
+
+    sample = BatonLiberoDataset(base)[0]
+
+    assert sample["current_images"].shape == (2, 3, 256, 256)
+    assert sample["future_images"].shape == (2, 4, 3, 256, 256)
+    assert sample["current_images"].dtype == torch.uint8
+    assert sample["future_images"].dtype == torch.uint8
+
+
 def test_hdf5_fixed_sampling_matches_original_loader(tmp_path):
     dataset = make_reader(
         tmp_path,

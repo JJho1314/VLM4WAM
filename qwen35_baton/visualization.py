@@ -1,4 +1,4 @@
-"""Truthful instruction-sensitivity panels for frozen Baton predictions."""
+"""Cross-attention heatmaps for frozen strict-Baton predictions."""
 
 from __future__ import annotations
 
@@ -16,10 +16,10 @@ from qwen35_baton.config import BatonGeometry
 from qwen35_baton.provider import BatonSemanticPlan
 
 
-HEATMAP_LABEL = "instruction-conditioned query sensitivity"
+HEATMAP_LABEL = "VLM planner cross-attention focus"
 AGGREGATION_LABEL = (
-    "display: per-keyframe min-max; Query Tower: mean layer/head, "
-    "sum keys per Qwen plan block"
+    "display: per-keyframe min-max; Baton cross-attention: mean head, "
+    "normalized query entropy over all plan states"
 )
 _HEATMAP_ALPHA = 0.45
 
@@ -86,6 +86,52 @@ def summarize_query_cross_attention(
     return blocked.sum(dim=-1).mean(dim=3).detach()
 
 
+def query_cross_attention_focus(
+    attention_maps: tuple[torch.Tensor, ...],
+    *,
+    num_frames: int = 4,
+    tokens_per_frame: int = 256,
+) -> torch.Tensor:
+    """Return per-query attention concentration as ``[B,C,F,patch]``."""
+
+    if not attention_maps:
+        raise ValueError("cross-attention maps are required")
+    first = attention_maps[0]
+    expected_tokens = num_frames * tokens_per_frame
+    if (
+        not isinstance(first, torch.Tensor)
+        or first.ndim not in (4, 5)
+        or tuple(first.shape[-2:]) != (expected_tokens, expected_tokens)
+    ):
+        raise ValueError("attention maps have incompatible Baton geometry")
+    maps = []
+    for attention in attention_maps:
+        if (
+            not isinstance(attention, torch.Tensor)
+            or attention.shape != first.shape
+            or not attention.dtype.is_floating_point
+            or not bool(torch.isfinite(attention).all())
+        ):
+            raise ValueError("all attention maps must share finite geometry")
+        maps.append(attention.float())
+    averaged = torch.stack(maps).mean(dim=0)
+    if averaged.ndim == 5:
+        averaged = averaged.mean(dim=2)
+    probabilities = averaged.clamp_min(0)
+    probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True).clamp_min(
+        1e-12
+    )
+    entropy = -(probabilities * probabilities.clamp_min(1e-12).log()).sum(dim=-1)
+    maximum_entropy = float(np.log(expected_tokens))
+    focus = 1.0 - entropy / maximum_entropy
+    return focus.clamp(0, 1).reshape(
+        first.shape[0],
+        first.shape[1],
+        num_frames,
+        tokens_per_frame,
+    ).detach()
+
+
 def _sample_payload(
     sample: Mapping[str, Any],
     plan: BatonSemanticPlan,
@@ -123,7 +169,7 @@ def _sample_payload(
 
 def _display_heatmap(values: torch.Tensor, *, height: int, width: int) -> np.ndarray:
     if values.shape != (256,) or not bool(torch.isfinite(values).all()):
-        raise ValueError("each sensitivity frame must contain 256 finite values")
+        raise ValueError("each attention frame must contain 256 finite values")
     values = values.float()
     minimum = values.min()
     maximum = values.max()
@@ -185,22 +231,17 @@ def _save_attention_archive(
     sample_index: int,
     path: Path,
 ) -> None:
-    sensitivity = plan.instruction_sensitivity
-    if sensitivity is None:
-        raise ValueError(
-            "attention visualization requires instruction sensitivity"
-        )
     if plan.cross_attention_maps is None:
-        query_attention = np.empty((0,), dtype=np.float32)
-    else:
-        query_attention = (
-            summarize_query_cross_attention(plan.cross_attention_maps)[sample_index]
-            .cpu()
-            .numpy()
-        )
+        raise ValueError("attention visualization requires cross-attention maps")
+    focus = query_cross_attention_focus(plan.cross_attention_maps)
+    query_attention = (
+        summarize_query_cross_attention(plan.cross_attention_maps)[sample_index]
+        .cpu()
+        .numpy()
+    )
     _atomic_npz(
         path,
-        instruction_sensitivity=sensitivity[sample_index].float().cpu().numpy(),
+        query_attention_focus=focus[sample_index].float().cpu().numpy(),
         query_tower_frame_attention=query_attention,
         future_indices=np.asarray(plan.future_indices, dtype=np.int64),
     )
@@ -218,10 +259,8 @@ def render_attention_panels(
 
     if not isinstance(plan, BatonSemanticPlan):
         raise TypeError("plan must be BatonSemanticPlan")
-    if plan.instruction_sensitivity is None:
-        raise ValueError(
-            "attention visualization requires instruction sensitivity"
-        )
+    if plan.cross_attention_maps is None:
+        raise ValueError("attention visualization requires cross-attention maps")
     if (
         not isinstance(filename_prefix, str)
         or not filename_prefix
@@ -245,7 +284,9 @@ def render_attention_panels(
         ) from error
 
     geometry = BatonGeometry()
-    sensitivity = plan.instruction_sensitivity[sample_index].detach().cpu()
+    focus = query_cross_attention_focus(plan.cross_attention_maps)[
+        sample_index
+    ].cpu()
     paths: list[Path] = []
     gap = 8
     header = 82
@@ -256,7 +297,7 @@ def render_attention_panels(
         panels = [rgb]
         for frame_index in range(len(geometry.future_indices)):
             heatmap = _display_heatmap(
-                sensitivity[camera_index, frame_index],
+                focus[camera_index, frame_index],
                 height=height,
                 width=width,
             )

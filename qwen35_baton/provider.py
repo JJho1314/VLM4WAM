@@ -13,7 +13,6 @@ from safetensors import safe_open
 from safetensors.torch import load_model
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from qwen35_baton.config import BatonCheckpointMetadata, BatonGeometry
 from qwen35_baton.data import BatonPlannerCollator
@@ -90,7 +89,7 @@ class BatonSemanticPlan:
     future_indices: tuple[int, ...]
     positions_xy: torch.Tensor
     cross_attention_maps: tuple[torch.Tensor, ...] | None
-    instruction_sensitivity: torch.Tensor | None
+    instruction_sensitivity: None = None
     relevance: None = None
 
     def __post_init__(self) -> None:
@@ -131,26 +130,16 @@ class BatonSemanticPlan:
         if self.relevance is not None:
             raise ValueError("continuous Baton plans never contain relevance")
         if self.instruction_sensitivity is not None:
-            sensitivity = self.instruction_sensitivity
-            if (
-                not isinstance(sensitivity, torch.Tensor)
-                or sensitivity.shape != (batch_size, 2, 4, 256)
-                or not sensitivity.dtype.is_floating_point
-                or sensitivity.device != self.tokens.device
-                or sensitivity.requires_grad
-                or not bool(torch.isfinite(sensitivity).all())
-            ):
-                raise ValueError(
-                    "instruction_sensitivity must be detached finite "
-                    "floating-point [B,2,4,256]"
-                )
+            raise ValueError(
+                "strict Baton plans do not contain counterfactual sensitivity"
+            )
         if self.cross_attention_maps is not None:
             if (
                 not isinstance(self.cross_attention_maps, tuple)
                 or len(self.cross_attention_maps) != geometry.query_layers
             ):
                 raise ValueError(
-                    "cross_attention_maps must contain all four Query Tower layers"
+                    "cross_attention_maps must contain the Baton alignment layer"
                 )
             expected = (
                 batch_size,
@@ -627,8 +616,7 @@ class FrozenBatonPlanner(nn.Module):
         self,
         current_images: torch.Tensor,
         instructions: Sequence[str],
-        counterfactual_instructions: Sequence[str] | None,
-    ) -> tuple[int, tuple[str, ...], tuple[str, ...] | None]:
+    ) -> tuple[int, tuple[str, ...]]:
         if (
             not isinstance(current_images, torch.Tensor)
             or current_images.ndim != 5
@@ -649,28 +637,7 @@ class FrozenBatonPlanner(nn.Module):
         positive = tuple(instructions)
         if any(type(value) is not str or not value.strip() for value in positive):
             raise ValueError("instructions must contain nonblank strings")
-        negative = None
-        if counterfactual_instructions is not None:
-            if isinstance(counterfactual_instructions, (str, bytes)) or not isinstance(
-                counterfactual_instructions, Sequence
-            ):
-                raise TypeError(
-                    "counterfactual instructions must be an outer sequence of strings"
-                )
-            negative = tuple(counterfactual_instructions)
-            if len(negative) != batch_size:
-                raise ValueError(
-                    "images and counterfactual instructions batch sizes must match"
-                )
-            if any(type(value) is not str or not value.strip() for value in negative):
-                raise ValueError(
-                    "counterfactual instructions must contain nonempty strings"
-                )
-            if any(a == b for a, b in zip(positive, negative, strict=True)):
-                raise ValueError(
-                    "counterfactual instructions must differ from positives"
-                )
-        return batch_size, positive, negative
+        return batch_size, positive
 
     def _autocast_context(self) -> Any:
         backbone = getattr(self.planner, "backbone", None)
@@ -696,26 +663,23 @@ class FrozenBatonPlanner(nn.Module):
     def _build_rows(
         self,
         current_images: torch.Tensor,
-        instruction_sets: tuple[tuple[str, ...], ...],
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+        instructions: tuple[str, ...],
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         collator = BatonPlannerCollator(
             self.processor,
             plan_pad_token_id=self.added_token_ids[5],
         )
         sequences: list[torch.Tensor] = []
         processed_rows: list[Mapping[str, torch.Tensor]] = []
-        camera_ids: list[int] = []
         cpu_images = current_images.detach().to(device="cpu")
-        for instructions in instruction_sets:
-            for sample_index, instruction in enumerate(instructions):
-                for camera_index in range(2):
-                    sequence, processed = collator._process_row(
-                        cpu_images[sample_index, camera_index],
-                        instruction,
-                    )
-                    sequences.append(sequence)
-                    processed_rows.append(processed)
-                    camera_ids.append(camera_index)
+        for sample_index, instruction in enumerate(instructions):
+            for camera_index in range(2):
+                sequence, processed = collator._process_row(
+                    cpu_images[sample_index, camera_index],
+                    instruction,
+                )
+                sequences.append(sequence)
+                processed_rows.append(processed)
         pad_token_id = getattr(self.processor.tokenizer, "pad_token_id", None)
         if type(pad_token_id) is not int:
             raise ValueError("processor tokenizer pad_token_id must be an integer")
@@ -739,7 +703,6 @@ class FrozenBatonPlanner(nn.Module):
         return (
             {name: value.to(device=device) for name, value in qwen_inputs.items()},
             positions.to(device=device),
-            torch.tensor(camera_ids, dtype=torch.long, device=device),
         )
 
     def _validate_output(
@@ -780,7 +743,7 @@ class FrozenBatonPlanner(nn.Module):
             or len(maps) != self.geometry.query_layers
         ):
             raise RuntimeError(
-                "planner must return four Query Tower cross-attention maps"
+                "planner must return the Baton alignment cross-attention map"
             )
         for attention in maps:
             if (
@@ -807,30 +770,26 @@ class FrozenBatonPlanner(nn.Module):
         current_images: torch.Tensor,
         instructions: Sequence[str],
         *,
-        counterfactual_instructions: Sequence[str] | None = None,
         return_attention: bool = False,
     ) -> BatonSemanticPlan:
-        """Predict full grids, optionally tracing attention and instruction sensitivity."""
+        """Predict full grids, optionally tracing Baton cross-attention."""
 
         if type(return_attention) is not bool:
             raise TypeError("return_attention must be a boolean")
-        batch_size, positive, negative = self._validate_inputs(
+        batch_size, positive = self._validate_inputs(
             current_images,
             instructions,
-            counterfactual_instructions,
         )
         self._freeze_for_inference()
-        instruction_sets = (positive,) if negative is None else (positive, negative)
-        qwen_inputs, plan_positions, camera_ids = self._build_rows(
+        qwen_inputs, plan_positions = self._build_rows(
             current_images,
-            instruction_sets,
+            positive,
         )
-        rows = batch_size * 2 * len(instruction_sets)
+        rows = batch_size * 2
         with self._autocast_context():
             output = self.planner.forward_rows(
                 qwen_inputs,
                 plan_positions,
-                camera_ids,
                 return_attention_maps=return_attention,
             )
         flat, raw_maps = self._validate_output(
@@ -838,24 +797,13 @@ class FrozenBatonPlanner(nn.Module):
             rows=rows,
             return_attention=return_attention,
         )
-        positive_rows = batch_size * 2
-        tokens = flat[:positive_rows].reshape(
+        tokens = flat.reshape(
             self.geometry.output_shape(batch_size)
         )
-        sensitivity = None
-        if negative is not None:
-            negative_tokens = flat[positive_rows:].reshape(
-                self.geometry.output_shape(batch_size)
-            )
-            sensitivity = 1.0 - F.cosine_similarity(
-                tokens.float(),
-                negative_tokens.float(),
-                dim=-1,
-            )
         attention_maps = None
         if raw_maps is not None:
             attention_maps = tuple(
-                attention[:positive_rows].reshape(
+                attention.reshape(
                     batch_size,
                     2,
                     self.geometry.tokens_per_camera,
@@ -875,7 +823,5 @@ class FrozenBatonPlanner(nn.Module):
                 if attention_maps is None
                 else tuple(value.detach() for value in attention_maps)
             ),
-            instruction_sensitivity=(
-                None if sensitivity is None else sensitivity.detach()
-            ),
+            instruction_sensitivity=None,
         )

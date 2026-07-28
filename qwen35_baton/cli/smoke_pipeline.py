@@ -52,24 +52,36 @@ _GE_ACT_ROOT = _REPOSITORY_ROOT / "ge_act"
 if str(_GE_ACT_ROOT) not in sys.path:
     sys.path.insert(0, str(_GE_ACT_ROOT))
 
-from models.ltx_models.baton_semantic_planner import (  # noqa: E402
-    FrozenDualCameraBatonPlanner,
-)
-from runner.ge_trainer import (  # noqa: E402
-    BATON_PREDICTION_SOURCE,
-    BATON_TEACHER_SOURCE,
-    BatonConditioningComponents,
-    EpochSeededRandomSampler,
-    TrainingCursor,
-    advance_training_cursor,
-    build_baton_semantic_condition,
-    build_optimizer_parameter_groups,
-    forward_baton_ge_act,
-    load_baton_training_checkpoint,
-    save_baton_training_checkpoint,
-    set_dataloader_epoch,
-    strict_load_baton_stage3_diffusion_model,
-)
+BATON_PREDICTION_SOURCE = "qwen35_baton_prediction"
+BATON_TEACHER_SOURCE = "qwen35_baton_teacher"
+
+
+def _load_ge_act_interfaces() -> None:
+    """Load the optional GE-Act stack only when the full smoke actually runs."""
+
+    global FrozenDualCameraBatonPlanner
+    global BatonConditioningComponents, EpochSeededRandomSampler, TrainingCursor
+    global advance_training_cursor, build_baton_semantic_condition
+    global build_optimizer_parameter_groups, forward_baton_ge_act
+    global load_baton_training_checkpoint, save_baton_training_checkpoint
+    global set_dataloader_epoch, strict_load_baton_stage3_diffusion_model
+
+    from models.ltx_models.baton_semantic_planner import (
+        FrozenDualCameraBatonPlanner,
+    )
+    from runner.ge_trainer import (
+        BatonConditioningComponents,
+        EpochSeededRandomSampler,
+        TrainingCursor,
+        advance_training_cursor,
+        build_baton_semantic_condition,
+        build_optimizer_parameter_groups,
+        forward_baton_ge_act,
+        load_baton_training_checkpoint,
+        save_baton_training_checkpoint,
+        set_dataloader_epoch,
+        strict_load_baton_stage3_diffusion_model,
+    )
 
 
 _SAMPLER_SEED = 42
@@ -212,30 +224,32 @@ class _TinyQwenBackbone(nn.Module):
 
 class _TinyQueryTower(nn.Module):
     qwen_dim = 8
-    query_dim = 1024
     num_frames = 4
     tokens_per_frame = 256
-    num_cameras = 2
 
     def __init__(self) -> None:
         super().__init__()
         self.scale = nn.Parameter(torch.tensor(0.75))
-        self.camera_embeddings = nn.Embedding(2, 1024)
 
     def forward(
         self,
         qwen_states: torch.Tensor,
-        camera_ids: torch.Tensor,
         *,
         return_attention_maps: bool,
     ) -> QueryTowerOutput:
-        hidden = qwen_states.mean(dim=-1, keepdim=True).expand(
-            -1, -1, -1, 1024
-        )
-        camera = self.camera_embeddings(camera_ids)[:, None, None]
         return QueryTowerOutput(
-            hidden_states=hidden * self.scale + camera,
-            cross_attention_maps=() if return_attention_maps else None,
+            hidden_states=qwen_states * self.scale,
+            cross_attention_maps=(
+                (
+                    torch.full(
+                        (qwen_states.shape[0], 1024, 1024),
+                        1.0 / 1024,
+                        device=qwen_states.device,
+                    ),
+                )
+                if return_attention_maps
+                else None
+            ),
         )
 
 
@@ -246,7 +260,11 @@ class _TinySemanticProjection(nn.Module):
         self.bias = nn.Parameter(torch.tensor(0.01))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return hidden_states * self.scale + self.bias
+        values = hidden_states.mean(dim=-1, keepdim=True)
+        return (values * self.scale + self.bias).expand(
+            *hidden_states.shape[:-1],
+            1024,
+        )
 
 
 class _TinyGeActModel(nn.Module):
@@ -446,9 +464,9 @@ def _make_teacher() -> FrozenSiglip2Teacher:
 def _stage1_batch() -> BatonPlannerBatch:
     rank_offset = _rank()
     plan_pad_id = 105
-    input_ids = torch.full((4, 1025), plan_pad_id, dtype=torch.long)
-    input_ids[:, 0] = torch.tensor([10, 11, 12, 13]) + rank_offset
-    plan_positions = torch.arange(1, 1025).expand(4, -1).clone()
+    input_ids = torch.full((2, 1025), plan_pad_id, dtype=torch.long)
+    input_ids[:, 0] = torch.tensor([10, 11]) + rank_offset
+    plan_positions = torch.arange(1, 1025).expand(2, -1).clone()
     current = torch.arange(1 * 2 * 3 * 2 * 2, dtype=torch.uint8).reshape(
         1, 2, 3, 2, 2
     ) + rank_offset
@@ -465,12 +483,9 @@ def _stage1_batch() -> BatonPlannerBatch:
         current_images=current,
         future_images=future,
         instructions=("pick the red cube",),
-        negative_instructions=("place the blue cube",),
         row_labels=(
-            ("positive", 0, "main"),
-            ("positive", 0, "wrist"),
-            ("negative", 0, "main"),
-            ("negative", 0, "wrist"),
+            (0, "main"),
+            (0, "wrist"),
         ),
     )
 
@@ -528,15 +543,10 @@ def _run_stage1(
     )
     output = wrapped(batch)
     with torch.no_grad():
-        current_teacher = teacher.encode_current(batch.current_images)
         future_teacher = teacher.encode_future(batch.future_images)
-    if output.negative is None:
-        raise RuntimeError("Stage 1 did not produce the counterfactual plan")
     loss = compute_baton_planner_loss(
         output.positive,
-        output.negative,
         future_teacher,
-        current_teacher,
     )
     loss.total.backward()
     torch.nn.utils.clip_grad_norm_(
@@ -1303,6 +1313,7 @@ def run_tiny_pipeline(
 ) -> TinyPipelineResult:
     """Run one tiny optimizer step for every Baton curriculum stage."""
 
+    _load_ge_act_interfaces()
     if verify_exact_resume and (
         not dist.is_initialized() or dist.get_world_size() != 2
     ):

@@ -66,7 +66,7 @@ class _Processor:
         assert not padding
         self.seen_texts.append(text[0])
         image_code = int(images[0][0, 0, 0].item())
-        instruction_code = 2 if "counterfactual" in text[0] else 1
+        instruction_code = 1
         input_ids = torch.tensor(
             [[image_code, instruction_code, *([PLAN_PAD_ID] * 1024)]],
             dtype=torch.long,
@@ -91,7 +91,6 @@ class _FakePlanner(nn.Module):
         self,
         qwen_inputs: Mapping[str, torch.Tensor],
         plan_positions: torch.Tensor,
-        camera_ids: torch.Tensor,
         *,
         return_attention_maps: bool = False,
     ) -> BatonPlannerOutput:
@@ -120,14 +119,10 @@ class _FakePlanner(nn.Module):
         maps = None
         if return_attention_maps:
             base = torch.arange(rows, dtype=torch.float32, device=flat.device)
-            maps = tuple(
-                base[:, None, None].expand(rows, 1024, 1024) + layer
-                for layer in range(4)
-            )
+            maps = (base[:, None, None].expand(rows, 1024, 1024),)
         return BatonPlannerOutput(
             flat=flat,
             positive=flat,
-            negative=None,
             cross_attention_maps=maps,
         )
 
@@ -162,14 +157,13 @@ def test_provider_returns_full_independent_camera_grids_and_patch_centers() -> N
     )
     assert plan.relevance is None
     assert plan.cross_attention_maps is None
-    assert plan.instruction_sensitivity is None
     assert plan.tokens[0, 0, 0, 0, 0].item() == 3
     assert plan.tokens[0, 1, 0, 0, 0].item() == 7
     assert planner.forward_calls == 1
     assert planner.attention_flags == [False]
 
 
-def test_counterfactual_sensitivity_uses_one_combined_no_grad_forward() -> None:
+def test_attention_trace_uses_one_positive_only_no_grad_forward() -> None:
     planner = _FakePlanner()
     provider = FrozenBatonPlanner(
         planner=planner,
@@ -180,39 +174,17 @@ def test_counterfactual_sensitivity_uses_one_combined_no_grad_forward() -> None:
     plan = provider.predict(
         _images(batch_size=1),
         ("pick cup",),
-        counterfactual_instructions=("counterfactual instruction",),
         return_attention=True,
     )
 
-    expected_main = 1 - torch.nn.functional.cosine_similarity(
-        torch.tensor([3.0, 1.0]),
-        torch.tensor([3.0, 2.0]),
-        dim=0,
-    )
-    expected_wrist = 1 - torch.nn.functional.cosine_similarity(
-        torch.tensor([7.0, 1.0]),
-        torch.tensor([7.0, 2.0]),
-        dim=0,
-    )
-    assert plan.instruction_sensitivity is not None
-    assert plan.instruction_sensitivity.shape == (1, 2, 4, 256)
-    torch.testing.assert_close(
-        plan.instruction_sensitivity[0, 0],
-        torch.full((4, 256), expected_main),
-    )
-    torch.testing.assert_close(
-        plan.instruction_sensitivity[0, 1],
-        torch.full((4, 256), expected_wrist),
-    )
     assert plan.cross_attention_maps is not None
-    assert len(plan.cross_attention_maps) == 4
+    assert len(plan.cross_attention_maps) == 1
     assert all(value.shape == (1, 2, 1024, 1024) for value in plan.cross_attention_maps)
     assert planner.forward_calls == 1
     assert planner.attention_flags == [True]
     assert planner.grad_enabled == [False]
     assert planner.autocast_enabled == [False]
     assert not plan.tokens.requires_grad
-    assert not plan.instruction_sensitivity.requires_grad
 
 
 class _Bf16QwenBase(nn.Module):
@@ -238,10 +210,8 @@ class _Bf16Qwen(nn.Module):
 
 class _MixedDtypeQueryTower(nn.Module):
     qwen_dim = 2
-    query_dim = 1024
     num_frames = 4
     tokens_per_frame = 256
-    num_cameras = 2
 
     def __init__(self) -> None:
         super().__init__()
@@ -252,11 +222,10 @@ class _MixedDtypeQueryTower(nn.Module):
     def forward(
         self,
         qwen_states: torch.Tensor,
-        camera_ids: torch.Tensor,
         *,
         return_attention_maps: bool = False,
     ) -> QueryTowerOutput:
-        del camera_ids, return_attention_maps
+        del return_attention_maps
         self.grad_enabled.append(torch.is_grad_enabled())
         self.autocast_enabled.append(
             torch.is_autocast_enabled(qwen_states.device.type)
@@ -340,21 +309,15 @@ def test_provider_rejects_malformed_inputs(
 
 
 @pytest.mark.parametrize(
-    ("instructions", "counterfactuals", "message"),
+    ("instructions", "message"),
     [
-        ("pick", None, "sequence"),
-        (b"pick", None, "sequence"),
-        (("pick", "pick", "pick", " "), None, "nonblank"),
-        (
-            ("pick", "pick", "pick", "pick"),
-            ("pick", "wrong", "wrong", "wrong"),
-            "must differ",
-        ),
+        ("pick", "sequence"),
+        (b"pick", "sequence"),
+        (("pick", "pick", "pick", " "), "nonblank"),
     ],
 )
-def test_provider_rejects_scalar_blank_or_equal_instruction_inputs(
+def test_provider_rejects_scalar_or_blank_instruction_inputs(
     instructions: Any,
-    counterfactuals: Any,
     message: str,
 ) -> None:
     provider = FrozenBatonPlanner(
@@ -367,7 +330,6 @@ def test_provider_rejects_scalar_blank_or_equal_instruction_inputs(
         provider.predict(
             _images(batch_size=4),
             instructions,
-            counterfactual_instructions=counterfactuals,
         )
 
 

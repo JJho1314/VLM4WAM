@@ -14,6 +14,7 @@ from qwen35_baton.cli.visualize_attention import (
 )
 from qwen35_baton.provider import BatonSemanticPlan
 from qwen35_baton.visualization import (
+    query_cross_attention_focus,
     render_attention_panels,
     summarize_query_cross_attention,
 )
@@ -26,24 +27,24 @@ def _positions(batch_size: int = 1) -> torch.Tensor:
     return grid.expand(batch_size, 2, 4, 256, 2).contiguous()
 
 
-def _plan(*, sensitivity: torch.Tensor | None = None) -> BatonSemanticPlan:
-    if sensitivity is None:
-        sensitivity = torch.arange(2048, dtype=torch.float32).reshape(1, 2, 4, 256)
-    maps = tuple(
-        torch.full((1, 2, 1024, 1024), float(layer + 1))
-        for layer in range(4)
-    )
+def _attention_maps() -> tuple[torch.Tensor, ...]:
+    keys = torch.arange(1024, dtype=torch.float32)
+    queries = torch.arange(1024, dtype=torch.float32)
+    logits = -((queries[:, None] - keys[None]) / 32.0).square()
+    attention = torch.softmax(logits, dim=-1)
+    return (attention[None, None].expand(1, 2, -1, -1).contiguous(),)
+
+
+def _plan(*, with_attention: bool = True) -> BatonSemanticPlan:
     return BatonSemanticPlan(
         tokens=torch.zeros(1, 2, 4, 256, 1024),
         future_indices=(0, 3, 5, 8),
         positions_xy=_positions(),
-        cross_attention_maps=maps,
-        instruction_sensitivity=sensitivity,
+        cross_attention_maps=_attention_maps() if with_attention else None,
     )
 
 
-def test_cross_attention_summary_averages_layer_and_head_then_sums_key_blocks() -> None:
-    # Two layers x two heads. Their elementwise mean is the literal matrix below.
+def test_cross_attention_summary_averages_head_then_sums_key_blocks() -> None:
     mean = torch.tensor(
         [
             [1.0, 2.0, 3.0, 4.0],
@@ -52,11 +53,8 @@ def test_cross_attention_summary_averages_layer_and_head_then_sums_key_blocks() 
             [13.0, 14.0, 15.0, 16.0],
         ]
     )
-    maps = tuple(
-        torch.stack((mean - 2.0 + layer, mean + layer), dim=0)[
-            None, None
-        ]
-        for layer in (0.0, 2.0)
+    maps = (
+        torch.stack((mean - 1.0, mean + 1.0), dim=0)[None, None],
     )
 
     summary = summarize_query_cross_attention(
@@ -67,6 +65,28 @@ def test_cross_attention_summary_averages_layer_and_head_then_sums_key_blocks() 
 
     expected = torch.tensor([[[[7.0, 11.0], [23.0, 27.0]]]])
     torch.testing.assert_close(summary, expected)
+
+
+def test_query_focus_is_normalized_per_query_attention_entropy() -> None:
+    uniform = torch.full((1, 2, 8, 8), 1.0 / 8)
+    peaked = uniform.clone()
+    peaked[:, :, 0] = 0
+    peaked[:, :, 0, 0] = 1
+
+    focus = query_cross_attention_focus(
+        (peaked,),
+        num_frames=2,
+        tokens_per_frame=4,
+    )
+
+    assert focus.shape == (1, 2, 2, 4)
+    torch.testing.assert_close(focus[:, :, 0, 0], torch.ones(1, 2))
+    torch.testing.assert_close(
+        focus[:, :, 0, 1:],
+        torch.zeros(1, 2, 3),
+        atol=1e-6,
+        rtol=0,
+    )
 
 
 def test_attention_visualization_writes_one_panel_per_camera_and_raw_npz(
@@ -81,63 +101,31 @@ def test_attention_visualization_writes_one_panel_per_camera_and_raw_npz(
         )[None],
         "instructions": ("pick up the blue cup",),
     }
-    plan = _plan()
 
-    paths = render_attention_panels(sample, plan, output_dir=tmp_path)
+    paths = render_attention_panels(sample, _plan(), output_dir=tmp_path)
 
     assert [path.name for path in paths] == [
         "sample_000_main.png",
         "sample_000_wrist.png",
     ]
-    assert all(path.stat().st_size > 0 for path in paths)
     for camera, path in zip(("main", "wrist"), paths, strict=True):
         with Image.open(path) as image:
             assert image.width > sample["current_images"].shape[-1] * 4
             assert image.info["camera"] == camera
-            assert (
-                image.info["heatmap_label"]
-                == "instruction-conditioned query sensitivity"
-            )
-            assert image.info["aggregation"] == (
-                "display: per-keyframe min-max; Query Tower: mean layer/head, "
-                "sum keys per Qwen plan block"
-            )
-            assert "bounding" not in " ".join(image.info.values()).lower()
+            assert image.info["heatmap_label"] == "VLM planner cross-attention focus"
+            assert "normalized query entropy" in image.info["aggregation"]
 
-    archive_path = tmp_path / "sample_000_attention.npz"
-    assert archive_path.is_file()
-    with np.load(archive_path) as archive:
+    with np.load(tmp_path / "sample_000_attention.npz") as archive:
         assert set(archive.files) == {
-            "instruction_sensitivity",
+            "query_attention_focus",
             "query_tower_frame_attention",
             "future_indices",
         }
-        np.testing.assert_array_equal(
-            archive["instruction_sensitivity"],
-            plan.instruction_sensitivity[0].numpy(),
-        )
+        assert archive["query_attention_focus"].shape == (2, 4, 256)
         assert archive["query_tower_frame_attention"].shape == (2, 4, 4)
         np.testing.assert_array_equal(
             archive["future_indices"],
             np.array([0, 3, 5, 8], dtype=np.int64),
-        )
-
-
-def test_display_normalization_does_not_modify_raw_saved_sensitivity(
-    tmp_path: Path,
-) -> None:
-    raw = torch.full((1, 2, 4, 256), 7.5)
-    sample = {
-        "current_images": torch.zeros(1, 2, 3, 8, 8, dtype=torch.uint8),
-        "instructions": ("pick",),
-    }
-
-    render_attention_panels(sample, _plan(sensitivity=raw), output_dir=tmp_path)
-
-    with np.load(tmp_path / "sample_000_attention.npz") as archive:
-        np.testing.assert_array_equal(
-            archive["instruction_sensitivity"],
-            np.full((2, 4, 256), 7.5, dtype=np.float32),
         )
 
 
@@ -149,8 +137,8 @@ def test_display_normalization_does_not_modify_raw_saved_sensitivity(
                 "current_images": torch.zeros(1, 2, 3, 8, 8, dtype=torch.uint8),
                 "instructions": ("pick",),
             },
-            _plan(sensitivity=None),
-            "",
+            _plan(with_attention=False),
+            "cross-attention",
         ),
         (
             {
@@ -168,116 +156,52 @@ def test_attention_visualization_rejects_malformed_inputs(
     message: str,
     tmp_path: Path,
 ) -> None:
-    if not message:
-        plan = BatonSemanticPlan(
-            tokens=plan.tokens,
-            future_indices=plan.future_indices,
-            positions_xy=plan.positions_xy,
-            cross_attention_maps=plan.cross_attention_maps,
-            instruction_sensitivity=None,
-        )
-        message = "instruction sensitivity"
-
     with pytest.raises((TypeError, ValueError), match=message):
         render_attention_panels(sample, plan, output_dir=tmp_path)
 
 
-def test_visualization_cli_fails_closed_before_checkpoint_load_on_bad_batch(
+def _cli_args(tmp_path: Path, instructions: Path) -> list[str]:
+    return [
+        "--checkpoint",
+        str(tmp_path / "checkpoint"),
+        "--qwen-model-path",
+        str(tmp_path / "qwen"),
+        "--qwen-tokenizer-path",
+        str(tmp_path / "tokenizer"),
+        "--qwen-processor-path",
+        str(tmp_path / "processor"),
+        "--siglip2-model-path",
+        str(tmp_path / "siglip2"),
+        "--expected-planner-topology",
+        str(tmp_path / "topology.json"),
+        "--input-npz",
+        str(tmp_path / "input.npz"),
+        "--instructions-json",
+        str(instructions),
+        "--output-dir",
+        str(tmp_path / "output"),
+    ]
+
+
+def test_visualization_cli_validates_batch_before_checkpoint_load(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    input_path = tmp_path / "input.npz"
     np.savez_compressed(
-        input_path,
+        tmp_path / "input.npz",
         current_images=np.zeros((2, 2, 3, 8, 8), dtype=np.uint8),
     )
     instructions = tmp_path / "instructions.json"
-    counterfactuals = tmp_path / "counterfactuals.json"
-    instructions.write_text('["pick", "place"]')
-    counterfactuals.write_text('["wrong"]')
-
-    def forbidden_load(*args: object, **kwargs: object) -> object:
-        raise AssertionError("checkpoint loading must follow input validation")
-
+    instructions.write_text('["pick"]')
     monkeypatch.setattr(
         "qwen35_baton.cli.visualize_attention.FrozenBatonPlanner.from_checkpoint",
-        forbidden_load,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("checkpoint loading must follow input validation")
+        ),
     )
 
     with pytest.raises(ValueError, match="batch sizes"):
-        visualize_main(
-            [
-                "--checkpoint",
-                str(tmp_path / "checkpoint"),
-                "--qwen-model-path",
-                str(tmp_path / "qwen"),
-                "--qwen-tokenizer-path",
-                str(tmp_path / "tokenizer"),
-                "--qwen-processor-path",
-                str(tmp_path / "processor"),
-                "--siglip2-model-path",
-                str(tmp_path / "siglip2"),
-                "--expected-planner-topology",
-                str(tmp_path / "topology.json"),
-                "--input-npz",
-                str(input_path),
-                "--instructions-json",
-                str(instructions),
-                "--counterfactual-instructions-json",
-                str(counterfactuals),
-                "--output-dir",
-                str(tmp_path / "output"),
-            ]
-        )
-
-
-def test_visualization_cli_rejects_equal_counterfactual_before_checkpoint_load(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    input_path = tmp_path / "input.npz"
-    np.savez_compressed(
-        input_path,
-        current_images=np.zeros((1, 2, 3, 8, 8), dtype=np.uint8),
-    )
-    instructions = tmp_path / "instructions.json"
-    counterfactuals = tmp_path / "counterfactuals.json"
-    instructions.write_text('["pick"]')
-    counterfactuals.write_text('["pick"]')
-
-    def forbidden_load(*args: object, **kwargs: object) -> object:
-        raise AssertionError("checkpoint loading must follow instruction validation")
-
-    monkeypatch.setattr(
-        "qwen35_baton.cli.visualize_attention.FrozenBatonPlanner.from_checkpoint",
-        forbidden_load,
-    )
-
-    with pytest.raises(ValueError, match="must differ"):
-        visualize_main(
-            [
-                "--checkpoint",
-                str(tmp_path / "checkpoint"),
-                "--qwen-model-path",
-                str(tmp_path / "qwen"),
-                "--qwen-tokenizer-path",
-                str(tmp_path / "tokenizer"),
-                "--qwen-processor-path",
-                str(tmp_path / "processor"),
-                "--siglip2-model-path",
-                str(tmp_path / "siglip2"),
-                "--expected-planner-topology",
-                str(tmp_path / "topology.json"),
-                "--input-npz",
-                str(input_path),
-                "--instructions-json",
-                str(instructions),
-                "--counterfactual-instructions-json",
-                str(counterfactuals),
-                "--output-dir",
-                str(tmp_path / "output"),
-            ]
-        )
+        visualize_main(_cli_args(tmp_path, instructions))
 
 
 def test_visualization_cli_rejects_float16_dtype_choice(
@@ -300,8 +224,6 @@ def test_visualization_cli_rejects_float16_dtype_choice(
                 "input.npz",
                 "--instructions-json",
                 "instructions.json",
-                "--counterfactual-instructions-json",
-                "counterfactuals.json",
                 "--output-dir",
                 "output",
                 "--dtype",
@@ -316,44 +238,24 @@ def test_visualization_cli_rejects_indexed_cpu_before_checkpoint_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    input_path = tmp_path / "input.npz"
     np.savez_compressed(
-        input_path,
+        tmp_path / "input.npz",
         current_images=np.zeros((1, 2, 3, 8, 8), dtype=np.uint8),
     )
     instructions = tmp_path / "instructions.json"
-    counterfactuals = tmp_path / "counterfactuals.json"
     instructions.write_text('["pick"]')
-    counterfactuals.write_text('["place"]')
     monkeypatch.setattr(
         provider_module,
         "_validate_checkpoint_envelope",
         lambda _: (_ for _ in ()).throw(
-            AssertionError("CLI device validation must precede checkpoint access")
+            AssertionError("device validation must precede checkpoint access")
         ),
     )
 
     with pytest.raises(ValueError, match="canonical CPU device"):
         visualize_main(
             [
-                "--checkpoint",
-                str(tmp_path / "checkpoint"),
-                "--qwen-model-path",
-                str(tmp_path / "qwen"),
-                "--qwen-tokenizer-path",
-                str(tmp_path / "tokenizer"),
-                "--qwen-processor-path",
-                str(tmp_path / "processor"),
-                "--siglip2-model-path",
-                str(tmp_path / "siglip2"),
-                "--input-npz",
-                str(input_path),
-                "--instructions-json",
-                str(instructions),
-                "--counterfactual-instructions-json",
-                str(counterfactuals),
-                "--output-dir",
-                str(tmp_path / "output"),
+                *_cli_args(tmp_path, instructions),
                 "--device",
                 "cpu:0",
                 "--dtype",

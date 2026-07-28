@@ -368,9 +368,8 @@ Expected: FAIL on stale negative/loss/tower assumptions, never on HDF5 decoding.
 
 Change `smoke_pipeline.py` fake batches and fake planner outputs to the
 positive-only `BatonPlannerBatch`/`BatonPlannerOutput` signatures. Change
-`provider.py` only where it constructs planner outputs; retain its optional
-counterfactual visualization forward as an inference analysis tool outside the
-training path.
+`provider.py` where it constructs planner outputs and retain only direct Baton
+cross-attention tracing as the inference analysis path.
 
 - [ ] **Step 4: Run the complete Baton suite**
 

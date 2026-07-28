@@ -45,11 +45,11 @@ class BatonGeometry:
     patch_size: int = 16
     grid_size: int = 16
     feature_dim: int = 1024
-    query_dim: int = 1024
-    query_layers: int = 4
+    query_dim: int = 2048
+    query_layers: int = 1
     query_heads: int = 16
-    query_ffn_dim: int = 4096
-    query_dropout: float = 0.1
+    query_ffn_dim: int = 0
+    query_dropout: float = 0.0
 
     def __post_init__(self) -> None:
         _require_equal("camera_names", self.camera_names, ("main", "wrist"))
@@ -58,11 +58,11 @@ class BatonGeometry:
         _require_equal("patch_size", self.patch_size, 16)
         _require_equal("grid_size", self.grid_size, 16)
         _require_equal("feature_dim", self.feature_dim, 1024)
-        _require_equal("query_dim", self.query_dim, 1024)
-        _require_equal("query_layers", self.query_layers, 4)
+        _require_equal("query_dim", self.query_dim, 2048)
+        _require_equal("query_layers", self.query_layers, 1)
         _require_equal("query_heads", self.query_heads, 16)
-        _require_equal("query_ffn_dim", self.query_ffn_dim, 4096)
-        _require_equal("query_dropout", self.query_dropout, 0.1)
+        _require_equal("query_ffn_dim", self.query_ffn_dim, 0)
+        _require_equal("query_dropout", self.query_dropout, 0.0)
 
     @property
     def tokens_per_frame(self) -> int:
@@ -86,11 +86,11 @@ class BatonGeometry:
 class BatonCheckpointMetadata:
     """Serialized compatibility contract for a continuous Baton checkpoint."""
 
-    FORMAT_VERSION: ClassVar[int] = 2
+    FORMAT_VERSION: ClassVar[int] = 3
     ARCHITECTURE_KIND: ClassVar[str] = "qwen35_baton_continuous"
     QWEN_BACKBONE: ClassVar[str] = "dense Qwen3.5-2B"
     SIGLIP2_MODEL: ClassVar[str] = "SigLIP2-large-patch16-256"
-    QUERY_NORM_STYLE: ClassVar[str] = "pre_norm"
+    QUERY_NORM_STYLE: ClassVar[str] = "none"
     _REQUIRED_FIELDS: ClassVar[tuple[str, ...]] = (
         "format_version",
         "architecture_kind",
@@ -219,7 +219,11 @@ class BatonCheckpointMetadata:
         _require_equal("query_ffn_dim", self.query_ffn_dim, geometry.query_ffn_dim)
         _require_equal("query_dropout", self.query_dropout, geometry.query_dropout)
         _require_equal("query_norm_style", self.query_norm_style, self.QUERY_NORM_STYLE)
-        _require_equal("query_mask_version", self.query_mask_version, "block_causal_v1")
+        _require_equal(
+            "query_mask_version",
+            self.query_mask_version,
+            "full_cross_attention_v1",
+        )
         _require_equal(
             "trainable_qwen_layer_indices",
             self.trainable_qwen_layer_indices,
@@ -276,7 +280,7 @@ class BatonCheckpointMetadata:
             query_ffn_dim=geometry.query_ffn_dim,
             query_dropout=geometry.query_dropout,
             query_norm_style=cls.QUERY_NORM_STYLE,
-            query_mask_version="block_causal_v1",
+            query_mask_version="full_cross_attention_v1",
             trainable_qwen_layer_indices=tuple(range(24)),
             loss_weights={"mse": 1.0},
             hdf5_manifest_hash=_example_sha256("hdf5-manifest"),
@@ -301,9 +305,13 @@ class BatonCheckpointMetadata:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> BatonCheckpointMetadata:
-        if isinstance(payload, Mapping) and payload.get("format_version") == 1:
+        if (
+            isinstance(payload, Mapping)
+            and payload.get("format_version") in (1, 2)
+        ):
             raise ValueError(
-                "Baton checkpoint format version 1 is incompatible with version 2"
+                "Baton checkpoint format versions 1 and 2 are incompatible "
+                "with strict Baton version 3"
             )
         _require_keys(payload, cls._REQUIRED_FIELDS)
         values = {name: payload[name] for name in cls._REQUIRED_FIELDS}

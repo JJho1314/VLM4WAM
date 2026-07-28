@@ -1111,7 +1111,7 @@ def test_loader_rejects_format_v1_checkpoint_before_mutation(
     planner, optimizer, scheduler = _runtime(seed=99)
     before = _clone_state(planner)
 
-    with pytest.raises(ValueError, match="format version 1.*incompatible.*version 2"):
+    with pytest.raises(ValueError, match="versions 1 and 2.*version 3"):
         load_baton_checkpoint(
             checkpoint,
             planner=planner,
