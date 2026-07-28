@@ -78,7 +78,7 @@ class Stage1TrainingConfig:
     hdf5_manifest_hash: str
     dataset_statistics_path: str
     per_device_batch: int = 2
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 1
     max_steps: int = 30_000
     warmup_steps: int = 1_000
     save_every: int = 5_000
@@ -88,6 +88,8 @@ class Stage1TrainingConfig:
     weight_decay: float = 0.01
     gradient_clip_norm: float = 1.0
     mixed_precision: str = "bf16"
+    gradient_checkpointing: bool = False
+    deepspeed_config_path: str = "qwen35_baton/configs/deepspeed_zero2.json"
     num_workers: int = 4
     seed: int = 42
     resume_from: str | None = None
@@ -126,6 +128,15 @@ class Stage1TrainingConfig:
             raise ValueError("warmup_steps must be in [0,max_steps)")
         if type(self.num_workers) is not int or self.num_workers < 0:
             raise ValueError("num_workers must be a non-negative integer")
+        if self.gradient_accumulation_steps != 1:
+            raise ValueError("gradient_accumulation_steps must be exactly 1")
+        if type(self.gradient_checkpointing) is not bool:
+            raise ValueError("gradient_checkpointing must be boolean")
+        if (
+            not isinstance(self.deepspeed_config_path, str)
+            or not self.deepspeed_config_path
+        ):
+            raise ValueError("deepspeed_config_path must be a nonempty string")
         if type(self.seed) is not int or self.seed < 0:
             raise ValueError("seed must be a non-negative integer")
         if self.mixed_precision not in ({"no", "bf16"} if self.tiny_test else {"bf16"}):
@@ -202,7 +213,7 @@ def validate_global_batch(
     world_size: int,
     gradient_accumulation_steps: int,
 ) -> int:
-    """Require the approved effective global batch, with no silent adjustment."""
+    """Report the effective batch without silently changing its factors."""
 
     values = {
         "per_device_batch": per_device_batch,
@@ -212,12 +223,6 @@ def validate_global_batch(
     if any(type(value) is not int or value <= 0 for value in values.values()):
         raise ValueError("global batch factors must be positive integers")
     effective = per_device_batch * world_size * gradient_accumulation_steps
-    if effective != 128:
-        raise ValueError(
-            "Stage-1 effective global batch must be exactly 128, "
-            f"got {per_device_batch} * {world_size} * "
-            f"{gradient_accumulation_steps} = {effective}"
-        )
     return effective
 
 
@@ -671,6 +676,27 @@ def _synchronize_device(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _configure_gradient_checkpointing(
+    planner: nn.Module,
+    *,
+    enabled: bool,
+) -> None:
+    backbone = getattr(planner, "backbone", None)
+    if not isinstance(backbone, nn.Module):
+        raise ValueError("Baton planner must expose its Qwen backbone")
+    method_name = (
+        "gradient_checkpointing_enable"
+        if enabled
+        else "gradient_checkpointing_disable"
+    )
+    method = getattr(backbone, method_name, None)
+    if not callable(method):
+        raise RuntimeError(
+            f"Qwen backbone does not expose public {method_name}()"
+        )
+    method()
+
+
 def _average_metrics(
     accelerator: Any,
     sums: Mapping[str, float],
@@ -851,9 +877,23 @@ def run_training(
         preflight_stage1(config.to_dict(), world_size=world_size)
         artifacts = load_local_artifacts(config)
         assert isinstance(artifacts, Stage1TrainingArtifacts)
+    if not config.tiny_test:
+        _configure_gradient_checkpointing(
+            artifacts.planner,
+            enabled=config.gradient_checkpointing,
+        )
 
     from accelerate import Accelerator
-    from accelerate.utils import GradientAccumulationPlugin
+    from accelerate.utils import DeepSpeedPlugin, GradientAccumulationPlugin
+
+    deepspeed_plugin = None
+    if not config.tiny_test:
+        deepspeed_plugin = DeepSpeedPlugin(
+            hf_ds_config=config.deepspeed_config_path,
+            gradient_accumulation_steps=1,
+            gradient_clipping=config.gradient_clip_norm,
+            zero_stage=2,
+        )
 
     accelerator = Accelerator(
         gradient_accumulation_plugin=GradientAccumulationPlugin(
@@ -863,6 +903,7 @@ def run_training(
         mixed_precision=config.mixed_precision,
         cpu=config.tiny_test,
         step_scheduler_with_optimizer=False,
+        deepspeed_plugin=deepspeed_plugin,
     )
     validate_global_batch(
         per_device_batch=config.per_device_batch,
@@ -1202,6 +1243,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--per-device-batch", type=int)
     parser.add_argument("--gradient-accumulation-steps", type=int)
+    parser.add_argument("--deepspeed-config-path", type=str)
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--resume-from", type=str)
     return parser
 
@@ -1214,6 +1261,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         overrides["per_device_batch"] = args.per_device_batch
     if args.gradient_accumulation_steps is not None:
         overrides["gradient_accumulation_steps"] = args.gradient_accumulation_steps
+    if args.deepspeed_config_path is not None:
+        overrides["deepspeed_config_path"] = args.deepspeed_config_path
+    if args.gradient_checkpointing is not None:
+        overrides["gradient_checkpointing"] = args.gradient_checkpointing
     if args.resume_from is not None:
         overrides["resume_from"] = args.resume_from
     if overrides:

@@ -77,7 +77,7 @@ def test_continuous_metadata_round_trips_the_complete_contract() -> None:
     }
     assert payload["architecture_kind"] == "qwen35_baton_continuous"
     assert payload["qwen_backbone"] == "dense Qwen3.5-2B"
-    assert payload["trainable_qwen_layer_indices"] == list(range(16, 24))
+    assert payload["trainable_qwen_layer_indices"] == list(range(24))
     assert payload["target_shape"] == [2, 4, 256, 1024]
     assert payload["future_indices"] == [0, 3, 5, 8]
     assert payload["teacher_feature_layer"] == -2

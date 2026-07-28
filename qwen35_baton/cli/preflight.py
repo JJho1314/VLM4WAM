@@ -5,12 +5,41 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
+import importlib
 import json
 from pathlib import Path
 from typing import Any
 
 from qwen35_baton.hashing import sha256_artifact, sha256_file
 from qwen35_baton.sequence import ADDED_TOKENS
+
+
+def require_qwen35_fast_path() -> dict[str, str]:
+    """Reject the released Qwen3.5 slow fallback before loading model weights."""
+
+    modules: dict[str, Any] = {}
+    missing: list[str] = []
+    for import_name, package_name in (
+        ("fla", "flash-linear-attention"),
+        ("causal_conv1d", "causal-conv1d"),
+    ):
+        try:
+            modules[import_name] = importlib.import_module(import_name)
+        except (ImportError, OSError):
+            missing.append(package_name)
+    causal_function = getattr(modules.get("causal_conv1d"), "causal_conv1d_fn", None)
+    if "causal-conv1d" not in missing and not callable(causal_function):
+        missing.append("causal-conv1d")
+    if missing:
+        raise RuntimeError(
+            "Qwen3.5 fused fast path is unavailable. Install both "
+            "flash-linear-attention[cuda] and causal-conv1d in the training "
+            f"environment; failed: {', '.join(sorted(set(missing)))}"
+        )
+    return {
+        name: str(getattr(module, "__version__", "installed"))
+        for name, module in modules.items()
+    }
 
 
 def _load_json(path: Path, *, label: str) -> Mapping[str, Any]:
@@ -208,6 +237,23 @@ def preflight_stage1(
         Path(config.output_dir),
         (qwen, processor, tokenizer, siglip, manifest, statistics),
     )
+    deepspeed = _load_json(
+        Path(config.deepspeed_config_path),
+        label="DeepSpeed ZeRO-2 config",
+    )
+    zero = deepspeed.get("zero_optimization")
+    if (
+        not isinstance(zero, Mapping)
+        or zero.get("stage") != 2
+        or "offload_optimizer" in zero
+        or "offload_param" in zero
+        or deepspeed.get("gradient_accumulation_steps") != 1
+        or deepspeed.get("bf16") != {"enabled": True}
+    ):
+        raise ValueError(
+            "DeepSpeed config must be BF16 ZeRO-2 with accumulation 1 and no offload"
+        )
+    fast_path = require_qwen35_fast_path()
     from qwen35_baton.cli.train_semantic_planner import validate_global_batch
 
     global_batch = validate_global_batch(
@@ -224,6 +270,8 @@ def preflight_stage1(
         "siglip2_config_hash": actual_siglip_config_hash,
         "siglip2_artifact_hash": actual_siglip_artifact_hash,
         "hdf5_manifest_hash": actual_manifest_hash,
+        "qwen35_fast_path": fast_path,
+        "deepspeed_zero_stage": 2,
     }
 
 
@@ -233,6 +281,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--world-size", type=int, required=True)
     parser.add_argument("--per-device-batch", type=int)
     parser.add_argument("--gradient-accumulation-steps", type=int)
+    parser.add_argument("--deepspeed-config-path", type=str)
     return parser
 
 
@@ -248,6 +297,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         overrides["gradient_accumulation_steps"] = (
             args.gradient_accumulation_steps
         )
+    if args.deepspeed_config_path is not None:
+        overrides["deepspeed_config_path"] = args.deepspeed_config_path
     if overrides:
         config = replace(config, **overrides)
     report = preflight_stage1(config, world_size=args.world_size)
