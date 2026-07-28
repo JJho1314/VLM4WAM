@@ -80,6 +80,16 @@ def test_teacher_targets_are_detached() -> None:
     assert all(parameter.requires_grad is False for parameter in teacher.model.parameters())
 
 
+def test_teacher_to_keeps_input_device_in_sync_with_vision_model() -> None:
+    teacher, _ = make_teacher()
+
+    returned = teacher.to(torch.device("meta"))
+
+    assert returned is teacher
+    assert teacher.device == torch.device("meta")
+    assert next(teacher.model.parameters()).device == torch.device("meta")
+
+
 def test_teacher_loads_only_the_siglip2_vision_tower(monkeypatch) -> None:
     import transformers
 

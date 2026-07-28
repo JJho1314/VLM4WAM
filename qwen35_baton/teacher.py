@@ -89,6 +89,15 @@ class FrozenSiglip2Teacher:
         self.model.requires_grad_(False)
         self.model.eval()
 
+    def to(self, device: torch.device | str) -> "FrozenSiglip2Teacher":
+        """Move the vision tower and keep preprocessing outputs on the same device."""
+
+        self.device = torch.device(device)
+        self.model.to(device=self.device, dtype=self.dtype)
+        self.model.requires_grad_(False)
+        self.model.eval()
+        return self
+
     @staticmethod
     def _as_uint8_rgb(frames: torch.Tensor) -> torch.Tensor:
         if not isinstance(frames, torch.Tensor) or frames.ndim != 4 or frames.shape[1] != 3:

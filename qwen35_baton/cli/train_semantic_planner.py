@@ -988,7 +988,10 @@ def run_training(
     )
     scheduler = artifacts.scheduler
     teacher_model = getattr(artifacts.teacher, "model", None)
-    if isinstance(teacher_model, nn.Module):
+    teacher_to = getattr(artifacts.teacher, "to", None)
+    if callable(teacher_to):
+        teacher_to(accelerator.device)
+    elif isinstance(teacher_model, nn.Module):
         teacher_model.to(accelerator.device)
         teacher_model.requires_grad_(False)
         teacher_model.eval()

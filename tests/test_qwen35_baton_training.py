@@ -88,6 +88,12 @@ class _TinyTeacher:
         self.model.requires_grad_(False)
         self.nonfinite = nonfinite
         self.output_dtype = output_dtype
+        self.move_count = 0
+
+    def to(self, device: torch.device | str) -> "_TinyTeacher":
+        self.model.to(device)
+        self.move_count += 1
+        return self
 
     def encode_future(self, images: torch.Tensor) -> torch.Tensor:
         result = self.model(images)
@@ -346,6 +352,7 @@ def test_one_tiny_stage1_step_updates_only_owned_parameters(tmp_path: Path) -> N
     assert all(
         parameter.grad is None for parameter in artifacts.teacher.model.parameters()
     )
+    assert artifacts.teacher.move_count == 1
     assert {
         "loss/total",
         "loss/mse",
