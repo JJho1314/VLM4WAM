@@ -5,6 +5,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import pickle
 import random
 import stat
 from typing import Any
@@ -27,6 +28,15 @@ from qwen35_baton.checkpoint import (
     save_baton_checkpoint,
     trusted_planner_topology_payload,
 )
+
+
+def test_rank_rng_state_uses_pickle_safe_lossless_numpy_encoding() -> None:
+    state = capture_rank_rng_state(distributed_rank=0)
+
+    assert state["numpy_state"].dtype == torch.int64
+    restored = pickle.loads(pickle.dumps(state))
+    assert torch.equal(restored["numpy_state"], state["numpy_state"])
+    assert torch.equal(restored["torch_cpu"], state["torch_cpu"])
 
 
 def test_persisted_steps_allow_adamw_lazy_state_for_unused_parameters() -> None:

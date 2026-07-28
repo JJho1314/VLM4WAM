@@ -143,7 +143,7 @@ def capture_rank_rng_state(*, distributed_rank: int) -> dict[str, Any]:
         "python_state": torch.tensor(python_state[1], dtype=torch.int64),
         "python_gauss": python_state[2],
         "numpy_bit_generator": str(numpy_state[0]),
-        "numpy_state": torch.from_numpy(numpy_state[1].copy()),
+        "numpy_state": torch.from_numpy(numpy_state[1].copy()).to(torch.int64),
         "numpy_position": int(numpy_state[2]),
         "numpy_has_gauss": int(numpy_state[3]),
         "numpy_cached_gaussian": float(numpy_state[4]),
@@ -189,7 +189,7 @@ def _validate_rank_rng_state(state: Any, *, expected_rank: int) -> None:
         or not isinstance(state["numpy_bit_generator"], str)
         or not state["numpy_bit_generator"]
         or not isinstance(numpy_state, torch.Tensor)
-        or numpy_state.dtype != torch.uint32
+        or numpy_state.dtype not in (torch.uint32, torch.int64)
         or numpy_state.ndim != 1
         or numpy_state.numel() == 0
         or type(state["numpy_position"]) is not int
