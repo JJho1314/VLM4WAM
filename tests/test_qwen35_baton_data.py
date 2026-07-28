@@ -90,24 +90,6 @@ class _BaseDataset:
         return {"video": normalized, "caption": record.caption}
 
 
-class _TwoSuiteBaseDataset(_BaseDataset):
-    def __init__(self) -> None:
-        super().__init__()
-        self.records = (
-            *self.records,
-            SimpleNamespace(
-                key="libero_spatial:000000",
-                caption="open the top drawer",
-                domain="libero_spatial",
-            ),
-            SimpleNamespace(
-                key="libero_spatial:000001",
-                caption="close the bottom drawer",
-                domain="libero_spatial",
-            ),
-        )
-
-
 @pytest.fixture
 def dataset():
     from qwen35_baton.data import BatonLiberoDataset
@@ -125,37 +107,18 @@ def test_dataset_selects_current_and_four_future_frames(dataset) -> None:
         sample["future_images"], expected_video[:, [4, 7, 9, 12]]
     )
     assert sample["suite"] == "libero_object"
-    assert sample["instruction"] != sample["negative_instruction"]
+    assert sample["instruction"] == "put the red mug on the plate"
+    assert "negative_instruction" not in sample
 
 
-def test_dataset_rejects_suites_without_an_alternative_instruction() -> None:
+def test_dataset_accepts_a_suite_with_one_instruction() -> None:
     from qwen35_baton.data import BatonLiberoDataset
 
     base = _BaseDataset()
     base.records = base.records[:1]
-    with pytest.raises(ValueError, match="at least two distinct instructions"):
-        BatonLiberoDataset(base)
-
-
-def test_dataset_negatives_never_cross_suite_boundaries() -> None:
-    from qwen35_baton.data import BatonLiberoDataset
-
-    dataset = BatonLiberoDataset(_TwoSuiteBaseDataset(), seed=7)
-    all_captions = {
-        suite: set(captions) for suite, captions in dataset.suite_to_captions.items()
-    }
-    for index in range(len(dataset)):
-        sample = dataset[index]
-        same_suite = all_captions[sample["suite"]]
-        other_suite = set().union(
-            *(
-                captions
-                for suite, captions in all_captions.items()
-                if suite != sample["suite"]
-            )
-        )
-        assert sample["negative_instruction"] in same_suite
-        assert sample["negative_instruction"] not in other_suite
+    dataset = BatonLiberoDataset(base)
+    assert len(dataset) == 1
+    assert dataset[0]["instruction"] == base.records[0].caption
 
 
 def test_plan_template_and_positions_fail_closed() -> None:
@@ -171,7 +134,7 @@ def test_plan_template_and_positions_fail_closed() -> None:
         find_plan_positions(ids, 5)
 
 
-def test_collator_orders_positive_then_negative_sample_major_rows(dataset) -> None:
+def test_collator_builds_only_positive_sample_major_camera_rows(dataset) -> None:
     from qwen35_baton.data import BatonPlannerCollator
 
     processor = _Processor()
@@ -181,28 +144,22 @@ def test_collator_orders_positive_then_negative_sample_major_rows(dataset) -> No
     plan_pad_token_id = processor.tokenizer.convert_tokens_to_ids("<PLAN_PAD>")
 
     assert batch.row_labels == (
-        ("positive", 0, "main"),
-        ("positive", 0, "wrist"),
-        ("positive", 1, "main"),
-        ("positive", 1, "wrist"),
-        ("negative", 0, "main"),
-        ("negative", 0, "wrist"),
-        ("negative", 1, "main"),
-        ("negative", 1, "wrist"),
+        (0, "main"),
+        (0, "wrist"),
+        (1, "main"),
+        (1, "wrist"),
     )
-    assert batch.plan_positions.shape == (8, 1024)
+    assert batch.qwen_inputs["input_ids"].shape[0] == 4
+    assert batch.plan_positions.shape == (4, 1024)
     assert torch.all(
         batch.qwen_inputs["input_ids"].gather(1, batch.plan_positions)
         == plan_pad_token_id
     )
     assert batch.current_images.shape == (2, 2, 3, 256, 256)
     assert batch.future_images.shape == (2, 2, 4, 3, 256, 256)
-    assert batch.positive_rows == slice(0, 4)
-    assert batch.negative_rows == slice(4, 8)
-    assert all(
-        positive != negative
-        for positive, negative in zip(batch.instructions, batch.negative_instructions)
-    )
+    assert not hasattr(batch, "negative_instructions")
+    assert not hasattr(batch, "positive_rows")
+    assert not hasattr(batch, "negative_rows")
 
     modified = dict(sample0)
     modified["current_images"] = sample0["current_images"].clone()

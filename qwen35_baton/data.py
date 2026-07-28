@@ -18,27 +18,18 @@ from qwen35_baton.sequence import PLAN_PAD, build_plan_text, find_plan_positions
 
 @dataclass(frozen=True)
 class BatonPlannerBatch:
-    """Positive and counterfactual camera rows aligned with teacher RGB."""
+    """Independent positive camera rows aligned with teacher RGB."""
 
     qwen_inputs: Mapping[str, torch.Tensor]
     plan_positions: torch.Tensor
     current_images: torch.Tensor
     future_images: torch.Tensor
     instructions: tuple[str, ...]
-    negative_instructions: tuple[str, ...]
-    row_labels: tuple[tuple[str, int, str], ...]
+    row_labels: tuple[tuple[int, str], ...]
 
     @property
     def batch_size(self) -> int:
         return len(self.instructions)
-
-    @property
-    def positive_rows(self) -> slice:
-        return slice(0, self.batch_size * 2)
-
-    @property
-    def negative_rows(self) -> slice:
-        return slice(self.batch_size * 2, self.batch_size * 4)
 
 
 class BatonLiberoDataset(Dataset[dict[str, Any]]):
@@ -68,21 +59,6 @@ class BatonLiberoDataset(Dataset[dict[str, Any]]):
                 value = getattr(record, field, None)
                 if not isinstance(value, str) or not value:
                     raise ValueError(f"manifest records require nonempty {field}")
-
-        captions: dict[str, set[str]] = {}
-        for record in records:
-            captions.setdefault(record.domain, set()).add(record.caption)
-        self.suite_to_captions = {
-            suite: tuple(sorted(values)) for suite, values in sorted(captions.items())
-        }
-        invalid = [
-            suite for suite, values in self.suite_to_captions.items() if len(values) < 2
-        ]
-        if invalid:
-            raise ValueError(
-                "each suite must contain at least two distinct instructions: "
-                + ", ".join(invalid)
-            )
 
         self.base_dataset = base_dataset
         self.records = records
@@ -115,22 +91,6 @@ class BatonLiberoDataset(Dataset[dict[str, Any]]):
 
     def _record_for_index(self, index: int) -> Any:
         return self.records[self._source_index(index)]
-
-    def _negative_instruction(self, record: Any) -> str:
-        candidates = tuple(
-            caption
-            for caption in self.suite_to_captions[record.domain]
-            if caption != record.caption
-        )
-        if not candidates:
-            raise ValueError("suite has no counterfactual instruction")
-        payload = json.dumps(
-            (self.seed, record.key, record.caption),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        choice = int.from_bytes(hashlib.sha256(payload).digest(), "big")
-        return candidates[choice % len(candidates)]
 
     def _load_base_sample(self, index: int) -> Any:
         """Run legacy stochastic transforms in an epoch/index-local RNG scope."""
@@ -201,14 +161,13 @@ class BatonLiberoDataset(Dataset[dict[str, Any]]):
             "current_images": rgb[:, self.n_previous - 1],
             "future_images": rgb[:, list(future_positions)],
             "instruction": record.caption,
-            "negative_instruction": self._negative_instruction(record),
             "suite": record.domain,
             "episode_key": record.key,
         }
 
 
 class BatonPlannerCollator:
-    """Create positive then negative, sample-major independent Qwen camera rows."""
+    """Create sample-major independent positive Qwen camera rows."""
 
     def __init__(self, processor: Any, *, plan_pad_token_id: int | None = None) -> None:
         self.processor = processor
@@ -323,40 +282,28 @@ class BatonPlannerCollator:
         ):
             raise ValueError("samples must contain uint8 [2,3,H,W] and [2,4,3,H,W] RGB")
         instructions = tuple(sample["instruction"] for sample in samples)
-        negatives = tuple(sample["negative_instruction"] for sample in samples)
         suites = tuple(sample["suite"] for sample in samples)
         if any(
             not isinstance(value, str) or not value
-            for value in instructions + negatives + suites
+            for value in instructions + suites
         ):
             raise ValueError("sample instructions and suites must be nonempty strings")
-        if any(
-            positive == negative for positive, negative in zip(instructions, negatives)
-        ):
-            raise ValueError(
-                "negative instructions must differ from positive instructions"
-            )
 
-        rows: list[tuple[str, int, str, torch.Tensor, str]] = []
-        for condition, condition_instructions in (
-            ("positive", instructions),
-            ("negative", negatives),
-        ):
-            for sample_index, instruction in enumerate(condition_instructions):
-                for camera_index, camera in enumerate(("main", "wrist")):
-                    rows.append(
-                        (
-                            condition,
-                            sample_index,
-                            camera,
-                            current_images[sample_index, camera_index],
-                            instruction,
-                        )
+        rows: list[tuple[int, str, torch.Tensor, str]] = []
+        for sample_index, instruction in enumerate(instructions):
+            for camera_index, camera in enumerate(("main", "wrist")):
+                rows.append(
+                    (
+                        sample_index,
+                        camera,
+                        current_images[sample_index, camera_index],
+                        instruction,
                     )
+                )
 
         sequences: list[torch.Tensor] = []
         processed_rows: list[Mapping[str, torch.Tensor]] = []
-        for _, _, _, image, instruction in rows:
+        for _, _, image, instruction in rows:
             sequence, processed = self._process_row(image, instruction)
             sequences.append(sequence)
             processed_rows.append(processed)
@@ -384,8 +331,7 @@ class BatonPlannerCollator:
             current_images=current_images,
             future_images=future_images,
             instructions=instructions,
-            negative_instructions=negatives,
             row_labels=tuple(
-                (condition, index, camera) for condition, index, camera, _, _ in rows
+                (index, camera) for index, camera, _, _ in rows
             ),
         )
