@@ -15,17 +15,20 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import subprocess
 import sys
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 import uuid
 
+from accelerate import Accelerator
 import numpy as np
 from safetensors.torch import save_file
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
 
 from qwen35_baton.cli.train_semantic_planner import (
     Stage1TrainingConfig,
@@ -56,12 +59,15 @@ from runner.ge_trainer import (  # noqa: E402
     BATON_PREDICTION_SOURCE,
     BATON_TEACHER_SOURCE,
     BatonConditioningComponents,
+    EpochSeededRandomSampler,
     TrainingCursor,
+    advance_training_cursor,
     build_baton_semantic_condition,
     build_optimizer_parameter_groups,
     forward_baton_ge_act,
     load_baton_training_checkpoint,
     save_baton_training_checkpoint,
+    set_dataloader_epoch,
     strict_load_baton_stage3_diffusion_model,
 )
 
@@ -127,6 +133,11 @@ class _Stage2Artifacts:
     rng_hash: str
     first_sample: tuple[int, int, int]
     rank_agreement: bool
+    accelerator: Accelerator
+    prepared_model: nn.Module
+    optimizer: torch.optim.Optimizer
+    scheduler: Any
+    dataloader_iterator: Any
 
 
 class _TinyImageProcessor:
@@ -412,8 +423,12 @@ def _rank_hash_agrees(digest: str) -> bool:
     return len(set(gathered)) == 1
 
 
-def _distributed_model(model: nn.Module) -> nn.Module:
-    if not dist.is_initialized():
+def _distributed_model(
+    model: nn.Module,
+    *,
+    synchronize_gradients: bool = True,
+) -> nn.Module:
+    if not dist.is_initialized() or not synchronize_gradients:
         return model
     return torch.nn.parallel.DistributedDataParallel(model)
 
@@ -429,17 +444,18 @@ def _make_teacher() -> FrozenSiglip2Teacher:
 
 
 def _stage1_batch() -> BatonPlannerBatch:
+    rank_offset = _rank()
     plan_pad_id = 105
     input_ids = torch.full((4, 1025), plan_pad_id, dtype=torch.long)
-    input_ids[:, 0] = torch.tensor([10, 11, 12, 13])
+    input_ids[:, 0] = torch.tensor([10, 11, 12, 13]) + rank_offset
     plan_positions = torch.arange(1, 1025).expand(4, -1).clone()
     current = torch.arange(1 * 2 * 3 * 2 * 2, dtype=torch.uint8).reshape(
         1, 2, 3, 2, 2
-    )
+    ) + rank_offset
     future = torch.arange(
         1 * 2 * 4 * 3 * 2 * 2,
         dtype=torch.uint8,
-    ).reshape(1, 2, 4, 3, 2, 2)
+    ).reshape(1, 2, 4, 3, 2, 2) + rank_offset
     return BatonPlannerBatch(
         qwen_inputs={
             "input_ids": input_ids,
@@ -482,7 +498,11 @@ def _stage1_config(output_dir: Path) -> Stage1TrainingConfig:
     )
 
 
-def _run_stage1(output_dir: Path) -> _Stage1Artifacts:
+def _run_stage1(
+    output_dir: Path,
+    *,
+    synchronize_gradients: bool,
+) -> _Stage1Artifacts:
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(101)
         planner = BatonQwen35Planner(
@@ -502,7 +522,10 @@ def _run_stage1(output_dir: Path) -> _Stage1Artifacts:
     source_before = _module_hash(teacher.model)
     trainable_before = _module_hash(planner, trainable_only=True)
     batch = _stage1_batch()
-    wrapped = _distributed_model(planner)
+    wrapped = _distributed_model(
+        planner,
+        synchronize_gradients=synchronize_gradients,
+    )
     output = wrapped(batch)
     with torch.no_grad():
         current_teacher = teacher.encode_current(batch.current_images)
@@ -670,6 +693,7 @@ def _ge_optimizer_step(
     source: str,
     *,
     sample: tuple[int, int, int] | None = None,
+    accelerator: Accelerator | None = None,
 ) -> tuple[int, int, int]:
     selected = _sample_marker() if sample is None else sample
     condition = build_baton_semantic_condition(
@@ -691,7 +715,10 @@ def _ge_optimizer_step(
     )
     latents = output["latents"]
     loss = latents["video"].square().mean() + latents["action"].square().mean()
-    loss.backward()
+    if accelerator is None:
+        loss.backward()
+    else:
+        accelerator.backward(loss)
     optimizer.step()
     scheduler.step()
     optimizer.zero_grad(set_to_none=True)
@@ -720,86 +747,6 @@ def _teacher_training_provenance() -> dict[str, str | int]:
     }
 
 
-def _training_state_payload(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: Any,
-) -> dict[str, Any]:
-    return {
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "rng": _rng_state(),
-    }
-
-
-class _CheckpointStateAdapter:
-    """Minimal Accelerate state adapter; the envelope remains production code."""
-
-    def __init__(
-        self,
-        model: nn.Module,
-        optimizer: torch.optim.Optimizer,
-        scheduler: Any,
-        *,
-        rank: int,
-        world_size: int,
-        distributed_save: bool,
-    ) -> None:
-        self.model = model
-        self.optimizer = optimizer
-        self.scheduler = scheduler
-        self.rank = rank
-        self.world_size = world_size
-        self.distributed_save = distributed_save
-        self.is_main_process = rank == 0
-
-    def wait_for_everyone(self) -> None:
-        if self.distributed_save:
-            _barrier()
-
-    def save_state(self, output_dir: str) -> None:
-        local = _training_state_payload(
-            self.model,
-            self.optimizer,
-            self.scheduler,
-        )
-        if self.distributed_save:
-            states: list[Any] = [None] * self.world_size
-            dist.all_gather_object(states, local)
-        else:
-            states = [local]
-        if self.is_main_process:
-            torch.save(
-                {"format_version": 1, "rank_states": states},
-                Path(output_dir) / "accelerator_state.pt",
-            )
-
-    def load_state(self, checkpoint_dir: str) -> None:
-        payload = torch.load(
-            Path(checkpoint_dir) / "accelerator_state.pt",
-            weights_only=False,
-            map_location="cpu",
-        )
-        states = payload.get("rank_states")
-        if (
-            payload.get("format_version") != 1
-            or not isinstance(states, list)
-            or len(states) != self.world_size
-        ):
-            raise ValueError("tiny Accelerator state has invalid rank coverage")
-        selected = states[self.rank]
-        self.model.load_state_dict(selected["model"], strict=True)
-        self.optimizer.load_state_dict(selected["optimizer"])
-        self.scheduler.load_state_dict(selected["scheduler"])
-        random.setstate(selected["rng"]["python"])
-        np.random.set_state(selected["rng"]["numpy"])
-        torch.random.set_rng_state(selected["rng"]["torch"])
-
-    def unwrap_model(self, model: nn.Module) -> nn.Module:
-        return model
-
-
 def _checkpoint_cursor(step: int) -> TrainingCursor:
     return TrainingCursor(
         global_step=step,
@@ -810,23 +757,97 @@ def _checkpoint_cursor(step: int) -> TrainingCursor:
     )
 
 
+class _Stage2SampleDataset(Dataset[int]):
+    def __len__(self) -> int:
+        return _MICROBATCHES_PER_EPOCH * max(_world_size(), 1)
+
+    def __getitem__(self, index: int) -> int:
+        return index
+
+
+def _stage2_dataloader() -> DataLoader:
+    dataset = _Stage2SampleDataset()
+    return DataLoader(
+        dataset,
+        sampler=EpochSeededRandomSampler(dataset, seed=_SAMPLER_SEED),
+        batch_size=1,
+        num_workers=0,
+        generator=torch.Generator().manual_seed(_SAMPLER_SEED),
+    )
+
+
+def _sample_from_dataloader(batch: torch.Tensor) -> tuple[int, int, int]:
+    sample_index = int(batch.reshape(-1)[0].item())
+    return (
+        sample_index * 100 + _rank(),
+        random.randrange(1000),
+        int(np.random.randint(0, 1000)) * 1000
+        + int(torch.randint(0, 1000, ()).item()),
+    )
+
+
+def _new_accelerated_stage2_state() -> tuple[
+    Accelerator,
+    nn.Module,
+    nn.Module,
+    torch.optim.Optimizer,
+    Any,
+    Any,
+]:
+    accelerator = Accelerator(
+        cpu=True,
+        step_scheduler_with_optimizer=False,
+    )
+    model = _TinyGeActModel()
+    optimizer, scheduler = _ge_optimizer(model, BATON_TEACHER_SOURCE)
+    dataloader = _stage2_dataloader()
+    prepared_model, optimizer, dataloader, scheduler = accelerator.prepare(
+        model,
+        optimizer,
+        dataloader,
+        scheduler,
+    )
+    set_dataloader_epoch(
+        dataloader,
+        epoch=0,
+        sampler_seed=_SAMPLER_SEED,
+    )
+    return (
+        accelerator,
+        model,
+        prepared_model,
+        optimizer,
+        scheduler,
+        dataloader,
+    )
+
+
 def _run_stage2(
     output_dir: Path,
     teacher: FrozenSiglip2Teacher,
 ) -> _Stage2Artifacts:
     _seed_all(_STEP_SEED)
-    model = _TinyGeActModel()
-    optimizer, scheduler = _ge_optimizer(model, BATON_TEACHER_SOURCE)
+    (
+        accelerator,
+        model,
+        prepared_model,
+        optimizer,
+        scheduler,
+        dataloader,
+    ) = _new_accelerated_stage2_state()
     components = _teacher_components(teacher)
     source_before = _module_hash(teacher.model)
     trainable_before = _module_hash(model)
-    wrapped = _distributed_model(model)
+    dataloader_iterator = iter(dataloader)
+    first_sample = _sample_from_dataloader(next(dataloader_iterator))
     first_sample = _ge_optimizer_step(
-        wrapped,
+        prepared_model,
         optimizer,
         scheduler,
         components,
         BATON_TEACHER_SOURCE,
+        sample=first_sample,
+        accelerator=accelerator,
     )
     source_after = _module_hash(teacher.model)
     trainable_after = _module_hash(model)
@@ -838,20 +859,17 @@ def _run_stage2(
     if not rank_agreement:
         raise RuntimeError("Stage-2 synchronized parameter hashes differ by rank")
 
-    cursor = _checkpoint_cursor(1)
-    adapter = _CheckpointStateAdapter(
-        model,
-        optimizer,
-        scheduler,
-        rank=_rank(),
-        world_size=_world_size(),
-        distributed_save=dist.is_initialized(),
+    cursor = advance_training_cursor(
+        _checkpoint_cursor(0),
+        epoch=0,
+        consumed_microbatches=1,
+        global_step=1,
     )
     checkpoint = save_baton_training_checkpoint(
-        adapter,
+        accelerator,
         output_dir / "stage2",
         cursor=cursor,
-        diffusion_model=model,
+        diffusion_model=accelerator.unwrap_model(prepared_model),
         source=BATON_TEACHER_SOURCE,
         training_provenance=_teacher_training_provenance(),
     )
@@ -874,39 +892,19 @@ def _run_stage2(
         rng_hash=_state_hash(_rng_state()),
         first_sample=first_sample,
         rank_agreement=rank_agreement,
+        accelerator=accelerator,
+        prepared_model=prepared_model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        dataloader_iterator=dataloader_iterator,
     )
-
-
-def _load_stage2_envelope(
-    stage2: _Stage2Artifacts,
-) -> bool:
-    model = _TinyGeActModel()
-    optimizer, scheduler = _ge_optimizer(model, BATON_TEACHER_SOURCE)
-    adapter = _CheckpointStateAdapter(
-        model,
-        optimizer,
-        scheduler,
-        rank=_rank(),
-        world_size=_world_size(),
-        distributed_save=False,
-    )
-    restored = load_baton_training_checkpoint(
-        adapter,
-        stage2.checkpoint,
-        diffusion_model=model,
-        expected_source=BATON_TEACHER_SOURCE,
-        expected_microbatches_per_epoch=_MICROBATCHES_PER_EPOCH,
-        expected_sampler_seed=_SAMPLER_SEED,
-        expected_training_provenance=_teacher_training_provenance(),
-    )
-    if restored != stage2.cursor or _module_hash(model) != stage2.artifact_hash:
-        raise RuntimeError("Stage-2 envelope restore differs from saved state")
-    return True
 
 
 def _run_stage3(
     stage2: _Stage2Artifacts,
     predicted_tokens: torch.Tensor,
+    *,
+    synchronize_gradients: bool,
 ) -> tuple[StageSmokeResult, bool, bool]:
     metadata = json.loads(
         (stage2.checkpoint / "baton_state.json").read_text(encoding="utf-8")
@@ -925,14 +923,17 @@ def _run_stage3(
     assert components.planner is not None
     source_before = _module_hash(components.planner)
     optimizer, scheduler = _ge_optimizer(model, BATON_PREDICTION_SOURCE)
-    wrapped = _distributed_model(model)
+    wrapped = _distributed_model(
+        model,
+        synchronize_gradients=synchronize_gradients,
+    )
     _ge_optimizer_step(
         wrapped,
         optimizer,
         scheduler,
         components,
         BATON_PREDICTION_SOURCE,
-        sample=(3, 5, 8),
+        sample=(3 + _rank() * 100, 5, 8),
     )
     source_after = _module_hash(components.planner)
     trainable_after = _module_hash(model)
@@ -961,39 +962,52 @@ def _run_stage3(
 
 def _resume_worker(
     checkpoint: Path,
-    result_path: Path,
-    *,
-    rank: int,
-    world_size: int,
+    result_dir: Path,
 ) -> int:
-    model = _TinyGeActModel()
-    optimizer, scheduler = _ge_optimizer(model, BATON_TEACHER_SOURCE)
-    teacher = _make_teacher()
-    adapter = _CheckpointStateAdapter(
+    _seed_all(_STEP_SEED)
+    (
+        accelerator,
         model,
+        prepared_model,
         optimizer,
         scheduler,
-        rank=rank,
-        world_size=world_size,
-        distributed_save=False,
-    )
+        dataloader,
+    ) = _new_accelerated_stage2_state()
+    teacher = _make_teacher()
     restored = load_baton_training_checkpoint(
-        adapter,
+        accelerator,
         checkpoint,
-        diffusion_model=model,
+        diffusion_model=accelerator.unwrap_model(prepared_model),
         expected_source=BATON_TEACHER_SOURCE,
         expected_microbatches_per_epoch=_MICROBATCHES_PER_EPOCH,
         expected_sampler_seed=_SAMPLER_SEED,
         expected_training_provenance=_teacher_training_provenance(),
     )
+    set_dataloader_epoch(
+        dataloader,
+        epoch=restored.epoch,
+        sampler_seed=restored.sampler_seed,
+    )
+    remaining = accelerator.skip_first_batches(
+        dataloader,
+        num_batches=restored.consumed_microbatches,
+    )
+    sample = _sample_from_dataloader(next(iter(remaining)))
     sample = _ge_optimizer_step(
-        model,
+        prepared_model,
         optimizer,
         scheduler,
         _teacher_components(teacher),
         BATON_TEACHER_SOURCE,
+        sample=sample,
+        accelerator=accelerator,
     )
-    final_cursor = _checkpoint_cursor(2)
+    final_cursor = advance_training_cursor(
+        restored,
+        epoch=restored.epoch,
+        consumed_microbatches=restored.consumed_microbatches + 1,
+        global_step=restored.global_step + 1,
+    )
     probes = [
         random.random(),
         float(np.random.rand()),
@@ -1001,32 +1015,37 @@ def _resume_worker(
     ]
     payload = {
         "pid": os.getpid(),
+        "rank": accelerator.process_index,
+        "world_size": accelerator.num_processes,
         "restored_cursor": restored.to_dict(),
         "final_cursor": final_cursor.to_dict(),
         "sample": list(sample),
-        "model_hash": _module_hash(model),
+        "model_hash": _module_hash(
+            accelerator.unwrap_model(prepared_model)
+        ),
         "optimizer_hash": _state_hash(optimizer.state_dict()),
         "scheduler_hash": _state_hash(scheduler.state_dict()),
         "probes": probes,
         "rng_hash": _state_hash(_rng_state()),
     }
-    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    result_path = result_dir / f"rank-{accelerator.process_index}.json"
     staging = result_path.with_name(f".{result_path.name}.{os.getpid()}.tmp")
     staging.write_text(
         json.dumps(payload, sort_keys=True, allow_nan=False) + "\n",
         encoding="utf-8",
     )
     os.replace(staging, result_path)
+    accelerator.wait_for_everyone()
     return 0
 
 
-def _fresh_process_resume(
+def _fresh_process_resume_command(
     checkpoint: Path,
-    result_path: Path,
+    result_dir: Path,
     *,
-    rank: int,
-    world_size: int,
-) -> Mapping[str, Any]:
+    two_rank: bool,
+) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
     for name in (
         "RANK",
@@ -1042,33 +1061,61 @@ def _fresh_process_resume(
         "TORCHELASTIC_MAX_RESTARTS",
     ):
         environment.pop(name, None)
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "qwen35_baton.cli.smoke_pipeline",
-            "--internal-resume-worker",
-            "--checkpoint",
-            str(checkpoint),
-            "--result-path",
-            str(result_path),
-            "--rank",
-            str(rank),
-            "--world-size",
-            str(world_size),
-        ],
+    worker = [
+        "-m",
+        "qwen35_baton.cli.smoke_pipeline",
+        "--internal-resume-worker",
+        "--checkpoint",
+        str(checkpoint),
+        "--result-path",
+        str(result_dir),
+    ]
+    command = [sys.executable]
+    if two_rank:
+        command.extend(
+            [
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                "--nproc_per_node=2",
+            ]
+        )
+    command.extend(worker)
+    return subprocess.run(
+        command,
         cwd=str(_REPOSITORY_ROOT),
         env=environment,
         check=False,
         capture_output=True,
         text=True,
+        timeout=90,
+    )
+
+
+def _load_stage2_envelope_in_fresh_process(
+    stage2: _Stage2Artifacts,
+    output_dir: Path,
+) -> bool:
+    result_dir = output_dir / "single-resume-worker"
+    completed = _fresh_process_resume_command(
+        stage2.checkpoint,
+        result_dir,
+        two_rank=False,
     )
     if completed.returncode:
         raise RuntimeError(
-            "fresh-process resume worker failed: "
+            "fresh-process envelope restore failed: "
             f"stdout={completed.stdout!r}, stderr={completed.stderr!r}"
         )
-    return json.loads(result_path.read_text(encoding="utf-8"))
+    resumed = json.loads(
+        (result_dir / "rank-0.json").read_text(encoding="utf-8")
+    )
+    if (
+        resumed["restored_cursor"] != stage2.cursor.to_dict()
+        or resumed["world_size"] != 1
+    ):
+        raise RuntimeError("fresh-process Stage-2 envelope restore is invalid")
+    return True
 
 
 def _verify_exact_resume(
@@ -1077,29 +1124,24 @@ def _verify_exact_resume(
 ) -> tuple[bool, bool]:
     if not dist.is_initialized() or dist.get_world_size() != 2:
         raise RuntimeError("exact distributed resume requires a real two-rank group")
-    _seed_all(_STEP_SEED)
-    model = _TinyGeActModel()
-    optimizer, scheduler = _ge_optimizer(model, BATON_TEACHER_SOURCE)
-    teacher = _make_teacher()
-    wrapped = _distributed_model(model)
-    first_sample = _ge_optimizer_step(
-        wrapped,
-        optimizer,
-        scheduler,
-        _teacher_components(teacher),
-        BATON_TEACHER_SOURCE,
+
+    second_sample = _sample_from_dataloader(
+        next(stage2.dataloader_iterator)
     )
-    if (
-        first_sample != stage2.first_sample
-        or _module_hash(model) != stage2.artifact_hash
-    ):
-        raise RuntimeError("uninterrupted first update differs from Stage-2 checkpoint")
-    second_sample = _ge_optimizer_step(
-        wrapped,
-        optimizer,
-        scheduler,
-        _teacher_components(teacher),
+    _ge_optimizer_step(
+        stage2.prepared_model,
+        stage2.optimizer,
+        stage2.scheduler,
+        _teacher_components(_make_teacher()),
         BATON_TEACHER_SOURCE,
+        sample=second_sample,
+        accelerator=stage2.accelerator,
+    )
+    final_cursor = advance_training_cursor(
+        stage2.cursor,
+        epoch=stage2.cursor.epoch,
+        consumed_microbatches=stage2.cursor.consumed_microbatches + 1,
+        global_step=stage2.cursor.global_step + 1,
     )
     baseline_probes = [
         random.random(),
@@ -1107,58 +1149,109 @@ def _verify_exact_resume(
         float(torch.rand(()).item()),
     ]
     baseline = {
-        "final_cursor": _checkpoint_cursor(2).to_dict(),
+        "rank": _rank(),
+        "final_cursor": final_cursor.to_dict(),
         "sample": list(second_sample),
-        "model_hash": _module_hash(model),
-        "optimizer_hash": _state_hash(optimizer.state_dict()),
-        "scheduler_hash": _state_hash(scheduler.state_dict()),
+        "model_hash": _module_hash(
+            stage2.accelerator.unwrap_model(stage2.prepared_model)
+        ),
+        "optimizer_hash": _state_hash(stage2.optimizer.state_dict()),
+        "scheduler_hash": _state_hash(stage2.scheduler.state_dict()),
         "probes": baseline_probes,
         "rng_hash": _state_hash(_rng_state()),
+        "parent_pid": os.getpid(),
     }
-    result_path = output_dir / "resume-workers" / f"rank-{_rank()}.json"
-    resumed = _fresh_process_resume(
-        stage2.checkpoint,
-        result_path,
-        rank=_rank(),
-        world_size=_world_size(),
+    baselines: list[Mapping[str, Any] | None] = [None] * _world_size()
+    dist.all_gather_object(baselines, baseline)
+
+    result_dir = output_dir / "resume-workers"
+    launch_status: list[dict[str, Any] | None] = [None]
+    if _rank() == 0:
+        try:
+            completed = _fresh_process_resume_command(
+                stage2.checkpoint,
+                result_dir,
+                two_rank=True,
+            )
+            if completed.returncode:
+                raise RuntimeError(
+                    "nested two-rank resume failed: "
+                    f"stdout={completed.stdout!r}, stderr={completed.stderr!r}"
+                )
+        except Exception as error:
+            launch_status[0] = {
+                "ok": False,
+                "message": str(error),
+            }
+        else:
+            launch_status[0] = {"ok": True}
+    dist.broadcast_object_list(launch_status, src=0)
+    if (
+        not isinstance(launch_status[0], dict)
+        or launch_status[0].get("ok") is not True
+    ):
+        raise RuntimeError(
+            "fresh nested resume launch failed: "
+            + str((launch_status[0] or {}).get("message", "invalid status"))
+        )
+
+    resumed_by_rank = [
+        json.loads(
+            (result_dir / f"rank-{rank}.json").read_text(encoding="utf-8")
+        )
+        for rank in range(2)
+    ]
+    complete_baselines = [
+        item for item in baselines if item is not None
+    ]
+    if len(complete_baselines) != 2:
+        raise RuntimeError("uninterrupted baseline did not report every rank")
+    baseline_by_rank = {
+        int(item["rank"]): item for item in complete_baselines
+    }
+    exact = all(
+        resumed["restored_cursor"] == stage2.cursor.to_dict()
+        and all(
+            resumed[name] == baseline_by_rank[rank][name]
+            for name in (
+                "final_cursor",
+                "sample",
+                "model_hash",
+                "optimizer_hash",
+                "scheduler_hash",
+                "probes",
+                "rng_hash",
+            )
+        )
+        for rank, resumed in enumerate(resumed_by_rank)
     )
-    expected_cursor = stage2.cursor.to_dict()
-    exact = (
-        resumed["restored_cursor"] == expected_cursor
-        and all(resumed[name] == baseline[name] for name in baseline)
+    parent_pids = {
+        int(item["parent_pid"]) for item in complete_baselines
+    }
+    fresh = all(
+        int(resumed["pid"]) not in parent_pids
+        for resumed in resumed_by_rank
     )
-    fresh = int(resumed["pid"]) != os.getpid()
-    gathered: list[Mapping[str, Any] | None] = [None] * _world_size()
-    dist.all_gather_object(
-        gathered,
-        {
-            "rank": _rank(),
-            "exact": exact,
-            "fresh": fresh,
-            "model_hash": resumed["model_hash"],
-            "optimizer_hash": resumed["optimizer_hash"],
-            "scheduler_hash": resumed["scheduler_hash"],
-            "sample": resumed["sample"],
-        },
-    )
-    if any(item is None for item in gathered):
-        raise RuntimeError("distributed resume did not report every rank")
-    complete = [item for item in gathered if item is not None]
     agreement = (
-        all(bool(item["exact"]) and bool(item["fresh"]) for item in complete)
-        and len({str(item["model_hash"]) for item in complete}) == 1
-        and len({str(item["optimizer_hash"]) for item in complete}) == 1
-        and len({str(item["scheduler_hash"]) for item in complete}) == 1
+        exact
+        and fresh
+        and [int(item["rank"]) for item in resumed_by_rank] == [0, 1]
+        and all(int(item["world_size"]) == 2 for item in resumed_by_rank)
+        and len({str(item["model_hash"]) for item in resumed_by_rank}) == 1
+        and len({str(item["optimizer_hash"]) for item in resumed_by_rank}) == 1
+        and len({str(item["scheduler_hash"]) for item in resumed_by_rank}) == 1
         and len(
             {
                 tuple(int(value) for value in item["sample"])
-                for item in complete
+                for item in resumed_by_rank
             }
         )
-        == 1
+        == 2
     )
     if not agreement:
-        raise RuntimeError("two-rank exact-resume state or sample sequence differs")
+        raise RuntimeError(
+            "two-rank exact-resume state, cursor, RNG, or sample differs"
+        )
     return True, True
 
 
@@ -1170,10 +1263,7 @@ def _invocation_directory(output_dir: Path) -> Path:
             "QWEN35_BATON_SMOKE_INVOCATION_ID",
             f"invocation-{uuid.uuid4().hex}",
         )
-        if (
-            not invocation.startswith("invocation-")
-            or Path(invocation).name != invocation
-        ):
+        if re.fullmatch(r"invocation-[0-9a-f]{32}", invocation) is None:
             raise ValueError("Baton smoke invocation ID is invalid")
     else:
         invocation = ""
@@ -1209,6 +1299,7 @@ def run_tiny_pipeline(
     output_dir: str | Path,
     *,
     verify_exact_resume: bool = False,
+    synchronize_gradients: bool = True,
 ) -> TinyPipelineResult:
     """Run one tiny optimizer step for every Baton curriculum stage."""
 
@@ -1219,17 +1310,26 @@ def run_tiny_pipeline(
             "verify_exact_resume requires torchrun with exactly two real ranks"
         )
     invocation = _invocation_directory(Path(output_dir))
-    stage1 = _run_stage1(invocation)
-    stage2 = _run_stage2(invocation, stage1.teacher)
-    envelope_loaded = _load_stage2_envelope(stage2)
-    stage3_result, strict_loaded, stage3_rank_agreement = _run_stage3(
-        stage2,
-        stage1.predicted_tokens,
+    stage1 = _run_stage1(
+        invocation,
+        synchronize_gradients=synchronize_gradients,
     )
+    stage2 = _run_stage2(invocation, stage1.teacher)
     exact: bool | None = None
     fresh: bool | None = None
     if verify_exact_resume:
         exact, fresh = _verify_exact_resume(stage2, invocation)
+        envelope_loaded = True
+    else:
+        envelope_loaded = _load_stage2_envelope_in_fresh_process(
+            stage2,
+            invocation,
+        )
+    stage3_result, strict_loaded, stage3_rank_agreement = _run_stage3(
+        stage2,
+        stage1.predicted_tokens,
+        synchronize_gradients=synchronize_gradients,
+    )
 
     local_counts = (
         stage1.result.optimizer_steps,
@@ -1297,8 +1397,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--checkpoint", help=argparse.SUPPRESS)
     parser.add_argument("--result-path", help=argparse.SUPPRESS)
-    parser.add_argument("--rank", type=int, help=argparse.SUPPRESS)
-    parser.add_argument("--world-size", type=int, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--disable-gradient-sync",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--validate-two-rank-result", help=argparse.SUPPRESS)
     return parser
 
@@ -1309,18 +1412,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         validate_two_rank_result(args.validate_two_rank_result)
         return 0
     if args.internal_resume_worker:
-        if (
-            not args.checkpoint
-            or not args.result_path
-            or args.rank is None
-            or args.world_size is None
-        ):
+        if not args.checkpoint or not args.result_path:
             raise ValueError("internal resume worker arguments are incomplete")
         return _resume_worker(
             Path(args.checkpoint),
             Path(args.result_path),
-            rank=args.rank,
-            world_size=args.world_size,
         )
     if not args.output_dir:
         raise ValueError("--output-dir is required")
@@ -1334,6 +1430,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = run_tiny_pipeline(
             args.output_dir,
             verify_exact_resume=args.verify_exact_resume,
+            synchronize_gradients=not args.disable_gradient_sync,
         )
         if _rank() == 0:
             print(json.dumps(asdict(result), sort_keys=True, allow_nan=False))

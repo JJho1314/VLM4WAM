@@ -1987,6 +1987,54 @@ def _tiny_step(model, optimizer, scheduler) -> None:
     optimizer.zero_grad()
 
 
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("destination", "already exists"),
+        ("snapshot", "injected rank-zero snapshot failure"),
+    ],
+)
+def test_baton_checkpoint_rank_zero_failures_propagate_without_deadlock(
+    tmp_path: Path,
+    failure: str,
+    message: str,
+) -> None:
+    result_path = tmp_path / f"{failure}.json"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc_per_node=2",
+            str(
+                REPOSITORY_ROOT
+                / "tests/helpers/baton_checkpoint_failure_worker.py"
+            ),
+            "--failure",
+            failure,
+            "--output-dir",
+            str(tmp_path / failure),
+            "--result-path",
+            str(result_path),
+        ],
+        cwd=REPOSITORY_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    results = json.loads(result_path.read_text(encoding="utf-8"))
+    assert len(results) == 2
+    assert all(result is not None for result in results)
+    assert {result["type"] for result in results} == {
+        "FileExistsError" if failure == "destination" else "RuntimeError"
+    }
+    assert all(message in result["message"] for result in results)
+
+
 def test_baton_resume_matches_uninterrupted_optimizer_scheduler_and_rng(
     tmp_path: Path,
 ) -> None:

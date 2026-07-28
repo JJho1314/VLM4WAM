@@ -1898,10 +1898,99 @@ def save_baton_training_checkpoint(
     destination = root / f"step_{cursor.global_step:06d}"
     staging = root / f".{destination.name}.incomplete"
     is_main = getattr(accelerator, "is_main_process", True)
-    if is_main:
-        root.mkdir(parents=True, exist_ok=True)
-    accelerator.wait_for_everyone()
-    if is_main:
+
+    def main_process_action(action) -> dict[str, Any]:
+        status: dict[str, Any] | None = None
+        if is_main:
+            try:
+                action()
+            except Exception as error:
+                status = {
+                    "ok": False,
+                    "exception_type": type(error).__name__,
+                    "message": str(error),
+                }
+            else:
+                status = {"ok": True}
+        payload = [status]
+        if dist.is_available() and dist.is_initialized():
+            dist.broadcast_object_list(payload, src=0)
+        received = payload[0]
+        if not isinstance(received, dict) or type(received.get("ok")) is not bool:
+            raise RuntimeError(
+                "Baton checkpoint rank-zero status broadcast is invalid"
+            )
+        return received
+
+    def all_process_action(action) -> dict[str, Any]:
+        try:
+            action()
+        except Exception as error:
+            local = {
+                "ok": False,
+                "rank": dist.get_rank() if dist.is_initialized() else 0,
+                "exception_type": type(error).__name__,
+                "message": str(error),
+            }
+        else:
+            local = {"ok": True}
+        if dist.is_available() and dist.is_initialized():
+            gathered: list[dict[str, Any] | None] = [
+                None
+            ] * dist.get_world_size()
+            dist.all_gather_object(gathered, local)
+            for candidate in gathered:
+                if isinstance(candidate, dict) and candidate.get("ok") is False:
+                    return candidate
+            if any(
+                not isinstance(candidate, dict)
+                or candidate.get("ok") is not True
+                for candidate in gathered
+            ):
+                return {
+                    "ok": False,
+                    "exception_type": "RuntimeError",
+                    "message": (
+                        "Baton checkpoint process status collective is invalid"
+                    ),
+                }
+        return local
+
+    def raise_status(
+        status: Mapping[str, Any],
+        *,
+        phase: str,
+        cleanup_status: Mapping[str, Any] | None = None,
+    ) -> None:
+        if status.get("ok") is True:
+            return
+        message = str(status.get("message", "unknown failure"))
+        if cleanup_status is not None and cleanup_status.get("ok") is False:
+            message += (
+                "; cleanup failed: "
+                + str(cleanup_status.get("message", "unknown cleanup failure"))
+            )
+        full_message = f"Baton checkpoint {phase} failed: {message}"
+        exception_type = str(status.get("exception_type", "RuntimeError"))
+        exception_class = {
+            "FileExistsError": FileExistsError,
+            "FileNotFoundError": FileNotFoundError,
+            "IsADirectoryError": IsADirectoryError,
+            "NotADirectoryError": NotADirectoryError,
+            "PermissionError": PermissionError,
+            "ValueError": ValueError,
+            "TypeError": TypeError,
+            "OSError": OSError,
+            "RuntimeError": RuntimeError,
+        }.get(exception_type, RuntimeError)
+        raise exception_class(full_message)
+
+    root_status = main_process_action(
+        lambda: root.mkdir(parents=True, exist_ok=True)
+    )
+    raise_status(root_status, phase="output directory creation")
+
+    def create_staging_directory() -> None:
         if destination.exists():
             raise FileExistsError(
                 f"Baton checkpoint already exists: {destination}"
@@ -1911,47 +2000,62 @@ def save_baton_training_checkpoint(
                 f"incomplete Baton checkpoint already exists: {staging}"
             )
         staging.mkdir()
-    try:
-        accelerator.wait_for_everyone()
-        accelerator.save_state(str(staging))
-        accelerator.wait_for_everyone()
-        if is_main:
-            diffusion_dir = staging / "diffusion_model"
-            diffusion_model.save_pretrained(
-                diffusion_dir,
-                safe_serialization=True,
+
+    staging_status = main_process_action(create_staging_directory)
+    raise_status(staging_status, phase="staging setup")
+
+    state_status = all_process_action(
+        lambda: accelerator.save_state(str(staging))
+    )
+    if state_status.get("ok") is False:
+        cleanup_status = main_process_action(lambda: shutil.rmtree(staging))
+        raise_status(
+            state_status,
+            phase="Accelerator state save",
+            cleanup_status=cleanup_status,
+        )
+
+    def publish_checkpoint() -> None:
+        diffusion_dir = staging / "diffusion_model"
+        diffusion_model.save_pretrained(
+            diffusion_dir,
+            safe_serialization=True,
+        )
+        metadata = {
+            "format_version": 1,
+            "checkpoint_kind": "ge_act_baton",
+            "model_children": ["diffusion_model"],
+            "source": source,
+            "topology_hash": _module_topology_hash(diffusion_model),
+            "snapshot_topology_hash": (
+                _diffusion_snapshot_topology_hash(diffusion_dir)
+            ),
+            "cursor": cursor.to_dict(),
+            "accelerator_files": _accelerator_state_files(staging),
+            "diffusion_subdir": "diffusion_model",
+            "diffusion_files": _diffusion_snapshot_files(diffusion_dir),
+            "training_provenance": validated_provenance,
+        }
+        (staging / "baton_state.json").write_text(
+            json.dumps(
+                metadata,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
             )
-            metadata = {
-                "format_version": 1,
-                "checkpoint_kind": "ge_act_baton",
-                "model_children": ["diffusion_model"],
-                "source": source,
-                "topology_hash": _module_topology_hash(diffusion_model),
-                "snapshot_topology_hash": (
-                    _diffusion_snapshot_topology_hash(diffusion_dir)
-                ),
-                "cursor": cursor.to_dict(),
-                "accelerator_files": _accelerator_state_files(staging),
-                "diffusion_subdir": "diffusion_model",
-                "diffusion_files": _diffusion_snapshot_files(diffusion_dir),
-                "training_provenance": validated_provenance,
-            }
-            (staging / "baton_state.json").write_text(
-                json.dumps(
-                    metadata,
-                    indent=2,
-                    sort_keys=True,
-                    allow_nan=False,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            os.replace(staging, destination)
-        accelerator.wait_for_everyone()
-    except Exception:
-        if is_main:
-            shutil.rmtree(staging, ignore_errors=True)
-        raise
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(staging, destination)
+
+    publish_status = main_process_action(publish_checkpoint)
+    if publish_status.get("ok") is False:
+        cleanup_status = main_process_action(lambda: shutil.rmtree(staging))
+        raise_status(
+            publish_status,
+            phase="snapshot publication",
+            cleanup_status=cleanup_status,
+        )
     return destination
 
 

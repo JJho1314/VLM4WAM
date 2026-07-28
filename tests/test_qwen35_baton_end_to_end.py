@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import subprocess
+import sys
+
 import pytest
 
 from qwen35_baton.cli.smoke_pipeline import (
+    _invocation_directory,
     run_tiny_pipeline,
     validate_two_rank_result,
 )
@@ -79,3 +85,57 @@ def test_two_rank_result_validation_rejects_a_false_green(
 
     with pytest.raises(RuntimeError, match="incomplete"):
         validate_two_rank_result(incomplete)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "invocation-not-hex",
+        "invocation-" + "a" * 31,
+        "invocation-" + "a" * 33,
+        "invocation-" + "A" * 32,
+        "prefix-invocation-" + "a" * 32,
+    ],
+)
+def test_invocation_directory_requires_exact_canonical_identifier(
+    tmp_path,
+    monkeypatch,
+    invalid: str,
+) -> None:
+    monkeypatch.setenv("QWEN35_BATON_SMOKE_INVOCATION_ID", invalid)
+
+    with pytest.raises(ValueError, match="invocation ID"):
+        _invocation_directory(tmp_path)
+
+
+def test_two_rank_smoke_detects_a_missing_gradient_collective(
+    tmp_path: Path,
+) -> None:
+    environment = dict(os.environ)
+    environment["QWEN35_BATON_SMOKE_INVOCATION_ID"] = (
+        "invocation-" + "a" * 32
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc_per_node=2",
+            "-m",
+            "qwen35_baton.cli.smoke_pipeline",
+            "--output-dir",
+            str(tmp_path),
+            "--disable-gradient-sync",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=45,
+        env=environment,
+    )
+
+    assert completed.returncode != 0
+    assert "synchronized parameter hashes differ by rank" in (
+        completed.stdout + completed.stderr
+    )

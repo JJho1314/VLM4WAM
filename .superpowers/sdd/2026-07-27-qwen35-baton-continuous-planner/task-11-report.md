@@ -178,3 +178,87 @@ binary/version warnings; the CPU/Gloo smoke does not use those extensions.
 - Semantic tokens retain all 1,024 patches per camera, exact production times
   and patch centers, and no mask or relevance fields.
 - The wrapper cannot turn a failed rendezvous or missing result into success.
+
+## Formal Review Fix Round 1
+
+Base reviewed commit: `3560e4e3646d5c5f3096410ce137fda2594cebdd`.
+
+The checkpoint publisher now turns every rank-zero filesystem phase into a
+serialized status broadcast before any later collective. This covers output
+directory creation, destination/staging checks, staging creation,
+`save_pretrained`, metadata and manifest generation, atomic replacement, and
+cleanup. Accelerator save failures are also gathered across all ranks before
+collective cleanup. Two real two-rank regressions prove that a pre-existing
+destination and an injected rank-zero snapshot exception terminate promptly
+with the same exception class and message on both ranks.
+
+The synthetic `_CheckpointStateAdapter` was removed. Stage 2 now uses
+`Accelerator(cpu=True)` with a prepared model, optimizer, scheduler, and
+deterministically sharded dataloader. The production Task-10 save/load
+functions persist and restore the real Accelerate files. Resume calls
+`set_dataloader_epoch`, `skip_first_batches`, and
+`advance_training_cursor`. Only outer rank zero launches the required fresh
+nested command:
+
+```text
+sys.executable -m torch.distributed.run --standalone --nproc_per_node=2 \
+  -m qwen35_baton.cli.smoke_pipeline --internal-resume-worker ...
+```
+
+Both fresh child ranks restore their own saved RNG state and exact cursor,
+consume their rank-specific next deterministic sample, and match the
+corresponding uninterrupted rank for model, optimizer, scheduler, cursor, RNG
+probes/state, and sample. The parent also requires child rank coverage
+`[0,1]`, world size two, fresh PIDs, and synchronized final mutable hashes.
+
+Stage 1, Stage 2, and Stage 3 now deliberately use different local rank
+inputs. Their normal synchronized parameter hashes agree. A two-rank negative
+control bypasses the Stage-1 DDP wrapper and must fail with rank-divergent
+parameter hashes, proving the agreement check is sensitive to a missing
+gradient collective. Invocation IDs now require the exact regex
+`invocation-[0-9a-f]{32}`; wrong alphabet, case, prefix, and lengths are
+rejected.
+
+Fresh fix-round verification:
+
+```text
+/data/LFT-W02_data/.conda/envs/ge-act/bin/python -m pytest -q \
+  tests/test_qwen35_baton_end_to_end.py
+
+10 passed, 4 warnings in 21.48s
+
+/data/LFT-W02_data/.conda/envs/ge-act/bin/python -m pytest -q \
+  tests/test_ge_act_baton_training_contract.py
+
+77 passed, 4 warnings in 25.00s
+
+bash qwen35_baton/scripts/smoke_two_rank.sh
+exit 0 in 24.00s
+rank_agreement=true
+executed_ranks=[0,1]
+stage1/stage2/stage3 optimizer_steps=1/1/1
+envelope_loaded=true
+strict_stage3_loaded=true
+exact_resume=true
+fresh_process_restore=true
+```
+
+The end-to-end file includes the two-rank missing-gradient-collective negative
+control, and the full training-contract file includes both two-rank
+rank-zero-failure regressions. Static verification also returned zero:
+
+```text
+git diff --check
+/data/LFT-W02_data/.conda/envs/ge-act/bin/python -m compileall -q \
+  ge_act/runner/ge_trainer.py \
+  qwen35_baton/cli/smoke_pipeline.py \
+  tests/test_ge_act_baton_training_contract.py \
+  tests/test_qwen35_baton_end_to_end.py \
+  tests/helpers/baton_checkpoint_failure_worker.py
+bash -n qwen35_baton/scripts/smoke_two_rank.sh
+```
+
+The previously recorded 448-test legacy gate remains the bounded legacy
+evidence; it was not rerun in this fix round because the formal-review changes
+are covered by the focused production checkpoint, smoke, and negative-control
+gates above.
