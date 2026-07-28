@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 def sample_pca_tokens(
@@ -93,3 +96,227 @@ def project_fixed_pca(
     high = torch.as_tensor(state["display_high"], device=values.device)
     projected = (values - mean) @ components.T
     return ((projected - low) / (high - low)).clamp(0, 1)
+
+
+class _UpsampleBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.skip = nn.Conv2d(in_channels, out_channels, 1)
+        self.refine = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1),
+            nn.GroupNorm(min(32, out_channels), out_channels),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        upsampled = F.interpolate(
+            features,
+            scale_factor=2,
+            mode="bilinear",
+            align_corners=False,
+        )
+        return self.skip(upsampled) + self.refine(upsampled)
+
+
+class SiglipPCAUpsampler(nn.Module):
+    def __init__(
+        self,
+        in_dim: int = 1024,
+        hidden_dim: int = 256,
+        grid_size: int = 16,
+        output_size: int = 256,
+    ) -> None:
+        super().__init__()
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.grid_size = grid_size
+        self.output_size = output_size
+        self.input_projection = nn.Conv2d(in_dim, hidden_dim, 1)
+        stage_channels = [
+            hidden_dim,
+            max(hidden_dim // 2, 8),
+            max(hidden_dim // 4, 8),
+            max(hidden_dim // 8, 8),
+        ]
+        channel_pairs = zip(
+            [hidden_dim, *stage_channels[:-1]],
+            stage_channels,
+        )
+        self.blocks = nn.ModuleList(
+            [
+                _UpsampleBlock(in_channels, out_channels)
+                for in_channels, out_channels in channel_pairs
+            ]
+        )
+        self.head = nn.Conv2d(stage_channels[-1], 3, 1)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        expected_tokens = self.grid_size * self.grid_size
+        if tokens.ndim != 3 or tokens.shape[1:] != (
+            expected_tokens,
+            self.in_dim,
+        ):
+            raise ValueError(
+                f"expected [B,{expected_tokens},{self.in_dim}], "
+                f"got {tuple(tokens.shape)}"
+            )
+        batch = tokens.shape[0]
+        features = tokens.transpose(1, 2).reshape(
+            batch,
+            self.in_dim,
+            self.grid_size,
+            self.grid_size,
+        )
+        features = self.input_projection(features)
+        for block in self.blocks:
+            features = block(features)
+        features = F.interpolate(
+            features,
+            size=(self.output_size, self.output_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return torch.sigmoid(self.head(features))
+
+    def config(self) -> dict[str, int]:
+        return {
+            "in_dim": self.in_dim,
+            "hidden_dim": self.hidden_dim,
+            "grid_size": self.grid_size,
+            "output_size": self.output_size,
+        }
+
+
+def pca_target_images(
+    features: torch.Tensor,
+    pca_state: Mapping[str, Any],
+    *,
+    grid_size: int,
+    output_size: int,
+) -> torch.Tensor:
+    if features.shape[1] != grid_size * grid_size:
+        raise ValueError("feature token count does not match the PCA grid")
+    projected = project_fixed_pca(features, pca_state)
+    images = projected.reshape(
+        features.shape[0],
+        grid_size,
+        grid_size,
+        3,
+    ).permute(0, 3, 1, 2)
+    return F.interpolate(
+        images,
+        size=(output_size, output_size),
+        mode="bilinear",
+        align_corners=False,
+    ).clamp(0, 1)
+
+
+def multiscale_gradient_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    scales: tuple[int, ...] = (1, 2, 4),
+) -> torch.Tensor:
+    loss = prediction.new_zeros(())
+    for scale in scales:
+        pred = (
+            F.avg_pool2d(prediction, scale)
+            if scale > 1
+            else prediction
+        )
+        truth = F.avg_pool2d(target, scale) if scale > 1 else target
+        loss = loss + F.l1_loss(
+            pred[..., :, 1:] - pred[..., :, :-1],
+            truth[..., :, 1:] - truth[..., :, :-1],
+        )
+        loss = loss + F.l1_loss(
+            pred[..., 1:, :] - pred[..., :-1, :],
+            truth[..., 1:, :] - truth[..., :-1, :],
+        )
+    return loss
+
+
+def validation_metrics(
+    prediction: torch.Tensor,
+    baseline: torch.Tensor,
+    target: torch.Tensor,
+) -> dict[str, float]:
+    return {
+        "probe_l1": float(F.l1_loss(prediction, target)),
+        "baseline_l1": float(F.l1_loss(baseline, target)),
+        "probe_gradient": float(
+            multiscale_gradient_loss(prediction, target)
+        ),
+        "baseline_gradient": float(
+            multiscale_gradient_loss(baseline, target)
+        ),
+    }
+
+
+def validation_gate_passed(metrics: Mapping[str, float]) -> bool:
+    return (
+        metrics["probe_l1"] < metrics["baseline_l1"]
+        and metrics["probe_gradient"] < metrics["baseline_gradient"]
+    )
+
+
+def load_validated_probe(
+    path: Path,
+    *,
+    expected_model_name: str,
+    device: torch.device,
+) -> tuple[SiglipPCAUpsampler, dict[str, Any]]:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not payload.get("accepted", False):
+        raise ValueError("probe checkpoint did not pass the validation gate")
+    if payload.get("model_name") != expected_model_name:
+        raise ValueError(
+            "probe checkpoint SigLIP2 model does not match the exporter"
+        )
+    required = {
+        "state_dict",
+        "config",
+        "pca_state",
+        "validation_metrics",
+        "feature_layer",
+    }
+    missing = sorted(required.difference(payload))
+    if missing:
+        raise ValueError(f"probe checkpoint is missing: {missing}")
+    if payload["feature_layer"] != "penultimate_spatial":
+        raise ValueError("probe checkpoint feature layer is incompatible")
+    if (
+        payload.get("low_input_size") != 256
+        or payload.get("high_input_size") != 512
+        or payload.get("high_grid_size") != 32
+    ):
+        raise ValueError("probe checkpoint teacher contract is incompatible")
+    config = payload["config"]
+    if (
+        config.get("in_dim") != 1024
+        or config.get("grid_size") != 16
+        or config.get("output_size") != 256
+    ):
+        raise ValueError("probe checkpoint feature contract is incompatible")
+    required_pca = {
+        "mean",
+        "components",
+        "display_low",
+        "display_high",
+        "feature_dim",
+        "component_sign_rule",
+        "max_tokens",
+    }
+    missing_pca = sorted(required_pca.difference(payload["pca_state"]))
+    if missing_pca:
+        raise ValueError(f"probe PCA state is missing: {missing_pca}")
+    if (
+        payload["pca_state"]["feature_dim"] != 1024
+        or payload["pca_state"]["component_sign_rule"]
+        != "largest_absolute_loading_positive"
+    ):
+        raise ValueError("probe PCA feature contract is incompatible")
+    probe = SiglipPCAUpsampler(**config).to(device).eval()
+    probe.load_state_dict(payload["state_dict"])
+    probe.requires_grad_(False)
+    return probe, payload
