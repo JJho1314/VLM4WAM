@@ -79,7 +79,7 @@ def test_generate_comparison_uses_all_cameras_and_preserves_export_sources(tmp_p
             source_dir.mkdir(parents=True)
             rgb = source_dir / "rgb.png"
             probe = source_dir / "siglip_probe.png"
-            Image.fromarray(np.full((256, 256, 3), value, dtype=np.uint8)).save(rgb)
+            Image.fromarray(np.full((512, 512, 3), value, dtype=np.uint8)).save(rgb)
             Image.fromarray(
                 np.full((256, 256, 3), value + camera_index + 1, dtype=np.uint8)
             ).save(probe)

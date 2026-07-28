@@ -80,11 +80,21 @@ def _source_paths(export_root: Path) -> list[tuple[int, str, Path, Path]]:
     return sources
 
 
-def _load_rgb(path: Path) -> Image.Image:
+def _load_rgb_reference(path: Path) -> Image.Image:
+    """Load an RGB reference and deterministically resize it for SigLIP/panels."""
     with Image.open(path) as image:
         rgb = image.convert("RGB")
     if rgb.size != (CONTENT_SIZE, CONTENT_SIZE):
-        raise ValueError(f"Expected a {CONTENT_SIZE}x{CONTENT_SIZE} image at {path}")
+        rgb = rgb.resize((CONTENT_SIZE, CONTENT_SIZE), Image.Resampling.LANCZOS)
+    return rgb
+
+
+def _load_probe(path: Path) -> Image.Image:
+    """Load a probe image, which must already match the SigLIP panel geometry."""
+    with Image.open(path) as image:
+        rgb = image.convert("RGB")
+    if rgb.size != (CONTENT_SIZE, CONTENT_SIZE):
+        raise ValueError(f"Expected a {CONTENT_SIZE}x{CONTENT_SIZE} probe image at {path}")
     return rgb
 
 
@@ -203,8 +213,8 @@ def generate_comparison(
     if png_path.exists() or json_path.exists():
         raise FileExistsError(f"Refusing to overwrite {png_path} or {json_path}")
 
-    rgb_images = [_load_rgb(rgb) for _, _, rgb, _ in sources]
-    probe_images = [_load_rgb(probe) for _, _, _, probe in sources]
+    rgb_images = [_load_rgb_reference(rgb) for _, _, rgb, _ in sources]
+    probe_images = [_load_probe(probe) for _, _, _, probe in sources]
     row_data = [
         {"frame": frame_index, "camera": camera, "phrase": active_target(frame_index)}
         for frame_index, camera, _, _ in sources
