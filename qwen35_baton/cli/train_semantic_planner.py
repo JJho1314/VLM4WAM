@@ -885,7 +885,7 @@ def run_training(
         # This CPU-only preflight is deliberately before Accelerator/GPU setup.
         from qwen35_baton.cli.preflight import preflight_stage1
 
-        preflight_stage1(config, world_size=world_size)
+        preflight_stage1(config.to_dict(), world_size=world_size)
         artifacts = load_local_artifacts(config)
         assert isinstance(artifacts, Stage1TrainingArtifacts)
 

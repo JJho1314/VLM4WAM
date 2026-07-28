@@ -1216,6 +1216,31 @@ def test_production_artifacts_are_constructed_after_global_seeding(
     assert draws[0] == draws[1]
 
 
+def test_run_training_passes_preflight_a_module_stable_mapping(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import qwen35_baton.cli.preflight as preflight_module
+    import qwen35_baton.cli.train_semantic_planner as training_module
+
+    received: list[Any] = []
+    config = _config(tmp_path / "run")
+    monkeypatch.setattr(
+        preflight_module,
+        "preflight_stage1",
+        lambda payload, **_: received.append(payload),
+    )
+    monkeypatch.setattr(
+        training_module,
+        "load_local_artifacts",
+        lambda _: _artifacts(config),
+    )
+
+    run_training(config)
+
+    assert len(received) == 1
+    assert received[0] == config.to_dict()
+
+
 def test_launcher_rejects_nondivisible_global_batch_before_preflight(
     tmp_path: Path,
 ) -> None:
