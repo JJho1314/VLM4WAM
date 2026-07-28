@@ -223,7 +223,7 @@ class BatonCheckpointMetadata:
         _require_equal(
             "trainable_qwen_layer_indices",
             self.trainable_qwen_layer_indices,
-            tuple(range(16, 24)),
+            tuple(range(24)),
         )
         if dict(self.loss_weights) != {"mse": 1.0}:
             raise ValueError("loss_weights must contain only Equation-8 MSE weight 1.0")
@@ -277,7 +277,7 @@ class BatonCheckpointMetadata:
             query_dropout=geometry.query_dropout,
             query_norm_style=cls.QUERY_NORM_STYLE,
             query_mask_version="block_causal_v1",
-            trainable_qwen_layer_indices=tuple(range(16, 24)),
+            trainable_qwen_layer_indices=tuple(range(24)),
             loss_weights={"mse": 1.0},
             hdf5_manifest_hash=_example_sha256("hdf5-manifest"),
             planner_topology_hash=_example_sha256("planner-topology"),

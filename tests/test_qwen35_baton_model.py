@@ -336,94 +336,14 @@ def test_planner_state_dict_round_trips_overlay_and_frozen_base() -> None:
 
 def test_stage1_ownership_is_explicit_disjoint_and_exhaustive() -> None:
     planner, _ = make_planner()
-    planner.sem_mlp = nn.Linear(1024, 1024)
 
     ownership = configure_stage1_trainable_modules(planner)
 
-    assert ownership.planner_modules == (
-        planner.query_tower,
-        planner.sem_mlp,
-        planner.plan_token_adapter,
-    )
-    assert ownership.qwen_top_layers == tuple(
-        planner.backbone.model.language_model.layers[-8:]
-    )
-    assert ownership.qwen_vision_modules == (planner.backbone.model.visual,)
-    category_ids = [
-        {
-            id(parameter)
-            for module in modules
-            for parameter in module.parameters()
-            if parameter.requires_grad
-        }
-        for modules in (
-            ownership.planner_modules,
-            ownership.qwen_top_layers,
-            ownership.qwen_vision_modules,
-        )
-    ]
-    assert not category_ids[0].intersection(category_ids[1])
-    assert not category_ids[0].intersection(category_ids[2])
-    assert not category_ids[1].intersection(category_ids[2])
-    assert set().union(*category_ids) == {
+    assert ownership.trainable_modules == (planner,)
+    assert {
+        id(parameter) for parameter in planner.parameters()
+    } == {
         id(parameter)
         for parameter in planner.parameters()
         if parameter.requires_grad
     }
-    assert not planner.frozen_base_embedding.weight.requires_grad
-    assert all(
-        not parameter.requires_grad
-        for layer in planner.backbone.model.language_model.layers[:4]
-        for parameter in layer.parameters()
-    )
-    assert all(
-        parameter.requires_grad
-        for layer in planner.backbone.model.language_model.layers[-8:]
-        for parameter in layer.parameters()
-    )
-    assert all(
-        parameter.requires_grad
-        for parameter in planner.backbone.model.visual.parameters()
-    )
-    assert all(
-        not parameter.requires_grad
-        for parameter in planner.backbone.model.language_model.norm.parameters()
-    )
-    assert all(
-        not parameter.requires_grad
-        for parameter in planner.backbone.lm_head.parameters()
-    )
-
-
-def test_stage1_ownership_rejects_ambiguous_explicit_vision_paths() -> None:
-    planner, _ = make_planner()
-    planner.backbone.vision_model = nn.Linear(8, 8)
-
-    with pytest.raises(ValueError, match="exactly one.*vision"):
-        configure_stage1_trainable_modules(planner)
-
-
-def test_stage1_ownership_rejects_parameter_overlap() -> None:
-    planner, _ = make_planner()
-    shared = planner.backbone.model.language_model.layers[-1]
-    planner.backbone.model.visual = shared
-
-    with pytest.raises(ValueError, match="overlap"):
-        configure_stage1_trainable_modules(planner)
-
-
-def test_stage1_ownership_rejects_shared_planner_module_parameters() -> None:
-    planner, _ = make_planner()
-    planner.sem_mlp = planner.query_tower
-
-    with pytest.raises(ValueError, match="overlap"):
-        configure_stage1_trainable_modules(planner)
-
-
-def test_stage1_ownership_rejects_shared_parameters_between_top_layers() -> None:
-    planner, _ = make_planner()
-    layers = planner.backbone.model.language_model.layers
-    layers[-1].weight = layers[-2].weight
-
-    with pytest.raises(ValueError, match="overlap"):
-        configure_stage1_trainable_modules(planner)

@@ -20,6 +20,7 @@ from qwen35_baton.cli.train_semantic_planner import (
     Stage1TrainingArtifacts,
     Stage1TrainingConfig,
     build_cosine_warmup_scheduler,
+    build_stage1_optimizer,
     build_stage1_optimizer_groups,
     checkpoint_steps,
     load_local_artifacts,
@@ -166,8 +167,7 @@ def _artifacts(
     torch.manual_seed(2026)
     planner = _TinyPlanner()
     ownership = configure_stage1_trainable_modules(planner)
-    groups = build_stage1_optimizer_groups(planner, ownership, config)
-    optimizer = torch.optim.AdamW(groups, weight_decay=0.0)
+    optimizer = build_stage1_optimizer(planner, ownership, config)
     scheduler = build_cosine_warmup_scheduler(optimizer, config)
     return Stage1TrainingArtifacts(
         planner=planner,
@@ -293,18 +293,25 @@ def _durable_metrics_record(
     }
 
 
-def test_stage1_optimizer_groups_are_exact_and_exhaustive(tmp_path: Path) -> None:
+def test_stage1_trains_the_entire_va_planner() -> None:
+    planner = _TinyPlanner()
+
+    ownership = configure_stage1_trainable_modules(planner)
+
+    assert all(parameter.requires_grad for parameter in planner.parameters())
+    assert ownership.trainable_modules == (planner,)
+
+
+def test_stage1_optimizer_is_one_exhaustive_group(tmp_path: Path) -> None:
     config = _config(tmp_path)
     planner = _TinyPlanner()
     ownership = configure_stage1_trainable_modules(planner)
 
     groups = build_stage1_optimizer_groups(planner, ownership, config)
 
-    assert {group["name"]: group["lr"] for group in groups} == {
-        "planner": 5e-5,
-        "qwen_top8": 1e-6,
-        "qwen_vision": 5e-7,
-    }
+    assert [(group["name"], group["lr"]) for group in groups] == [
+        ("va_planner", 1e-5)
+    ]
     grouped_ids = [id(parameter) for group in groups for parameter in group["params"]]
     trainable_ids = [
         id(parameter) for parameter in planner.parameters() if parameter.requires_grad
@@ -326,29 +333,35 @@ def test_stage1_optimizer_groups_are_exact_and_exhaustive(tmp_path: Path) -> Non
         ]
 
 
+def test_stage1_uses_baton_adamw_contract(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    planner = _TinyPlanner()
+    ownership = configure_stage1_trainable_modules(planner)
+
+    optimizer = build_stage1_optimizer(planner, ownership, config)
+
+    assert isinstance(optimizer, torch.optim.AdamW)
+    assert optimizer.defaults["betas"] == (0.9, 0.999)
+    assert {group["lr"] for group in optimizer.param_groups} == {1e-5}
+    assert {group["weight_decay"] for group in optimizer.param_groups} == {
+        config.weight_decay
+    }
+
+
 def test_one_tiny_stage1_step_updates_only_owned_parameters(tmp_path: Path) -> None:
     config = _config(tmp_path)
     artifacts = _artifacts(config)
     before = _clone_parameters(artifacts.planner)
-    owned_ids = {
-        id(parameter)
-        for modules in (
-            artifacts.ownership.planner_modules,
-            artifacts.ownership.qwen_top_layers,
-            artifacts.ownership.qwen_vision_modules,
-        )
-        for module in modules
-        for parameter in module.parameters()
-    }
-
     result = run_training(config, artifacts=artifacts)
 
     assert result.global_step == 1
-    for name, parameter in artifacts.planner.named_parameters():
-        if id(parameter) in owned_ids:
-            assert not torch.equal(parameter.detach(), before[name]), name
-        else:
-            torch.testing.assert_close(parameter.detach(), before[name], rtol=0, atol=0)
+    assert all(
+        parameter.requires_grad for parameter in artifacts.planner.parameters()
+    )
+    assert any(
+        not torch.equal(parameter.detach(), before[name])
+        for name, parameter in artifacts.planner.named_parameters()
+    )
     assert all(
         parameter.grad is None for parameter in artifacts.teacher.model.parameters()
     )
@@ -1141,9 +1154,10 @@ def test_stage1_recipe_requirements_and_launchers_are_fixed(tmp_path: Path) -> N
     assert config["max_steps"] == 30_000
     assert config["save_every"] == 5_000
     assert config["max_consecutive_skipped_updates"] == 8
-    assert config["planner_lr"] == 5e-5
-    assert config["qwen_top8_lr"] == 1e-6
-    assert config["qwen_vision_lr"] == 5e-7
+    assert config["learning_rate"] == 1e-5
+    assert "planner_lr" not in config
+    assert "qwen_top8_lr" not in config
+    assert "qwen_vision_lr" not in config
     requirements = [
         line.strip()
         for line in (

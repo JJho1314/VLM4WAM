@@ -38,11 +38,7 @@ from qwen35_baton.ownership import (
 from qwen35_baton.sequence import ADDED_TOKENS, build_plan_text
 
 
-_APPROVED_LRS = {
-    "planner": 5e-5,
-    "qwen_top8": 1e-6,
-    "qwen_vision": 5e-7,
-}
+_APPROVED_LR = 1e-5
 _METRICS_SCHEMA_VERSION = 1
 _METRICS_RECORD_KEYS = frozenset(
     {"schema_version", "step", "metrics", "checksum"}
@@ -88,9 +84,7 @@ class Stage1TrainingConfig:
     save_every: int = 5_000
     log_every: int = 20
     max_consecutive_skipped_updates: int = 8
-    planner_lr: float = 5e-5
-    qwen_top8_lr: float = 1e-6
-    qwen_vision_lr: float = 5e-7
+    learning_rate: float = 1e-5
     weight_decay: float = 0.01
     gradient_clip_norm: float = 1.0
     mixed_precision: str = "bf16"
@@ -144,12 +138,8 @@ class Stage1TrainingConfig:
             raise ValueError(
                 "production Stage-1 cadence must be 30000 steps with saves every 5000"
             )
-        if {
-            "planner": self.planner_lr,
-            "qwen_top8": self.qwen_top8_lr,
-            "qwen_vision": self.qwen_vision_lr,
-        } != _APPROVED_LRS:
-            raise ValueError("Stage-1 optimizer learning rates differ from the contract")
+        if self.learning_rate != _APPROVED_LR:
+            raise ValueError("Stage-1 learning rate must be exactly 1e-5")
         for name in (
             "hdf5_manifest_hash",
             "siglip2_config_hash",
@@ -260,32 +250,18 @@ def build_stage1_optimizer_groups(
     ownership: Stage1Ownership,
     config: Stage1TrainingConfig,
 ) -> list[dict[str, Any]]:
-    """Build the exact three nonoverlapping groups covering all trainable state."""
+    """Build one exhaustive parameter group for the full VA-Planner."""
 
     if not isinstance(planner, nn.Module):
         raise TypeError("planner must be a torch module")
     if not isinstance(ownership, Stage1Ownership):
         raise TypeError("ownership must be Stage1Ownership")
-    groups = [
-        {
-            "name": "planner",
-            "params": _owned_parameters(ownership.planner_modules),
-            "lr": config.planner_lr,
-            "initial_lr": config.planner_lr,
-        },
-        {
-            "name": "qwen_top8",
-            "params": _owned_parameters(ownership.qwen_top_layers),
-            "lr": config.qwen_top8_lr,
-            "initial_lr": config.qwen_top8_lr,
-        },
-        {
-            "name": "qwen_vision",
-            "params": _owned_parameters(ownership.qwen_vision_modules),
-            "lr": config.qwen_vision_lr,
-            "initial_lr": config.qwen_vision_lr,
-        },
-    ]
+    groups = [{
+        "name": "va_planner",
+        "params": _owned_parameters(ownership.trainable_modules),
+        "lr": config.learning_rate,
+        "initial_lr": config.learning_rate,
+    }]
     grouped = [id(parameter) for group in groups for parameter in group["params"]]
     trainable = [
         id(parameter) for parameter in planner.parameters() if parameter.requires_grad
@@ -294,16 +270,16 @@ def build_stage1_optimizer_groups(
         raise ValueError(
             "Stage-1 optimizer ownership must be duplicate-free and exhaustive"
         )
-    aliases: dict[int, list[str]] = {}
-    for name, parameter in planner.named_parameters(remove_duplicate=False):
-        aliases.setdefault(id(parameter), []).append(name)
+    canonical_names = {
+        id(parameter): name for name, parameter in planner.named_parameters()
+    }
     for group in groups:
-        names = [aliases.get(id(parameter), []) for parameter in group["params"]]
-        if any(len(values) != 1 for values in names):
+        names = [canonical_names.get(id(parameter)) for parameter in group["params"]]
+        if any(name is None for name in names):
             raise ValueError(
-                "Stage-1 optimizer parameter names must be canonical and unique"
+                "Stage-1 optimizer parameters must have canonical names"
             )
-        group["parameter_names"] = [values[0] for values in names]
+        group["parameter_names"] = names
         group["parameter_shapes"] = [
             list(parameter.shape) for parameter in group["params"]
         ]
@@ -311,6 +287,20 @@ def build_stage1_optimizer_groups(
             str(parameter.dtype) for parameter in group["params"]
         ]
     return groups
+
+
+def build_stage1_optimizer(
+    planner: nn.Module,
+    ownership: Stage1Ownership,
+    config: Stage1TrainingConfig,
+) -> torch.optim.AdamW:
+    """Construct the Baton AdamW optimizer for the full VA-Planner."""
+
+    return torch.optim.AdamW(
+        build_stage1_optimizer_groups(planner, ownership, config),
+        betas=(0.9, 0.999),
+        weight_decay=config.weight_decay,
+    )
 
 
 def _cosine_warmup_multiplier(
@@ -503,10 +493,7 @@ def load_local_artifacts(
     if len(train_batches) <= 0:
         raise ValueError("Stage-1 dataset must yield at least one complete microbatch")
     ownership = configure_stage1_trainable_modules(planner)
-    optimizer = torch.optim.AdamW(
-        build_stage1_optimizer_groups(planner, ownership, config),
-        weight_decay=config.weight_decay,
-    )
+    optimizer = build_stage1_optimizer(planner, ownership, config)
     scheduler = build_cosine_warmup_scheduler(optimizer, config)
     example = BatonCheckpointMetadata.example()
     metadata = replace(

@@ -1056,8 +1056,12 @@ def _validate_persisted_steps(
         if isinstance(group, Mapping)
         for identifier in group.get("params", ())
     ]
-    if cursor.global_step > 0 and set(parameter_ids) != set(slots):
-        raise ValueError("optimizer step state is incomplete for the cursor")
+    slot_ids = set(slots)
+    parameter_id_set = set(parameter_ids)
+    if cursor.global_step > 0 and not slot_ids:
+        raise ValueError("optimizer step state is empty for a nonzero cursor")
+    if not slot_ids.issubset(parameter_id_set):
+        raise ValueError("optimizer step state contains parameters outside its groups")
     for slot in slots.values():
         if not isinstance(slot, Mapping):
             raise ValueError("optimizer state topology is invalid")

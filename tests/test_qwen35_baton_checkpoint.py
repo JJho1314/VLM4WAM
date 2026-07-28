@@ -27,6 +27,55 @@ from qwen35_baton.checkpoint import (
     save_baton_checkpoint,
     trusted_planner_topology_payload,
 )
+
+
+def test_persisted_steps_allow_adamw_lazy_state_for_unused_parameters() -> None:
+    from qwen35_baton.checkpoint import _validate_persisted_steps
+
+    cursor = BatonTrainingCursor(
+        global_step=2,
+        epoch=0,
+        consumed_microbatches=2,
+        microbatches_per_epoch=4,
+        sampler_seed=7,
+    )
+    _validate_persisted_steps(
+        {
+            "param_groups": [{"params": [0, 1]}],
+            "state": {0: {"step": torch.tensor(2.0)}},
+        },
+        {"last_epoch": 2, "_step_count": 3},
+        cursor,
+    )
+
+
+def test_persisted_steps_reject_empty_or_foreign_adamw_state() -> None:
+    from qwen35_baton.checkpoint import _validate_persisted_steps
+
+    cursor = BatonTrainingCursor(
+        global_step=2,
+        epoch=0,
+        consumed_microbatches=2,
+        microbatches_per_epoch=4,
+        sampler_seed=7,
+    )
+    scheduler = {"last_epoch": 2, "_step_count": 3}
+
+    with pytest.raises(ValueError, match="empty"):
+        _validate_persisted_steps(
+            {"param_groups": [{"params": [0, 1]}], "state": {}},
+            scheduler,
+            cursor,
+        )
+    with pytest.raises(ValueError, match="outside"):
+        _validate_persisted_steps(
+            {
+                "param_groups": [{"params": [0, 1]}],
+                "state": {2: {"step": torch.tensor(2.0)}},
+            },
+            scheduler,
+            cursor,
+        )
 from qwen35_baton.cli.train_semantic_planner import BatonCosineWarmupScheduler
 from qwen35_baton.config import BatonCheckpointMetadata
 from qwen35_baton.hashing import sha256_json
