@@ -209,6 +209,59 @@ def test_probe_training_metadata_records_exact_optimizer_recipe() -> None:
     }
 
 
+def test_train_probe_materializes_teacher_tensors_for_backward() -> None:
+    class FakeTeacher:
+        def __init__(self, token_count: int) -> None:
+            self.token_count = token_count
+
+        def _prep(self, frames: torch.Tensor) -> torch.Tensor:
+            return frames
+
+        def _patch_tokens(self, frames: torch.Tensor) -> torch.Tensor:
+            assert torch.is_inference_mode_enabled()
+            tokens = torch.full(
+                (frames.shape[0], self.token_count, 4),
+                0.5,
+                device=frames.device,
+            )
+            assert torch.is_inference(tokens)
+            return tokens
+
+    loader = torch.utils.data.DataLoader(
+        [torch.zeros(3, 8, 8)],
+        batch_size=1,
+    )
+    probe = SiglipPCAUpsampler(
+        in_dim=4,
+        hidden_dim=32,
+        grid_size=16,
+        output_size=256,
+    )
+    pca_state = {
+        "mean": torch.zeros(4),
+        "components": torch.eye(4)[:3],
+        "display_low": torch.zeros(3),
+        "display_high": torch.ones(3),
+        "feature_dim": 4,
+    }
+
+    train_probe._train_probe(
+        probe,
+        loader,
+        low_teacher=FakeTeacher(16 * 16),
+        high_teacher=FakeTeacher(32 * 32),
+        pca_state=pca_state,
+        device=torch.device("cpu"),
+        steps=1,
+        learning_rate=2e-4,
+    )
+
+    assert any(
+        parameter.grad is not None
+        for parameter in probe.parameters()
+    )
+
+
 @pytest.mark.parametrize(
     ("model_name", "feature_dim", "error"),
     [

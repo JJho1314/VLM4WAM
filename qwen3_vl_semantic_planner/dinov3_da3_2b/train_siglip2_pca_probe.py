@@ -326,6 +326,8 @@ def _train_probe(
                 output_size=256,
             )
 
+        low_tokens = low_tokens.clone()
+        target = target.clone()
         prediction = probe(low_tokens)
         pixel_loss = F.l1_loss(prediction, target)
         edge_loss = multiscale_gradient_loss(prediction, target)
