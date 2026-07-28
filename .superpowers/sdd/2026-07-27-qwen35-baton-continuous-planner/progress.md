@@ -33,3 +33,5 @@ Task 10: fix round 2/5 (4 addressed, 1 open — worker-invariant stateless HDF5 
 Task 10: fix round 3/5 (1 addressed, 1 open — same-byte safetensors hash/deserialization and immutable snapshot manifest; commit e6df762..d6c5027)
 Task 10: fix round 4/5 (1 addressed, 0 open — single sealed Stage2 envelope load eliminates split-envelope TOCTOU; commit d6c5027..4780812)
 Task 10: complete (commits 4fa0cce..4780812, independent review approved; required gate 128 passed, HDF5 protected/functional gate 80 passed)
+Task 11: fix round 1/5 (4 addressed, 0 open — collective checkpoint failure propagation; real Accelerate two-rank exact resume; rank-distinct DDP negative control; strict invocation UUID; commit 3560e4e..8a474d2)
+Task 11: complete (commits 78f66f7..8a474d2, independent review approved; end-to-end 10 passed, training-contract 77 passed, legacy/source 448 passed, real two-rank nested-resume smoke passed)
