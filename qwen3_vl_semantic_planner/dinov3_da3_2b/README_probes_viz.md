@@ -67,3 +67,33 @@ quality of a four-layer WSA checkpoint.
 The default OLA probe directory is `/data/users/junjie/probes_2b`. The keeper WSA
 probe is `da3_depth_wsa_probe.pt`; generated visualizations should remain under an
 ignored `outputs/` directory.
+
+## SigLIP2 PCA upsampling probe
+
+Input: penultimate 16x16x1024 SigLIP2-large tokens. Target: the same frozen
+model at 512 input, fixed global PCA, 32x32 -> 256x256. The probe is
+feature-only and does not accept RGB.
+
+On HPC3, submit the reproducible formal recipe with:
+
+```bash
+sbatch qwen3_vl_semantic_planner/dinov3_da3_2b/\
+sbatch_train_siglip2_pca_probe_hpc3.sh
+```
+
+The launcher uses the `acd_u` partition with one GPU and 12 CPUs. Set
+`RUN_KIND=smoke` to force 2 steps, 1 PCA batch, and 1 validation batch; the
+formal default is 5,000 steps, batch size 8, 25 PCA batches, and 50 validation
+batches. Its environment overrides are `RUN_KIND`, `STEPS`, `BATCH_SIZE`,
+`OUTPUT_DIR`, `FRAME_CACHE_DIR`, `SIGLIP2_MODEL_DIR`, `PYTHON`, and
+`REPO_ROOT`.
+
+Keeper: `siglip2_pca_upsample_probe.pt`. Rejected run:
+`siglip2_pca_upsample_probe_rejected.pt` and exit code 2.
+To add an accepted probe to episode export, pass it explicitly:
+
+```bash
+python qwen3_vl_semantic_planner/dinov3_da3_2b/\
+export_libero_episode_siglip2_da3.py \
+  --siglip-pca-probe /path/to/siglip2_pca_upsample_probe.pt
+```

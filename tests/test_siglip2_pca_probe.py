@@ -166,6 +166,23 @@ def test_probe_training_parser_uses_approved_recipe() -> None:
     assert args.seed == 0
 
 
+def test_hpc3_launcher_records_probe_recipe() -> None:
+    launcher = (
+        Path(__file__).resolve().parents[1]
+        / "qwen3_vl_semantic_planner/dinov3_da3_2b/"
+        "sbatch_train_siglip2_pca_probe_hpc3.sh"
+    ).read_text()
+
+    assert "#SBATCH --partition=acd_u" in launcher
+    assert "#SBATCH --gres=gpu:1" in launcher
+    assert "libero_fastwam_frame_cache_160" in launcher
+    assert "siglip2-large-patch16-256" in launcher
+    assert "RUN_KIND" in launcher
+    assert "--pca-batches" in launcher
+    assert "--validation-batches" in launcher
+    assert "siglip2_pca_upsample_probe.pt" not in launcher
+
+
 def test_probe_training_metadata_records_exact_optimizer_recipe() -> None:
     metadata = train_probe.training_metadata(
         steps=5000,
