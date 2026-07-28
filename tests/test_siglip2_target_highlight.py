@@ -175,14 +175,45 @@ class _FakeProcessor:
         }
 
 
-class _FakePairwiseSiglip(torch.nn.Module):
+class _FakeVisionLayer(torch.nn.Module):
+    def __init__(self, *, return_tuple: bool = False) -> None:
+        super().__init__()
+        self.return_tuple = return_tuple
+
+    def forward(self, hidden_states):
+        if self.return_tuple:
+            return (hidden_states,)
+        return hidden_states
+
+
+class _FakeVisionEncoder(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.unused_parameter = torch.nn.Parameter(torch.ones(1))
-        self.vision_model = SimpleNamespace(
-            config=SimpleNamespace(image_size=256, patch_size=16, hidden_size=1024)
+        self.layers = torch.nn.ModuleList(
+            [_FakeVisionLayer(return_tuple=True), _FakeVisionLayer()]
         )
+
+
+class _FakeVisionModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(image_size=256, patch_size=16, hidden_size=1024)
+        self.encoder = _FakeVisionEncoder()
+
+
+class _FakePairwiseSiglip(torch.nn.Module):
+    def __init__(
+        self,
+        *,
+        penultimate_calls: str = "once",
+        fail_after_vision: bool = False,
+    ) -> None:
+        super().__init__()
+        self.unused_parameter = torch.nn.Parameter(torch.ones(1))
+        self.vision_model = _FakeVisionModel()
         self.text_model = SimpleNamespace()
+        self.penultimate_calls = penultimate_calls
+        self.fail_after_vision = fail_after_vision
         pattern = torch.zeros(1, 256, 1024)
         for row in range(4):
             for column in range(4):
@@ -206,15 +237,21 @@ class _FakePairwiseSiglip(torch.nn.Module):
             "return_dict": return_dict,
         }
         tokens = pixel_values[:, :1, 0, 0].view(-1, 1, 1) * self.token_pattern
+        penultimate = self.vision_model.encoder.layers[-2]
+        final_layer = self.vision_model.encoder.layers[-1]
+        if self.penultimate_calls != "none":
+            tokens = penultimate(tokens)[0]
+            if self.penultimate_calls == "twice":
+                tokens = penultimate(tokens)[0]
+        tokens = final_layer(tokens)
+        if self.fail_after_vision:
+            raise RuntimeError("fake full-model failure")
         visual_features = tokens.sum(dim=1)[:, :2]
         text_features = torch.eye(2, device=tokens.device)[input_ids[:, 0]]
         logits_per_image = visual_features @ text_features.T
-        decoy_final_layer = tokens * 0
         return SimpleNamespace(
             logits_per_image=logits_per_image,
-            vision_model_output=SimpleNamespace(
-                hidden_states=(torch.zeros_like(tokens), tokens, decoy_final_layer)
-            ),
+            vision_model_output=SimpleNamespace(hidden_states=None),
         )
 
 
@@ -240,7 +277,41 @@ def test_siglip_pair_gradcam_backpropagates_each_pairwise_diagonal_score():
     assert model.forward_kwargs == {"output_hidden_states": True, "return_dict": True}
     assert all(not parameter.requires_grad for parameter in model.parameters())
     assert all(parameter.grad is None for parameter in model.parameters())
+    assert len(model.vision_model.encoder.layers[-2]._forward_hooks) == 0
     assert processor.calls[0][2:] == ("max_length", "pt")
 
     with pytest.raises(ValueError, match="same length"):
         highlighter(images, ["only one phrase"])
+
+
+@pytest.mark.parametrize("penultimate_calls", ["none", "twice"])
+def test_siglip_pair_gradcam_rejects_missing_or_duplicate_hook_captures(
+    penultimate_calls,
+):
+    model = _FakePairwiseSiglip(penultimate_calls=penultimate_calls)
+    highlighter = SiglipPairGradCAM(
+        Path("unused-fake-checkpoint"),
+        torch.device("cpu"),
+        model=model,
+        processor=_FakeProcessor(),
+    )
+
+    with pytest.raises(RuntimeError, match="exactly one"):
+        highlighter([Image.new("RGB", (2, 2))], ["target"])
+
+    assert len(model.vision_model.encoder.layers[-2]._forward_hooks) == 0
+
+
+def test_siglip_pair_gradcam_removes_hook_after_full_model_error():
+    model = _FakePairwiseSiglip(fail_after_vision=True)
+    highlighter = SiglipPairGradCAM(
+        Path("unused-fake-checkpoint"),
+        torch.device("cpu"),
+        model=model,
+        processor=_FakeProcessor(),
+    )
+
+    with pytest.raises(RuntimeError, match="fake full-model failure"):
+        highlighter([Image.new("RGB", (2, 2))], ["target"])
+
+    assert len(model.vision_model.encoder.layers[-2]._forward_hooks) == 0

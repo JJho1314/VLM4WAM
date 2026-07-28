@@ -106,13 +106,32 @@ class SiglipPairGradCAM:
         )
         pixel_values = inputs.pop("pixel_values").to(self.device)
         pixel_values.requires_grad_(True)
-        outputs = self.model(
-            pixel_values=pixel_values,
-            **{name: value.to(self.device) for name, value in inputs.items()},
-            output_hidden_states=True,
-            return_dict=True,
-        )
-        tokens = outputs.vision_model_output.hidden_states[-2]
+        captured_tokens: list[torch.Tensor] = []
+
+        def capture_penultimate_tokens(_module, _inputs, output) -> None:
+            if isinstance(output, tuple):
+                output = output[0]
+            if not isinstance(output, torch.Tensor):
+                raise RuntimeError("SigLIP penultimate layer did not return a tensor")
+            captured_tokens.append(output)
+
+        penultimate_layer = self.model.vision_model.encoder.layers[-2]
+        hook_handle = penultimate_layer.register_forward_hook(capture_penultimate_tokens)
+        try:
+            outputs = self.model(
+                pixel_values=pixel_values,
+                **{name: value.to(self.device) for name, value in inputs.items()},
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        finally:
+            hook_handle.remove()
+        if len(captured_tokens) != 1:
+            raise RuntimeError(
+                "Expected exactly one SigLIP penultimate layer capture, "
+                f"got {len(captured_tokens)}."
+            )
+        tokens = captured_tokens[0]
         tokens.retain_grad()
         score = outputs.logits_per_image.diagonal().sum()
         score.backward()
