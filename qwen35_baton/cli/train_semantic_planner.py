@@ -932,6 +932,52 @@ def _reconcile_metrics(path: Path, *, completed_step: int) -> None:
             temporary.unlink()
 
 
+def configure_rank_local_triton_cache(
+    *, cache_root: str | Path | None = None
+) -> Path | None:
+    """Give each distributed worker its own Triton cache directory."""
+
+    try:
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    except ValueError as error:
+        raise ValueError("WORLD_SIZE must be an integer") from error
+    if world_size <= 1:
+        return None
+    try:
+        local_rank = int(os.environ["LOCAL_RANK"])
+    except KeyError as error:
+        raise ValueError("distributed training requires LOCAL_RANK") from error
+    except ValueError as error:
+        raise ValueError("LOCAL_RANK must be an integer") from error
+    if not 0 <= local_rank < world_size:
+        raise ValueError("LOCAL_RANK must be in [0,WORLD_SIZE)")
+
+    if cache_root is None:
+        configured_root = os.environ.get("TRITON_CACHE_DIR")
+        root = (
+            Path(configured_root)
+            if configured_root
+            else Path(tempfile.gettempdir()) / "qwen35_baton_triton"
+        )
+    else:
+        root = Path(cache_root)
+    rendezvous = sha256_json(
+        {
+            "master_addr": os.environ.get("MASTER_ADDR", ""),
+            "master_port": os.environ.get("MASTER_PORT", ""),
+            "world_size": world_size,
+        }
+    )[:16]
+    rank_cache = (
+        root.expanduser().resolve()
+        / f"run_{rendezvous}"
+        / f"local_rank_{local_rank}"
+    )
+    rank_cache.mkdir(parents=True, exist_ok=True)
+    os.environ["TRITON_CACHE_DIR"] = str(rank_cache)
+    return rank_cache
+
+
 def run_training(
     config: Stage1TrainingConfig,
     *,
@@ -942,6 +988,7 @@ def run_training(
 
     if not isinstance(config, Stage1TrainingConfig):
         raise TypeError("config must be Stage1TrainingConfig")
+    configure_rank_local_triton_cache()
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     # Model constructors consume RNG too, so seed before creating any artifact.
     _seed_everything(config.seed)

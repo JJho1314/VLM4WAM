@@ -26,6 +26,7 @@ from qwen35_baton.cli.train_semantic_planner import (
     build_stage1_optimizer,
     build_stage1_optimizer_groups,
     checkpoint_steps,
+    configure_rank_local_triton_cache,
     load_local_artifacts,
     require_stage1_global_batch,
     resolve_deepspeed_runtime_config,
@@ -37,6 +38,26 @@ from qwen35_baton.ownership import configure_stage1_trainable_modules
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_distributed_training_uses_an_isolated_triton_cache_per_local_rank(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setenv("LOCAL_RANK", "3")
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29417")
+    monkeypatch.delenv("TRITON_CACHE_DIR", raising=False)
+
+    cache = configure_rank_local_triton_cache(cache_root=tmp_path)
+
+    assert cache is not None
+    assert cache.parent.parent == tmp_path
+    assert cache.parent.name.startswith("run_")
+    assert len(cache.parent.name) == len("run_") + 16
+    assert cache.name == "local_rank_3"
+    assert cache.is_dir()
+    assert os.environ["TRITON_CACHE_DIR"] == str(cache)
 
 
 class _TinyLanguage(nn.Module):
