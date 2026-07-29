@@ -14,6 +14,7 @@
   "max_steps": 30000,
   "warmup_steps": 1000,
   "save_every": 5000,
+  "initial_save_step": 20,
   "log_every": 20,
   "max_consecutive_skipped_updates": 8,
   "learning_rate": 0.00001,

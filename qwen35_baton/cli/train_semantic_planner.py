@@ -82,6 +82,7 @@ class Stage1TrainingConfig:
     max_steps: int = 30_000
     warmup_steps: int = 1_000
     save_every: int = 5_000
+    initial_save_step: int | None = 20
     log_every: int = 20
     max_consecutive_skipped_updates: int = 8
     learning_rate: float = 1e-5
@@ -126,6 +127,14 @@ class Stage1TrainingConfig:
             or self.warmup_steps >= self.max_steps
         ):
             raise ValueError("warmup_steps must be in [0,max_steps)")
+        if (
+            self.initial_save_step is not None
+            and (
+                type(self.initial_save_step) is not int
+                or not 0 < self.initial_save_step < self.max_steps
+            )
+        ):
+            raise ValueError("initial_save_step must be None or in (0,max_steps)")
         if type(self.num_workers) is not int or self.num_workers < 0:
             raise ValueError("num_workers must be a non-negative integer")
         if type(self.gradient_checkpointing) is not bool:
@@ -142,10 +151,13 @@ class Stage1TrainingConfig:
         if self.gradient_clip_norm != 1.0:
             raise ValueError("Stage-1 gradient clipping norm must be exactly 1.0")
         if not self.tiny_test and (
-            self.max_steps != 30_000 or self.save_every != 5_000
+            self.max_steps != 30_000
+            or self.save_every != 5_000
+            or self.initial_save_step != 20
         ):
             raise ValueError(
-                "production Stage-1 cadence must be 30000 steps with saves every 5000"
+                "production Stage-1 cadence must run 30000 steps, probe step 20, "
+                "then save every 5000 steps"
             )
         if self.learning_rate != _APPROVED_LR:
             raise ValueError("Stage-1 learning rate must be exactly 1e-5")
@@ -244,12 +256,28 @@ def require_stage1_global_batch(
     return effective
 
 
-def checkpoint_steps(*, max_steps: int, save_every: int) -> tuple[int, ...]:
+def checkpoint_steps(
+    *,
+    max_steps: int,
+    save_every: int,
+    initial_save_step: int | None = None,
+) -> tuple[int, ...]:
     if type(max_steps) is not int or type(save_every) is not int:
         raise TypeError("checkpoint cadence values must be integers")
     if max_steps <= 0 or save_every <= 0 or max_steps % save_every:
         raise ValueError("max_steps must be a positive multiple of save_every")
-    return tuple(range(save_every, max_steps + 1, save_every))
+    if (
+        initial_save_step is not None
+        and (
+            type(initial_save_step) is not int
+            or not 0 < initial_save_step < max_steps
+        )
+    ):
+        raise ValueError("initial_save_step must be None or in (0,max_steps)")
+    steps = set(range(save_every, max_steps + 1, save_every))
+    if initial_save_step is not None:
+        steps.add(initial_save_step)
+    return tuple(sorted(steps))
 
 
 def resolve_deepspeed_runtime_config(
@@ -1053,6 +1081,13 @@ def run_training(
     window_sums: dict[str, float] = {}
     window_microbatches = 0
     consecutive_skipped_updates = 0
+    save_steps = frozenset(
+        checkpoint_steps(
+            max_steps=config.max_steps,
+            save_every=config.save_every,
+            initial_save_step=config.initial_save_step,
+        )
+    )
     while cursor.global_step < target_step:
         epoch = cursor.epoch
         _set_dataloader_epoch(
@@ -1250,7 +1285,7 @@ def run_training(
                             step=cursor.global_step,
                             metrics=last_metrics,
                         )
-                if cursor.global_step % config.save_every == 0:
+                if cursor.global_step in save_steps:
                     last_checkpoint = _save_training_checkpoint(
                         accelerator=accelerator,
                         config=config,

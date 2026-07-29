@@ -155,6 +155,7 @@ def _config(
         max_steps=max_steps,
         warmup_steps=0 if max_steps == 1 else 1,
         save_every=save_every,
+        initial_save_step=None,
         log_every=1,
         seed=17,
         mixed_precision="no",
@@ -452,10 +453,11 @@ def test_deepspeed_runtime_config_resolves_micro_and_global_batch(
             **config.to_dict(),
             "tiny_test": False,
             "mixed_precision": "bf16",
-            "max_steps": 30_000,
-            "warmup_steps": 1_000,
-            "save_every": 5_000,
-            "per_device_batch": 2,
+                "max_steps": 30_000,
+                "warmup_steps": 1_000,
+                "save_every": 5_000,
+                "initial_save_step": 20,
+                "per_device_batch": 2,
             "gradient_accumulation_steps": 4,
             "deepspeed_config_path": str(source),
         }
@@ -488,6 +490,7 @@ def test_production_stage1_uses_checkpoint_compatible_ddp(
             "max_steps": 30_000,
             "warmup_steps": 1_000,
             "save_every": 5_000,
+            "initial_save_step": 20,
         }
     )
     artifacts = _artifacts(config)
@@ -562,8 +565,13 @@ def test_gradient_checkpointing_uses_qwen_public_api(
     assert calls == [expected]
 
 
-def test_checkpoint_cadence_is_every_5000_through_30000() -> None:
-    assert checkpoint_steps(max_steps=30_000, save_every=5_000) == (
+def test_checkpoint_cadence_probes_step_20_then_saves_every_5000() -> None:
+    assert checkpoint_steps(
+        max_steps=30_000,
+        save_every=5_000,
+        initial_save_step=20,
+    ) == (
+        20,
         5_000,
         10_000,
         15_000,

@@ -507,6 +507,7 @@ def _stage1_config(output_dir: Path) -> Stage1TrainingConfig:
         max_steps=2,
         warmup_steps=0,
         save_every=1,
+        initial_save_step=None,
         mixed_precision="no",
         num_workers=0,
         tiny_test=True,
