@@ -385,6 +385,58 @@ def test_checkpoint_save_rejects_unnamed_optimizer_lr_groups(
     assert not destination.exists()
 
 
+def test_checkpoint_uses_the_first_registered_name_for_an_aliased_parameter(
+    tmp_path: Path,
+) -> None:
+    class _AliasedPlanner(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.backbone = nn.Module()
+            self.backbone.lm_head = nn.Linear(2, 1, bias=False)
+            self.frozen_base_embedding = self.backbone.lm_head
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return self.backbone.lm_head(value)
+
+    planner = _AliasedPlanner()
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "name": "planner",
+                "params": [planner.backbone.lm_head.weight],
+                "lr": 5e-5,
+            }
+        ]
+    )
+    scheduler = BatonCosineWarmupScheduler(
+        optimizer, warmup_steps=0, max_steps=10
+    )
+    planner(torch.tensor([[1.0, -2.0]])).square().mean().backward()
+    optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad(set_to_none=True)
+    destination = tmp_path / "step_000001"
+
+    save_baton_checkpoint(
+        destination,
+        planner=planner,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        metadata=_metadata_for_planner(planner),
+        cursor=_cursor(),
+        rank_rng_state={0: capture_rank_rng_state(distributed_rank=0)},
+    )
+
+    optimizer_state = torch.load(
+        destination / "optimizer.pt",
+        weights_only=True,
+        map_location="cpu",
+    )
+    assert optimizer_state["param_groups"][0]["parameter_names"] == [
+        "backbone.lm_head.weight"
+    ]
+
+
 def test_continuous_loader_rejects_ta_tok_metadata_before_model_mutation(
     tmp_path: Path,
 ) -> None:

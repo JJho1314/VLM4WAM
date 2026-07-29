@@ -346,9 +346,9 @@ def _optimizer_parameter_contract(
     planner: nn.Module,
     optimizer: torch.optim.Optimizer,
 ) -> list[dict[str, list[Any]]]:
-    aliases: dict[int, list[str]] = {}
-    for name, parameter in planner.named_parameters(remove_duplicate=False):
-        aliases.setdefault(id(parameter), []).append(name)
+    canonical_names = {
+        id(parameter): name for name, parameter in planner.named_parameters()
+    }
     contracts: list[dict[str, list[Any]]] = []
     seen: set[int] = set()
     for group in optimizer.param_groups:
@@ -362,12 +362,12 @@ def _optimizer_parameter_contract(
             if identifier in seen:
                 raise ValueError("optimizer parameters must be unique across groups")
             seen.add(identifier)
-            parameter_aliases = aliases.get(identifier, [])
-            if len(parameter_aliases) != 1:
+            parameter_name = canonical_names.get(identifier)
+            if not isinstance(parameter_name, str) or not parameter_name:
                 raise ValueError(
                     "optimizer parameter names must be canonical and unique"
                 )
-            names.append(parameter_aliases[0])
+            names.append(parameter_name)
             shapes.append(list(parameter.shape))
             dtypes.append(str(parameter.dtype))
         contracts.append(
