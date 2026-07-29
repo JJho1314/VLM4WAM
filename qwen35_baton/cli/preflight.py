@@ -237,23 +237,6 @@ def preflight_stage1(
         Path(config.output_dir),
         (qwen, processor, tokenizer, siglip, manifest, statistics),
     )
-    deepspeed = _load_json(
-        Path(config.deepspeed_config_path),
-        label="DeepSpeed ZeRO-2 config",
-    )
-    zero = deepspeed.get("zero_optimization")
-    if (
-        not isinstance(zero, Mapping)
-        or zero.get("stage") != 2
-        or "offload_optimizer" in zero
-        or "offload_param" in zero
-        or deepspeed.get("gradient_accumulation_steps") != "auto"
-        or deepspeed.get("bf16") != {"enabled": True}
-    ):
-        raise ValueError(
-            "DeepSpeed config must be BF16 ZeRO-2 with runtime-resolved "
-            "accumulation and no offload"
-        )
     fast_path = require_qwen35_fast_path()
     from qwen35_baton.cli.train_semantic_planner import require_stage1_global_batch
 
@@ -272,7 +255,7 @@ def preflight_stage1(
         "siglip2_artifact_hash": actual_siglip_artifact_hash,
         "hdf5_manifest_hash": actual_manifest_hash,
         "qwen35_fast_path": fast_path,
-        "deepspeed_zero_stage": 2,
+        "distributed_strategy": "ddp",
     }
 
 

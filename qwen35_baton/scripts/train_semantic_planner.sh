@@ -5,7 +5,6 @@ NUM_GPUS="${NUM_GPUS:-8}"
 PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-4}"
 CONFIG="${CONFIG:-${1:-qwen35_baton/configs/libero_stage1.json}}"
-DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-qwen35_baton/configs/deepspeed_zero2.json}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
@@ -35,8 +34,7 @@ export HF_DATASETS_OFFLINE=1
   --config "${CONFIG}" \
   --world-size "${NUM_GPUS}" \
   --per-device-batch "${PER_DEVICE_BATCH}" \
-  --gradient-accumulation-steps "${GRAD_ACCUM}" \
-  --deepspeed-config-path "${DEEPSPEED_CONFIG}"
+  --gradient-accumulation-steps "${GRAD_ACCUM}"
 "${PYTHON_BIN}" -m torch.distributed.run \
   --standalone \
   --nproc_per_node="${NUM_GPUS}" \
@@ -44,5 +42,4 @@ export HF_DATASETS_OFFLINE=1
   --config "${CONFIG}" \
   --per-device-batch "${PER_DEVICE_BATCH}" \
   --gradient-accumulation-steps "${GRAD_ACCUM}" \
-  --deepspeed-config-path "${DEEPSPEED_CONFIG}" \
   "${checkpoint_flag}"

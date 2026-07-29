@@ -931,20 +931,7 @@ def run_training(
         )
 
     from accelerate import Accelerator
-    from accelerate.utils import DeepSpeedPlugin, GradientAccumulationPlugin
-
-    deepspeed_plugin = None
-    if not config.tiny_test:
-        deepspeed_runtime_config = resolve_deepspeed_runtime_config(
-            config,
-            world_size=world_size,
-        )
-        deepspeed_plugin = DeepSpeedPlugin(
-            hf_ds_config=deepspeed_runtime_config,
-            gradient_accumulation_steps=config.gradient_accumulation_steps,
-            gradient_clipping=config.gradient_clip_norm,
-            zero_stage=2,
-        )
+    from accelerate.utils import GradientAccumulationPlugin
 
     accelerator = Accelerator(
         gradient_accumulation_plugin=GradientAccumulationPlugin(
@@ -954,7 +941,6 @@ def run_training(
         mixed_precision=config.mixed_precision,
         cpu=config.tiny_test,
         step_scheduler_with_optimizer=False,
-        deepspeed_plugin=deepspeed_plugin,
     )
     if not config.tiny_test:
         require_stage1_global_batch(

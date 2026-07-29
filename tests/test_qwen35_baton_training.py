@@ -469,6 +469,52 @@ def test_deepspeed_runtime_config_resolves_micro_and_global_batch(
     assert resolved["zero_optimization"]["stage"] == 2
 
 
+def test_production_stage1_uses_checkpoint_compatible_ddp(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import accelerate
+    import accelerate.utils
+    import qwen35_baton.cli.train_semantic_planner as training_module
+
+    baseline = _config(tmp_path)
+    config = Stage1TrainingConfig(
+        **{
+            **baseline.to_dict(),
+            "tiny_test": False,
+            "mixed_precision": "bf16",
+            "per_device_batch": 32,
+            "gradient_accumulation_steps": 4,
+            "max_steps": 30_000,
+            "warmup_steps": 1_000,
+            "save_every": 5_000,
+        }
+    )
+    artifacts = _artifacts(config)
+    fake_accelerator = _skipping_accelerator([False])
+
+    def forbidden_deepspeed_plugin(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(
+            "Stage-1 must keep a full AdamW state on every DDP rank"
+        )
+
+    monkeypatch.setattr(accelerate, "Accelerator", fake_accelerator)
+    monkeypatch.setattr(
+        accelerate.utils,
+        "DeepSpeedPlugin",
+        forbidden_deepspeed_plugin,
+    )
+    monkeypatch.setattr(
+        training_module,
+        "_configure_gradient_checkpointing",
+        lambda *args, **kwargs: None,
+    )
+
+    result = run_training(config, artifacts=artifacts, stop_at_step=1)
+
+    assert result.global_step == 1
+
+
 def test_qwen35_fast_path_fails_closed_when_compiled_dependency_is_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1169,6 +1215,7 @@ def test_preflight_is_cpu_side_and_validates_local_artifact_contracts(
         "causal_conv1d": "test",
     }
     assert report["qwen_backbone"] == "dense Qwen3.5-2B"
+    assert report["distributed_strategy"] == "ddp"
     assert report["siglip2_geometry"] == {
         "image_size": 256,
         "patch_size": 16,
@@ -1361,9 +1408,11 @@ def test_stage1_recipe_requirements_and_launchers_are_fixed(tmp_path: Path) -> N
     assert calls[0].startswith("-m qwen35_baton.cli.preflight ")
     assert "--per-device-batch 32" in calls[0]
     assert "--gradient-accumulation-steps 4" in calls[0]
+    assert "--deepspeed-config-path" not in calls[0]
     assert calls[1].startswith("-m torch.distributed.run ")
     assert "--per-device-batch 32" in calls[1]
     assert "--gradient-accumulation-steps 4" in calls[1]
+    assert "--deepspeed-config-path" not in calls[1]
 
 
 def test_production_artifacts_are_constructed_after_global_seeding(
