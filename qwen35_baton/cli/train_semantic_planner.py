@@ -462,6 +462,33 @@ class EpochSeededRandomSampler(torch.utils.data.Sampler[int]):
         return len(self.data_source)
 
 
+def build_stage1_dataloader(
+    dataset: Any,
+    *,
+    collate_fn: Any,
+    config: Stage1TrainingConfig,
+) -> torch.utils.data.DataLoader:
+    """Build workers without inheriting the CUDA-initialized training process."""
+
+    sampler = EpochSeededRandomSampler(dataset, seed=config.seed)
+    generator = torch.Generator()
+    generator.manual_seed(config.seed)
+    worker_options = (
+        {"multiprocessing_context": "spawn"} if config.num_workers > 0 else {}
+    )
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=config.per_device_batch,
+        sampler=sampler,
+        collate_fn=collate_fn,
+        num_workers=config.num_workers,
+        drop_last=True,
+        generator=generator,
+        persistent_workers=config.num_workers > 0,
+        **worker_options,
+    )
+
+
 def _artifact_hash(path: Path) -> str:
     return sha256_artifact(path)
 
@@ -557,18 +584,10 @@ def load_local_artifacts(
         train_dataset=True,
     )
     dataset = BatonLiberoDataset(base_dataset, seed=config.seed)
-    sampler = EpochSeededRandomSampler(dataset, seed=config.seed)
-    generator = torch.Generator()
-    generator.manual_seed(config.seed)
-    train_batches = torch.utils.data.DataLoader(
+    train_batches = build_stage1_dataloader(
         dataset,
-        batch_size=config.per_device_batch,
-        sampler=sampler,
         collate_fn=BatonPlannerCollator(processor),
-        num_workers=config.num_workers,
-        drop_last=True,
-        generator=generator,
-        persistent_workers=config.num_workers > 0,
+        config=config,
     )
     if len(train_batches) <= 0:
         raise ValueError("Stage-1 dataset must yield at least one complete microbatch")

@@ -185,6 +185,28 @@ def _config(
     )
 
 
+def test_stage1_workers_use_spawn_instead_of_inheriting_the_cuda_parent(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+    import qwen35_baton.cli.train_semantic_planner as training_module
+
+    build_loader = getattr(training_module, "build_stage1_dataloader", None)
+    assert callable(build_loader), "Stage-1 must own its DataLoader process policy"
+    config = replace(
+        _config(tmp_path),
+        per_device_batch=1,
+        num_workers=2,
+    )
+    dataset = torch.utils.data.TensorDataset(torch.arange(4))
+
+    loader = build_loader(dataset, collate_fn=None, config=config)
+
+    assert loader.persistent_workers is True
+    assert loader.multiprocessing_context is not None
+    assert loader.multiprocessing_context.get_start_method() == "spawn"
+
+
 def _artifacts(
     config: Stage1TrainingConfig,
     *,
