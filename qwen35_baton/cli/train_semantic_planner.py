@@ -92,6 +92,7 @@ class Stage1TrainingConfig:
     gradient_checkpointing: bool = False
     deepspeed_config_path: str = "qwen35_baton/configs/deepspeed_zero2.json"
     num_workers: int = 4
+    persistent_workers: bool = True
     seed: int = 42
     resume_from: str | None = None
     tiny_test: bool = False
@@ -137,6 +138,8 @@ class Stage1TrainingConfig:
             raise ValueError("initial_save_step must be None or in (0,max_steps)")
         if type(self.num_workers) is not int or self.num_workers < 0:
             raise ValueError("num_workers must be a non-negative integer")
+        if type(self.persistent_workers) is not bool:
+            raise ValueError("persistent_workers must be boolean")
         if type(self.gradient_checkpointing) is not bool:
             raise ValueError("gradient_checkpointing must be boolean")
         if (
@@ -484,7 +487,7 @@ def build_stage1_dataloader(
         num_workers=config.num_workers,
         drop_last=True,
         generator=generator,
-        persistent_workers=config.num_workers > 0,
+        persistent_workers=config.num_workers > 0 and config.persistent_workers,
         **worker_options,
     )
 

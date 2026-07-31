@@ -207,6 +207,31 @@ def test_stage1_workers_use_spawn_instead_of_inheriting_the_cuda_parent(
     assert loader.multiprocessing_context.get_start_method() == "spawn"
 
 
+def test_stage1_workers_can_restart_each_epoch_to_release_worker_memory(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+    import qwen35_baton.cli.train_semantic_planner as training_module
+
+    config = replace(
+        _config(tmp_path),
+        per_device_batch=1,
+        num_workers=2,
+        persistent_workers=False,
+    )
+    dataset = torch.utils.data.TensorDataset(torch.arange(4))
+
+    loader = training_module.build_stage1_dataloader(
+        dataset,
+        collate_fn=None,
+        config=config,
+    )
+
+    assert loader.persistent_workers is False
+    assert loader.multiprocessing_context is not None
+    assert loader.multiprocessing_context.get_start_method() == "spawn"
+
+
 def _artifacts(
     config: Stage1TrainingConfig,
     *,
