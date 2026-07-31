@@ -13,6 +13,7 @@
 - Training data is only `episodes/` from `DavidxWang/worldarena2026-robotwin-data`; `official_episodes/` and all official WorldArena validation/test roots are rejected.
 - Each sample contains exactly one camera named `head`, one current RGB frame, and four strictly future RGB frames.
 - Future indices use `f_k = c + round((k + 1) * (120 - c) / 4)` for `k=0..3`, with `c` in `[0,116]` for the 121-frame release.
+- Source MP4 lengths are not trusted as canonical. The downloaded 509-episode release has 0/509 MP4s with exactly 121 decoded frames (observed range 76–787), while all metadata/actions declare 121. For every decodable source with `N >= 1`, map canonical index `i=0..120` to `round(i * (N - 1) / 120)`, allowing repeats for short videos and uniform downsampling for long videos while covering both endpoints. HDF5 and all future-frame sampling remain in canonical 121-frame coordinates.
 - Qwen receives the current head image and unchanged instruction only; actions and calibration paths remain metadata.
 - SigLIP2 remains frozen and online; the only loss is pointwise MSE against penultimate `[256,1024]` patch features.
 - Qwen3.5-2B, the visual alignment tower, and Sem-MLP remain trainable under the existing strict Stage-1 ownership contract.
@@ -194,6 +195,7 @@ git commit -m "feat(baton): support one-camera training batches"
 
 **Interfaces:**
 - Produces: `WorldArenaRecord` and `load_worldarena_source_manifest(path, dataset_root)`.
+- Produces: `canonical_source_frame_indices(source_frame_count) -> tuple[int, ...]` with exactly 121 endpoint-covering indices.
 - Produces: `future_frame_indices(current_index, frame_count=121) -> tuple[int, int, int, int]`.
 - Produces: `WorldArenaMP4Dataset(records, *, seed, split="train")` for correctness comparison.
 - Produces: `WorldArenaHDF5Dataset(manifest_path, *, seed, split="train")`.
@@ -247,7 +249,7 @@ def test_hdf5_dataset_returns_one_head_camera_and_metadata(tmp_path: Path) -> No
 
 
 def test_hdf5_selected_rgb_matches_online_mp4_decode(tmp_path: Path) -> None:
-    records = _write_source_episode(tmp_path, frame_count=121)
+    records = _write_source_episode(tmp_path, frame_count=137)
     online = WorldArenaMP4Dataset(records, seed=42, split="validation")
     manifest = predecode_worldarena(records, output_root=tmp_path / "cache", seed=42)
     cached = WorldArenaHDF5Dataset(manifest, seed=42, split="validation")
@@ -297,26 +299,28 @@ Manifest loading resolves every relative path under `dataset_root`, requires `vi
 
 - [ ] **Step 4: Implement deterministic predecode and atomic manifest publication**
 
-The CLI reads `metadata_train_a2v.jsonl`, decodes every video with OpenCV, requires exactly 121 frames, converts BGR to RGB, resizes to `256x256` with `INTER_AREA`, and writes one temporary HDF5 file before `os.replace`:
+The CLI reads `metadata_train_a2v.jsonl`, decodes every video with OpenCV, rejects videos with zero decodable frames, and normalizes every actual source length `N >= 1` to the canonical 121-frame timeline using `canonical_to_source[i] = round(i * (N - 1) / 120)`. This contract is required by the downloaded release: all 509 MP4 lengths differ from 121 (observed 76–787), although all 509 metadata/action records declare 121. `WorldArenaMP4Dataset` probes actual decodable `N` rather than trusting `CAP_PROP_FRAME_COUNT`. Convert selected BGR frames to RGB, resize to `256x256` with `INTER_AREA`, and write one temporary HDF5 file before `os.replace`:
 
 ```python
 with h5py.File(temporary, "w") as handle:
     handle.create_dataset(
         "rgb",
-        data=np.stack(frames),
+        data=canonical_frames,
         dtype=np.uint8,
         chunks=(1, 256, 256, 3),
         compression="lzf",
     )
 ```
 
-Assign validation membership by the first eight bytes of `sha256(f"{seed}:{episode_id}")`; publish `manifest.json` containing sorted relative HDF5 paths, source SHA-256 values, split, task, instruction, frame count, and optional metadata paths. Write `stats.json` with train/validation counts, task counts, image size, frame count, seed, source repository, and manifest SHA-256.
+Assign validation membership by the first eight bytes of `sha256(f"{seed}:{episode_id}")`; publish `manifest.json` containing sorted relative HDF5 paths, source SHA-256 values, split, task, instruction, canonical `frame_count=121`, actual `source_frame_count=N`, and optional metadata paths. Write `stats.json` with train/validation counts, task counts, image size, canonical frame count, per-episode source frame counts, seed, source repository, and manifest SHA-256.
+
+Complete-generation publication is fail-closed: `output_root` must not exist or be empty. Build every shard plus `manifest.json` and `stats.json` in a sibling staging directory on the same filesystem, fsync files and directories, then publish the complete cache with one final `os.replace(staging, output_root)`. Any failure removes staging and leaves the original output untouched; a nonempty existing cache is never overwritten.
 
 - [ ] **Step 5: Implement epoch-deterministic HDF5 loading**
 
 `WorldArenaHDF5Dataset` stores the epoch in shared memory. For each sample, select current frame with a local SHA-256 seed of `(seed, epoch, episode_id)` in training and `(seed, episode_id)` in validation, read only the five indexed frames inside a context-managed HDF5 handle, transpose RGB to CHW, and return one leading head-camera axis.
 
-`WorldArenaMP4Dataset` shares the same index-selection helper and output schema, but decodes only the five required source indices from the localized MP4. It exists for tests and one-episode smoke comparison; the production trainer selects HDF5 only.
+`WorldArenaMP4Dataset` shares the same canonical index-selection helper and output schema, maps those five canonical indices through the same `canonical_to_source` rule, and decodes only the resulting source indices from the localized MP4. It exists for tests and one-episode smoke comparison; the production trainer selects HDF5 only.
 
 - [ ] **Step 6: Run tests and a real one-video predecode smoke**
 
