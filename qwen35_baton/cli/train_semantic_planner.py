@@ -49,7 +49,7 @@ _METRICS_SCHEMA_VERSION = 1
 _METRICS_RECORD_KEYS = frozenset(
     {"schema_version", "step", "metrics", "checksum"}
 )
-_DURABLE_METRIC_NAMES = frozenset(
+_DURABLE_METRIC_BASE_NAMES = frozenset(
     {
         "loss/total",
         "loss/mse",
@@ -60,12 +60,17 @@ _DURABLE_METRIC_NAMES = frozenset(
         "backward_time",
         "throughput",
         "microbatches",
-        *(
-            f"mse/{camera}/frame_{frame}"
-            for camera in ("main", "wrist")
-            for frame in range(4)
-        ),
     }
+)
+_DURABLE_METRIC_NAME_SETS = frozenset(
+    _DURABLE_METRIC_BASE_NAMES.union(
+        {
+            f"mse/{camera}/frame_{frame}"
+            for camera in camera_names
+            for frame in range(4)
+        }
+    )
+    for camera_names in (("main", "wrist"), ("head",))
 )
 
 
@@ -83,6 +88,7 @@ class Stage1TrainingConfig:
     hdf5_manifest_path: str
     hdf5_manifest_hash: str
     dataset_statistics_path: str
+    dataset_type: str = "libero_hdf5"
     per_device_batch: int = 4
     gradient_accumulation_steps: int = 4
     max_steps: int = 30_000
@@ -159,6 +165,13 @@ class Stage1TrainingConfig:
             )
         if type(self.gradient_checkpointing) is not bool:
             raise ValueError("gradient_checkpointing must be boolean")
+        if not isinstance(self.dataset_type, str) or self.dataset_type not in {
+            "libero_hdf5",
+            "worldarena_hdf5",
+        }:
+            raise ValueError(
+                "dataset_type must be 'libero_hdf5' or 'worldarena_hdf5'"
+            )
         if (
             not isinstance(self.deepspeed_config_path, str)
             or not self.deepspeed_config_path
@@ -572,9 +585,6 @@ def load_local_artifacts(
     from qwen35_baton.data import BatonLiberoDataset, BatonPlannerCollator
     from qwen35_baton.model import BatonQwen35Planner
     from qwen35_baton.teacher import FrozenSiglip2Teacher
-    from ge_act.data.libero_fastwam_hdf5_dataset import (
-        LiberoFastWAMHDF5Dataset,
-    )
 
     tokenizer = components["tokenizer"]
     processor = components["processor"]
@@ -598,15 +608,35 @@ def load_local_artifacts(
         vision_model=vision_model,
         dtype=torch.bfloat16,
     )
-    base_dataset = LiberoFastWAMHDF5Dataset(
-        config.hdf5_manifest_path,
-        config.dataset_statistics_path,
-        train_dataset=True,
-    )
-    dataset = BatonLiberoDataset(base_dataset, seed=config.seed)
+    if config.dataset_type == "libero_hdf5":
+        from ge_act.data.libero_fastwam_hdf5_dataset import (
+            LiberoFastWAMHDF5Dataset,
+        )
+
+        base_dataset = LiberoFastWAMHDF5Dataset(
+            config.hdf5_manifest_path,
+            config.dataset_statistics_path,
+            train_dataset=True,
+        )
+        dataset = BatonLiberoDataset(base_dataset, seed=config.seed)
+        camera_names = ("main", "wrist")
+    elif config.dataset_type == "worldarena_hdf5":
+        from qwen35_baton.worldarena_data import WorldArenaHDF5Dataset
+
+        dataset = WorldArenaHDF5Dataset(
+            config.hdf5_manifest_path,
+            seed=config.seed,
+            split="train",
+        )
+        camera_names = ("head",)
+    else:
+        raise AssertionError("validated dataset_type is unreachable")
     train_batches = build_stage1_dataloader(
         dataset,
-        collate_fn=BatonPlannerCollator(processor),
+        collate_fn=BatonPlannerCollator(
+            processor,
+            camera_names=camera_names,
+        ),
         config=config,
     )
     if len(train_batches) <= 0:
@@ -614,7 +644,7 @@ def load_local_artifacts(
     ownership = configure_stage1_trainable_modules(planner)
     optimizer = build_stage1_optimizer(planner, ownership, config)
     scheduler = build_cosine_warmup_scheduler(optimizer, config)
-    example = BatonCheckpointMetadata.example()
+    example = BatonCheckpointMetadata.example(camera_names=camera_names)
     metadata = replace(
         example,
         qwen_config_hash=sha256_file(Path(config.qwen_model_path) / "config.json"),
@@ -919,7 +949,10 @@ def _durable_metrics_record(
 ) -> dict[str, Any]:
     if type(step) is not int or step <= 0:
         raise ValueError("durable metric step must be a positive integer")
-    if not isinstance(metrics, Mapping) or set(metrics) != _DURABLE_METRIC_NAMES:
+    if (
+        not isinstance(metrics, Mapping)
+        or frozenset(metrics) not in _DURABLE_METRIC_NAME_SETS
+    ):
         raise ValueError("durable metric names differ from the Stage-1 contract")
     if any(
         not isinstance(name, str)
@@ -933,7 +966,7 @@ def _durable_metrics_record(
         "step": step,
         "metrics": {
             name: float(metrics[name])
-            for name in sorted(_DURABLE_METRIC_NAMES)
+            for name in sorted(metrics)
         },
     }
     return {
@@ -957,7 +990,7 @@ def _validated_durable_metrics_record(
         or type(step) is not int
         or step <= 0
         or not isinstance(metrics, Mapping)
-        or set(metrics) != _DURABLE_METRIC_NAMES
+        or frozenset(metrics) not in _DURABLE_METRIC_NAME_SETS
         or any(
             not isinstance(name, str)
             or type(value) is not float
@@ -1523,7 +1556,18 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument("--resume-from", type=str)
+    parser.add_argument("--stop-at-step", type=_positive_integer)
     return parser
+
+
+def _positive_integer(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1542,7 +1586,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         overrides["resume_from"] = args.resume_from
     if overrides:
         config = replace(config, **overrides)
-    result = run_training(config)
+    result = run_training(config, stop_at_step=args.stop_at_step)
     if int(os.environ.get("RANK", "0")) == 0:
         print(
             json.dumps(

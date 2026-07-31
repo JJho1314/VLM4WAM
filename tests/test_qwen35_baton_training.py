@@ -205,6 +205,30 @@ def _config(
     )
 
 
+def test_stage1_accepts_only_explicit_worldarena_dataset_type(
+    tmp_path: Path,
+) -> None:
+    assert (
+        replace(_config(tmp_path), dataset_type="worldarena_hdf5").dataset_type
+        == "worldarena_hdf5"
+    )
+    for invalid in ("worldarena", None, True, ["worldarena_hdf5"]):
+        with pytest.raises(ValueError, match="dataset_type"):
+            replace(_config(tmp_path), dataset_type=invalid)
+
+
+def test_tiny_worldarena_preflight_reports_dataset_and_camera_contract(
+    tmp_path: Path,
+) -> None:
+    report = preflight_stage1(
+        replace(_config(tmp_path), dataset_type="worldarena_hdf5"),
+        world_size=1,
+    )
+
+    assert report["dataset_type"] == "worldarena_hdf5"
+    assert report["camera_names"] == ["head"]
+
+
 @pytest.mark.parametrize("value", [None, 1, 100])
 def test_worker_restart_interval_accepts_disabled_or_positive_values(
     tmp_path: Path, value: int | None
@@ -412,6 +436,27 @@ def _durable_metrics_record(
     }
 
 
+def test_worldarena_durable_metrics_accept_only_the_head_camera_contract() -> None:
+    import qwen35_baton.cli.train_semantic_planner as training_module
+
+    metrics = {
+        "loss/total": 1.0,
+        "loss/mse": 1.0,
+        "data_time": 0.1,
+        "qwen_time": 0.1,
+        "teacher_time": 0.1,
+        "query_tower_time": 0.1,
+        "backward_time": 0.1,
+        "throughput": 1.0,
+        "microbatches": 8.0,
+        **{f"mse/head/frame_{frame}": 1.0 for frame in range(4)},
+    }
+
+    record = training_module._durable_metrics_record(step=20, metrics=metrics)
+
+    assert record["metrics"] == metrics
+
+
 def test_stage1_trains_the_entire_va_planner() -> None:
     planner = _TinyPlanner()
 
@@ -566,11 +611,11 @@ def test_deepspeed_runtime_config_resolves_micro_and_global_batch(
             **config.to_dict(),
             "tiny_test": False,
             "mixed_precision": "bf16",
-                "max_steps": 30_000,
-                "warmup_steps": 1_000,
-                "save_every": 5_000,
-                "initial_save_step": 20,
-                "per_device_batch": 2,
+            "max_steps": 30_000,
+            "warmup_steps": 1_000,
+            "save_every": 5_000,
+            "initial_save_step": 20,
+            "per_device_batch": 2,
             "gradient_accumulation_steps": 4,
             "deepspeed_config_path": str(source),
         }
@@ -830,10 +875,10 @@ def test_each_microbatch_is_one_optimizer_update(
 
     assert result.cursor == __import__(
         "qwen35_baton.checkpoint", fromlist=["BatonTrainingCursor"]
-        ).BatonTrainingCursor(
-            global_step=2,
-            epoch=0,
-            consumed_microbatches=2,
+    ).BatonTrainingCursor(
+        global_step=2,
+        epoch=0,
+        consumed_microbatches=2,
         microbatches_per_epoch=5,
         sampler_seed=config.seed,
     )
@@ -963,8 +1008,8 @@ def test_always_skipped_optimizer_updates_fail_at_the_bounded_limit(
     with pytest.raises(
         FloatingPointError,
         match=(
-                "8 consecutive synchronized optimizer updates were skipped"
-                ".*global_step=0.*epoch=0.*consumed_microbatches=8"
+            "8 consecutive synchronized optimizer updates were skipped"
+            ".*global_step=0.*epoch=0.*consumed_microbatches=8"
         ),
     ):
         run_training(config, artifacts=artifacts)
@@ -1321,8 +1366,52 @@ def _write_preflight_fixture(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
             }
         )
     )
+    shard = dataset / "libero_object.h5"
+    shard.touch()
     manifest = dataset / "manifest.json"
-    manifest.write_text('{"format_version":1}\n')
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "camera_names": ["main", "wrist"],
+                "image_size": [256, 256],
+                "source_fps": 20,
+                "n_previous": 4,
+                "chunk": 9,
+                "action_chunk": 36,
+                "action_type": "absolute",
+                "action_space": "eef",
+                "compression": "lzf",
+                "source_roots": [str(dataset)],
+                "datasets": {
+                    "rgb_main": {
+                        "shape_tail": [256, 256, 3],
+                        "dtype": "uint8",
+                    },
+                    "rgb_wrist": {
+                        "shape_tail": [256, 256, 3],
+                        "dtype": "uint8",
+                    },
+                    "action": {"width": 7, "dtype": "float32"},
+                    "state": {"width": 8, "dtype": "float32"},
+                },
+                "converter_fingerprint": "0" * 64,
+                "episodes": [
+                    {
+                        "key": "libero_object:000000",
+                        "shard": shard.name,
+                        "group": "episodes/libero_object:000000",
+                        "caption": "pick up the cup",
+                        "domain": "libero_object",
+                        "episode_index": 0,
+                        "length": 121,
+                    }
+                ],
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
     from qwen35_baton.hashing import sha256_file
 
     payload = {
@@ -1377,6 +1466,100 @@ def test_preflight_is_cpu_side_and_validates_local_artifact_contracts(
         "hidden_size": 1024,
     }
     assert len(set(report["added_token_ids"])) == 7
+    assert report["dataset_type"] == "libero_hdf5"
+    assert report["camera_names"] == ["main", "wrist"]
+
+
+def test_worldarena_preflight_requires_matching_manifest_and_cache_stats(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "qwen35_baton.cli.preflight.require_qwen35_fast_path",
+        lambda: {"fla": "test", "causal_conv1d": "test"},
+    )
+    config, payload = _write_preflight_fixture(tmp_path)
+    manifest = Path(payload["hdf5_manifest_path"])
+    cache_root = manifest.parent
+    episode_id = "pick_cup__episode0"
+    source_root = tmp_path / "worldarena2026-robotwin-data"
+    source_episode = source_root / "episodes" / episode_id
+    source_episode.mkdir(parents=True)
+    shard = cache_root / "episodes" / f"{episode_id}.h5"
+    shard.parent.mkdir()
+    shard.touch()
+    record = {
+        "episode_id": episode_id,
+        "hdf5_path": f"episodes/{episode_id}.h5",
+        "source_dataset_root": str(source_root.resolve()),
+        "source_video_path": str((source_episode / "video.mp4").resolve()),
+        "source_video_relative_path": f"episodes/{episode_id}/video.mp4",
+        "source_video_sha256": "0" * 64,
+        "split": "train",
+        "task": "pick_cup",
+        "instruction": "pick up the cup",
+        "frame_count": 121,
+        "source_frame_count": 121,
+    }
+
+    def publish_worldarena(records: list[dict[str, Any]]) -> None:
+        manifest.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "source_repository": "worldarena2026-robotwin-data",
+                    "records": records,
+                }
+            )
+            + "\n"
+        )
+        manifest_hash = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        stats.write_text(
+            json.dumps(
+                {
+                    "source_repository": "worldarena2026-robotwin-data",
+                    "manifest_sha256": manifest_hash,
+                }
+            )
+            + "\n"
+        )
+        payload.update(
+            dataset_type="worldarena_hdf5",
+            hdf5_manifest_hash=manifest_hash,
+        )
+        config.write_text(json.dumps(payload))
+
+    stats = manifest.parent / "stats.json"
+    publish_worldarena([record])
+
+    report = preflight_stage1(config, world_size=8)
+
+    assert report["dataset_type"] == "worldarena_hdf5"
+    assert report["camera_names"] == ["head"]
+
+    publish_worldarena([])
+    with pytest.raises(ValueError, match="records|train"):
+        preflight_stage1(config, world_size=8)
+
+    validation_record = dict(record, split="validation")
+    publish_worldarena([validation_record])
+    with pytest.raises(ValueError, match="train"):
+        preflight_stage1(config, world_size=8)
+
+    publish_worldarena([record])
+
+    payload["dataset_type"] = "libero_hdf5"
+    config.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="dataset_type"):
+        preflight_stage1(config, world_size=8)
+
+    payload["dataset_type"] = "worldarena_hdf5"
+    other_stats = tmp_path / "stats.json"
+    other_stats.write_text(stats.read_text())
+    payload["dataset_statistics_path"] = str(other_stats)
+    config.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="cache stats.json"):
+        preflight_stage1(config, world_size=8)
 
 
 def test_preflight_rejects_non_128_production_global_batch(
@@ -1505,6 +1688,95 @@ def test_local_model_loading_forces_offline_only_transformers_calls(
     assert all(kwargs.get("local_files_only") is True for _, kwargs in calls)
 
 
+def test_worldarena_artifacts_use_one_head_camera(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import qwen35_baton.cli.train_semantic_planner as training_module
+    import qwen35_baton.model as model_module
+    import qwen35_baton.teacher as teacher_module
+    import qwen35_baton.worldarena_data as worldarena_module
+    import ge_act.data.libero_fastwam_hdf5_dataset as libero_module
+    from qwen35_baton.sequence import ADDED_TOKENS, PLAN_PAD
+
+    token_ids = {token: index + 1 for index, token in enumerate(ADDED_TOKENS)}
+    tokenizer = SimpleNamespace(
+        convert_tokens_to_ids=lambda token: token_ids[token],
+        pad_token_id=0,
+    )
+
+    class _Processor:
+        tokenizer: Any = None
+
+        def __call__(self, **_: Any) -> dict[str, torch.Tensor]:
+            identifiers = torch.full((1, 1024), token_ids[PLAN_PAD], dtype=torch.long)
+            return {
+                "input_ids": identifiers,
+                "attention_mask": torch.ones_like(identifiers),
+            }
+
+    class _WorldArenaDataset(torch.utils.data.Dataset[dict[str, Any]]):
+        def __init__(self, manifest_path: str, *, seed: int, split: str) -> None:
+            assert manifest_path == "unused"
+            assert seed == 17
+            assert split == "train"
+
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, index: int) -> dict[str, Any]:
+            assert index == 0
+            return {
+                "current_images": torch.zeros((1, 3, 256, 256), dtype=torch.uint8),
+                "future_images": torch.zeros((1, 4, 3, 256, 256), dtype=torch.uint8),
+                "instruction": "pick up the green bottle",
+                "suite": "worldarena",
+            }
+
+    monkeypatch.setattr(training_module, "sha256_file", lambda _: "0" * 64)
+    monkeypatch.setattr(training_module, "sha256_artifact", lambda _: "0" * 64)
+    monkeypatch.setattr(
+        training_module,
+        "_load_transformer_components",
+        lambda _: {
+            "tokenizer": tokenizer,
+            "processor": _Processor(),
+            "qwen": object(),
+            "siglip_processor": object(),
+            "siglip": SimpleNamespace(vision_model=nn.Linear(1, 1)),
+        },
+    )
+    monkeypatch.setattr(
+        model_module,
+        "BatonQwen35Planner",
+        lambda *args, **kwargs: _TinyPlanner(),
+    )
+    monkeypatch.setattr(
+        teacher_module.FrozenSiglip2Teacher,
+        "from_components",
+        classmethod(lambda cls, **kwargs: _TinyTeacher()),
+    )
+    monkeypatch.setattr(worldarena_module, "WorldArenaHDF5Dataset", _WorldArenaDataset)
+    monkeypatch.setattr(
+        libero_module,
+        "LiberoFastWAMHDF5Dataset",
+        lambda *args, **kwargs: pytest.fail("WorldArena must not use LIBERO data"),
+    )
+    config = replace(
+        _config(tmp_path),
+        dataset_type="worldarena_hdf5",
+        per_device_batch=1,
+        num_workers=0,
+    )
+
+    artifacts = load_local_artifacts(config)
+    batch = next(iter(artifacts.train_batches))
+
+    assert batch.camera_names == ("head",)
+    assert batch.future_images.shape[1:3] == (1, 4)
+    assert artifacts.metadata.camera_names == ("head",)
+
+
 def test_stage1_recipe_requirements_and_launchers_are_fixed(tmp_path: Path) -> None:
     config = json.loads(
         (REPO_ROOT / "qwen35_baton/configs/libero_stage1.json").read_text()
@@ -1571,6 +1843,77 @@ def test_stage1_recipe_requirements_and_launchers_are_fixed(tmp_path: Path) -> N
     assert "--per-device-batch 32" in calls[1]
     assert "--gradient-accumulation-steps 4" in calls[1]
     assert "--deepspeed-config-path" not in calls[1]
+    assert "--stop-at-step" not in calls[1]
+
+
+def test_worldarena_launcher_uses_eight_gpu_recipe_and_forwards_probe_bound(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "python.log"
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "${BATON_TEST_LOG}"\n'
+    )
+    fake_python.chmod(0o755)
+    environment = {
+        **os.environ,
+        "BATON_TEST_LOG": str(log),
+        "PYTHON_BIN": str(fake_python),
+        "STOP_AT_STEP": "20",
+    }
+    for name in ("NUM_GPUS", "PER_DEVICE_BATCH", "GRAD_ACCUM", "CONFIG"):
+        environment.pop(name, None)
+
+    subprocess.run(
+        [
+            "bash",
+            str(
+                REPO_ROOT / "qwen35_baton/scripts/train_worldarena_semantic_planner.sh"
+            ),
+        ],
+        check=True,
+        cwd=REPO_ROOT,
+        env=environment,
+    )
+
+    calls = log.read_text().splitlines()
+    assert "--world-size 8" in calls[0]
+    assert "--per-device-batch 2" in calls[0]
+    assert "--gradient-accumulation-steps 8" in calls[0]
+    assert "qwen35_baton/configs/worldarena_stage1.json" in calls[0]
+    assert "--nproc_per_node=8" in calls[1]
+    assert "--stop-at-step 20" in calls[1]
+
+
+def test_cli_stop_at_step_is_positive_and_forwarded_to_training(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import qwen35_baton.cli.train_semantic_planner as training_module
+
+    config = tmp_path / "stage1.json"
+    config.write_text(json.dumps(_config(tmp_path / "output").to_dict()))
+    captured: list[int | None] = []
+
+    def fake_training(
+        config: Stage1TrainingConfig,
+        *,
+        stop_at_step: int | None = None,
+    ) -> Any:
+        captured.append(stop_at_step)
+        return SimpleNamespace(
+            global_step=1,
+            checkpoint=None,
+            cursor=SimpleNamespace(to_dict=lambda: {}),
+        )
+
+    monkeypatch.setattr(training_module, "run_training", fake_training)
+
+    assert training_module.main(["--config", str(config)]) == 0
+    assert training_module.main(["--config", str(config), "--stop-at-step", "20"]) == 0
+    with pytest.raises(SystemExit):
+        training_module.main(["--config", str(config), "--stop-at-step", "0"])
+    assert captured == [None, 20]
 
 
 def test_production_artifacts_are_constructed_after_global_seeding(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -17,6 +18,39 @@ from qwen35_baton import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_worldarena_stage1_recipe_preserves_model_provenance_and_global_batch() -> None:
+    libero = json.loads(
+        (REPO_ROOT / "qwen35_baton/configs/libero_stage1.json").read_text()
+    )
+    worldarena = json.loads(
+        (REPO_ROOT / "qwen35_baton/configs/worldarena_stage1.json").read_text()
+    )
+
+    assert worldarena["dataset_type"] == "worldarena_hdf5"
+    assert (
+        worldarena["per_device_batch"] * 8 * worldarena["gradient_accumulation_steps"]
+        == 128
+    )
+    assert worldarena["per_device_batch"] == 2
+    assert worldarena["gradient_accumulation_steps"] == 8
+    assert worldarena["max_steps"] == 30_000
+    assert worldarena["initial_save_step"] == 20
+    assert worldarena["save_every"] == 5_000
+    assert worldarena["num_workers"] == 8
+    assert worldarena["persistent_workers"] is True
+    assert worldarena["worker_restart_interval_epochs"] == 100
+    for field in (
+        "qwen_model_path",
+        "qwen_processor_path",
+        "qwen_tokenizer_path",
+        "siglip2_model_path",
+        "siglip2_config_hash",
+        "siglip2_artifact_hash",
+        "deepspeed_config_path",
+    ):
+        assert worldarena[field] == libero[field]
 
 
 def test_baton_geometry_is_the_approved_256px_contract() -> None:

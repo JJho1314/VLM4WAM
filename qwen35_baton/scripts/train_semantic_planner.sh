@@ -25,6 +25,10 @@ checkpoint_flag="--no-gradient-checkpointing"
 if [[ "${GRADIENT_CHECKPOINTING}" == "1" ]]; then
   checkpoint_flag="--gradient-checkpointing"
 fi
+stop_args=()
+if [[ -n "${STOP_AT_STEP:-}" ]]; then
+  stop_args=(--stop-at-step "${STOP_AT_STEP}")
+fi
 
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -42,4 +46,5 @@ export HF_DATASETS_OFFLINE=1
   --config "${CONFIG}" \
   --per-device-batch "${PER_DEVICE_BATCH}" \
   --gradient-accumulation-steps "${GRAD_ACCUM}" \
+  "${stop_args[@]}" \
   "${checkpoint_flag}"

@@ -14,6 +14,13 @@ from qwen35_baton.hashing import sha256_artifact, sha256_file
 from qwen35_baton.sequence import ADDED_TOKENS
 
 
+_WORLD_ARENA_SOURCE_REPOSITORY = "worldarena2026-robotwin-data"
+_CAMERA_NAMES = {
+    "libero_hdf5": ("main", "wrist"),
+    "worldarena_hdf5": ("head",),
+}
+
+
 def require_qwen35_fast_path() -> dict[str, str]:
     """Reject the released Qwen3.5 slow fallback before loading model weights."""
 
@@ -59,6 +66,50 @@ def _require_directory(path: Path, *, label: str) -> Path:
     if not resolved.is_dir():
         raise FileNotFoundError(f"{label} directory does not exist: {resolved}")
     return resolved
+
+
+def _manifest_dataset_type(payload: Mapping[str, Any]) -> str:
+    worldarena = (
+        payload.get("version") == 1
+        and payload.get("source_repository") == _WORLD_ARENA_SOURCE_REPOSITORY
+        and isinstance(payload.get("records"), list)
+    )
+    libero = (
+        payload.get("schema_version") == 1
+        and payload.get("camera_names") == ["main", "wrist"]
+        and isinstance(payload.get("episodes"), list)
+    )
+    matches = [
+        dataset_type
+        for dataset_type, matched in (
+            ("libero_hdf5", libero),
+            ("worldarena_hdf5", worldarena),
+        )
+        if matched
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "HDF5 manifest must declare exactly one supported dataset_type"
+        )
+    return matches[0]
+
+
+def _validate_dataset_manifest(
+    *,
+    dataset_type: str,
+    manifest: Path,
+    seed: int,
+) -> None:
+    if dataset_type == "libero_hdf5":
+        from ge_act.data.libero_fastwam_hdf5_schema import load_manifest
+
+        load_manifest(manifest)
+    elif dataset_type == "worldarena_hdf5":
+        from qwen35_baton.worldarena_data import WorldArenaHDF5Dataset
+
+        WorldArenaHDF5Dataset(manifest, seed=seed, split="train")
+    else:
+        raise AssertionError("validated dataset_type is unreachable")
 
 
 def _validate_qwen_config(path: Path) -> None:
@@ -191,6 +242,8 @@ def preflight_stage1(
                 world_size=world_size,
                 gradient_accumulation_steps=config.gradient_accumulation_steps,
             ),
+            "dataset_type": config.dataset_type,
+            "camera_names": list(_CAMERA_NAMES[config.dataset_type]),
         }
 
     qwen = _require_directory(Path(config.qwen_model_path), label="Qwen model")
@@ -210,6 +263,25 @@ def preflight_stage1(
     if not statistics.is_file():
         raise FileNotFoundError(
             f"dataset statistics file does not exist: {statistics}"
+        )
+    manifest_payload = _load_json(manifest, label="HDF5 manifest")
+    manifest_dataset_type = _manifest_dataset_type(manifest_payload)
+    if manifest_dataset_type != config.dataset_type:
+        raise ValueError(
+            "HDF5 manifest dataset_type mismatch: "
+            f"config declares {config.dataset_type!r}, manifest declares "
+            f"{manifest_dataset_type!r}"
+        )
+    _validate_dataset_manifest(
+        dataset_type=config.dataset_type,
+        manifest=manifest,
+        seed=config.seed,
+    )
+    if config.dataset_type == "worldarena_hdf5" and statistics != manifest.with_name(
+        "stats.json"
+    ):
+        raise ValueError(
+            "WorldArena dataset_statistics_path must be the cache stats.json"
         )
     _validate_qwen_config(qwen)
     _validate_processor(processor)
@@ -233,6 +305,15 @@ def preflight_stage1(
             "HDF5 manifest hash mismatch: "
             f"expected {config.hdf5_manifest_hash}, got {actual_manifest_hash}"
         )
+    if config.dataset_type == "worldarena_hdf5":
+        stats_payload = _load_json(statistics, label="WorldArena cache stats.json")
+        if (
+            stats_payload.get("source_repository") != _WORLD_ARENA_SOURCE_REPOSITORY
+            or stats_payload.get("manifest_sha256") != actual_manifest_hash
+        ):
+            raise ValueError(
+                "WorldArena cache stats.json provenance differs from its manifest"
+            )
     _reject_output_ancestor(
         Path(config.output_dir),
         (qwen, processor, tokenizer, siglip, manifest, statistics),
@@ -248,6 +329,8 @@ def preflight_stage1(
     return {
         "tiny_test": False,
         "global_batch": global_batch,
+        "dataset_type": config.dataset_type,
+        "camera_names": list(_CAMERA_NAMES[config.dataset_type]),
         "qwen_backbone": "dense Qwen3.5-2B",
         "added_token_ids": token_ids,
         "siglip2_geometry": geometry,
