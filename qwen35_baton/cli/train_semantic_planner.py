@@ -36,6 +36,12 @@ from qwen35_baton.ownership import (
     configure_stage1_trainable_modules,
 )
 from qwen35_baton.sequence import ADDED_TOKENS, build_plan_text
+from qwen35_baton.worker_lifecycle import (
+    append_worker_lifecycle_event,
+    recycle_persistent_dataloader_workers,
+    should_restart_workers,
+    validate_recycle_statuses,
+)
 
 
 _APPROVED_LR = 1e-5
@@ -719,6 +725,88 @@ def _rank_states(accelerator: Any) -> dict[int, Mapping[str, Any]]:
     return states
 
 
+def _recycle_stage1_workers_distributed(
+    *,
+    accelerator: Any,
+    batches: Any,
+    completed_epoch: int,
+) -> float:
+    accelerator.wait_for_everyone()
+    started = time.perf_counter()
+    try:
+        recycled = recycle_persistent_dataloader_workers(batches)
+        error = None
+    except Exception as exception:
+        recycled = False
+        error = f"{type(exception).__name__}: {exception}"
+    local = {
+        "rank": accelerator.process_index,
+        "epoch": completed_epoch,
+        "recycled": recycled,
+        "error": error,
+        "elapsed": time.perf_counter() - started,
+    }
+    if accelerator.num_processes == 1:
+        statuses = [local]
+    else:
+        from accelerate.utils import gather_object
+
+        statuses = gather_object([local])
+    return validate_recycle_statuses(
+        statuses,
+        world_size=accelerator.num_processes,
+        completed_epoch=completed_epoch,
+    )
+
+
+def _append_worker_lifecycle_event_distributed(
+    *,
+    accelerator: Any,
+    path: Path,
+    completed_epoch: int,
+    next_epoch: int,
+    restart_count: int,
+    interval_epochs: int,
+    elapsed_seconds: float,
+) -> None:
+    error = None
+    if accelerator.is_main_process:
+        try:
+            append_worker_lifecycle_event(
+                path,
+                completed_epoch=completed_epoch,
+                next_epoch=next_epoch,
+                restart_count=restart_count,
+                interval_epochs=interval_epochs,
+                elapsed_seconds=elapsed_seconds,
+            )
+        except Exception as exception:
+            error = f"{type(exception).__name__}: {exception}"
+    local = {"rank": accelerator.process_index, "error": error}
+    if accelerator.num_processes == 1:
+        statuses = [local]
+    else:
+        from accelerate.utils import gather_object
+
+        statuses = gather_object([local])
+    ranks = sorted(
+        status.get("rank")
+        for status in statuses
+        if isinstance(status, Mapping) and type(status.get("rank")) is int
+    )
+    errors = [
+        status.get("error")
+        for status in statuses
+        if isinstance(status, Mapping) and status.get("error") is not None
+    ]
+    if ranks != list(range(accelerator.num_processes)) or errors:
+        raise RuntimeError(
+            "worker lifecycle event logging failed closed: "
+            f"statuses={statuses!r}"
+        )
+    accelerator.wait_for_everyone()
+
+
 def _save_training_checkpoint(
     *,
     accelerator: Any,
@@ -1110,6 +1198,7 @@ def run_training(
         sampler_seed=config.seed,
     )
     metrics_path = Path(config.output_dir) / "training_metrics.jsonl"
+    worker_lifecycle_path = Path(config.output_dir) / "worker_lifecycle.jsonl"
     if config.resume_from is not None:
         resumed = load_baton_checkpoint(
             Path(config.resume_from),
@@ -1382,6 +1471,32 @@ def run_training(
             if cursor.global_step >= target_step:
                 break
         else:
+            completed_epoch = epoch
+            interval_epochs = config.worker_restart_interval_epochs
+            if (
+                cursor.global_step < target_step
+                and config.num_workers > 0
+                and config.persistent_workers
+                and should_restart_workers(
+                    completed_epoch=completed_epoch,
+                    interval_epochs=interval_epochs,
+                )
+            ):
+                assert interval_epochs is not None
+                elapsed = _recycle_stage1_workers_distributed(
+                    accelerator=accelerator,
+                    batches=train_batches,
+                    completed_epoch=completed_epoch,
+                )
+                _append_worker_lifecycle_event_distributed(
+                    accelerator=accelerator,
+                    path=worker_lifecycle_path,
+                    completed_epoch=completed_epoch,
+                    next_epoch=cursor.epoch,
+                    restart_count=(completed_epoch + 1) // interval_epochs,
+                    interval_epochs=interval_epochs,
+                    elapsed_seconds=elapsed,
+                )
             continue
     return Stage1TrainingResult(
         global_step=cursor.global_step,

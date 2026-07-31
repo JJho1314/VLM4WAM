@@ -23,6 +23,7 @@ from qwen35_baton.cli.train_semantic_planner import (
     Stage1TrainingArtifacts,
     Stage1TrainingConfig,
     build_cosine_warmup_scheduler,
+    build_stage1_dataloader,
     build_stage1_optimizer,
     build_stage1_optimizer_groups,
     checkpoint_steps,
@@ -35,6 +36,9 @@ from qwen35_baton.cli.train_semantic_planner import (
 )
 from qwen35_baton.config import BatonCheckpointMetadata
 from qwen35_baton.ownership import configure_stage1_trainable_modules
+from qwen35_baton.worker_lifecycle import (
+    recycle_persistent_dataloader_workers,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -151,6 +155,22 @@ def _tiny_batches(count: int = 25) -> tuple[_TinyBatch, ...]:
         )
         for index in range(count)
     )
+
+
+class _TinyBatchDataset(torch.utils.data.Dataset[_TinyBatch]):
+    def __init__(self, *, count: int) -> None:
+        self._batches = _tiny_batches(count)
+
+    def __len__(self) -> int:
+        return len(self._batches)
+
+    def __getitem__(self, index: int) -> _TinyBatch:
+        return self._batches[index]
+
+
+def _identity_tiny_batch(samples: list[_TinyBatch]) -> _TinyBatch:
+    assert len(samples) == 1
+    return samples[0]
 
 
 def _config(
@@ -818,6 +838,40 @@ def test_each_microbatch_is_one_optimizer_update(
         sampler_seed=config.seed,
     )
     assert artifacts.scheduler.last_epoch == 2
+
+
+def test_training_recycles_workers_only_between_complete_epochs(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        _config(tmp_path, max_steps=2, save_every=2),
+        per_device_batch=1,
+        num_workers=1,
+        persistent_workers=True,
+        worker_restart_interval_epochs=1,
+    )
+    artifacts = _artifacts(config)
+    artifacts.train_batches = build_stage1_dataloader(
+        _TinyBatchDataset(count=1),
+        collate_fn=_identity_tiny_batch,
+        config=config,
+    )
+
+    try:
+        result = run_training(config, artifacts=artifacts)
+    finally:
+        recycle_persistent_dataloader_workers(artifacts.train_batches)
+
+    assert result.global_step == 2
+    assert result.cursor.epoch == 2
+    assert result.cursor.consumed_microbatches == 0
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "worker_lifecycle.jsonl").read_text().splitlines()
+    ]
+    assert len(records) == 1
+    assert records[0]["completed_epoch"] == 0
+    assert records[0]["next_epoch"] == 1
 
 
 def test_four_microbatches_make_one_optimizer_and_scheduler_update(

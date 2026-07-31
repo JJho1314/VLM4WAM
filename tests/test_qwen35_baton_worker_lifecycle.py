@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from pathlib import Path
 
 import pytest
@@ -12,8 +13,10 @@ from qwen35_baton.cli.train_semantic_planner import (
     build_stage1_dataloader,
 )
 from qwen35_baton.worker_lifecycle import (
+    append_worker_lifecycle_event,
     recycle_persistent_dataloader_workers,
     should_restart_workers,
+    validate_recycle_statuses,
 )
 
 
@@ -43,6 +46,68 @@ def _worker_pids(loader: torch.utils.data.DataLoader) -> tuple[int, ...]:
     iterator = loader._iterator
     assert iterator is not None
     return tuple(worker.pid for worker in iterator._workers)
+
+
+def test_recycle_status_validation_returns_the_slowest_rank_duration() -> None:
+    statuses = [
+        {"rank": 0, "epoch": 99, "recycled": True, "error": None, "elapsed": 1.25},
+        {"rank": 1, "epoch": 99, "recycled": True, "error": None, "elapsed": 1.75},
+    ]
+    assert validate_recycle_statuses(
+        statuses,
+        world_size=2,
+        completed_epoch=99,
+    ) == 1.75
+
+
+@pytest.mark.parametrize(
+    "statuses",
+    [
+        [{"rank": 0, "epoch": 99, "recycled": False, "error": None, "elapsed": 1.0}],
+        [{"rank": 0, "epoch": 98, "recycled": True, "error": None, "elapsed": 1.0}],
+        [
+            {
+                "rank": 0,
+                "epoch": 99,
+                "recycled": False,
+                "error": "shutdown failed",
+                "elapsed": 1.0,
+            }
+        ],
+    ],
+)
+def test_recycle_status_validation_fails_closed(
+    statuses: list[dict[str, object]],
+) -> None:
+    with pytest.raises(RuntimeError, match="worker recycl"):
+        validate_recycle_statuses(
+            statuses,
+            world_size=1,
+            completed_epoch=99,
+        )
+
+
+def test_worker_lifecycle_event_is_separate_from_training_metrics(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "worker_lifecycle.jsonl"
+    append_worker_lifecycle_event(
+        path,
+        completed_epoch=99,
+        next_epoch=100,
+        restart_count=1,
+        interval_epochs=100,
+        elapsed_seconds=1.75,
+    )
+    assert json.loads(path.read_text()) == {
+        "completed_epoch": 99,
+        "elapsed_seconds": 1.75,
+        "event": "dataloader_workers_restarted",
+        "interval_epochs": 100,
+        "next_epoch": 100,
+        "restart_count": 1,
+        "schema_version": 1,
+    }
 
 
 @pytest.mark.parametrize(

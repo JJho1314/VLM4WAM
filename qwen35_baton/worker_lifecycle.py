@@ -2,9 +2,76 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+import json
+import math
+import os
+from pathlib import Path
 from typing import Any
 
 import torch
+
+
+def validate_recycle_statuses(
+    statuses: Sequence[Mapping[str, Any]],
+    *,
+    world_size: int,
+    completed_epoch: int,
+) -> float:
+    if type(world_size) is not int or world_size <= 0:
+        raise ValueError("world_size must be a positive integer")
+    if len(statuses) != world_size:
+        raise RuntimeError(
+            "worker recycling did not publish exactly one status per rank"
+        )
+    ranks: list[int] = []
+    elapsed_values: list[float] = []
+    for status in statuses:
+        rank = status.get("rank")
+        elapsed = status.get("elapsed")
+        if (
+            type(rank) is not int
+            or status.get("epoch") != completed_epoch
+            or status.get("recycled") is not True
+            or status.get("error") is not None
+            or isinstance(elapsed, bool)
+            or not isinstance(elapsed, (int, float))
+            or not math.isfinite(float(elapsed))
+            or float(elapsed) < 0.0
+        ):
+            raise RuntimeError(f"worker recycling failed closed: {statuses!r}")
+        ranks.append(rank)
+        elapsed_values.append(float(elapsed))
+    if sorted(ranks) != list(range(world_size)):
+        raise RuntimeError(
+            "worker recycling did not publish one unique status per rank"
+        )
+    return max(elapsed_values)
+
+
+def append_worker_lifecycle_event(
+    path: Path,
+    *,
+    completed_epoch: int,
+    next_epoch: int,
+    restart_count: int,
+    interval_epochs: int,
+    elapsed_seconds: float,
+) -> None:
+    record = {
+        "schema_version": 1,
+        "event": "dataloader_workers_restarted",
+        "completed_epoch": completed_epoch,
+        "next_epoch": next_epoch,
+        "restart_count": restart_count,
+        "interval_epochs": interval_epochs,
+        "elapsed_seconds": elapsed_seconds,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def should_restart_workers(
