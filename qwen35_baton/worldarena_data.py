@@ -27,7 +27,9 @@ _CACHE_REQUIRED_RECORD_FIELDS = frozenset(
     (
         "episode_id",
         "hdf5_path",
+        "source_dataset_root",
         "source_video_path",
+        "source_video_relative_path",
         "source_video_sha256",
         "split",
         "task",
@@ -54,10 +56,89 @@ class WorldArenaRecord:
     actions_16d_path: Path | None
     intrinsic_path: Path | None
     extrinsic_path: Path | None
+    dataset_root: Path | None = None
+    source_video_relative_path: str | None = None
 
 
 def _is_official_path(path: Path) -> bool:
     return any(part.casefold() == "official_episodes" for part in path.parts)
+
+
+def _is_forbidden_source_root(path: Path) -> bool:
+    forbidden = {
+        "official_episodes",
+        "official_validation",
+        "official_val",
+        "official_test",
+        "worldarena_validation",
+        "worldarena_test",
+        "validation",
+        "test",
+    }
+    for part in path.parts:
+        normalized = part.casefold().replace("-", "_")
+        if normalized in forbidden:
+            return True
+        official_validation_or_test = normalized.startswith("official_") and (
+            "validation" in normalized
+            or "test" in normalized
+            or "episode" in normalized
+        )
+        worldarena_validation_or_test = normalized.startswith("worldarena_") and (
+            "validation" in normalized or "test" in normalized
+        )
+        if official_validation_or_test or worldarena_validation_or_test:
+            return True
+    return False
+
+
+def _validate_training_video_provenance(
+    *,
+    dataset_root: Any,
+    video_path: Any,
+    relative_path: Any,
+    episode_id: str,
+) -> tuple[Path, str]:
+    """Prove the video is the canonical training asset under its source root."""
+
+    if not isinstance(dataset_root, (str, os.PathLike)):
+        raise ValueError("training provenance requires source_dataset_root")
+    raw_root = Path(dataset_root).expanduser()
+    root = raw_root.resolve()
+    if not raw_root.is_absolute() or raw_root != root:
+        raise ValueError("source_dataset_root must be an absolute canonical path")
+    if root.name != _SOURCE_REPOSITORY or _is_forbidden_source_root(root):
+        raise ValueError("source_dataset_root is not the canonical training repository")
+    expected_relative = f"episodes/{episode_id}/video.mp4"
+    if relative_path != expected_relative:
+        raise ValueError("source video provenance must be exactly " + expected_relative)
+    if not isinstance(video_path, (str, os.PathLike)):
+        raise ValueError("training provenance requires source_video_path")
+    expected_video = root / "episodes" / episode_id / "video.mp4"
+    resolved_expected_video = expected_video.resolve()
+    if resolved_expected_video != expected_video:
+        raise ValueError(
+            "canonical training provenance must not traverse source symlinks"
+        )
+    raw_video = Path(video_path).expanduser()
+    resolved_video = raw_video.resolve()
+    if (
+        not raw_video.is_absolute()
+        or raw_video != expected_video
+        or raw_video != resolved_video
+    ):
+        raise ValueError(
+            "source_video_path does not match canonical training provenance"
+        )
+    if _is_forbidden_source_root(resolved_video):
+        raise ValueError("source_video_path resolves to a forbidden dataset area")
+    try:
+        resolved_video.relative_to(root)
+    except ValueError as error:
+        raise ValueError(
+            "source video provenance escapes source_dataset_root"
+        ) from error
+    return root, expected_relative
 
 
 def _require_under_root(path: Path, root: Path) -> Path:
@@ -174,11 +255,6 @@ def load_worldarena_source_manifest(
             video_path = localize_source_path(
                 video_value, dataset_root=root, required=True
             )
-            relative_video = video_path.relative_to(root)
-            if not relative_video.parts or relative_video.parts[0] != "episodes":
-                raise ValueError(
-                    "source videos must resolve inside dataset_root/episodes"
-                )
             episode_id = video_path.parent.name
             if not episode_id:
                 raise ValueError(
@@ -189,12 +265,19 @@ def load_worldarena_source_manifest(
             task_name = episode_id.split("__episode", 1)[0]
             if not task_name:
                 raise ValueError(f"episode {episode_id!r} has no task prefix")
+            source_video_relative_path = video_path.relative_to(root).as_posix()
+            _validate_training_video_provenance(
+                dataset_root=root,
+                video_path=video_path,
+                relative_path=source_video_relative_path,
+                episode_id=episode_id,
+            )
 
             records.append(
                 WorldArenaRecord(
                     episode_id=episode_id,
                     task_name=task_name,
-                    instruction=prompt.strip(),
+                    instruction=prompt,
                     video_path=video_path,
                     actions_16d_path=_optional_localized_path(
                         payload.get("action_path"),
@@ -211,6 +294,8 @@ def load_worldarena_source_manifest(
                         dataset_root=root,
                         field="extrinsic_path",
                     ),
+                    dataset_root=root,
+                    source_video_relative_path=source_video_relative_path,
                 )
             )
             episode_ids.add(episode_id)
@@ -310,8 +395,16 @@ def _decodable_frame_count(path: Path) -> int:
 def _record_metadata(
     record: WorldArenaRecord, *, source_frame_count: int
 ) -> dict[str, Any]:
+    dataset_root, relative_path = _validate_training_video_provenance(
+        dataset_root=record.dataset_root,
+        video_path=record.video_path,
+        relative_path=record.source_video_relative_path,
+        episode_id=record.episode_id,
+    )
     metadata: dict[str, Any] = {
+        "source_dataset_root": str(dataset_root),
         "source_video_path": str(record.video_path),
+        "source_video_relative_path": relative_path,
         "task": record.task_name,
         "source_frame_count": source_frame_count,
     }
@@ -442,6 +535,8 @@ def _cached_metadata(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
     for key in (
         "source_video_path",
+        "source_dataset_root",
+        "source_video_relative_path",
         "actions_16d_path",
         "intrinsic_path",
         "extrinsic_path",
@@ -552,6 +647,12 @@ class WorldArenaHDF5Dataset(Dataset[dict[str, Any]]):
                 raise ValueError("official paths are forbidden in cache metadata")
             if Path(source_video_path).parent.name != episode_id:
                 raise ValueError("source_video_path does not match episode_id")
+            _validate_training_video_provenance(
+                dataset_root=item["source_dataset_root"],
+                video_path=source_video_path,
+                relative_path=item["source_video_relative_path"],
+                episode_id=episode_id,
+            )
             _validate_sha256(item["source_video_sha256"], field="source_video_sha256")
             for _, hash_field in _CACHE_OPTIONAL_FIELD_PAIRS:
                 if hash_field in item:
@@ -611,7 +712,7 @@ class WorldArenaHDF5Dataset(Dataset[dict[str, Any]]):
             rgb = np.asarray(rgb_dataset[list(indices)], dtype=np.uint8)
         return _rgb_sample(
             rgb,
-            instruction=record["instruction"].strip(),
+            instruction=record["instruction"],
             episode_id=record["episode_id"],
             source_indices=indices,
             metadata=record["metadata"],
@@ -645,6 +746,12 @@ def _validate_records(
         expected_task = record.episode_id.split("__episode", 1)[0]
         if record.task_name != expected_task:
             raise ValueError("WorldArena record task_name must match episode_id")
+        _validate_training_video_provenance(
+            dataset_root=record.dataset_root,
+            video_path=record.video_path,
+            relative_path=record.source_video_relative_path,
+            episode_id=record.episode_id,
+        )
         seen.add(record.episode_id)
         if _is_official_path(record.video_path):
             raise ValueError("official episode paths are forbidden")
@@ -740,14 +847,22 @@ def _source_manifest_record(
     split: str,
     source_frame_count: int,
 ) -> dict[str, Any]:
+    dataset_root, relative_path = _validate_training_video_provenance(
+        dataset_root=record.dataset_root,
+        video_path=record.video_path,
+        relative_path=record.source_video_relative_path,
+        episode_id=record.episode_id,
+    )
     payload: dict[str, Any] = {
         "episode_id": record.episode_id,
         "hdf5_path": hdf5_path,
+        "source_dataset_root": str(dataset_root),
         "source_video_path": str(record.video_path),
+        "source_video_relative_path": relative_path,
         "source_video_sha256": _sha256_file(record.video_path),
         "split": split,
         "task": record.task_name,
-        "instruction": record.instruction.strip(),
+        "instruction": record.instruction,
         "frame_count": _FRAME_COUNT,
         "source_frame_count": source_frame_count,
     }

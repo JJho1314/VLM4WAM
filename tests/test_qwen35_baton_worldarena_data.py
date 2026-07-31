@@ -56,7 +56,12 @@ def _write_source_episode(
     episode_id: str = "pick_cup__episode0",
     instruction: str = "pick up the cup",
 ) -> tuple[WorldArenaRecord, ...]:
-    episode = root / "episodes" / episode_id
+    dataset_root = (
+        root
+        if root.name == "worldarena2026-robotwin-data"
+        else root / "worldarena2026-robotwin-data"
+    )
+    episode = dataset_root / "episodes" / episode_id
     video = episode / "video.mp4"
     actions = episode / "actions_16d.npy"
     intrinsic = root / "camera_params" / "head_intrinsic_params.json"
@@ -75,6 +80,8 @@ def _write_source_episode(
             actions_16d_path=actions.resolve(),
             intrinsic_path=intrinsic.resolve(),
             extrinsic_path=extrinsic.resolve(),
+            dataset_root=dataset_root.resolve(),
+            source_video_relative_path=f"episodes/{episode_id}/video.mp4",
         ),
     )
 
@@ -94,7 +101,8 @@ def _write_cache(root: Path, *, frame_count: int = 121) -> Path:
             chunks=(1, 256, 256, 3),
             compression="lzf",
         )
-    actions = root / "episodes" / "pick_cup__episode0" / "actions_16d.npy"
+    source_root = root / "worldarena2026-robotwin-data"
+    actions = source_root / "episodes" / "pick_cup__episode0" / "actions_16d.npy"
     actions.parent.mkdir(parents=True)
     np.save(actions, np.zeros(16, dtype=np.float32))
     manifest = cache / "manifest.json"
@@ -107,8 +115,15 @@ def _write_cache(root: Path, *, frame_count: int = 121) -> Path:
                     {
                         "episode_id": "pick_cup__episode0",
                         "hdf5_path": "episodes/pick_cup__episode0.h5",
+                        "source_dataset_root": str(source_root.resolve()),
                         "source_video_path": str(
-                            root / "episodes" / "pick_cup__episode0" / "video.mp4"
+                            source_root
+                            / "episodes"
+                            / "pick_cup__episode0"
+                            / "video.mp4"
+                        ),
+                        "source_video_relative_path": (
+                            "episodes/pick_cup__episode0/video.mp4"
                         ),
                         "source_video_sha256": "0" * 64,
                         "split": "train",
@@ -219,10 +234,11 @@ def test_source_paths_fail_closed_on_escape_unknown_absolute_and_missing(
 def test_source_manifest_requires_video_prompt_and_unique_episode_ids(
     tmp_path: Path,
 ) -> None:
-    episode = tmp_path / "episodes" / "pick_cup__episode0"
+    dataset_root = tmp_path / "worldarena2026-robotwin-data"
+    episode = dataset_root / "episodes" / "pick_cup__episode0"
     _write_video(episode / "video.mp4")
     np.save(episode / "actions_16d.npy", np.zeros(1, dtype=np.float32))
-    manifest = tmp_path / "metadata_train_a2v.jsonl"
+    manifest = dataset_root / "metadata_train_a2v.jsonl"
     valid = {
         "video": "episodes/pick_cup__episode0/video.mp4",
         "prompt": "  pick up the cup  ",
@@ -230,25 +246,117 @@ def test_source_manifest_requires_video_prompt_and_unique_episode_ids(
         "pick_cup__episode0/actions_16d.npy",
     }
     manifest.write_text(json.dumps(valid) + "\n", encoding="utf-8")
-    records = load_worldarena_source_manifest(manifest, tmp_path)
+    records = load_worldarena_source_manifest(manifest, dataset_root)
     assert records == (
         WorldArenaRecord(
             episode_id="pick_cup__episode0",
             task_name="pick_cup",
-            instruction="pick up the cup",
+            instruction="  pick up the cup  ",
             video_path=(episode / "video.mp4").resolve(),
             actions_16d_path=(episode / "actions_16d.npy").resolve(),
             intrinsic_path=None,
             extrinsic_path=None,
+            dataset_root=dataset_root.resolve(),
+            source_video_relative_path="episodes/pick_cup__episode0/video.mp4",
         ),
     )
 
+    cache_manifest = predecode_worldarena(
+        records, output_root=tmp_path / "padded-cache", seed=42
+    )
+    cached_payload = json.loads(cache_manifest.read_text())
+    assert cached_payload["records"][0]["instruction"] == "  pick up the cup  "
+    cached = WorldArenaHDF5Dataset(cache_manifest, seed=42, split="train")
+    assert cached[0]["instruction"] == "  pick up the cup  "
+
     manifest.write_text(json.dumps({"video": valid["video"], "prompt": "  "}) + "\n")
     with pytest.raises(ValueError, match="prompt"):
-        load_worldarena_source_manifest(manifest, tmp_path)
+        load_worldarena_source_manifest(manifest, dataset_root)
     manifest.write_text(json.dumps(valid) + "\n" + json.dumps(valid) + "\n")
     with pytest.raises(ValueError, match="duplicate"):
-        load_worldarena_source_manifest(manifest, tmp_path)
+        load_worldarena_source_manifest(manifest, dataset_root)
+
+
+def test_predecode_rejects_direct_record_without_canonical_training_provenance(
+    tmp_path: Path,
+) -> None:
+    episode_id = "pick_cup__episode0"
+    dataset_root = tmp_path / "worldarena2026-robotwin-data"
+    episode = dataset_root / "official_validation" / episode_id
+    video = episode / "video.mp4"
+    actions = episode / "actions_16d.npy"
+    _write_video(video)
+    np.save(actions, np.zeros(16, dtype=np.float32))
+    record = WorldArenaRecord(
+        episode_id=episode_id,
+        task_name="pick_cup",
+        instruction="pick up the cup",
+        video_path=video.resolve(),
+        actions_16d_path=actions.resolve(),
+        intrinsic_path=None,
+        extrinsic_path=None,
+        dataset_root=dataset_root.resolve(),
+        source_video_relative_path=(f"official_validation/{episode_id}/video.mp4"),
+    )
+    with pytest.raises(ValueError, match="provenance|episodes"):
+        predecode_worldarena((record,), output_root=tmp_path / "cache", seed=42)
+
+
+def test_mp4_dataset_rejects_canonical_episode_path_symlinked_to_validation(
+    tmp_path: Path,
+) -> None:
+    episode_id = "pick_cup__episode0"
+    dataset_root = tmp_path / "worldarena2026-robotwin-data"
+    official_episode = dataset_root / "official_validation" / episode_id
+    video = official_episode / "video.mp4"
+    _write_video(video)
+    episodes = dataset_root / "episodes"
+    episodes.mkdir()
+    (episodes / episode_id).symlink_to(official_episode, target_is_directory=True)
+    record = WorldArenaRecord(
+        episode_id=episode_id,
+        task_name="pick_cup",
+        instruction="pick up the cup",
+        video_path=video.resolve(),
+        actions_16d_path=None,
+        intrinsic_path=None,
+        extrinsic_path=None,
+        dataset_root=dataset_root.resolve(),
+        source_video_relative_path=f"episodes/{episode_id}/video.mp4",
+    )
+
+    with pytest.raises(ValueError, match="symlink|canonical training provenance"):
+        WorldArenaMP4Dataset((record,), seed=42, split="validation")
+
+
+def test_hdf5_manifest_rejects_noncanonical_source_provenance(tmp_path: Path) -> None:
+    manifest = _write_cache(tmp_path)
+    payload = json.loads(manifest.read_text())
+    payload["records"][0]["source_video_path"] = str(
+        tmp_path
+        / "worldarena2026-robotwin-data"
+        / "official_validation"
+        / "pick_cup__episode0"
+        / "video.mp4"
+    )
+    payload["records"][0]["source_video_relative_path"] = (
+        "official_validation/pick_cup__episode0/video.mp4"
+    )
+    manifest.write_text(json.dumps(payload) + "\n")
+    with pytest.raises(ValueError, match="provenance|episodes"):
+        WorldArenaHDF5Dataset(manifest, seed=42)
+
+    source_root = tmp_path / "official-validation-data" / "worldarena2026-robotwin-data"
+    payload["records"][0]["source_dataset_root"] = str(source_root)
+    payload["records"][0]["source_video_path"] = str(
+        source_root / "episodes" / "pick_cup__episode0" / "video.mp4"
+    )
+    payload["records"][0]["source_video_relative_path"] = (
+        "episodes/pick_cup__episode0/video.mp4"
+    )
+    manifest.write_text(json.dumps(payload) + "\n")
+    with pytest.raises(ValueError, match="source_dataset_root"):
+        WorldArenaHDF5Dataset(manifest, seed=42)
 
 
 def test_predecode_rejects_episode_id_path_traversal(tmp_path: Path) -> None:
