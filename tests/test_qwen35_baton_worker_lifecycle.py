@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 from pathlib import Path
+import re
 
 import pytest
 import torch
@@ -196,7 +197,41 @@ def test_recycling_rejects_missing_private_iterator_state(tmp_path: Path) -> Non
     )
     del loader._iterator
 
-    with pytest.raises(RuntimeError, match="does not expose iterator state"):
+    loader_type = f"{type(loader).__module__}.{type(loader).__qualname__}"
+    with pytest.raises(
+        RuntimeError,
+        match=rf"{re.escape(loader_type)} does not expose iterator state",
+    ):
+        recycle_persistent_dataloader_workers(loader)
+
+
+def test_recycling_rejects_missing_private_worker_shutdown(tmp_path: Path) -> None:
+    class IteratorWithoutShutdown:
+        pass
+
+    loader = build_stage1_dataloader(
+        torch.utils.data.TensorDataset(torch.arange(4)),
+        collate_fn=None,
+        config=replace(
+            _config(tmp_path),
+            per_device_batch=1,
+            num_workers=1,
+            persistent_workers=True,
+        ),
+    )
+    loader._iterator = IteratorWithoutShutdown()
+
+    loader_type = f"{type(loader).__module__}.{type(loader).__qualname__}"
+    iterator_type = (
+        f"{type(loader._iterator).__module__}.{type(loader._iterator).__qualname__}"
+    )
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            rf"{re.escape(loader_type)} iterator {re.escape(iterator_type)} "
+            "does not expose worker shutdown"
+        ),
+    ):
         recycle_persistent_dataloader_workers(loader)
 
 

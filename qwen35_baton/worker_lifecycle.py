@@ -115,13 +115,20 @@ def recycle_persistent_dataloader_workers(batches: Any) -> bool:
     missing = object()
     iterator = getattr(loader, "_iterator", missing)
     if iterator is missing:
-        raise RuntimeError("persistent DataLoader does not expose iterator state")
+        raise RuntimeError(
+            "persistent DataLoader "
+            f"{type(loader).__module__}.{type(loader).__qualname__} "
+            "does not expose iterator state"
+        )
     if iterator is None:
         return False
     shutdown = getattr(iterator, "_shutdown_workers", None)
     if not callable(shutdown):
         raise RuntimeError(
-            "active persistent DataLoader iterator does not expose worker shutdown"
+            "active persistent DataLoader "
+            f"{type(loader).__module__}.{type(loader).__qualname__} iterator "
+            f"{type(iterator).__module__}.{type(iterator).__qualname__} "
+            "does not expose worker shutdown"
         )
     shutdown()
     loader._iterator = None
