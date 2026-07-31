@@ -93,6 +93,7 @@ class Stage1TrainingConfig:
     deepspeed_config_path: str = "qwen35_baton/configs/deepspeed_zero2.json"
     num_workers: int = 4
     persistent_workers: bool = True
+    worker_restart_interval_epochs: int | None = 100
     seed: int = 42
     resume_from: str | None = None
     tiny_test: bool = False
@@ -140,6 +141,16 @@ class Stage1TrainingConfig:
             raise ValueError("num_workers must be a non-negative integer")
         if type(self.persistent_workers) is not bool:
             raise ValueError("persistent_workers must be boolean")
+        if (
+            self.worker_restart_interval_epochs is not None
+            and (
+                type(self.worker_restart_interval_epochs) is not int
+                or self.worker_restart_interval_epochs <= 0
+            )
+        ):
+            raise ValueError(
+                "worker_restart_interval_epochs must be None or a positive integer"
+            )
         if type(self.gradient_checkpointing) is not bool:
             raise ValueError("gradient_checkpointing must be boolean")
         if (

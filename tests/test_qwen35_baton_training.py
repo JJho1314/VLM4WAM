@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from contextlib import nullcontext
 import hashlib
 import json
@@ -183,6 +183,31 @@ def _config(
         tiny_test=True,
         resume_from=None if resume_from is None else str(resume_from),
     )
+
+
+@pytest.mark.parametrize("value", [None, 1, 100])
+def test_worker_restart_interval_accepts_disabled_or_positive_values(
+    tmp_path: Path, value: int | None
+) -> None:
+    config = replace(
+        _config(tmp_path),
+        worker_restart_interval_epochs=value,
+    )
+    assert config.worker_restart_interval_epochs == value
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, 1.5])
+def test_worker_restart_interval_rejects_invalid_values(
+    tmp_path: Path, value: object
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="worker_restart_interval_epochs",
+    ):
+        replace(
+            _config(tmp_path),
+            worker_restart_interval_epochs=value,
+        )
 
 
 def test_stage1_workers_use_spawn_instead_of_inheriting_the_cuda_parent(
