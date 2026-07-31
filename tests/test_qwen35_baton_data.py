@@ -176,6 +176,22 @@ def test_collator_builds_only_positive_sample_major_camera_rows(dataset) -> None
     )
 
 
+def test_collator_builds_one_head_row_per_worldarena_sample() -> None:
+    from qwen35_baton.data import BatonPlannerCollator
+
+    collator = BatonPlannerCollator(_Processor(), camera_names=("head",))
+    sample = {
+        "current_images": torch.zeros((1, 3, 256, 256), dtype=torch.uint8),
+        "future_images": torch.zeros((1, 4, 3, 256, 256), dtype=torch.uint8),
+        "instruction": "pick up the green bottle",
+        "suite": "worldarena",
+    }
+    batch = collator([sample, sample])
+    assert batch.camera_names == ("head",)
+    assert batch.row_labels == ((0, "head"), (1, "head"))
+    assert batch.qwen_inputs["input_ids"].shape[0] == 2
+
+
 def test_batch_contract_exposes_fixed_geometry(dataset) -> None:
     from qwen35_baton.data import BatonPlannerCollator
 

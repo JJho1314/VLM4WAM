@@ -314,17 +314,20 @@ class BatonQwen35Planner(nn.Module):
         if not isinstance(batch, BatonPlannerBatch):
             raise TypeError("batch must be BatonPlannerBatch")
         batch_size = batch.batch_size
-        if batch_size <= 0 or len(batch.row_labels) != batch_size * 2:
-            raise ValueError("Baton batch must contain two Qwen rows per sample")
+        camera_count = len(batch.camera_names)
+        if (
+            batch_size <= 0
+            or camera_count <= 0
+            or len(batch.row_labels) != batch_size * camera_count
+        ):
+            raise ValueError("Baton batch must contain one Qwen row per camera per sample")
         expected_labels = tuple(
             (sample, camera)
             for sample in range(batch_size)
-            for camera in ("main", "wrist")
+            for camera in batch.camera_names
         )
         if batch.row_labels != expected_labels:
-            raise ValueError(
-                "Baton rows must be sample-major main/wrist"
-            )
+            raise ValueError("Baton rows must be sample-major in camera_names order")
         row_output = self.forward_rows(
             batch.qwen_inputs,
             batch.plan_positions,
@@ -334,7 +337,7 @@ class BatonQwen35Planner(nn.Module):
             flat=row_output.flat,
             positive=row_output.flat.reshape(
                 batch_size,
-                2,
+                camera_count,
                 _NUM_FRAMES,
                 _TOKENS_PER_FRAME,
                 _FEATURE_DIM,

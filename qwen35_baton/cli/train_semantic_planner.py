@@ -840,6 +840,7 @@ def _loss_metrics(
     *,
     positive: torch.Tensor,
     target: torch.Tensor,
+    camera_names: tuple[str, ...],
 ) -> dict[str, float]:
     metrics = {
         "loss/total": float(losses.total.detach().float().cpu()),
@@ -847,11 +848,10 @@ def _loss_metrics(
     }
     positive_math = positive.detach().float()
     target_math = target.detach().float()
-    camera_names = ("main", "wrist")
+    if len(camera_names) != positive.shape[1]:
+        raise ValueError("camera_names must match the prediction camera axis")
     for camera in range(positive.shape[1]):
-        camera_name = (
-            camera_names[camera] if camera < len(camera_names) else f"camera_{camera}"
-        )
+        camera_name = camera_names[camera]
         for frame in range(positive.shape[2]):
             predicted = positive_math[:, camera, frame]
             teacher = target_math[:, camera, frame]
@@ -1393,6 +1393,11 @@ def run_training(
                 losses,
                 positive=planner_output.positive,
                 target=future_teacher,
+                camera_names=getattr(
+                    batch,
+                    "camera_names",
+                    artifacts.metadata.camera_names,
+                ),
             )
             micro_metrics.update(
                 {

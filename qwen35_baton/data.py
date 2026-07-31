@@ -26,6 +26,7 @@ class BatonPlannerBatch:
     future_images: torch.Tensor
     instructions: tuple[str, ...]
     row_labels: tuple[tuple[int, str], ...]
+    camera_names: tuple[str, ...] = ("main", "wrist")
 
     @property
     def batch_size(self) -> int:
@@ -169,7 +170,20 @@ class BatonLiberoDataset(Dataset[dict[str, Any]]):
 class BatonPlannerCollator:
     """Create sample-major independent positive Qwen camera rows."""
 
-    def __init__(self, processor: Any, *, plan_pad_token_id: int | None = None) -> None:
+    def __init__(
+        self,
+        processor: Any,
+        *,
+        camera_names: tuple[str, ...] = ("main", "wrist"),
+        plan_pad_token_id: int | None = None,
+    ) -> None:
+        if (
+            not camera_names
+            or any(not isinstance(name, str) or not name for name in camera_names)
+            or len(set(camera_names)) != len(camera_names)
+        ):
+            raise ValueError("camera_names must contain unique nonempty strings")
+        self.camera_names = camera_names
         self.processor = processor
         if plan_pad_token_id is None:
             tokenizer = getattr(processor, "tokenizer", None)
@@ -272,15 +286,19 @@ class BatonPlannerCollator:
             raise ValueError("collator requires at least one sample")
         current_images = torch.stack([sample["current_images"] for sample in samples])
         future_images = torch.stack([sample["future_images"] for sample in samples])
+        camera_count = len(self.camera_names)
         if (
             current_images.ndim != 5
-            or tuple(current_images.shape[1:3]) != (2, 3)
+            or tuple(current_images.shape[1:3]) != (camera_count, 3)
             or future_images.ndim != 6
-            or tuple(future_images.shape[1:4]) != (2, 4, 3)
+            or tuple(future_images.shape[1:4]) != (camera_count, 4, 3)
             or current_images.dtype != torch.uint8
             or future_images.dtype != torch.uint8
         ):
-            raise ValueError("samples must contain uint8 [2,3,H,W] and [2,4,3,H,W] RGB")
+            raise ValueError(
+                "samples must contain uint8 [C,3,H,W] and [C,4,3,H,W] RGB "
+                "matching camera_names"
+            )
         instructions = tuple(sample["instruction"] for sample in samples)
         suites = tuple(sample["suite"] for sample in samples)
         if any(
@@ -291,7 +309,7 @@ class BatonPlannerCollator:
 
         rows: list[tuple[int, str, torch.Tensor, str]] = []
         for sample_index, instruction in enumerate(instructions):
-            for camera_index, camera in enumerate(("main", "wrist")):
+            for camera_index, camera in enumerate(self.camera_names):
                 rows.append(
                     (
                         sample_index,
@@ -334,4 +352,5 @@ class BatonPlannerCollator:
             row_labels=tuple(
                 (index, camera) for index, camera, _, _ in rows
             ),
+            camera_names=self.camera_names,
         )

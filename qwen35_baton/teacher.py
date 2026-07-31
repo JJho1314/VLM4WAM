@@ -173,15 +173,16 @@ class FrozenSiglip2Teacher:
 
     @torch.no_grad()
     def encode_future(self, images: torch.Tensor) -> torch.Tensor:
-        """Encode ``[B,2,4,3,H,W]`` RGB into detached future patch features."""
+        """Encode ``[B,C,4,3,H,W]`` RGB into detached future patch features."""
 
         if (
             not isinstance(images, torch.Tensor)
             or images.ndim != 6
-            or images.shape[1:4] != (2, 4, 3)
+            or images.shape[1] <= 0
+            or images.shape[2:4] != (4, 3)
         ):
-            raise ValueError(f"future images must be [B,2,4,3,H,W], got {tuple(images.shape)}")
-        batch_size = images.shape[0]
+            raise ValueError("future images must be [B,C,4,3,H,W]")
+        batch_size, camera_count = images.shape[:2]
         return self._encode_frames(images.reshape(-1, *images.shape[-3:])).reshape(
-            batch_size, 2, 4, 256, 1024
+            batch_size, camera_count, 4, 256, 1024
         )

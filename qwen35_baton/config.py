@@ -204,14 +204,21 @@ class BatonCheckpointMetadata:
             or len(set(self.added_token_ids)) != len(self.added_token_ids)
         ):
             raise ValueError("added_token_ids must contain one unique ID per added token")
-        _require_equal("camera_names", self.camera_names, geometry.camera_names)
+        if self.camera_names not in (("main", "wrist"), ("head",)):
+            raise ValueError(
+                "camera_names must be either ('main', 'wrist') or ('head',)"
+            )
         _require_equal("camera_flattening", self.camera_flattening, "sample_major")
         _require_equal("siglip2_model", self.siglip2_model, self.SIGLIP2_MODEL)
         _require_equal("teacher_image_size", self.teacher_image_size, geometry.image_size)
         _require_equal("teacher_patch_size", self.teacher_patch_size, geometry.patch_size)
         _require_equal("teacher_feature_layer", self.teacher_feature_layer, -2)
         _require_equal("teacher_dtype", self.teacher_dtype, "bfloat16")
-        _require_equal("target_shape", self.target_shape, (2, 4, 256, 1024))
+        _require_equal(
+            "target_shape",
+            self.target_shape,
+            (len(self.camera_names), 4, 256, 1024),
+        )
         _require_equal("future_indices", self.future_indices, geometry.future_indices)
         _require_equal("query_dim", self.query_dim, geometry.query_dim)
         _require_equal("query_layers", self.query_layers, geometry.query_layers)
@@ -250,7 +257,9 @@ class BatonCheckpointMetadata:
             raise ValueError("distributed_cursor names must be unique")
 
     @classmethod
-    def example(cls) -> BatonCheckpointMetadata:
+    def example(
+        cls, *, camera_names: tuple[str, ...] = ("main", "wrist")
+    ) -> BatonCheckpointMetadata:
         geometry = BatonGeometry()
         return cls(
             format_version=cls.FORMAT_VERSION,
@@ -262,7 +271,7 @@ class BatonCheckpointMetadata:
             input_template_hash=_example_sha256("input-template"),
             added_tokens=_PLAN_TOKENS,
             added_token_ids=tuple(range(151_665, 151_672)),
-            camera_names=geometry.camera_names,
+            camera_names=camera_names,
             camera_flattening="sample_major",
             siglip2_model=cls.SIGLIP2_MODEL,
             siglip2_config_hash=_example_sha256("siglip2-config"),
@@ -272,7 +281,12 @@ class BatonCheckpointMetadata:
             teacher_feature_layer=-2,
             teacher_preprocessing_hash=_example_sha256("siglip2-preprocessing"),
             teacher_dtype="bfloat16",
-            target_shape=(2, 4, geometry.tokens_per_frame, geometry.feature_dim),
+            target_shape=(
+                len(camera_names),
+                4,
+                geometry.tokens_per_frame,
+                geometry.feature_dim,
+            ),
             future_indices=geometry.future_indices,
             query_dim=geometry.query_dim,
             query_layers=geometry.query_layers,

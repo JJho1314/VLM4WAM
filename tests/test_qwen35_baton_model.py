@@ -111,8 +111,13 @@ class TinySemMLP(nn.Module):
         return hidden_states[..., :1].expand(*hidden_states.shape[:-1], 1024)
 
 
-def make_batch(*, batch_size: int = 2) -> BatonPlannerBatch:
-    rows = batch_size * 2
+def make_batch(
+    *,
+    batch_size: int = 2,
+    camera_names: tuple[str, ...] = ("main", "wrist"),
+) -> BatonPlannerBatch:
+    camera_count = len(camera_names)
+    rows = batch_size * camera_count
     input_ids = torch.full((rows, 1026), PLAN_PAD_TOKEN_ID, dtype=torch.long)
     input_ids[:, 0] = torch.arange(1, rows + 1)
     input_ids[:, -1] = 2
@@ -120,7 +125,7 @@ def make_batch(*, batch_size: int = 2) -> BatonPlannerBatch:
     labels = tuple(
         (sample, camera)
         for sample in range(batch_size)
-        for camera in ("main", "wrist")
+        for camera in camera_names
     )
     return BatonPlannerBatch(
         qwen_inputs={
@@ -128,12 +133,15 @@ def make_batch(*, batch_size: int = 2) -> BatonPlannerBatch:
             "attention_mask": torch.ones_like(input_ids),
         },
         plan_positions=plan_positions,
-        current_images=torch.zeros(batch_size, 2, 3, 2, 2, dtype=torch.uint8),
+        current_images=torch.zeros(
+            batch_size, camera_count, 3, 2, 2, dtype=torch.uint8
+        ),
         future_images=torch.zeros(
-            batch_size, 2, 4, 3, 2, 2, dtype=torch.uint8
+            batch_size, camera_count, 4, 3, 2, 2, dtype=torch.uint8
         ),
         instructions=tuple(f"task {index}" for index in range(batch_size)),
         row_labels=labels,
+        camera_names=camera_names,
     )
 
 
@@ -170,6 +178,15 @@ def test_model_returns_only_positive_dual_camera_predictions() -> None:
     assert not hasattr(output, "negative")
     assert output.flat.shape == (4, 4, 256, 1024)
     assert qwen.model.forward_calls == 1
+
+
+def test_model_reshapes_one_head_row_per_sample() -> None:
+    batch = make_batch(batch_size=2, camera_names=("head",))
+    planner, _ = make_planner()
+
+    output = planner.forward(batch)
+
+    assert output.positive.shape == (2, 1, 4, 256, 1024)
 
 
 def test_model_calls_multimodal_base_without_lm_logits_or_cache() -> None:

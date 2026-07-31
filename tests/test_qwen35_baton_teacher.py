@@ -67,6 +67,14 @@ def test_teacher_extracts_penultimate_patch_grid() -> None:
     torch.testing.assert_close(features, torch.ones_like(features))
 
 
+def test_teacher_accepts_one_camera_future_rgb() -> None:
+    teacher, _ = make_teacher()
+    features = teacher.encode_future(
+        torch.zeros((2, 1, 4, 3, 256, 256), dtype=torch.uint8)
+    )
+    assert features.shape == (2, 1, 4, 256, 1024)
+
+
 def test_teacher_targets_are_detached() -> None:
     teacher, _ = make_teacher()
     future_images = torch.randint(256, (1, 2, 4, 3, 256, 256), dtype=torch.uint8)

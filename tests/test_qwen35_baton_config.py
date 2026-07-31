@@ -93,6 +93,13 @@ def test_continuous_metadata_round_trips_the_complete_contract() -> None:
     assert BatonCheckpointMetadata.from_dict(payload) == metadata
 
 
+def test_checkpoint_metadata_accepts_truthful_head_camera_shape() -> None:
+    metadata = BatonCheckpointMetadata.example(camera_names=("head",))
+    assert metadata.camera_names == ("head",)
+    assert metadata.target_shape == (1, 4, 256, 1024)
+    assert BatonCheckpointMetadata.from_dict(metadata.to_dict()) == metadata
+
+
 def test_continuous_metadata_rejects_wrong_backbone_identity() -> None:
     payload = BatonCheckpointMetadata.example().to_dict()
 
