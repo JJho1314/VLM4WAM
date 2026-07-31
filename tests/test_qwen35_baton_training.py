@@ -1514,6 +1514,9 @@ def test_stage1_recipe_requirements_and_launchers_are_fixed(tmp_path: Path) -> N
     assert config["max_consecutive_skipped_updates"] == 8
     assert config["per_device_batch"] == 4
     assert config["gradient_accumulation_steps"] == 4
+    assert config["num_workers"] == 8
+    assert config["persistent_workers"] is True
+    assert config["worker_restart_interval_epochs"] == 100
     assert config["gradient_checkpointing"] is False
     assert config["learning_rate"] == 1e-5
     assert "planner_lr" not in config

@@ -24,6 +24,8 @@
   "gradient_checkpointing": false,
   "deepspeed_config_path": "qwen35_baton/configs/deepspeed_zero2.json",
   "num_workers": 8,
+  "persistent_workers": true,
+  "worker_restart_interval_epochs": 100,
   "seed": 42,
   "resume_from": null,
   "tiny_test": false
