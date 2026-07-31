@@ -118,6 +118,23 @@ def test_recycling_without_an_active_iterator_is_a_noop(tmp_path: Path) -> None:
     assert recycle_persistent_dataloader_workers(loader) is False
 
 
+def test_recycling_rejects_missing_private_iterator_state(tmp_path: Path) -> None:
+    loader = build_stage1_dataloader(
+        torch.utils.data.TensorDataset(torch.arange(4)),
+        collate_fn=None,
+        config=replace(
+            _config(tmp_path),
+            per_device_batch=1,
+            num_workers=1,
+            persistent_workers=True,
+        ),
+    )
+    del loader._iterator
+
+    with pytest.raises(RuntimeError, match="does not expose iterator state"):
+        recycle_persistent_dataloader_workers(loader)
+
+
 def test_recycling_rejects_an_unsupported_wrapper() -> None:
     class UnsupportedLoader:
         pass

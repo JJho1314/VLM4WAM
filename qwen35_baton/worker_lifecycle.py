@@ -45,7 +45,10 @@ def recycle_persistent_dataloader_workers(batches: Any) -> bool:
     loader = _underlying_torch_dataloader(batches)
     if loader.num_workers == 0 or not loader.persistent_workers:
         return False
-    iterator = getattr(loader, "_iterator", None)
+    missing = object()
+    iterator = getattr(loader, "_iterator", missing)
+    if iterator is missing:
+        raise RuntimeError("persistent DataLoader does not expose iterator state")
     if iterator is None:
         return False
     shutdown = getattr(iterator, "_shutdown_workers", None)
