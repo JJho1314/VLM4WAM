@@ -1339,7 +1339,8 @@ def test_head_v3_migration_recovers_every_published_transaction_boundary(
             "new_manifest_sha256": new_manifest_hash,
         },
     )
-    (staging / ".replace-metadata.json-crashed").write_text(
+    replace_residue = checkpoint / ".metadata.json.metadata-v4-replace-crashed"
+    replace_residue.write_text(
         "incomplete disposable copy",
         encoding="utf-8",
     )
@@ -1356,6 +1357,7 @@ def test_head_v3_migration_recovers_every_published_transaction_boundary(
     assert BatonCheckpointMetadata.from_dict(
         json.loads((checkpoint / "metadata.json").read_text())
     ).camera_names == ("head",)
+    assert not replace_residue.exists()
     assert not tuple(checkpoint.parent.glob(f".{checkpoint.name}.metadata-v4-*"))
 
 
@@ -1418,7 +1420,26 @@ def test_head_v4_migration_discards_partial_post_commit_cleanup_residue(
     assert not tuple(checkpoint.parent.glob(f".{checkpoint.name}.metadata-v4-*"))
 
 
-def test_concurrent_head_v3_migrations_are_serialized_without_rollback_race(
+def test_head_v4_migration_discards_same_directory_replace_residue(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step_000001"
+    _save_valid_checkpoint(
+        checkpoint,
+        metadata=BatonCheckpointMetadata.example(camera_names=("head",)),
+    )
+    _rewrite_checkpoint_metadata_as_v3(checkpoint)
+    migrate_legacy_head_checkpoint_v4(checkpoint)
+    residue = checkpoint / ".manifest.json.metadata-v4-replace-crashed"
+    residue.write_text("incomplete copy", encoding="utf-8")
+
+    result = migrate_legacy_head_checkpoint_v4(checkpoint)
+
+    assert result.migrated is False
+    assert not residue.exists()
+
+
+def test_concurrent_head_v3_migration_fails_closed_without_rollback_race(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1461,15 +1482,17 @@ def test_concurrent_head_v3_migrations_are_serialized_without_rollback_race(
     first.start()
     assert first_replacing.wait(timeout=5)
     second.start()
-    second.join(timeout=0.2)
-    assert second.is_alive()
+    second.join(timeout=5)
+    assert not second.is_alive()
     release_first.set()
     first.join(timeout=5)
     second.join(timeout=5)
 
     assert not first.is_alive() and not second.is_alive()
-    assert failures == []
-    assert sorted(result.migrated for result in results) == [False, True]
+    assert len(failures) == 1
+    assert isinstance(failures[0], RuntimeError)
+    assert "active metadata migration" in str(failures[0])
+    assert [result.migrated for result in results] == [True]
     metadata = BatonCheckpointMetadata.from_dict(
         json.loads((checkpoint / "metadata.json").read_text())
     )

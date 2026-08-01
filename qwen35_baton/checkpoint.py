@@ -345,8 +345,8 @@ def _atomic_replace_from(source: Path, destination: Path) -> None:
     """Copy a staged file then atomically replace one live checkpoint entry."""
 
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".replace-{destination.name}-",
-        dir=source.parent,
+        prefix=f".{destination.name}.metadata-v4-replace-",
+        dir=destination.parent,
     )
     os.close(descriptor)
     temporary = Path(temporary_name)
@@ -358,6 +358,7 @@ def _atomic_replace_from(source: Path, destination: Path) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
+            _fsync_directory(destination.parent)
 
 
 def _restore_metadata_migration(checkpoint: Path, staging: Path) -> None:
@@ -379,7 +380,12 @@ def _exclusive_metadata_migration_lock(checkpoint: Path) -> Any:
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise ValueError("metadata migration lock must be a regular file")
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(
+                f"checkpoint already has an active metadata migration: {checkpoint}"
+            ) from error
         yield
     finally:
         try:
@@ -398,6 +404,21 @@ def _metadata_migration_directories(
     if any(not path.is_dir() or path.is_symlink() for path in candidates):
         raise ValueError(
             f"checkpoint has invalid metadata migration {phase} residue: {candidates}"
+        )
+    return candidates
+
+
+def _metadata_migration_replace_residue(checkpoint: Path) -> tuple[Path, ...]:
+    candidates = tuple(
+        sorted(
+            path
+            for destination in ("metadata.json", "manifest.json")
+            for path in checkpoint.glob(f".{destination}.metadata-v4-replace-*")
+        )
+    )
+    if any(not path.is_file() or path.is_symlink() for path in candidates):
+        raise ValueError(
+            f"checkpoint has invalid metadata replace residue: {candidates}"
         )
     return candidates
 
@@ -433,7 +454,8 @@ def _recover_metadata_migration(checkpoint: Path) -> None:
     building = _metadata_migration_directories(checkpoint, phase="building")
     prepared = _metadata_migration_directories(checkpoint, phase="prepared")
     cleanup = _metadata_migration_directories(checkpoint, phase="cleanup")
-    if not building and not prepared and not cleanup:
+    replace_residue = _metadata_migration_replace_residue(checkpoint)
+    if not building and not prepared and not cleanup and not replace_residue:
         return
     if len(prepared) > 1:
         raise ValueError(
@@ -510,6 +532,10 @@ def _recover_metadata_migration(checkpoint: Path) -> None:
         )
     for residue in (*building, *cleanup):
         _discard_metadata_migration_directory(checkpoint, residue)
+    for residue in replace_residue:
+        residue.unlink()
+    if replace_residue:
+        _fsync_directory(checkpoint)
 
 
 def migrate_legacy_head_checkpoint_v4(
