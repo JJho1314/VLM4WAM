@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
+import fcntl
 import json
 import math
 import os
@@ -343,8 +345,8 @@ def _atomic_replace_from(source: Path, destination: Path) -> None:
     """Copy a staged file then atomically replace one live checkpoint entry."""
 
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.metadata-v4-",
-        dir=destination.parent,
+        prefix=f".replace-{destination.name}-",
+        dir=source.parent,
     )
     os.close(descriptor)
     temporary = Path(temporary_name)
@@ -356,7 +358,6 @@ def _atomic_replace_from(source: Path, destination: Path) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
-            _fsync_directory(destination.parent)
 
 
 def _restore_metadata_migration(checkpoint: Path, staging: Path) -> None:
@@ -364,74 +365,151 @@ def _restore_metadata_migration(checkpoint: Path, staging: Path) -> None:
     _atomic_replace_from(staging / "old-manifest.json", checkpoint / "manifest.json")
 
 
-def _recover_metadata_migration(checkpoint: Path) -> None:
-    candidates = tuple(checkpoint.parent.glob(f".{checkpoint.name}.metadata-v4-*"))
-    if not candidates:
-        return
-    if len(candidates) != 1 or not candidates[0].is_dir():
+@contextmanager
+def _exclusive_metadata_migration_lock(checkpoint: Path) -> Any:
+    """Serialize one checkpoint's migration through an NFS-visible lock inode."""
+
+    lock_path = checkpoint.parent / f".{checkpoint.name}.metadata-v4.lock"
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("metadata migration lock must be a regular file")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _metadata_migration_directories(
+    checkpoint: Path,
+    *,
+    phase: str,
+) -> tuple[Path, ...]:
+    prefix = f".{checkpoint.name}.metadata-v4-{phase}-"
+    candidates = tuple(sorted(checkpoint.parent.glob(f"{prefix}*")))
+    if any(not path.is_dir() or path.is_symlink() for path in candidates):
         raise ValueError(
-            f"checkpoint has ambiguous metadata migration staging: {candidates}"
+            f"checkpoint has invalid metadata migration {phase} residue: {candidates}"
         )
-    staging = candidates[0]
-    transaction = _load_json(
-        staging / "transaction.json",
-        label="metadata migration transaction",
-    )
-    required = {
-        "format_version",
-        "checkpoint",
-        "old_metadata_sha256",
-        "old_manifest_sha256",
-        "new_metadata_sha256",
-        "new_manifest_sha256",
-    }
-    if (
-        set(transaction) != required
-        or transaction["format_version"] != 1
-        or transaction["checkpoint"] != checkpoint.name
-    ):
-        raise ValueError("metadata migration transaction journal is invalid")
-    staged_files = {
-        "old_metadata_sha256": staging / "old-metadata.json",
-        "old_manifest_sha256": staging / "old-manifest.json",
-        "new_metadata_sha256": staging / "metadata.json",
-        "new_manifest_sha256": staging / "manifest.json",
-    }
-    for field, path in staged_files.items():
-        if not path.is_file() or sha256_file(path) != transaction[field]:
+    return candidates
+
+
+def _discard_metadata_migration_directory(
+    checkpoint: Path,
+    directory: Path,
+) -> None:
+    """Atomically mark a staging directory disposable before recursive cleanup."""
+
+    if not directory.exists():
+        return
+    if not directory.is_dir() or directory.is_symlink():
+        raise ValueError(f"metadata migration residue is not a directory: {directory}")
+    prefix = f".{checkpoint.name}.metadata-v4-"
+    if not directory.name.startswith(prefix):
+        raise ValueError("metadata migration cleanup escaped its checkpoint prefix")
+    if not directory.name.startswith(f"{prefix}cleanup-"):
+        suffix = directory.name[len(prefix) :]
+        cleanup = checkpoint.parent / f"{prefix}cleanup-{suffix}"
+        if cleanup.exists():
             raise ValueError(
-                f"metadata migration transaction journal differs from {path.name}"
+                f"metadata migration cleanup destination already exists: {cleanup}"
             )
-    current_pair = (
-        sha256_file(checkpoint / "metadata.json"),
-        sha256_file(checkpoint / "manifest.json"),
-    )
-    old_pair = (
-        transaction["old_metadata_sha256"],
-        transaction["old_manifest_sha256"],
-    )
-    new_pair = (
-        transaction["new_metadata_sha256"],
-        transaction["new_manifest_sha256"],
-    )
-    if current_pair == new_pair:
-        _validate_checkpoint_hash_envelope(
-            checkpoint,
-            allow_legacy_head=False,
+        os.replace(directory, cleanup)
+        _fsync_directory(checkpoint.parent)
+        directory = cleanup
+    shutil.rmtree(directory, ignore_errors=False)
+    _fsync_directory(checkpoint.parent)
+
+
+def _recover_metadata_migration(checkpoint: Path) -> None:
+    building = _metadata_migration_directories(checkpoint, phase="building")
+    prepared = _metadata_migration_directories(checkpoint, phase="prepared")
+    cleanup = _metadata_migration_directories(checkpoint, phase="cleanup")
+    if not building and not prepared and not cleanup:
+        return
+    if len(prepared) > 1:
+        raise ValueError(
+            f"checkpoint has ambiguous prepared metadata migrations: {prepared}"
         )
+    if prepared:
+        staging = prepared[0]
+        transaction = _load_json(
+            staging / "transaction.json",
+            label="metadata migration transaction",
+        )
+        required = {
+            "format_version",
+            "checkpoint",
+            "old_metadata_sha256",
+            "old_manifest_sha256",
+            "new_metadata_sha256",
+            "new_manifest_sha256",
+        }
+        if (
+            set(transaction) != required
+            or type(transaction["format_version"]) is not int
+            or transaction["format_version"] != 1
+            or transaction["checkpoint"] != checkpoint.name
+        ):
+            raise ValueError("metadata migration transaction journal is invalid")
+        staged_files = {
+            "old_metadata_sha256": staging / "old-metadata.json",
+            "old_manifest_sha256": staging / "old-manifest.json",
+            "new_metadata_sha256": staging / "metadata.json",
+            "new_manifest_sha256": staging / "manifest.json",
+        }
+        for field, path in staged_files.items():
+            if not path.is_file() or sha256_file(path) != transaction[field]:
+                raise ValueError(
+                    f"metadata migration transaction journal differs from {path.name}"
+                )
+        current_pair = (
+            sha256_file(checkpoint / "metadata.json"),
+            sha256_file(checkpoint / "manifest.json"),
+        )
+        old_pair = (
+            transaction["old_metadata_sha256"],
+            transaction["old_manifest_sha256"],
+        )
+        new_pair = (
+            transaction["new_metadata_sha256"],
+            transaction["new_manifest_sha256"],
+        )
+        if current_pair == new_pair:
+            _validate_checkpoint_hash_envelope(
+                checkpoint,
+                allow_legacy_head=False,
+            )
+        else:
+            if current_pair != old_pair:
+                _restore_metadata_migration(checkpoint, staging)
+            raw, metadata, _ = _validate_checkpoint_hash_envelope(
+                checkpoint,
+                allow_legacy_head=True,
+            )
+            if raw.get("format_version") != 3 or metadata.camera_names != ("head",):
+                raise ValueError(
+                    "metadata migration recovery did not restore a legacy head v3 "
+                    "envelope"
+                )
+        _discard_metadata_migration_directory(checkpoint, staging)
     else:
-        if current_pair != old_pair:
-            _restore_metadata_migration(checkpoint, staging)
-        raw, metadata, _ = _validate_checkpoint_hash_envelope(
+        # Building and cleanup names are never transaction authorities. They
+        # are disposable only after the complete live envelope proves valid.
+        _validate_checkpoint_hash_envelope(
             checkpoint,
             allow_legacy_head=True,
         )
-        if raw.get("format_version") != 3 or metadata.camera_names != ("head",):
-            raise ValueError(
-                "metadata migration recovery did not restore a legacy head v3 envelope"
-            )
-    shutil.rmtree(staging, ignore_errors=False)
-    _fsync_directory(checkpoint.parent)
+    for residue in (*building, *cleanup):
+        _discard_metadata_migration_directory(checkpoint, residue)
 
 
 def migrate_legacy_head_checkpoint_v4(
@@ -453,6 +531,15 @@ def migrate_legacy_head_checkpoint_v4(
         raise FileNotFoundError(
             f"Baton checkpoint directory does not exist: {checkpoint}"
         )
+    with _exclusive_metadata_migration_lock(checkpoint):
+        return _migrate_legacy_head_checkpoint_v4_locked(checkpoint)
+
+
+def _migrate_legacy_head_checkpoint_v4_locked(
+    checkpoint: Path,
+) -> BatonMetadataMigrationResult:
+    """Run recovery and migration while holding the checkpoint lock."""
+
     _recover_metadata_migration(checkpoint)
     old_metadata_hash = sha256_file(checkpoint / "metadata.json")
     raw_metadata, metadata, manifest = _validate_checkpoint_hash_envelope(
@@ -474,12 +561,16 @@ def migrate_legacy_head_checkpoint_v4(
     if raw_metadata.get("format_version") != 3:
         raise ValueError("metadata v4 migration requires a legacy head v3 checkpoint")
 
-    staging = Path(
+    building = Path(
         tempfile.mkdtemp(
-            prefix=f".{checkpoint.name}.metadata-v4-",
+            prefix=f".{checkpoint.name}.metadata-v4-building-",
             dir=checkpoint.parent,
         )
     )
+    prepared = building.with_name(
+        building.name.replace("metadata-v4-building-", "metadata-v4-prepared-", 1)
+    )
+    staging = building
     old_metadata = checkpoint / "metadata.json"
     old_manifest = checkpoint / "manifest.json"
     remove_staging = True
@@ -515,6 +606,14 @@ def migrate_legacy_head_checkpoint_v4(
                 "new_manifest_sha256": sha256_file(staging / "manifest.json"),
             },
         )
+        for name in (
+            "old-metadata.json",
+            "old-manifest.json",
+            "metadata.json",
+            "manifest.json",
+            "transaction.json",
+        ):
+            _fsync_file(staging / name)
         _fsync_directory(staging)
 
         BatonCheckpointMetadata.from_dict(
@@ -526,6 +625,10 @@ def migrate_legacy_head_checkpoint_v4(
         )
         if staged_manifest.get("files") != new_manifest["files"]:
             raise ValueError("staged migration manifest is invalid")
+
+        os.replace(building, prepared)
+        _fsync_directory(checkpoint.parent)
+        staging = prepared
 
         try:
             _atomic_replace_from(staging / "metadata.json", old_metadata)
@@ -554,8 +657,17 @@ def migrate_legacy_head_checkpoint_v4(
         )
     finally:
         if remove_staging:
-            shutil.rmtree(staging, ignore_errors=False)
-            _fsync_directory(checkpoint.parent)
+            candidates = tuple(
+                sorted(
+                    {path for path in (staging, prepared, building) if path.exists()}
+                )
+            )
+            if len(candidates) > 1:
+                raise ValueError(
+                    f"metadata migration has ambiguous cleanup state: {candidates}"
+                )
+            if candidates:
+                _discard_metadata_migration_directory(checkpoint, candidates[0])
 
 
 def _optimizer_topology(

@@ -12,6 +12,16 @@ def _require_equal(name: str, actual: Any, expected: Any) -> None:
         raise ValueError(f"{name} must be {expected!r}, got {actual!r}")
 
 
+def _require_exact_int(name: str, value: Any) -> None:
+    if type(value) is not int:
+        raise ValueError(f"{name} must be an integer, got {type(value).__name__}")
+
+
+def _require_exact_int_tuple(name: str, value: Any) -> None:
+    if not isinstance(value, tuple) or any(type(item) is not int for item in value):
+        raise ValueError(f"{name} must contain only integers")
+
+
 def _require_nonempty_strings(instance: object, names: tuple[str, ...]) -> None:
     for name in names:
         value = getattr(instance, name)
@@ -122,6 +132,7 @@ class BatonTemporalPolicy:
 
     def __post_init__(self) -> None:
         if self.kind == "fixed_offsets":
+            _require_exact_int_tuple("temporal_policy.offsets", self.offsets)
             expected = {
                 "offsets": (0, 3, 5, 8),
                 "canonical_frame_count": None,
@@ -131,6 +142,18 @@ class BatonTemporalPolicy:
                 "formula": None,
             }
         elif self.kind == "normalized_remaining_horizon":
+            _require_exact_int(
+                "temporal_policy.canonical_frame_count",
+                self.canonical_frame_count,
+            )
+            _require_exact_int_tuple(
+                "temporal_policy.current_index_range",
+                self.current_index_range,
+            )
+            _require_exact_int(
+                "temporal_policy.target_count",
+                self.target_count_value,
+            )
             expected = {
                 "offsets": None,
                 "canonical_frame_count": 121,
@@ -368,6 +391,25 @@ class BatonCheckpointMetadata:
 
     def __post_init__(self) -> None:
         geometry = BatonGeometry()
+        for name in (
+            "format_version",
+            "teacher_image_size",
+            "teacher_patch_size",
+            "teacher_feature_layer",
+            "query_dim",
+            "query_layers",
+            "query_heads",
+            "query_ffn_dim",
+            "global_step",
+        ):
+            _require_exact_int(name, getattr(self, name))
+        _require_exact_int_tuple("target_shape", self.target_shape)
+        _require_exact_int_tuple(
+            "trainable_qwen_layer_indices",
+            self.trainable_qwen_layer_indices,
+        )
+        if type(self.query_dropout) is not float:
+            raise ValueError("query_dropout must be a floating-point number")
         _require_equal("format_version", self.format_version, self.FORMAT_VERSION)
         _require_equal(
             "architecture_kind", self.architecture_kind, self.ARCHITECTURE_KIND
@@ -435,7 +477,10 @@ class BatonCheckpointMetadata:
             self.trainable_qwen_layer_indices,
             tuple(range(24)),
         )
-        if dict(self.loss_weights) != {"mse": 1.0}:
+        if (
+            dict(self.loss_weights) != {"mse": 1.0}
+            or type(self.loss_weights.get("mse")) is not float
+        ):
             raise ValueError("loss_weights must contain only Equation-8 MSE weight 1.0")
         if self.global_step < 0:
             raise ValueError("global_step must be non-negative")

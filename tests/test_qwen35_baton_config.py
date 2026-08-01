@@ -204,6 +204,73 @@ def test_metadata_rejects_camera_and_temporal_policy_reinterpretation() -> None:
         BatonCheckpointMetadata.from_dict(head)
 
 
+@pytest.mark.parametrize(
+    ("camera_names", "mutate", "message"),
+    (
+        (
+            ("main", "wrist"),
+            lambda policy: policy["offsets"].__setitem__(0, False),
+            "offsets",
+        ),
+        (
+            ("head",),
+            lambda policy: policy.__setitem__("canonical_frame_count", 121.0),
+            "canonical_frame_count",
+        ),
+        (
+            ("head",),
+            lambda policy: policy["current_index_range"].__setitem__(0, False),
+            "current_index_range",
+        ),
+        (
+            ("head",),
+            lambda policy: policy.__setitem__("target_count", 4.0),
+            "target_count",
+        ),
+    ),
+)
+def test_v4_temporal_policy_rejects_noncanonical_json_integer_types(
+    camera_names: tuple[str, ...],
+    mutate: object,
+    message: str,
+) -> None:
+    payload = BatonCheckpointMetadata.example(camera_names=camera_names).to_dict()
+    assert callable(mutate)
+    mutate(payload["temporal_policy"])
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        BatonCheckpointMetadata.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("format_version", 4.0),
+        ("teacher_image_size", 256.0),
+        ("teacher_feature_layer", -2.0),
+        ("query_dim", 2048.0),
+        ("global_step", False),
+    ),
+)
+def test_v4_metadata_rejects_noncanonical_json_integer_types(
+    field: str,
+    value: object,
+) -> None:
+    payload = BatonCheckpointMetadata.example().to_dict()
+    payload[field] = value
+
+    with pytest.raises((TypeError, ValueError), match=field):
+        BatonCheckpointMetadata.from_dict(payload)
+
+
+def test_v4_metadata_rejects_noncanonical_integer_sequence_elements() -> None:
+    payload = BatonCheckpointMetadata.example().to_dict()
+    payload["target_shape"][1] = 4.0
+
+    with pytest.raises((TypeError, ValueError), match="target_shape"):
+        BatonCheckpointMetadata.from_dict(payload)
+
+
 def test_continuous_metadata_rejects_wrong_backbone_identity() -> None:
     payload = BatonCheckpointMetadata.example().to_dict()
 
