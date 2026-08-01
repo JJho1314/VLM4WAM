@@ -18,6 +18,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from qwen35_baton.config import exact_half_even_round
+
 
 _FRAME_COUNT = 121
 _IMAGE_SIZE = 256
@@ -319,7 +321,7 @@ def future_frame_indices(
         raise ValueError("current index must leave four strictly future frames")
     last = frame_count - 1
     future = tuple(
-        current_index + round((step + 1) * (last - current_index) / 4)
+        current_index + exact_half_even_round((step + 1) * (last - current_index), 4)
         for step in range(4)
     )
     if len(set(future)) != 4 or tuple(sorted(future)) != future:
@@ -336,7 +338,8 @@ def canonical_source_frame_indices(
         raise ValueError("source video must contain at least one decodable frame")
     last = source_frame_count - 1
     return tuple(
-        round(index * last / (_FRAME_COUNT - 1)) for index in range(_FRAME_COUNT)
+        exact_half_even_round(index * last, _FRAME_COUNT - 1)
+        for index in range(_FRAME_COUNT)
     )
 
 
@@ -564,6 +567,46 @@ def _validate_sha256(value: Any, *, field: str) -> None:
         raise ValueError(f"cached record field {field} must be lowercase SHA-256")
 
 
+def _validated_rgb_dataset(
+    handle: h5py.File,
+    *,
+    shard: Path,
+    split: str,
+    episode_id: str,
+) -> h5py.Dataset:
+    prefix = f"WorldArena {split} shard {episode_id!r} ({shard})"
+    if "rgb" not in handle:
+        raise ValueError(f"{prefix} has no rgb dataset")
+    rgb = handle["rgb"]
+    if not isinstance(rgb, h5py.Dataset):
+        raise ValueError(f"{prefix} rgb must be an HDF5 dataset")
+    if rgb.shape != (_FRAME_COUNT, _IMAGE_SIZE, _IMAGE_SIZE, 3):
+        raise ValueError(f"{prefix} rgb must have shape [121,256,256,3]")
+    if rgb.dtype != np.dtype(np.uint8):
+        raise ValueError(f"{prefix} rgb must have uint8 dtype")
+    if rgb.chunks != (1, _IMAGE_SIZE, _IMAGE_SIZE, 3):
+        raise ValueError(f"{prefix} rgb must be chunked one frame at a time")
+    if rgb.compression != "lzf":
+        raise ValueError(f"{prefix} rgb must use LZF compression")
+    return rgb
+
+
+@dataclass(frozen=True)
+class WorldArenaCacheAudit:
+    """Metadata-only schema audit counts for a complete published cache."""
+
+    record_count: int
+    train_count: int
+    validation_count: int
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "record_count": self.record_count,
+            "train_count": self.train_count,
+            "validation_count": self.validation_count,
+        }
+
+
 class WorldArenaHDF5Dataset(Dataset[dict[str, Any]]):
     """Epoch-deterministic WorldArena cache reader with one head camera."""
 
@@ -695,20 +738,20 @@ class WorldArenaHDF5Dataset(Dataset[dict[str, Any]]):
             split=self.split,
             frame_count=record["frame_count"],
         )
-        with h5py.File(record["hdf5_path"], "r") as handle:
-            if "rgb" not in handle:
-                raise ValueError(
-                    f"cached HDF5 has no rgb dataset: {record['hdf5_path']}"
-                )
-            rgb_dataset = handle["rgb"]
-            if rgb_dataset.shape != (_FRAME_COUNT, _IMAGE_SIZE, _IMAGE_SIZE, 3):
-                raise ValueError("cached rgb must have shape [121,256,256,3]")
-            if rgb_dataset.dtype != np.dtype(np.uint8):
-                raise ValueError("cached rgb must have uint8 dtype")
-            if rgb_dataset.chunks != (1, _IMAGE_SIZE, _IMAGE_SIZE, 3):
-                raise ValueError("cached rgb must be chunked one frame at a time")
-            if rgb_dataset.compression != "lzf":
-                raise ValueError("cached rgb must use LZF compression")
+        try:
+            handle_context = h5py.File(record["hdf5_path"], "r")
+        except OSError as error:
+            raise ValueError(
+                f"WorldArena {self.split} shard {record['episode_id']!r} "
+                f"is not valid HDF5: {record['hdf5_path']}"
+            ) from error
+        with handle_context as handle:
+            rgb_dataset = _validated_rgb_dataset(
+                handle,
+                shard=record["hdf5_path"],
+                split=self.split,
+                episode_id=record["episode_id"],
+            )
             rgb = np.asarray(rgb_dataset[list(indices)], dtype=np.uint8)
         return _rgb_sample(
             rgb,
@@ -717,6 +760,63 @@ class WorldArenaHDF5Dataset(Dataset[dict[str, Any]]):
             source_indices=indices,
             metadata=record["metadata"],
         )
+
+
+def audit_worldarena_hdf5_cache(
+    manifest_path: str | os.PathLike[str],
+) -> WorldArenaCacheAudit:
+    """Inspect every referenced shard schema without reading RGB frame chunks."""
+
+    path = Path(manifest_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"WorldArena cache manifest does not exist: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("WorldArena cache manifest is invalid JSON") from error
+    records = payload.get("records") if isinstance(payload, Mapping) else None
+    if not isinstance(records, list) or not records:
+        # Reuse the strict reader for the canonical schema-level diagnostic.
+        WorldArenaHDF5Dataset(path, seed=0, split="train")
+        raise AssertionError("strict WorldArena manifest validation is unreachable")
+    declared_splits = {
+        record.get("split") for record in records if isinstance(record, Mapping)
+    }
+    if not declared_splits or not declared_splits.issubset(_SPLITS):
+        WorldArenaHDF5Dataset(path, seed=0, split="train")
+        raise AssertionError("strict WorldArena split validation is unreachable")
+
+    counts = Counter()
+    audited = 0
+    for split in ("train", "validation"):
+        if split not in declared_splits:
+            continue
+        dataset = WorldArenaHDF5Dataset(path, seed=0, split=split)
+        counts[split] = len(dataset.records)
+        for record in dataset.records:
+            shard = record["hdf5_path"]
+            try:
+                handle_context = h5py.File(shard, "r")
+            except OSError as error:
+                raise ValueError(
+                    f"WorldArena {split} shard {record['episode_id']!r} "
+                    f"is not valid HDF5: {shard}"
+                ) from error
+            with handle_context as handle:
+                _validated_rgb_dataset(
+                    handle,
+                    shard=shard,
+                    split=split,
+                    episode_id=record["episode_id"],
+                )
+            audited += 1
+    if audited != len(records):
+        raise ValueError("WorldArena cache audit did not cover every manifest record")
+    return WorldArenaCacheAudit(
+        record_count=audited,
+        train_count=counts["train"],
+        validation_count=counts["validation"],
+    )
 
 
 def _validate_records(

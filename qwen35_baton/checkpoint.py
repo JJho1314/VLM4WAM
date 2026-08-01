@@ -123,6 +123,26 @@ class BatonResumeState:
     rank_rng_state: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class BatonMetadataMigrationResult:
+    """Evidence from an idempotent legacy-head metadata migration."""
+
+    checkpoint: Path
+    migrated: bool
+    old_metadata_sha256: str
+    new_metadata_sha256: str
+    manifest_sha256: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "checkpoint": str(self.checkpoint),
+            "migrated": self.migrated,
+            "old_metadata_sha256": self.old_metadata_sha256,
+            "new_metadata_sha256": self.new_metadata_sha256,
+            "manifest_sha256": self.manifest_sha256,
+        }
+
+
 def capture_rank_rng_state(*, distributed_rank: int) -> dict[str, Any]:
     """Capture Python, NumPy, CPU Torch, and every visible CUDA RNG stream."""
 
@@ -135,7 +155,8 @@ def capture_rank_rng_state(*, distributed_rank: int) -> dict[str, Any]:
         "distributed_rank": distributed_rank,
         "torch_cpu": torch.random.get_rng_state().cpu(),
         "torch_cuda": [
-            state.cpu() for state in (
+            state.cpu()
+            for state in (
                 torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
             )
         ],
@@ -276,6 +297,267 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _validate_checkpoint_hash_envelope(
+    checkpoint: Path,
+    *,
+    allow_legacy_head: bool,
+) -> tuple[Mapping[str, Any], BatonCheckpointMetadata, Mapping[str, Any]]:
+    missing = [
+        name
+        for name in (*_CHECKPOINT_FILES, "manifest.json")
+        if not (checkpoint / name).is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f"incomplete Baton checkpoint {checkpoint}: missing {missing}"
+        )
+    manifest = _load_json(checkpoint / "manifest.json", label="manifest")
+    hashes = manifest.get("files")
+    if (
+        manifest.get("format_version") != 2
+        or not isinstance(hashes, Mapping)
+        or set(hashes) != set(_CHECKPOINT_FILES)
+        or any(
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in hashes.values()
+        )
+    ):
+        raise ValueError("checkpoint file hash manifest is invalid")
+    for name in _CHECKPOINT_FILES:
+        if hashes[name] != sha256_file(checkpoint / name):
+            raise ValueError(f"checkpoint hash mismatch for {name}")
+    raw_metadata = _load_json(checkpoint / "metadata.json", label="metadata")
+    if raw_metadata.get("format_version") == 3 and allow_legacy_head:
+        metadata = BatonCheckpointMetadata._from_legacy_v3(
+            raw_metadata,
+            allow_head=True,
+        )
+    else:
+        metadata = BatonCheckpointMetadata.from_dict(raw_metadata)
+    return raw_metadata, metadata, manifest
+
+
+def _atomic_replace_from(source: Path, destination: Path) -> None:
+    """Copy a staged file then atomically replace one live checkpoint entry."""
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.metadata-v4-",
+        dir=destination.parent,
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        shutil.copy2(source, temporary)
+        _fsync_file(temporary)
+        os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+            _fsync_directory(destination.parent)
+
+
+def _restore_metadata_migration(checkpoint: Path, staging: Path) -> None:
+    _atomic_replace_from(staging / "old-metadata.json", checkpoint / "metadata.json")
+    _atomic_replace_from(staging / "old-manifest.json", checkpoint / "manifest.json")
+
+
+def _recover_metadata_migration(checkpoint: Path) -> None:
+    candidates = tuple(checkpoint.parent.glob(f".{checkpoint.name}.metadata-v4-*"))
+    if not candidates:
+        return
+    if len(candidates) != 1 or not candidates[0].is_dir():
+        raise ValueError(
+            f"checkpoint has ambiguous metadata migration staging: {candidates}"
+        )
+    staging = candidates[0]
+    transaction = _load_json(
+        staging / "transaction.json",
+        label="metadata migration transaction",
+    )
+    required = {
+        "format_version",
+        "checkpoint",
+        "old_metadata_sha256",
+        "old_manifest_sha256",
+        "new_metadata_sha256",
+        "new_manifest_sha256",
+    }
+    if (
+        set(transaction) != required
+        or transaction["format_version"] != 1
+        or transaction["checkpoint"] != checkpoint.name
+    ):
+        raise ValueError("metadata migration transaction journal is invalid")
+    staged_files = {
+        "old_metadata_sha256": staging / "old-metadata.json",
+        "old_manifest_sha256": staging / "old-manifest.json",
+        "new_metadata_sha256": staging / "metadata.json",
+        "new_manifest_sha256": staging / "manifest.json",
+    }
+    for field, path in staged_files.items():
+        if not path.is_file() or sha256_file(path) != transaction[field]:
+            raise ValueError(
+                f"metadata migration transaction journal differs from {path.name}"
+            )
+    current_pair = (
+        sha256_file(checkpoint / "metadata.json"),
+        sha256_file(checkpoint / "manifest.json"),
+    )
+    old_pair = (
+        transaction["old_metadata_sha256"],
+        transaction["old_manifest_sha256"],
+    )
+    new_pair = (
+        transaction["new_metadata_sha256"],
+        transaction["new_manifest_sha256"],
+    )
+    if current_pair == new_pair:
+        _validate_checkpoint_hash_envelope(
+            checkpoint,
+            allow_legacy_head=False,
+        )
+    else:
+        if current_pair != old_pair:
+            _restore_metadata_migration(checkpoint, staging)
+        raw, metadata, _ = _validate_checkpoint_hash_envelope(
+            checkpoint,
+            allow_legacy_head=True,
+        )
+        if raw.get("format_version") != 3 or metadata.camera_names != ("head",):
+            raise ValueError(
+                "metadata migration recovery did not restore a legacy head v3 envelope"
+            )
+    shutil.rmtree(staging, ignore_errors=False)
+    _fsync_directory(checkpoint.parent)
+
+
+def migrate_legacy_head_checkpoint_v4(
+    checkpoint_dir: str | Path,
+) -> BatonMetadataMigrationResult:
+    """Migrate only legacy head metadata using a fail-closed two-file transaction.
+
+    Every checkpoint payload hash is verified before and after the transaction.
+    Planner, optimizer, scheduler, scaler, RNG, and cursor files are never opened
+    for writing. Each live JSON replacement is atomic, and an interrupted pair is
+    fail-closed because the manifest checksum cannot validate until both land.
+    """
+
+    raw_path = Path(checkpoint_dir).expanduser()
+    if raw_path.is_symlink():
+        raise ValueError("checkpoint migration does not accept symlink paths")
+    checkpoint = raw_path.resolve()
+    if not checkpoint.is_dir():
+        raise FileNotFoundError(
+            f"Baton checkpoint directory does not exist: {checkpoint}"
+        )
+    _recover_metadata_migration(checkpoint)
+    old_metadata_hash = sha256_file(checkpoint / "metadata.json")
+    raw_metadata, metadata, manifest = _validate_checkpoint_hash_envelope(
+        checkpoint,
+        allow_legacy_head=True,
+    )
+    if metadata.camera_names != ("head",):
+        raise ValueError(
+            "metadata v4 migration applies only to legacy head checkpoints"
+        )
+    if raw_metadata.get("format_version") == BatonCheckpointMetadata.FORMAT_VERSION:
+        return BatonMetadataMigrationResult(
+            checkpoint=checkpoint,
+            migrated=False,
+            old_metadata_sha256=old_metadata_hash,
+            new_metadata_sha256=old_metadata_hash,
+            manifest_sha256=sha256_file(checkpoint / "manifest.json"),
+        )
+    if raw_metadata.get("format_version") != 3:
+        raise ValueError("metadata v4 migration requires a legacy head v3 checkpoint")
+
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{checkpoint.name}.metadata-v4-",
+            dir=checkpoint.parent,
+        )
+    )
+    old_metadata = checkpoint / "metadata.json"
+    old_manifest = checkpoint / "manifest.json"
+    remove_staging = True
+    try:
+        shutil.copy2(old_metadata, staging / "old-metadata.json")
+        shutil.copy2(old_manifest, staging / "old-manifest.json")
+        _json_write(staging / "metadata.json", metadata.to_dict())
+        os.chmod(
+            staging / "metadata.json",
+            stat.S_IMODE(old_metadata.stat().st_mode),
+        )
+        new_metadata_hash = sha256_file(staging / "metadata.json")
+        new_manifest = json.loads(json.dumps(manifest, sort_keys=True, allow_nan=False))
+        new_manifest["files"]["metadata.json"] = new_metadata_hash
+        for name in _CHECKPOINT_FILES:
+            if name != "metadata.json" and (
+                new_manifest["files"][name] != manifest["files"][name]
+            ):
+                raise AssertionError("migration changed an unrelated manifest checksum")
+        _json_write(staging / "manifest.json", new_manifest)
+        os.chmod(
+            staging / "manifest.json",
+            stat.S_IMODE(old_manifest.stat().st_mode),
+        )
+        _json_write(
+            staging / "transaction.json",
+            {
+                "format_version": 1,
+                "checkpoint": checkpoint.name,
+                "old_metadata_sha256": old_metadata_hash,
+                "old_manifest_sha256": sha256_file(old_manifest),
+                "new_metadata_sha256": new_metadata_hash,
+                "new_manifest_sha256": sha256_file(staging / "manifest.json"),
+            },
+        )
+        _fsync_directory(staging)
+
+        BatonCheckpointMetadata.from_dict(
+            _load_json(staging / "metadata.json", label="staged metadata")
+        )
+        staged_manifest = _load_json(
+            staging / "manifest.json",
+            label="staged manifest",
+        )
+        if staged_manifest.get("files") != new_manifest["files"]:
+            raise ValueError("staged migration manifest is invalid")
+
+        try:
+            _atomic_replace_from(staging / "metadata.json", old_metadata)
+            _atomic_replace_from(staging / "manifest.json", old_manifest)
+            _validate_checkpoint_hash_envelope(
+                checkpoint,
+                allow_legacy_head=False,
+            )
+        except BaseException:
+            try:
+                _restore_metadata_migration(checkpoint, staging)
+                _validate_checkpoint_hash_envelope(
+                    checkpoint,
+                    allow_legacy_head=True,
+                )
+            except BaseException:
+                remove_staging = False
+                raise
+            raise
+        return BatonMetadataMigrationResult(
+            checkpoint=checkpoint,
+            migrated=True,
+            old_metadata_sha256=old_metadata_hash,
+            new_metadata_sha256=new_metadata_hash,
+            manifest_sha256=sha256_file(old_manifest),
+        )
+    finally:
+        if remove_staging:
+            shutil.rmtree(staging, ignore_errors=False)
+            _fsync_directory(checkpoint.parent)
+
+
 def _optimizer_topology(
     optimizer_state: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
@@ -330,14 +612,11 @@ def _optimizer_topology(
             }
         )
     names = [
-        parameter["name"]
-        for group in topology
-        for parameter in group["parameters"]
+        parameter["name"] for group in topology for parameter in group["parameters"]
     ]
-    if (
-        any(not isinstance(name, str) or not name for name in names)
-        or len(names) != len(set(names))
-    ):
+    if any(not isinstance(name, str) or not name for name in names) or len(
+        names
+    ) != len(set(names)):
         raise ValueError("optimizer parameter names must be canonical and unique")
     return topology
 
@@ -390,9 +669,7 @@ def _annotate_optimizer_state(
     if not isinstance(groups, list) or len(groups) != len(optimizer.param_groups):
         raise ValueError("optimizer group topology differs from runtime")
     contracts = _optimizer_parameter_contract(planner, optimizer)
-    for group, live_group, contract in zip(
-        groups, optimizer.param_groups, contracts
-    ):
+    for group, live_group, contract in zip(groups, optimizer.param_groups, contracts):
         group.update(contract)
         live_group.update(contract)
 
@@ -429,9 +706,7 @@ def _validate_scheduler_state_values(state: Mapping[str, Any]) -> None:
         raise ValueError("scheduler contract is missing or invalid")
     warmup_steps = contract["warmup_steps"]
     max_steps = contract["max_steps"]
-    max_consecutive_skipped_updates = contract[
-        "max_consecutive_skipped_updates"
-    ]
+    max_consecutive_skipped_updates = contract["max_consecutive_skipped_updates"]
     base_lrs = contract["base_lrs"]
     last_epoch = state.get("last_epoch")
     current_lrs = state.get("_last_lr")
@@ -460,8 +735,7 @@ def _validate_scheduler_state_values(state: Mapping[str, Any]) -> None:
             1.0,
             max(
                 0.0,
-                float(last_epoch - warmup_steps)
-                / float(max_steps - warmup_steps),
+                float(last_epoch - warmup_steps) / float(max_steps - warmup_steps),
             ),
         )
         multiplier = 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -574,9 +848,7 @@ def planner_module_topology(planner: nn.Module) -> dict[str, Any]:
             raise ValueError(
                 f"planner tensor {name} has unsupported safetensors dtype {value.dtype}"
             )
-        tensors.append(
-            {"name": name, "shape": list(value.shape), "dtype": dtype}
-        )
+        tensors.append({"name": name, "shape": list(value.shape), "dtype": dtype})
     contract = {
         "format_version": 1,
         "tensors": tensors,
@@ -592,9 +864,7 @@ def trusted_planner_topology_payload(
     """Wrap a canonical topology in its independently verifiable root envelope."""
 
     validate_planner_topology_contract(topology)
-    canonical = json.loads(
-        json.dumps(topology, sort_keys=True, allow_nan=False)
-    )
+    canonical = json.loads(json.dumps(topology, sort_keys=True, allow_nan=False))
     return {
         "format_version": 1,
         "topology": canonical,
@@ -614,7 +884,9 @@ def load_trusted_planner_topology(
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            raise ValueError(f"trusted planner topology JSON is invalid: {path}") from error
+            raise ValueError(
+                f"trusted planner topology JSON is invalid: {path}"
+            ) from error
         if not isinstance(payload, Mapping):
             raise ValueError("trusted planner topology must contain a JSON object")
         payload = dict(payload)
@@ -655,18 +927,14 @@ def publish_trusted_planner_topology(
             os.link(temporary, destination)
         except FileExistsError:
             anchored, anchored_hash = load_trusted_planner_topology(destination)
-            if (
-                anchored != payload["topology"]
-                or anchored_hash != payload["sha256"]
-            ):
+            if anchored != payload["topology"] or anchored_hash != payload["sha256"]:
                 raise ValueError(
                     "existing trusted planner topology differs from publisher"
                 )
         published_mode = stat.S_IMODE(destination.stat().st_mode)
         if published_mode != 0o644:
             raise PermissionError(
-                "trusted planner topology mode must be 0644, "
-                f"got {published_mode:04o}"
+                f"trusted planner topology mode must be 0644, got {published_mode:04o}"
             )
         _fsync_directory(destination.parent)
     finally:
@@ -761,9 +1029,7 @@ def save_baton_checkpoint(
             str(staging / "planner.safetensors"),
             metadata={"format": BatonCheckpointMetadata.ARCHITECTURE_KIND},
         )
-        written_topology = planner_safetensors_topology(
-            staging / "planner.safetensors"
-        )
+        written_topology = planner_safetensors_topology(staging / "planner.safetensors")
         if written_topology != trusted_topology:
             raise ValueError(
                 "written planner safetensors topology differs from trusted metadata"
@@ -807,16 +1073,12 @@ def save_baton_checkpoint(
             metadata,
             cursor,
             world_size=len(states),
-            optimizer_hash=sha256_json(
-                _optimizer_topology(optimizer_state)
-            ),
+            optimizer_hash=sha256_json(_optimizer_topology(optimizer_state)),
             scheduler_hash=sha256_json(_scheduler_topology(scheduler_state)),
             rng_hash=sha256_file(staging / "rank_rng.pt"),
         )
         _json_write(staging / "metadata.json", runtime_metadata.to_dict())
-        hashes = {
-            name: sha256_file(staging / name) for name in _CHECKPOINT_FILES
-        }
+        hashes = {name: sha256_file(staging / name) for name in _CHECKPOINT_FILES}
         _json_write(
             staging / "manifest.json",
             {"format_version": 2, "files": hashes},
@@ -888,9 +1150,7 @@ def _validate_model_topology(checkpoint: Path, planner: nn.Module) -> None:
         if name not in runtime or tuple(runtime[name].shape) != shape:
             raise ValueError(f"planner state topology mismatch at {name}")
     missing = set(runtime).difference(saved)
-    alias_names = {
-        name for name, target in aliases.items() if target in saved
-    }
+    alias_names = {name for name, target in aliases.items() if target in saved}
     if missing.difference(alias_names):
         raise ValueError("planner state topology keys differ from checkpoint")
 
@@ -921,7 +1181,8 @@ def _validate_optimizer_runtime(
     ):
         if (
             saved_group.get("name") != runtime_group.get("name")
-            or len(saved_group.get("params", ())) != len(runtime_group.get("params", ()))
+            or len(saved_group.get("params", ()))
+            != len(runtime_group.get("params", ()))
             or len(saved_group.get("params", ())) != len(live_group.get("params", ()))
             or float(saved_group.get("initial_lr", saved_group.get("lr", 0.0)))
             != float(runtime_group.get("initial_lr", runtime_group.get("lr", 0.0)))
@@ -944,9 +1205,7 @@ def _validate_optimizer_runtime(
     if not isinstance(saved_slots, Mapping):
         raise ValueError("optimizer state topology is invalid")
     for saved_group, live_group in zip(saved_groups, optimizer.param_groups):
-        for identifier, parameter in zip(
-            saved_group["params"], live_group["params"]
-        ):
+        for identifier, parameter in zip(saved_group["params"], live_group["params"]):
             slot = saved_slots.get(identifier, {})
             if not isinstance(slot, Mapping):
                 raise ValueError("optimizer slot topology is invalid")
@@ -1000,9 +1259,7 @@ def _validate_optimizer_scheduler_lrs(
         or len(names) != len(set(names))
     ):
         raise ValueError("optimizer LR group names must be ordered and unique")
-    for group, base_lr, current_lr in zip(
-        groups, contract["base_lrs"], current_lrs
-    ):
+    for group, base_lr, current_lr in zip(groups, contract["base_lrs"], current_lrs):
         saved_base_lr = group.get("initial_lr", group.get("lr"))
         saved_current_lr = group.get("lr")
         if (
@@ -1037,7 +1294,9 @@ def _validate_scaler_runtime(saved: Mapping[str, Any], scaler: Any | None) -> No
     if scaler is not None:
         saved_state = saved["state_dict"]
         runtime_state = scaler.state_dict()
-        if not isinstance(saved_state, Mapping) or set(saved_state) != set(runtime_state):
+        if not isinstance(saved_state, Mapping) or set(saved_state) != set(
+            runtime_state
+        ):
             raise ValueError("checkpoint scaler topology differs from runtime")
 
 
@@ -1135,9 +1394,7 @@ def load_baton_checkpoint(
         raise ValueError(
             "trusted planner topology hash differs from checkpoint metadata"
         )
-    actual_topology = planner_safetensors_topology(
-        checkpoint / "planner.safetensors"
-    )
+    actual_topology = planner_safetensors_topology(checkpoint / "planner.safetensors")
     if sha256_json(actual_topology) != metadata.planner_topology_hash:
         raise ValueError(
             "planner safetensors topology hash differs from checkpoint metadata"
@@ -1151,9 +1408,7 @@ def load_baton_checkpoint(
         _load_json(checkpoint / "cursor.json", label="cursor")
     )
     if cursor.sampler_seed != expected_sampler_seed:
-        raise ValueError(
-            "checkpoint sampler seed differs from runtime data contract"
-        )
+        raise ValueError("checkpoint sampler seed differs from runtime data contract")
     if cursor.microbatches_per_epoch != expected_microbatches_per_epoch:
         raise ValueError(
             "checkpoint microbatches per epoch differs from runtime data contract"
@@ -1208,9 +1463,7 @@ def load_baton_checkpoint(
     _validate_persisted_steps(optimizer_state, scheduler_state, cursor)
     _validate_scheduler_state_values(scheduler_state)
     _validate_optimizer_scheduler_lrs(optimizer_state, scheduler_state)
-    optimizer_hash = sha256_json(
-        _optimizer_topology(optimizer_state)
-    )
+    optimizer_hash = sha256_json(_optimizer_topology(optimizer_state))
     if optimizer_hash != metadata.optimizer_topology_hash:
         raise ValueError("optimizer topology hash differs from checkpoint metadata")
     if (

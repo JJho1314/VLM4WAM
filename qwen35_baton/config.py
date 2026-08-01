@@ -82,11 +82,194 @@ class BatonGeometry:
         )
 
 
+def exact_half_even_round(numerator: int, denominator: int) -> int:
+    """Round a non-negative rational exactly, with ties going to an even integer."""
+
+    if (
+        type(numerator) is not int
+        or numerator < 0
+        or type(denominator) is not int
+        or denominator <= 0
+    ):
+        raise ValueError(
+            "exact half-even rounding requires a non-negative integer numerator "
+            "and a positive integer denominator"
+        )
+    quotient, remainder = divmod(numerator, denominator)
+    twice_remainder = 2 * remainder
+    return quotient + int(
+        twice_remainder > denominator
+        or (twice_remainder == denominator and quotient % 2 == 1)
+    )
+
+
+@dataclass(frozen=True)
+class BatonTemporalPolicy:
+    """Dataset-specific meaning of the four predicted semantic frames."""
+
+    _WORLD_ARENA_FORMULA: ClassVar[str] = (
+        "f_k = c + round_half_even((k + 1) * (120 - c) / 4), k=0..3"
+    )
+    _ROUNDING: ClassVar[str] = "round_half_even_exact_integer_v1"
+
+    kind: str
+    offsets: tuple[int, ...] | None = None
+    canonical_frame_count: int | None = None
+    current_index_range: tuple[int, int] | None = None
+    target_count_value: int | None = None
+    rounding: str | None = None
+    formula: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind == "fixed_offsets":
+            expected = {
+                "offsets": (0, 3, 5, 8),
+                "canonical_frame_count": None,
+                "current_index_range": None,
+                "target_count_value": None,
+                "rounding": None,
+                "formula": None,
+            }
+        elif self.kind == "normalized_remaining_horizon":
+            expected = {
+                "offsets": None,
+                "canonical_frame_count": 121,
+                "current_index_range": (0, 116),
+                "target_count_value": 4,
+                "rounding": self._ROUNDING,
+                "formula": self._WORLD_ARENA_FORMULA,
+            }
+        else:
+            raise ValueError(f"unsupported Baton temporal policy kind: {self.kind!r}")
+        for name, expected_value in expected.items():
+            _require_equal(
+                f"temporal_policy.{name}",
+                getattr(self, name),
+                expected_value,
+            )
+
+    @classmethod
+    def libero_fixed(cls) -> BatonTemporalPolicy:
+        return cls(
+            kind="fixed_offsets",
+            offsets=(0, 3, 5, 8),
+        )
+
+    @classmethod
+    def worldarena_normalized(cls) -> BatonTemporalPolicy:
+        return cls(
+            kind="normalized_remaining_horizon",
+            canonical_frame_count=121,
+            current_index_range=(0, 116),
+            target_count_value=4,
+            rounding=cls._ROUNDING,
+            formula=cls._WORLD_ARENA_FORMULA,
+        )
+
+    @property
+    def target_count(self) -> int:
+        if self.offsets is not None:
+            return len(self.offsets)
+        if self.target_count_value is None:
+            raise AssertionError("validated temporal policy has no target count")
+        return self.target_count_value
+
+    def resolve_future_indices(
+        self,
+        *,
+        current_index: int | None = None,
+    ) -> tuple[int, int, int, int]:
+        if self.kind == "fixed_offsets":
+            if current_index is not None:
+                raise ValueError(
+                    "fixed-offset temporal policy does not accept current_index"
+                )
+            if self.offsets is None:
+                raise AssertionError("validated fixed policy has no offsets")
+            return self.offsets  # type: ignore[return-value]
+        if type(current_index) is not int:
+            raise ValueError(
+                "normalized temporal policy requires an integer current_index"
+            )
+        if self.current_index_range is None or self.canonical_frame_count is None:
+            raise AssertionError("validated normalized policy is incomplete")
+        minimum, maximum = self.current_index_range
+        if not minimum <= current_index <= maximum:
+            raise ValueError(
+                f"current_index must be in [{minimum}, {maximum}], got {current_index}"
+            )
+        last = self.canonical_frame_count - 1
+        resolved = tuple(
+            current_index
+            + exact_half_even_round((step + 1) * (last - current_index), 4)
+            for step in range(self.target_count)
+        )
+        if (
+            len(resolved) != 4
+            or len(set(resolved)) != 4
+            or tuple(sorted(resolved)) != resolved
+        ):
+            raise ValueError(
+                "normalized future indices must be four unique ordered positions"
+            )
+        return resolved  # type: ignore[return-value]
+
+    def to_dict(self) -> dict[str, Any]:
+        if self.kind == "fixed_offsets":
+            return {"kind": self.kind, "offsets": list(self.offsets or ())}
+        return {
+            "kind": self.kind,
+            "canonical_frame_count": self.canonical_frame_count,
+            "current_index_range": list(self.current_index_range or ()),
+            "target_count": self.target_count,
+            "rounding": self.rounding,
+            "formula": self.formula,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> BatonTemporalPolicy:
+        if not isinstance(payload, Mapping):
+            raise ValueError("temporal_policy must contain a JSON object")
+        kind = payload.get("kind")
+        if kind == "fixed_offsets":
+            _require_keys(payload, ("kind", "offsets"))
+            offsets = payload["offsets"]
+            if not isinstance(offsets, (list, tuple)):
+                raise ValueError("temporal_policy.offsets must be a sequence")
+            return cls(kind=kind, offsets=tuple(offsets))
+        if kind == "normalized_remaining_horizon":
+            _require_keys(
+                payload,
+                (
+                    "kind",
+                    "canonical_frame_count",
+                    "current_index_range",
+                    "target_count",
+                    "rounding",
+                    "formula",
+                ),
+            )
+            current_range = payload["current_index_range"]
+            if not isinstance(current_range, (list, tuple)):
+                raise ValueError(
+                    "temporal_policy.current_index_range must be a sequence"
+                )
+            return cls(
+                kind=kind,
+                canonical_frame_count=payload["canonical_frame_count"],
+                current_index_range=tuple(current_range),  # type: ignore[arg-type]
+                target_count_value=payload["target_count"],
+                rounding=payload["rounding"],
+                formula=payload["formula"],
+            )
+        raise ValueError(f"unsupported Baton temporal policy kind: {kind!r}")
+
+
 @dataclass(frozen=True)
 class BatonCheckpointMetadata:
     """Serialized compatibility contract for a continuous Baton checkpoint."""
 
-    FORMAT_VERSION: ClassVar[int] = 3
+    FORMAT_VERSION: ClassVar[int] = 4
     ARCHITECTURE_KIND: ClassVar[str] = "qwen35_baton_continuous"
     QWEN_BACKBONE: ClassVar[str] = "dense Qwen3.5-2B"
     SIGLIP2_MODEL: ClassVar[str] = "SigLIP2-large-patch16-256"
@@ -112,7 +295,7 @@ class BatonCheckpointMetadata:
         "teacher_preprocessing_hash",
         "teacher_dtype",
         "target_shape",
-        "future_indices",
+        "temporal_policy",
         "query_dim",
         "query_layers",
         "query_heads",
@@ -165,7 +348,7 @@ class BatonCheckpointMetadata:
     teacher_preprocessing_hash: str
     teacher_dtype: str
     target_shape: tuple[int, ...]
-    future_indices: tuple[int, ...]
+    temporal_policy: BatonTemporalPolicy
     query_dim: int
     query_layers: int
     query_heads: int
@@ -203,15 +386,21 @@ class BatonCheckpointMetadata:
             )
             or len(set(self.added_token_ids)) != len(self.added_token_ids)
         ):
-            raise ValueError("added_token_ids must contain one unique ID per added token")
+            raise ValueError(
+                "added_token_ids must contain one unique ID per added token"
+            )
         if self.camera_names not in (("main", "wrist"), ("head",)):
             raise ValueError(
                 "camera_names must be either ('main', 'wrist') or ('head',)"
             )
         _require_equal("camera_flattening", self.camera_flattening, "sample_major")
         _require_equal("siglip2_model", self.siglip2_model, self.SIGLIP2_MODEL)
-        _require_equal("teacher_image_size", self.teacher_image_size, geometry.image_size)
-        _require_equal("teacher_patch_size", self.teacher_patch_size, geometry.patch_size)
+        _require_equal(
+            "teacher_image_size", self.teacher_image_size, geometry.image_size
+        )
+        _require_equal(
+            "teacher_patch_size", self.teacher_patch_size, geometry.patch_size
+        )
         _require_equal("teacher_feature_layer", self.teacher_feature_layer, -2)
         _require_equal("teacher_dtype", self.teacher_dtype, "bfloat16")
         _require_equal(
@@ -219,7 +408,17 @@ class BatonCheckpointMetadata:
             self.target_shape,
             (len(self.camera_names), 4, 256, 1024),
         )
-        _require_equal("future_indices", self.future_indices, geometry.future_indices)
+        if not isinstance(self.temporal_policy, BatonTemporalPolicy):
+            raise TypeError("temporal_policy must be a BatonTemporalPolicy")
+        expected_policy = (
+            BatonTemporalPolicy.libero_fixed()
+            if self.camera_names == ("main", "wrist")
+            else BatonTemporalPolicy.worldarena_normalized()
+        )
+        if self.temporal_policy != expected_policy:
+            raise ValueError(
+                "camera_names and temporal_policy must identify the same dataset contract"
+            )
         _require_equal("query_dim", self.query_dim, geometry.query_dim)
         _require_equal("query_layers", self.query_layers, geometry.query_layers)
         _require_equal("query_heads", self.query_heads, geometry.query_heads)
@@ -250,7 +449,9 @@ class BatonCheckpointMetadata:
             or value < 0
             for name, value in self.distributed_cursor
         ):
-            raise ValueError("distributed_cursor must contain non-negative named integer values")
+            raise ValueError(
+                "distributed_cursor must contain non-negative named integer values"
+            )
         if len({name for name, _ in self.distributed_cursor}) != len(
             self.distributed_cursor
         ):
@@ -287,7 +488,11 @@ class BatonCheckpointMetadata:
                 geometry.tokens_per_frame,
                 geometry.feature_dim,
             ),
-            future_indices=geometry.future_indices,
+            temporal_policy=(
+                BatonTemporalPolicy.libero_fixed()
+                if camera_names == ("main", "wrist")
+                else BatonTemporalPolicy.worldarena_normalized()
+            ),
             query_dim=geometry.query_dim,
             query_layers=geometry.query_layers,
             query_heads=geometry.query_heads,
@@ -302,7 +507,11 @@ class BatonCheckpointMetadata:
             optimizer_topology_hash=_example_sha256("optimizer-topology"),
             scheduler_topology_hash=_example_sha256("scheduler-topology"),
             global_step=0,
-            distributed_cursor=(("epoch", 0), ("consumed_microbatches", 0), ("sampler_seed", 0)),
+            distributed_cursor=(
+                ("epoch", 0),
+                ("consumed_microbatches", 0),
+                ("sampler_seed", 0),
+            ),
             rng_state_hash=_example_sha256("rng-state"),
         )
 
@@ -312,32 +521,67 @@ class BatonCheckpointMetadata:
         payload["added_token_ids"] = list(self.added_token_ids)
         payload["camera_names"] = list(self.camera_names)
         payload["target_shape"] = list(self.target_shape)
-        payload["future_indices"] = list(self.future_indices)
-        payload["trainable_qwen_layer_indices"] = list(self.trainable_qwen_layer_indices)
+        payload["temporal_policy"] = self.temporal_policy.to_dict()
+        payload["trainable_qwen_layer_indices"] = list(
+            self.trainable_qwen_layer_indices
+        )
         payload["distributed_cursor"] = dict(self.distributed_cursor)
         return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> BatonCheckpointMetadata:
-        if (
-            isinstance(payload, Mapping)
-            and payload.get("format_version") in (1, 2)
-        ):
+        if isinstance(payload, Mapping) and payload.get("format_version") in (1, 2):
             raise ValueError(
                 "Baton checkpoint format versions 1 and 2 are incompatible "
-                "with strict Baton version 3"
+                "with strict Baton version 4"
             )
+        if isinstance(payload, Mapping) and payload.get("format_version") == 3:
+            return cls._from_legacy_v3(payload, allow_head=False)
         _require_keys(payload, cls._REQUIRED_FIELDS)
         values = {name: payload[name] for name in cls._REQUIRED_FIELDS}
         values["added_tokens"] = tuple(values["added_tokens"])
         values["added_token_ids"] = tuple(values["added_token_ids"])
         values["camera_names"] = tuple(values["camera_names"])
         values["target_shape"] = tuple(values["target_shape"])
-        values["future_indices"] = tuple(values["future_indices"])
-        values["trainable_qwen_layer_indices"] = tuple(values["trainable_qwen_layer_indices"])
+        values["temporal_policy"] = BatonTemporalPolicy.from_dict(
+            values["temporal_policy"]
+        )
+        values["trainable_qwen_layer_indices"] = tuple(
+            values["trainable_qwen_layer_indices"]
+        )
         values["loss_weights"] = dict(values["loss_weights"])
         values["distributed_cursor"] = tuple(values["distributed_cursor"].items())
         return cls(**values)
+
+    @classmethod
+    def _from_legacy_v3(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        allow_head: bool,
+    ) -> BatonCheckpointMetadata:
+        required = tuple(
+            "future_indices" if name == "temporal_policy" else name
+            for name in cls._REQUIRED_FIELDS
+        )
+        _require_keys(payload, required)
+        camera_names = payload.get("camera_names")
+        if camera_names == ["head"] or camera_names == ("head",):
+            if not allow_head:
+                raise ValueError(
+                    "legacy head Baton v3 checkpoint has ambiguous temporal "
+                    "metadata; migration required before loading"
+                )
+            temporal_policy = BatonTemporalPolicy.worldarena_normalized()
+        else:
+            temporal_policy = BatonTemporalPolicy.libero_fixed()
+        if payload.get("future_indices") not in ([0, 3, 5, 8], (0, 3, 5, 8)):
+            raise ValueError("legacy Baton v3 future_indices must be (0,3,5,8)")
+        migrated = dict(payload)
+        migrated["format_version"] = cls.FORMAT_VERSION
+        migrated["temporal_policy"] = temporal_policy.to_dict()
+        del migrated["future_indices"]
+        return cls.from_dict(migrated)
 
 
 _PLAN_TOKENS = (

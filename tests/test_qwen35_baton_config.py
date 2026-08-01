@@ -12,6 +12,7 @@ import pytest
 from qwen35_baton import (
     BatonCheckpointMetadata,
     BatonGeometry,
+    BatonTemporalPolicy,
     sha256_file,
     sha256_json,
 )
@@ -91,7 +92,7 @@ def test_continuous_metadata_round_trips_the_complete_contract() -> None:
         "teacher_preprocessing_hash",
         "teacher_dtype",
         "target_shape",
-        "future_indices",
+        "temporal_policy",
         "query_dim",
         "query_layers",
         "query_heads",
@@ -113,7 +114,12 @@ def test_continuous_metadata_round_trips_the_complete_contract() -> None:
     assert payload["qwen_backbone"] == "dense Qwen3.5-2B"
     assert payload["trainable_qwen_layer_indices"] == list(range(24))
     assert payload["target_shape"] == [2, 4, 256, 1024]
-    assert payload["future_indices"] == [0, 3, 5, 8]
+    assert payload["format_version"] == 4
+    assert payload["temporal_policy"] == {
+        "kind": "fixed_offsets",
+        "offsets": [0, 3, 5, 8],
+    }
+    assert "future_indices" not in payload
     assert payload["teacher_feature_layer"] == -2
     assert payload["query_dim"] == 2048
     assert payload["query_layers"] == 1
@@ -129,9 +135,73 @@ def test_continuous_metadata_round_trips_the_complete_contract() -> None:
 
 def test_checkpoint_metadata_accepts_truthful_head_camera_shape() -> None:
     metadata = BatonCheckpointMetadata.example(camera_names=("head",))
+    payload = metadata.to_dict()
+
     assert metadata.camera_names == ("head",)
     assert metadata.target_shape == (1, 4, 256, 1024)
-    assert BatonCheckpointMetadata.from_dict(metadata.to_dict()) == metadata
+    assert metadata.temporal_policy == BatonTemporalPolicy.worldarena_normalized()
+    assert payload["temporal_policy"] == {
+        "kind": "normalized_remaining_horizon",
+        "canonical_frame_count": 121,
+        "current_index_range": [0, 116],
+        "target_count": 4,
+        "rounding": "round_half_even_exact_integer_v1",
+        "formula": ("f_k = c + round_half_even((k + 1) * (120 - c) / 4), k=0..3"),
+    }
+    assert "future_indices" not in payload
+    assert [0, 3, 5, 8] not in payload.values()
+    assert BatonCheckpointMetadata.from_dict(payload) == metadata
+
+
+def _legacy_v3_payload(metadata: BatonCheckpointMetadata) -> dict[str, object]:
+    payload = metadata.to_dict()
+    payload["format_version"] = 3
+    payload["future_indices"] = [0, 3, 5, 8]
+    del payload["temporal_policy"]
+    return payload
+
+
+def test_legacy_v3_libero_metadata_migrates_in_memory_without_rewrite() -> None:
+    restored = BatonCheckpointMetadata.from_dict(
+        _legacy_v3_payload(BatonCheckpointMetadata.example())
+    )
+
+    assert restored.format_version == 4
+    assert restored.camera_names == ("main", "wrist")
+    assert restored.temporal_policy == BatonTemporalPolicy.libero_fixed()
+
+
+def test_legacy_v3_head_metadata_requires_explicit_checkpoint_migration() -> None:
+    payload = _legacy_v3_payload(
+        BatonCheckpointMetadata.example(camera_names=("head",))
+    )
+
+    with pytest.raises(ValueError, match="legacy head.*migration required"):
+        BatonCheckpointMetadata.from_dict(payload)
+
+
+def test_temporal_policy_uses_exact_half_even_remaining_horizon_contract() -> None:
+    policy = BatonTemporalPolicy.worldarena_normalized()
+
+    assert policy.resolve_future_indices(current_index=0) == (30, 60, 90, 120)
+    assert policy.resolve_future_indices(current_index=2) == (32, 61, 90, 120)
+    assert policy.resolve_future_indices(current_index=116) == (117, 118, 119, 120)
+    with pytest.raises(ValueError, match="current_index"):
+        policy.resolve_future_indices()
+    with pytest.raises(ValueError, match=r"\[0, 116\]"):
+        policy.resolve_future_indices(current_index=117)
+
+
+def test_metadata_rejects_camera_and_temporal_policy_reinterpretation() -> None:
+    libero = BatonCheckpointMetadata.example().to_dict()
+    libero["temporal_policy"] = BatonTemporalPolicy.worldarena_normalized().to_dict()
+    with pytest.raises(ValueError, match="camera_names.*temporal_policy"):
+        BatonCheckpointMetadata.from_dict(libero)
+
+    head = BatonCheckpointMetadata.example(camera_names=("head",)).to_dict()
+    head["temporal_policy"] = BatonTemporalPolicy.libero_fixed().to_dict()
+    with pytest.raises(ValueError, match="camera_names.*temporal_policy"):
+        BatonCheckpointMetadata.from_dict(head)
 
 
 def test_continuous_metadata_rejects_wrong_backbone_identity() -> None:
@@ -143,11 +213,11 @@ def test_continuous_metadata_rejects_wrong_backbone_identity() -> None:
         BatonCheckpointMetadata.from_dict(payload)
 
 
-def test_format_v1_metadata_is_explicitly_incompatible_with_v2() -> None:
+def test_format_v1_metadata_is_explicitly_incompatible_with_v4() -> None:
     payload = BatonCheckpointMetadata.example().to_dict()
     payload["format_version"] = 1
 
-    with pytest.raises(ValueError, match="versions 1 and 2.*version 3"):
+    with pytest.raises(ValueError, match="versions 1 and 2.*version 4"):
         BatonCheckpointMetadata.from_dict(payload)
 
 
@@ -236,9 +306,10 @@ def test_sha256_helpers_are_stable_and_stream_file_contents(tmp_path: Path) -> N
     assert sha256_json({"b": [2, 1], "a": "Baton"}) == sha256_json(
         {"a": "Baton", "b": [2, 1]}
     )
-    assert sha256_file(artifact, chunk_size=3) == hashlib.sha256(
-        b"baton-contract\n"
-    ).hexdigest()
+    assert (
+        sha256_file(artifact, chunk_size=3)
+        == hashlib.sha256(b"baton-contract\n").hexdigest()
+    )
 
 
 def test_baton_package_does_not_import_legacy_planners() -> None:

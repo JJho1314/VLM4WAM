@@ -19,7 +19,7 @@ from qwen35_baton.checkpoint import (
     save_baton_checkpoint,
 )
 from qwen35_baton.cli.train_semantic_planner import BatonCosineWarmupScheduler
-from qwen35_baton.config import BatonCheckpointMetadata
+from qwen35_baton.config import BatonCheckpointMetadata, BatonTemporalPolicy
 from qwen35_baton.hashing import sha256_artifact, sha256_file, sha256_json
 from qwen35_baton.model import BatonPlannerOutput, BatonQwen35Planner
 from qwen35_baton.provider import FrozenBatonPlanner
@@ -134,6 +134,12 @@ def _images(batch_size: int = 2) -> torch.Tensor:
     return images
 
 
+def _head_images(batch_size: int = 2) -> torch.Tensor:
+    images = torch.zeros(batch_size, 1, 3, 8, 8, dtype=torch.uint8)
+    images[:, 0, 0, 0, 0] = 11
+    return images
+
+
 def test_provider_returns_full_independent_camera_grids_and_patch_centers() -> None:
     planner = _FakePlanner()
     provider = FrozenBatonPlanner(
@@ -145,6 +151,8 @@ def test_provider_returns_full_independent_camera_grids_and_patch_centers() -> N
     plan = provider.predict(_images(), ("pick cup", "open drawer"))
 
     assert plan.tokens.shape == (2, 2, 4, 256, 1024)
+    assert plan.camera_names == ("main", "wrist")
+    assert plan.temporal_policy == BatonTemporalPolicy.libero_fixed()
     assert plan.future_indices == (0, 3, 5, 8)
     assert plan.positions_xy.shape == (2, 2, 4, 256, 2)
     torch.testing.assert_close(
@@ -161,6 +169,40 @@ def test_provider_returns_full_independent_camera_grids_and_patch_centers() -> N
     assert plan.tokens[0, 1, 0, 0, 0].item() == 7
     assert planner.forward_calls == 1
     assert planner.attention_flags == [False]
+
+
+def test_head_provider_uses_checkpoint_camera_and_normalized_temporal_contract() -> (
+    None
+):
+    planner = _FakePlanner()
+    provider = FrozenBatonPlanner(
+        planner=planner,
+        processor=_Processor(),
+        added_token_ids=ADDED_TOKEN_IDS,
+        camera_names=("head",),
+        temporal_policy=BatonTemporalPolicy.worldarena_normalized(),
+    )
+
+    plan = provider.predict(_head_images(), ("pick cup", "open drawer"))
+
+    assert provider.camera_names == ("head",)
+    assert provider.temporal_policy == BatonTemporalPolicy.worldarena_normalized()
+    assert plan.tokens.shape == (2, 1, 4, 256, 1024)
+    assert plan.camera_names == ("head",)
+    assert plan.temporal_policy == BatonTemporalPolicy.worldarena_normalized()
+    assert plan.future_indices is None
+    assert plan.resolve_future_indices(current_canonical_index=2) == (
+        32,
+        61,
+        90,
+        120,
+    )
+    assert plan.positions_xy.shape == (2, 1, 4, 256, 2)
+    assert planner.forward_calls == 1
+    assert len(provider.processor.seen_texts) == 2
+
+    with pytest.raises(ValueError, match=r"\[B,1,3,H,W\]"):
+        provider.predict(_images(), ("pick cup", "open drawer"))
 
 
 def test_attention_trace_uses_one_positive_only_no_grad_forward() -> None:
@@ -227,9 +269,7 @@ class _MixedDtypeQueryTower(nn.Module):
     ) -> QueryTowerOutput:
         del return_attention_maps
         self.grad_enabled.append(torch.is_grad_enabled())
-        self.autocast_enabled.append(
-            torch.is_autocast_enabled(qwen_states.device.type)
-        )
+        self.autocast_enabled.append(torch.is_autocast_enabled(qwen_states.device.type))
         hidden = self.projection(qwen_states).expand(*qwen_states.shape[:-1], 1024)
         return QueryTowerOutput(hidden_states=hidden, cross_attention_maps=None)
 
@@ -450,6 +490,8 @@ def _metadata_for_artifacts(
     tokenizer_path: Path,
     processor_path: Path,
     siglip_path: Path | None = None,
+    *,
+    camera_names: tuple[str, ...] = ("main", "wrist"),
 ) -> BatonCheckpointMetadata:
     siglip_updates: dict[str, Any] = {}
     if siglip_path is not None:
@@ -459,7 +501,7 @@ def _metadata_for_artifacts(
             "teacher_preprocessing_hash": sha256_artifact(siglip_path),
         }
     return replace(
-        BatonCheckpointMetadata.example(),
+        BatonCheckpointMetadata.example(camera_names=camera_names),
         qwen_config_hash=sha256_file(model_path / "config.json"),
         tokenizer_hash=sha256_artifact(tokenizer_path),
         processor_hash=sha256_artifact(processor_path),
@@ -698,6 +740,49 @@ def test_valid_checkpoint_loads_state_then_returns_frozen_provider(
     assert provider.planner.weight.item() == 3.0
     assert all(not module.training for module in provider.modules())
     assert all(not parameter.requires_grad for parameter in provider.parameters())
+
+
+def test_head_checkpoint_propagates_camera_and_temporal_policy_into_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path, tokenizer_path, processor_path = _write_artifacts(tmp_path)
+    siglip_path = _write_siglip_artifact(tmp_path)
+    checkpoint = tmp_path / "checkpoint"
+    source = _FakePlanner()
+    _write_checkpoint(
+        checkpoint,
+        metadata=_metadata_for_artifacts(
+            model_path,
+            tokenizer_path,
+            processor_path,
+            siglip_path,
+            camera_names=("head",),
+        ),
+        planner=source,
+    )
+    topology_path = _write_expected_topology(checkpoint)
+    _trust_siglip_geometry(monkeypatch)
+
+    provider = FrozenBatonPlanner.from_checkpoint(
+        checkpoint,
+        qwen_model_path=model_path,
+        qwen_tokenizer_path=tokenizer_path,
+        qwen_processor_path=processor_path,
+        siglip2_model_path=siglip_path,
+        expected_planner_topology=topology_path,
+        torch_dtype=torch.float32,
+        _component_loader=lambda **_: (_Processor(), _FakePlanner()),
+    )
+    plan = provider.predict(_head_images(batch_size=1), ("pick cup",))
+
+    assert provider.camera_names == ("head",)
+    assert provider.temporal_policy == BatonTemporalPolicy.worldarena_normalized()
+    assert plan.tokens.shape == (1, 1, 4, 256, 1024)
+    assert plan.camera_names == ("head",)
+    assert plan.future_indices is None
+    with pytest.raises(ValueError, match=r"\[B,1,3,H,W\]"):
+        provider.predict(_images(batch_size=1), ("pick cup",))
 
 
 def test_float16_is_rejected_before_checkpoint_or_component_loading(
@@ -1011,4 +1096,6 @@ def test_trusted_aliased_planner_topology_round_trips(
     )
 
     assert provider.planner.weight.item() == 4.0
-    assert provider.planner.weight.data_ptr() == provider.planner.weight_alias.data_ptr()
+    assert (
+        provider.planner.weight.data_ptr() == provider.planner.weight_alias.data_ptr()
+    )

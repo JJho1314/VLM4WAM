@@ -7,7 +7,9 @@ import os
 from pathlib import Path
 import pickle
 import random
+import shutil
 import stat
+import tempfile
 from typing import Any
 
 import numpy as np
@@ -22,12 +24,16 @@ from qwen35_baton.checkpoint import (
     capture_rank_rng_state,
     load_baton_checkpoint as _load_baton_checkpoint,
     load_trusted_planner_topology,
+    migrate_legacy_head_checkpoint_v4,
     planner_module_topology,
     planner_safetensors_topology,
     publish_trusted_planner_topology,
     save_baton_checkpoint,
     trusted_planner_topology_payload,
 )
+from qwen35_baton.cli.train_semantic_planner import BatonCosineWarmupScheduler
+from qwen35_baton.config import BatonCheckpointMetadata
+from qwen35_baton.hashing import sha256_file, sha256_json
 
 
 def test_rank_rng_state_uses_pickle_safe_lossless_numpy_encoding() -> None:
@@ -86,9 +92,6 @@ def test_persisted_steps_reject_empty_or_foreign_adamw_state() -> None:
             scheduler,
             cursor,
         )
-from qwen35_baton.cli.train_semantic_planner import BatonCosineWarmupScheduler
-from qwen35_baton.config import BatonCheckpointMetadata
-from qwen35_baton.hashing import sha256_json
 
 
 class _Scaler:
@@ -155,9 +158,7 @@ def _run_concurrent_publications(
 def load_baton_checkpoint(*args: Any, **kwargs: Any):
     kwargs.setdefault("expected_sampler_seed", 41)
     kwargs.setdefault("expected_microbatches_per_epoch", 11)
-    topology = planner_safetensors_topology(
-        Path(args[0]) / "planner.safetensors"
-    )
+    topology = planner_safetensors_topology(Path(args[0]) / "planner.safetensors")
     kwargs.setdefault("expected_planner_topology", topology)
     kwargs["expected_contract"] = replace(
         kwargs["expected_contract"],
@@ -182,9 +183,7 @@ def _runtime(seed: int = 7):
     optimizer = torch.optim.AdamW(
         [{"name": "planner", "params": list(planner.parameters()), "lr": 5e-5}]
     )
-    scheduler = BatonCosineWarmupScheduler(
-        optimizer, warmup_steps=0, max_steps=10
-    )
+    scheduler = BatonCosineWarmupScheduler(optimizer, warmup_steps=0, max_steps=10)
     value = planner(torch.tensor([[1.0, -2.0]])).square().mean()
     value.backward()
     optimizer.step()
@@ -208,11 +207,11 @@ def _save_valid_checkpoint(
     *,
     ranks: int = 1,
     scaler: _Scaler | None = None,
+    metadata: BatonCheckpointMetadata | None = None,
 ):
     planner, optimizer, scheduler = _runtime()
     rank_states = {
-        rank: capture_rank_rng_state(distributed_rank=rank)
-        for rank in range(ranks)
+        rank: capture_rank_rng_state(distributed_rank=rank) for rank in range(ranks)
     }
     save_baton_checkpoint(
         checkpoint,
@@ -220,11 +219,29 @@ def _save_valid_checkpoint(
         optimizer=optimizer,
         scheduler=scheduler,
         scaler=scaler,
-        metadata=_metadata_for_planner(planner),
+        metadata=_metadata_for_planner(planner, metadata),
         cursor=_cursor(),
         rank_rng_state=rank_states,
     )
     return planner, optimizer, scheduler
+
+
+def _rewrite_checkpoint_metadata_as_v3(
+    checkpoint: Path,
+) -> dict[str, Any]:
+    metadata = json.loads((checkpoint / "metadata.json").read_text())
+    metadata["format_version"] = 3
+    metadata["future_indices"] = [0, 3, 5, 8]
+    del metadata["temporal_policy"]
+    (checkpoint / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n"
+    )
+    manifest = json.loads((checkpoint / "manifest.json").read_text())
+    manifest["files"]["metadata.json"] = sha256_file(checkpoint / "metadata.json")
+    (checkpoint / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
+    return metadata
 
 
 def _clone_state(module: nn.Module) -> dict[str, torch.Tensor]:
@@ -274,9 +291,7 @@ def test_zero_step_checkpoint_supports_validated_model_only_loading(
     optimizer = torch.optim.AdamW(
         [{"name": "planner", "params": list(planner.parameters()), "lr": 5e-5}]
     )
-    scheduler = BatonCosineWarmupScheduler(
-        optimizer, warmup_steps=0, max_steps=10
-    )
+    scheduler = BatonCosineWarmupScheduler(optimizer, warmup_steps=0, max_steps=10)
     checkpoint = tmp_path / "step_000000"
     cursor = BatonTrainingCursor(
         global_step=0,
@@ -360,9 +375,7 @@ def test_checkpoint_save_rejects_unnamed_optimizer_lr_groups(
 ) -> None:
     planner = nn.Linear(2, 1)
     optimizer = torch.optim.AdamW(planner.parameters(), lr=5e-5)
-    scheduler = BatonCosineWarmupScheduler(
-        optimizer, warmup_steps=0, max_steps=10
-    )
+    scheduler = BatonCosineWarmupScheduler(optimizer, warmup_steps=0, max_steps=10)
     destination = tmp_path / "step_000000"
 
     with pytest.raises(ValueError, match="LR group names"):
@@ -408,9 +421,7 @@ def test_checkpoint_uses_the_first_registered_name_for_an_aliased_parameter(
             }
         ]
     )
-    scheduler = BatonCosineWarmupScheduler(
-        optimizer, warmup_steps=0, max_steps=10
-    )
+    scheduler = BatonCosineWarmupScheduler(optimizer, warmup_steps=0, max_steps=10)
     planner(torch.tensor([[1.0, -2.0]])).square().mean().backward()
     optimizer.step()
     scheduler.step()
@@ -1003,9 +1014,7 @@ def test_identical_preexisting_anchor_with_noncanonical_mode_fails_closed(
 ) -> None:
     destination = tmp_path / "planner_topology.json"
     topology = _race_topology(9)
-    destination.write_text(
-        json.dumps(trusted_planner_topology_payload(topology))
-    )
+    destination.write_text(json.dumps(trusted_planner_topology_payload(topology)))
     destination.chmod(0o600)
 
     with pytest.raises(PermissionError, match="mode.*0644"):
@@ -1092,9 +1101,7 @@ def test_loader_rejects_refreshed_wrong_planner_dtype_before_mutation(
 ) -> None:
     checkpoint = tmp_path / "step_000001"
     source, _, _ = _save_valid_checkpoint(checkpoint)
-    trusted_topology = planner_safetensors_topology(
-        checkpoint / "planner.safetensors"
-    )
+    trusted_topology = planner_safetensors_topology(checkpoint / "planner.safetensors")
     expected_contract = replace(
         BatonCheckpointMetadata.example(),
         planner_topology_hash=sha256_json(trusted_topology),
@@ -1131,9 +1138,7 @@ def test_loader_rejects_wrong_external_topology_before_mutation(
 ) -> None:
     checkpoint = tmp_path / "step_000001"
     _save_valid_checkpoint(checkpoint)
-    trusted_topology = planner_safetensors_topology(
-        checkpoint / "planner.safetensors"
-    )
+    trusted_topology = planner_safetensors_topology(checkpoint / "planner.safetensors")
     expected_contract = replace(
         BatonCheckpointMetadata.example(),
         planner_topology_hash=sha256_json(trusted_topology),
@@ -1157,6 +1162,215 @@ def test_loader_rejects_wrong_external_topology_before_mutation(
     _assert_state_equal(planner.state_dict(), before)
 
 
+def test_legacy_libero_v3_checkpoint_resumes_against_v4_contract(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step_000001"
+    _save_valid_checkpoint(checkpoint)
+    _rewrite_checkpoint_metadata_as_v3(checkpoint)
+    planner, optimizer, scheduler = _runtime(seed=99)
+
+    resumed = load_baton_checkpoint(
+        checkpoint,
+        planner=planner,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        expected_contract=BatonCheckpointMetadata.example(),
+    )
+
+    assert resumed.metadata.format_version == 4
+    assert resumed.metadata.camera_names == ("main", "wrist")
+
+
+def test_legacy_head_v3_checkpoint_fails_before_runtime_mutation(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step_000001"
+    _save_valid_checkpoint(
+        checkpoint,
+        metadata=BatonCheckpointMetadata.example(camera_names=("head",)),
+    )
+    _rewrite_checkpoint_metadata_as_v3(checkpoint)
+    planner, optimizer, scheduler = _runtime(seed=99)
+    before = _clone_state(planner)
+
+    with pytest.raises(ValueError, match="legacy head.*migration required"):
+        load_baton_checkpoint(
+            checkpoint,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            expected_contract=BatonCheckpointMetadata.example(camera_names=("head",)),
+        )
+
+    _assert_state_equal(planner.state_dict(), before)
+
+
+def test_head_v3_migration_is_atomic_idempotent_and_preserves_all_state(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step_000001"
+    _save_valid_checkpoint(
+        checkpoint,
+        metadata=BatonCheckpointMetadata.example(camera_names=("head",)),
+    )
+    _rewrite_checkpoint_metadata_as_v3(checkpoint)
+    state_files = (
+        "planner.safetensors",
+        "optimizer.pt",
+        "scheduler.pt",
+        "scaler.pt",
+        "rank_rng.pt",
+        "cursor.json",
+    )
+    state_bytes = {name: (checkpoint / name).read_bytes() for name in state_files}
+    old_manifest = json.loads((checkpoint / "manifest.json").read_text())
+
+    result = migrate_legacy_head_checkpoint_v4(checkpoint)
+
+    assert result.migrated is True
+    metadata = json.loads((checkpoint / "metadata.json").read_text())
+    manifest = json.loads((checkpoint / "manifest.json").read_text())
+    assert metadata["format_version"] == 4
+    assert metadata["camera_names"] == ["head"]
+    assert "future_indices" not in metadata
+    assert metadata["temporal_policy"]["kind"] == ("normalized_remaining_horizon")
+    assert manifest["files"]["metadata.json"] == sha256_file(
+        checkpoint / "metadata.json"
+    )
+    for name in state_files:
+        assert (checkpoint / name).read_bytes() == state_bytes[name]
+        assert manifest["files"][name] == old_manifest["files"][name]
+    assert not tuple(checkpoint.parent.glob(f".{checkpoint.name}.metadata-v4-*"))
+
+    metadata_bytes = (checkpoint / "metadata.json").read_bytes()
+    manifest_bytes = (checkpoint / "manifest.json").read_bytes()
+    second = migrate_legacy_head_checkpoint_v4(checkpoint)
+    assert second.migrated is False
+    assert (checkpoint / "metadata.json").read_bytes() == metadata_bytes
+    assert (checkpoint / "manifest.json").read_bytes() == manifest_bytes
+
+    planner, optimizer, scheduler = _runtime(seed=99)
+    resumed = load_baton_checkpoint(
+        checkpoint,
+        planner=planner,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        expected_contract=BatonCheckpointMetadata.example(camera_names=("head",)),
+    )
+    assert resumed.metadata.camera_names == ("head",)
+
+
+def test_head_v3_migration_failure_leaves_original_envelope_untouched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "step_000001"
+    _save_valid_checkpoint(
+        checkpoint,
+        metadata=BatonCheckpointMetadata.example(camera_names=("head",)),
+    )
+    _rewrite_checkpoint_metadata_as_v3(checkpoint)
+    before = {
+        name: (checkpoint / name).read_bytes()
+        for name in ("metadata.json", "manifest.json")
+    }
+
+    original_replace = checkpoint_module._atomic_replace_from
+    calls = 0
+
+    def fail_second_replace(source: Path, destination: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected atomic replace failure")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_atomic_replace_from",
+        fail_second_replace,
+    )
+    with pytest.raises(OSError, match="replace failure"):
+        migrate_legacy_head_checkpoint_v4(checkpoint)
+
+    for name, expected in before.items():
+        assert (checkpoint / name).read_bytes() == expected
+    assert not tuple(checkpoint.parent.glob(f".{checkpoint.name}.metadata-v4-*"))
+
+
+def test_head_v3_migration_recovers_a_crash_between_the_two_json_replaces(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step_000001"
+    _save_valid_checkpoint(
+        checkpoint,
+        metadata=BatonCheckpointMetadata.example(camera_names=("head",)),
+    )
+    raw = _rewrite_checkpoint_metadata_as_v3(checkpoint)
+    old_metadata_hash = sha256_file(checkpoint / "metadata.json")
+    old_manifest_hash = sha256_file(checkpoint / "manifest.json")
+    migrated = BatonCheckpointMetadata._from_legacy_v3(raw, allow_head=True)
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{checkpoint.name}.metadata-v4-",
+            dir=checkpoint.parent,
+        )
+    )
+    shutil.copy2(checkpoint / "metadata.json", staging / "old-metadata.json")
+    shutil.copy2(checkpoint / "manifest.json", staging / "old-manifest.json")
+    checkpoint_module._json_write(staging / "metadata.json", migrated.to_dict())
+    new_metadata_hash = sha256_file(staging / "metadata.json")
+    manifest = json.loads((checkpoint / "manifest.json").read_text())
+    manifest["files"]["metadata.json"] = new_metadata_hash
+    checkpoint_module._json_write(staging / "manifest.json", manifest)
+    new_manifest_hash = sha256_file(staging / "manifest.json")
+    checkpoint_module._json_write(
+        staging / "transaction.json",
+        {
+            "format_version": 1,
+            "checkpoint": checkpoint.name,
+            "old_metadata_sha256": old_metadata_hash,
+            "old_manifest_sha256": old_manifest_hash,
+            "new_metadata_sha256": new_metadata_hash,
+            "new_manifest_sha256": new_manifest_hash,
+        },
+    )
+    checkpoint_module._atomic_replace_from(
+        staging / "metadata.json",
+        checkpoint / "metadata.json",
+    )
+
+    result = migrate_legacy_head_checkpoint_v4(checkpoint)
+
+    assert result.migrated is True
+    assert BatonCheckpointMetadata.from_dict(
+        json.loads((checkpoint / "metadata.json").read_text())
+    ).camera_names == ("head",)
+    assert not tuple(checkpoint.parent.glob(f".{checkpoint.name}.metadata-v4-*"))
+
+
+def test_head_v3_migration_cli_reports_changed_then_idempotent(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from qwen35_baton.cli.migrate_checkpoint_v4 import main
+
+    checkpoint = tmp_path / "step_000001"
+    _save_valid_checkpoint(
+        checkpoint,
+        metadata=BatonCheckpointMetadata.example(camera_names=("head",)),
+    )
+    _rewrite_checkpoint_metadata_as_v3(checkpoint)
+
+    assert main([str(checkpoint)]) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first[0]["migrated"] is True
+    assert main([str(checkpoint)]) == 0
+    second = json.loads(capsys.readouterr().out)
+    assert second[0]["migrated"] is False
+
+
 def test_loader_rejects_format_v1_checkpoint_before_mutation(
     tmp_path: Path,
 ) -> None:
@@ -1173,7 +1387,7 @@ def test_loader_rejects_format_v1_checkpoint_before_mutation(
     planner, optimizer, scheduler = _runtime(seed=99)
     before = _clone_state(planner)
 
-    with pytest.raises(ValueError, match="versions 1 and 2.*version 3"):
+    with pytest.raises(ValueError, match="versions 1 and 2.*version 4"):
         load_baton_checkpoint(
             checkpoint,
             planner=planner,

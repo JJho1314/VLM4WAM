@@ -98,16 +98,19 @@ def _validate_dataset_manifest(
     *,
     dataset_type: str,
     manifest: Path,
-    seed: int,
-) -> None:
+) -> dict[str, int] | None:
     if dataset_type == "libero_hdf5":
         from ge_act.data.libero_fastwam_hdf5_schema import load_manifest
 
         load_manifest(manifest)
+        return None
     elif dataset_type == "worldarena_hdf5":
-        from qwen35_baton.worldarena_data import WorldArenaHDF5Dataset
+        from qwen35_baton.worldarena_data import audit_worldarena_hdf5_cache
 
-        WorldArenaHDF5Dataset(manifest, seed=seed, split="train")
+        audit = audit_worldarena_hdf5_cache(manifest)
+        if audit.train_count <= 0:
+            raise ValueError("WorldArena cache must contain at least one train record")
+        return audit.to_dict()
     else:
         raise AssertionError("validated dataset_type is unreachable")
 
@@ -200,9 +203,7 @@ def _siglip_geometry(path: Path) -> dict[str, int]:
     for name, value in expected.items():
         actual = getattr(vision, name, None)
         if actual != value:
-            raise ValueError(
-                f"local SigLIP2 {name} must be {value}, got {actual!r}"
-            )
+            raise ValueError(f"local SigLIP2 {name} must be {value}, got {actual!r}")
     return expected
 
 
@@ -253,17 +254,13 @@ def preflight_stage1(
     tokenizer = _require_directory(
         Path(config.qwen_tokenizer_path), label="Qwen tokenizer"
     )
-    siglip = _require_directory(
-        Path(config.siglip2_model_path), label="SigLIP2 model"
-    )
+    siglip = _require_directory(Path(config.siglip2_model_path), label="SigLIP2 model")
     manifest = Path(config.hdf5_manifest_path).expanduser().resolve()
     statistics = Path(config.dataset_statistics_path).expanduser().resolve()
     if not manifest.is_file():
         raise FileNotFoundError(f"HDF5 manifest does not exist: {manifest}")
     if not statistics.is_file():
-        raise FileNotFoundError(
-            f"dataset statistics file does not exist: {statistics}"
-        )
+        raise FileNotFoundError(f"dataset statistics file does not exist: {statistics}")
     manifest_payload = _load_json(manifest, label="HDF5 manifest")
     manifest_dataset_type = _manifest_dataset_type(manifest_payload)
     if manifest_dataset_type != config.dataset_type:
@@ -272,32 +269,11 @@ def preflight_stage1(
             f"config declares {config.dataset_type!r}, manifest declares "
             f"{manifest_dataset_type!r}"
         )
-    _validate_dataset_manifest(
-        dataset_type=config.dataset_type,
-        manifest=manifest,
-        seed=config.seed,
-    )
     if config.dataset_type == "worldarena_hdf5" and statistics != manifest.with_name(
         "stats.json"
     ):
         raise ValueError(
             "WorldArena dataset_statistics_path must be the cache stats.json"
-        )
-    _validate_qwen_config(qwen)
-    _validate_processor(processor)
-    token_ids = _added_token_ids(tokenizer)
-    geometry = _siglip_geometry(siglip)
-    actual_siglip_config_hash = sha256_file(siglip / "config.json")
-    if actual_siglip_config_hash != config.siglip2_config_hash:
-        raise ValueError(
-            "SigLIP2 config hash mismatch: "
-            f"expected {config.siglip2_config_hash}, got {actual_siglip_config_hash}"
-        )
-    actual_siglip_artifact_hash = sha256_artifact(siglip)
-    if actual_siglip_artifact_hash != config.siglip2_artifact_hash:
-        raise ValueError(
-            "SigLIP2 artifact hash mismatch: "
-            f"expected {config.siglip2_artifact_hash}, got {actual_siglip_artifact_hash}"
         )
     actual_manifest_hash = sha256_file(manifest)
     if actual_manifest_hash != config.hdf5_manifest_hash:
@@ -314,6 +290,26 @@ def preflight_stage1(
             raise ValueError(
                 "WorldArena cache stats.json provenance differs from its manifest"
             )
+    worldarena_cache_audit = _validate_dataset_manifest(
+        dataset_type=config.dataset_type,
+        manifest=manifest,
+    )
+    _validate_qwen_config(qwen)
+    _validate_processor(processor)
+    token_ids = _added_token_ids(tokenizer)
+    geometry = _siglip_geometry(siglip)
+    actual_siglip_config_hash = sha256_file(siglip / "config.json")
+    if actual_siglip_config_hash != config.siglip2_config_hash:
+        raise ValueError(
+            "SigLIP2 config hash mismatch: "
+            f"expected {config.siglip2_config_hash}, got {actual_siglip_config_hash}"
+        )
+    actual_siglip_artifact_hash = sha256_artifact(siglip)
+    if actual_siglip_artifact_hash != config.siglip2_artifact_hash:
+        raise ValueError(
+            "SigLIP2 artifact hash mismatch: "
+            f"expected {config.siglip2_artifact_hash}, got {actual_siglip_artifact_hash}"
+        )
     _reject_output_ancestor(
         Path(config.output_dir),
         (qwen, processor, tokenizer, siglip, manifest, statistics),
@@ -326,7 +322,7 @@ def preflight_stage1(
         world_size=world_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
     )
-    return {
+    report = {
         "tiny_test": False,
         "global_batch": global_batch,
         "dataset_type": config.dataset_type,
@@ -340,6 +336,9 @@ def preflight_stage1(
         "qwen35_fast_path": fast_path,
         "distributed_strategy": "ddp",
     }
+    if worldarena_cache_audit is not None:
+        report["worldarena_cache_audit"] = worldarena_cache_audit
+    return report
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -361,9 +360,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.per_device_batch is not None:
         overrides["per_device_batch"] = args.per_device_batch
     if args.gradient_accumulation_steps is not None:
-        overrides["gradient_accumulation_steps"] = (
-            args.gradient_accumulation_steps
-        )
+        overrides["gradient_accumulation_steps"] = args.gradient_accumulation_steps
     if args.deepspeed_config_path is not None:
         overrides["deepspeed_config_path"] = args.deepspeed_config_path
     if overrides:

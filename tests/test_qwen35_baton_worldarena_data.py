@@ -16,6 +16,7 @@ from qwen35_baton.worldarena_data import (
     WorldArenaHDF5Dataset,
     WorldArenaMP4Dataset,
     WorldArenaRecord,
+    audit_worldarena_hdf5_cache,
     canonical_source_frame_indices,
     future_frame_indices,
     load_worldarena_source_manifest,
@@ -146,12 +147,57 @@ def _write_cache(root: Path, *, frame_count: int = 121) -> Path:
     return manifest
 
 
+def _write_two_split_cache(root: Path) -> tuple[Path, dict[str, Path]]:
+    manifest = _write_cache(root)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    train = payload["records"][0]
+    validation = dict(train)
+    validation_id = "pick_cup__episode1"
+    validation["episode_id"] = validation_id
+    validation["hdf5_path"] = f"episodes/{validation_id}.h5"
+    validation["source_video_path"] = str(
+        Path(validation["source_dataset_root"])
+        / "episodes"
+        / validation_id
+        / "video.mp4"
+    )
+    validation["source_video_relative_path"] = f"episodes/{validation_id}/video.mp4"
+    validation["split"] = "validation"
+    validation.pop("actions_16d_path")
+    validation.pop("actions_16d_sha256")
+    validation_shard = manifest.parent / validation["hdf5_path"]
+    with h5py.File(validation_shard, "w") as handle:
+        handle.create_dataset(
+            "rgb",
+            shape=(121, 256, 256, 3),
+            dtype=np.uint8,
+            chunks=(1, 256, 256, 3),
+            compression="lzf",
+        )
+    payload["records"].append(validation)
+    manifest.write_text(
+        json.dumps(payload, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return manifest, {
+        "train": manifest.parent / train["hdf5_path"],
+        "validation": validation_shard,
+    }
+
+
 def test_future_indices_are_strict_unique_and_cover_remaining_horizon() -> None:
     assert future_frame_indices(0) == (30, 60, 90, 120)
     assert future_frame_indices(116) == (117, 118, 119, 120)
     for current in range(117):
         future = future_frame_indices(current)
         assert current < future[0] < future[1] < future[2] < future[3] <= 120
+
+
+def test_temporal_rounding_is_exact_half_even_for_future_and_source_indices() -> None:
+    assert future_frame_indices(2) == (32, 61, 90, 120)
+    canonical = canonical_source_frame_indices(61)
+    assert canonical[:4] == (0, 0, 1, 2)
+    assert canonical[-1] == 60
     for current, frame_count in ((-1, 121), (117, 121), (0, 4)):
         with pytest.raises(ValueError, match="strictly future"):
             future_frame_indices(current, frame_count)
@@ -410,6 +456,49 @@ def test_hdf5_dataset_rejects_non_lzf_or_non_frame_chunked_rgb(
     dataset = WorldArenaHDF5Dataset(manifest, seed=42)
     with pytest.raises(ValueError, match="LZF|chunk"):
         dataset[0]
+
+
+def test_cache_audit_inspects_every_train_and_validation_shard(tmp_path: Path) -> None:
+    manifest, _ = _write_two_split_cache(tmp_path)
+
+    audit = audit_worldarena_hdf5_cache(manifest)
+
+    assert audit.record_count == 2
+    assert audit.train_count == 1
+    assert audit.validation_count == 1
+
+
+@pytest.mark.parametrize(
+    ("split", "defect", "message"),
+    [
+        ("train", "dtype", "uint8"),
+        ("validation", "shape", "shape"),
+        ("train", "chunks", "chunked"),
+        ("validation", "compression", "LZF"),
+    ],
+)
+def test_cache_audit_rejects_malformed_shards_in_every_split(
+    tmp_path: Path,
+    split: str,
+    defect: str,
+    message: str,
+) -> None:
+    manifest, shards = _write_two_split_cache(tmp_path)
+    shape = (120, 256, 256, 3) if defect == "shape" else (121, 256, 256, 3)
+    dtype = np.float32 if defect == "dtype" else np.uint8
+    chunks = (2, 256, 256, 3) if defect == "chunks" else (1, 256, 256, 3)
+    compression = None if defect == "compression" else "lzf"
+    with h5py.File(shards[split], "w") as handle:
+        handle.create_dataset(
+            "rgb",
+            shape=shape,
+            dtype=dtype,
+            chunks=chunks,
+            compression=compression,
+        )
+
+    with pytest.raises(ValueError, match=rf"{split}.*{message}"):
+        audit_worldarena_hdf5_cache(manifest)
 
 
 def test_hdf5_dataset_returns_one_head_camera_and_metadata(tmp_path: Path) -> None:

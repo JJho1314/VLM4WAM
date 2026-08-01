@@ -11,6 +11,8 @@ import subprocess
 from types import SimpleNamespace
 from typing import Any
 
+import h5py
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -415,9 +417,7 @@ def _assert_nested_equal(left: Any, right: Any) -> None:
         assert left == right
 
 
-def _durable_metrics_record(
-    *, step: int, metrics: dict[str, float]
-) -> dict[str, Any]:
+def _durable_metrics_record(*, step: int, metrics: dict[str, float]) -> dict[str, Any]:
     unsigned = {
         "schema_version": 1,
         "step": step,
@@ -473,9 +473,7 @@ def test_stage1_optimizer_is_one_exhaustive_group(tmp_path: Path) -> None:
 
     groups = build_stage1_optimizer_groups(planner, ownership, config)
 
-    assert [(group["name"], group["lr"]) for group in groups] == [
-        ("va_planner", 1e-5)
-    ]
+    assert [(group["name"], group["lr"]) for group in groups] == [("va_planner", 1e-5)]
     grouped_ids = [id(parameter) for group in groups for parameter in group["params"]]
     trainable_ids = [
         id(parameter) for parameter in planner.parameters() if parameter.requires_grad
@@ -519,9 +517,7 @@ def test_one_tiny_stage1_step_updates_only_owned_parameters(tmp_path: Path) -> N
     result = run_training(config, artifacts=artifacts)
 
     assert result.global_step == 1
-    assert all(
-        parameter.requires_grad for parameter in artifacts.planner.parameters()
-    )
+    assert all(parameter.requires_grad for parameter in artifacts.planner.parameters())
     assert any(
         not torch.equal(parameter.detach(), before[name])
         for name, parameter in artifacts.planner.named_parameters()
@@ -655,9 +651,7 @@ def test_production_stage1_uses_checkpoint_compatible_ddp(
     fake_accelerator = _skipping_accelerator([False])
 
     def forbidden_deepspeed_plugin(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError(
-            "Stage-1 must keep a full AdamW state on every DDP rank"
-        )
+        raise AssertionError("Stage-1 must keep a full AdamW state on every DDP rank")
 
     monkeypatch.setattr(accelerate, "Accelerator", fake_accelerator)
     monkeypatch.setattr(
@@ -1158,9 +1152,7 @@ def test_resume_ignores_partial_record_before_complete_record_for_same_step(
 
     run_training(resumed_config, artifacts=_artifacts(resumed_config))
 
-    reconciled = [
-        json.loads(line) for line in metrics_path.read_text().splitlines()
-    ]
+    reconciled = [json.loads(line) for line in metrics_path.read_text().splitlines()]
     assert [record["step"] for record in reconciled] == [2, 3, 4]
     assert reconciled[0] == complete_step_two
 
@@ -1183,9 +1175,7 @@ def test_resume_rejects_metrics_record_with_corrupt_checksum(
 
     run_training(resumed_config, artifacts=_artifacts(resumed_config))
 
-    records = [
-        json.loads(line) for line in metrics_path.read_text().splitlines()
-    ]
+    records = [json.loads(line) for line in metrics_path.read_text().splitlines()]
     assert [record["step"] for record in records] == [3, 4]
 
 
@@ -1207,9 +1197,7 @@ def test_resume_deduplicates_identical_integrity_valid_metrics_records(
 
     run_training(resumed_config, artifacts=_artifacts(resumed_config))
 
-    records = [
-        json.loads(line) for line in metrics_path.read_text().splitlines()
-    ]
+    records = [json.loads(line) for line in metrics_path.read_text().splitlines()]
     assert [record["step"] for record in records] == [2, 3, 4]
     assert records[0] == complete
 
@@ -1487,7 +1475,14 @@ def test_worldarena_preflight_requires_matching_manifest_and_cache_stats(
     source_episode.mkdir(parents=True)
     shard = cache_root / "episodes" / f"{episode_id}.h5"
     shard.parent.mkdir()
-    shard.touch()
+    with h5py.File(shard, "w") as handle:
+        handle.create_dataset(
+            "rgb",
+            shape=(121, 256, 256, 3),
+            dtype=np.uint8,
+            chunks=(1, 256, 256, 3),
+            compression="lzf",
+        )
     record = {
         "episode_id": episode_id,
         "hdf5_path": f"episodes/{episode_id}.h5",
@@ -1536,6 +1531,11 @@ def test_worldarena_preflight_requires_matching_manifest_and_cache_stats(
 
     assert report["dataset_type"] == "worldarena_hdf5"
     assert report["camera_names"] == ["head"]
+    assert report["worldarena_cache_audit"] == {
+        "record_count": 1,
+        "train_count": 1,
+        "validation_count": 0,
+    }
 
     publish_worldarena([])
     with pytest.raises(ValueError, match="records|train"):
@@ -1559,6 +1559,108 @@ def test_worldarena_preflight_requires_matching_manifest_and_cache_stats(
     payload["dataset_statistics_path"] = str(other_stats)
     config.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="cache stats.json"):
+        preflight_stage1(config, world_size=8)
+
+
+def test_worldarena_preflight_checks_integrity_and_provenance_before_all_shards(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "qwen35_baton.cli.preflight.require_qwen35_fast_path",
+        lambda: {"fla": "test", "causal_conv1d": "test"},
+    )
+    config, payload = _write_preflight_fixture(tmp_path)
+    manifest = Path(payload["hdf5_manifest_path"])
+    stats = manifest.with_name("stats.json")
+    source_root = tmp_path / "worldarena2026-robotwin-data"
+    records: list[dict[str, Any]] = []
+    shards: dict[str, Path] = {}
+    for index, split in enumerate(("train", "validation")):
+        episode_id = f"pick_cup__episode{index}"
+        source_episode = source_root / "episodes" / episode_id
+        source_episode.mkdir(parents=True)
+        shard = manifest.parent / "episodes" / f"{episode_id}.h5"
+        shard.parent.mkdir(exist_ok=True)
+        with h5py.File(shard, "w") as handle:
+            handle.create_dataset(
+                "rgb",
+                shape=(121, 256, 256, 3),
+                dtype=np.uint8,
+                chunks=(1, 256, 256, 3),
+                compression="lzf",
+            )
+        shards[split] = shard
+        records.append(
+            {
+                "episode_id": episode_id,
+                "hdf5_path": f"episodes/{episode_id}.h5",
+                "source_dataset_root": str(source_root.resolve()),
+                "source_video_path": str((source_episode / "video.mp4").resolve()),
+                "source_video_relative_path": f"episodes/{episode_id}/video.mp4",
+                "source_video_sha256": "0" * 64,
+                "split": split,
+                "task": "pick_cup",
+                "instruction": "pick up the cup",
+                "frame_count": 121,
+                "source_frame_count": 121,
+            }
+        )
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "source_repository": "worldarena2026-robotwin-data",
+                "records": records,
+            }
+        )
+        + "\n"
+    )
+    valid_manifest_hash = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    stats.write_text(
+        json.dumps(
+            {
+                "source_repository": "worldarena2026-robotwin-data",
+                "manifest_sha256": valid_manifest_hash,
+            }
+        )
+        + "\n"
+    )
+    payload.update(
+        dataset_type="worldarena_hdf5",
+        hdf5_manifest_hash=valid_manifest_hash,
+    )
+    config.write_text(json.dumps(payload))
+
+    with h5py.File(shards["validation"], "w") as handle:
+        handle.create_dataset(
+            "rgb",
+            shape=(121, 256, 256, 3),
+            dtype=np.float32,
+            chunks=(1, 256, 256, 3),
+            compression="lzf",
+        )
+
+    manifest.write_text(manifest.read_text() + " ")
+    changed_manifest_hash = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="HDF5 manifest hash mismatch"):
+        preflight_stage1(config, world_size=8)
+
+    payload["hdf5_manifest_hash"] = changed_manifest_hash
+    config.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="stats.json provenance"):
+        preflight_stage1(config, world_size=8)
+
+    stats.write_text(
+        json.dumps(
+            {
+                "source_repository": "worldarena2026-robotwin-data",
+                "manifest_sha256": changed_manifest_hash,
+            }
+        )
+        + "\n"
+    )
+    with pytest.raises(ValueError, match="validation.*uint8"):
         preflight_stage1(config, world_size=8)
 
 
@@ -1796,9 +1898,9 @@ def test_stage1_recipe_requirements_and_launchers_are_fixed(tmp_path: Path) -> N
     assert "qwen_vision_lr" not in config
     requirements = [
         line.strip()
-        for line in (
-            REPO_ROOT / "ge_act/requirements-qwen35-baton.txt"
-        ).read_text().splitlines()
+        for line in (REPO_ROOT / "ge_act/requirements-qwen35-baton.txt")
+        .read_text()
+        .splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
     assert requirements == [
@@ -1810,8 +1912,7 @@ def test_stage1_recipe_requirements_and_launchers_are_fixed(tmp_path: Path) -> N
     log = tmp_path / "python.log"
     fake_python = tmp_path / "python"
     fake_python.write_text(
-        "#!/usr/bin/env bash\n"
-        'printf "%s\\n" "$*" >> "${BATON_TEST_LOG}"\n'
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "${BATON_TEST_LOG}"\n'
     )
     fake_python.chmod(0o755)
     environment = {
@@ -1926,11 +2027,17 @@ def test_production_artifacts_are_constructed_after_global_seeding(
 
     def fake_loader(config: Stage1TrainingConfig) -> Stage1TrainingArtifacts:
         draws.append(
-            (random.random(), float(__import__("numpy").random.random()), float(torch.rand(())))
+            (
+                random.random(),
+                float(__import__("numpy").random.random()),
+                float(torch.rand(())),
+            )
         )
         return _artifacts(config)
 
-    monkeypatch.setattr(preflight_module, "preflight_stage1", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        preflight_module, "preflight_stage1", lambda *args, **kwargs: {}
+    )
     monkeypatch.setattr(training_module, "load_local_artifacts", fake_loader)
     first_config = _config(tmp_path / "first")
     second_config = Stage1TrainingConfig(

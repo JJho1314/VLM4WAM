@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 from typing import Any
@@ -14,7 +14,11 @@ from safetensors.torch import load_model
 import torch
 import torch.nn as nn
 
-from qwen35_baton.config import BatonCheckpointMetadata, BatonGeometry
+from qwen35_baton.config import (
+    BatonCheckpointMetadata,
+    BatonGeometry,
+    BatonTemporalPolicy,
+)
 from qwen35_baton.data import BatonPlannerCollator
 from qwen35_baton.hashing import sha256_artifact, sha256_file, sha256_json
 from qwen35_baton.model import BatonPlannerOutput, BatonQwen35Planner
@@ -43,7 +47,9 @@ def _validated_provider_device(
         raise ValueError(f"unsupported provider device: {device!r}") from error
     if target.type == "cpu":
         if target.index is not None:
-            raise ValueError("provider requires the canonical CPU device without an index")
+            raise ValueError(
+                "provider requires the canonical CPU device without an index"
+            )
         return torch.device("cpu")
     if target.type != "cuda":
         raise ValueError("provider device must support CPU/CUDA autocast semantics")
@@ -51,11 +57,7 @@ def _validated_provider_device(
         raise ValueError("CUDA provider device requested but CUDA is unavailable")
     try:
         device_count = torch.cuda.device_count()
-        ordinal = (
-            torch.cuda.current_device()
-            if target.index is None
-            else target.index
-        )
+        ordinal = torch.cuda.current_device() if target.index is None else target.index
     except (RuntimeError, AssertionError) as error:
         raise ValueError("CUDA device ordinal could not be resolved") from error
     if (
@@ -75,9 +77,7 @@ def _validated_provider_device(
                 f"CUDA device ordinal {ordinal} could not validate bfloat16 support"
             ) from error
         if not bf16_supported:
-            raise ValueError(
-                f"CUDA device ordinal {ordinal} does not support bfloat16"
-            )
+            raise ValueError(f"CUDA device ordinal {ordinal} does not support bfloat16")
     return torch.device("cuda", ordinal)
 
 
@@ -86,34 +86,58 @@ class BatonSemanticPlan:
     """Detached full-grid planner output consumed by downstream GE-Act."""
 
     tokens: torch.Tensor
-    future_indices: tuple[int, ...]
+    future_indices: tuple[int, ...] | None
     positions_xy: torch.Tensor
     cross_attention_maps: tuple[torch.Tensor, ...] | None
+    camera_names: tuple[str, ...] = ("main", "wrist")
+    temporal_policy: BatonTemporalPolicy = field(
+        default_factory=BatonTemporalPolicy.libero_fixed
+    )
     instruction_sensitivity: None = None
     relevance: None = None
 
     def __post_init__(self) -> None:
         geometry = BatonGeometry()
+        _validate_camera_temporal_contract(
+            self.camera_names,
+            self.temporal_policy,
+        )
+        expected_shape = (
+            len(self.camera_names),
+            self.temporal_policy.target_count,
+            geometry.tokens_per_frame,
+            geometry.feature_dim,
+        )
         if (
             not isinstance(self.tokens, torch.Tensor)
             or self.tokens.ndim != 5
-            or tuple(self.tokens.shape[1:]) != geometry.output_shape(1)[1:]
+            or tuple(self.tokens.shape[1:]) != expected_shape
             or not self.tokens.dtype.is_floating_point
             or not bool(torch.isfinite(self.tokens).all())
             or self.tokens.requires_grad
         ):
             raise ValueError(
                 "tokens must be detached finite floating-point "
-                "[B,2,4,256,1024]"
+                f"[B,{len(self.camera_names)},4,256,1024]"
             )
         batch_size = int(self.tokens.shape[0])
         if batch_size <= 0:
             raise ValueError("tokens must contain at least one sample")
-        if self.future_indices != geometry.future_indices:
-            raise ValueError("future_indices must be exactly (0,3,5,8)")
+        expected_indices = (
+            self.temporal_policy.resolve_future_indices()
+            if self.temporal_policy.kind == "fixed_offsets"
+            else None
+        )
+        if self.future_indices != expected_indices:
+            raise ValueError(
+                "future_indices must match the static temporal policy; normalized "
+                "plans must leave them unset"
+            )
         expected_positions = build_patch_center_positions(
             batch_size,
             device=self.tokens.device,
+            camera_names=self.camera_names,
+            temporal_policy=self.temporal_policy,
         )
         if (
             not isinstance(self.positions_xy, torch.Tensor)
@@ -125,7 +149,7 @@ class BatonSemanticPlan:
         ):
             raise ValueError(
                 "positions_xy must be detached normalized 16x16 patch centers "
-                "with shape [B,2,4,256,2]"
+                f"with shape [B,{len(self.camera_names)},4,256,2]"
             )
         if self.relevance is not None:
             raise ValueError("continuous Baton plans never contain relevance")
@@ -143,7 +167,7 @@ class BatonSemanticPlan:
                 )
             expected = (
                 batch_size,
-                len(geometry.camera_names),
+                len(self.camera_names),
                 geometry.tokens_per_camera,
                 geometry.tokens_per_camera,
             )
@@ -158,20 +182,58 @@ class BatonSemanticPlan:
                 ):
                     raise ValueError(
                         "each cross-attention map must be detached finite "
-                        "floating-point [B,2,1024,1024]"
+                        f"floating-point [B,{len(self.camera_names)},1024,1024]"
                     )
+
+    def resolve_future_indices(
+        self,
+        *,
+        current_canonical_index: int | None = None,
+    ) -> tuple[int, int, int, int]:
+        """Resolve policy positions; normalized plans require the sample's current index."""
+
+        return self.temporal_policy.resolve_future_indices(
+            current_index=current_canonical_index
+        )
+
+
+def _validate_camera_temporal_contract(
+    camera_names: tuple[str, ...],
+    temporal_policy: BatonTemporalPolicy,
+) -> None:
+    if camera_names == ("main", "wrist"):
+        expected = BatonTemporalPolicy.libero_fixed()
+    elif camera_names == ("head",):
+        expected = BatonTemporalPolicy.worldarena_normalized()
+    else:
+        raise ValueError("camera_names must be either ('main', 'wrist') or ('head',)")
+    if (
+        not isinstance(temporal_policy, BatonTemporalPolicy)
+        or temporal_policy != expected
+    ):
+        raise ValueError(
+            "camera_names and temporal_policy must identify the same dataset contract"
+        )
 
 
 def build_patch_center_positions(
     batch_size: int,
     *,
     device: torch.device | str | None = None,
+    camera_names: tuple[str, ...] = ("main", "wrist"),
+    temporal_policy: BatonTemporalPolicy | None = None,
 ) -> torch.Tensor:
     """Return exact row-major normalized centers of the fixed ``16 x 16`` grid."""
 
     if type(batch_size) is not int or batch_size <= 0:
         raise ValueError("batch_size must be a positive integer")
     geometry = BatonGeometry()
+    policy = (
+        BatonTemporalPolicy.libero_fixed()
+        if temporal_policy is None
+        else temporal_policy
+    )
+    _validate_camera_temporal_contract(camera_names, policy)
     centers = (
         torch.arange(geometry.grid_size, device=device, dtype=torch.float32) + 0.5
     ) / geometry.grid_size
@@ -185,8 +247,8 @@ def build_patch_center_positions(
     )
     return xy.expand(
         batch_size,
-        len(geometry.camera_names),
-        len(geometry.future_indices),
+        len(camera_names),
+        policy.target_count,
         -1,
         -1,
     ).contiguous()
@@ -225,8 +287,7 @@ def _validate_checkpoint_envelope(checkpoint: Path) -> BatonCheckpointMetadata:
         or not isinstance(hashes, Mapping)
         or set(hashes) != set(_CHECKPOINT_FILES)
         or any(
-            not isinstance(value, str) or len(value) != 64
-            for value in hashes.values()
+            not isinstance(value, str) or len(value) != 64 for value in hashes.values()
         )
     ):
         raise ValueError("checkpoint file hash manifest is invalid")
@@ -262,9 +323,15 @@ def _validate_checkpoint_envelope(checkpoint: Path) -> BatonCheckpointMetadata:
         raise ValueError("checkpoint optimizer state topology is invalid")
     if not isinstance(scheduler_state, Mapping):
         raise ValueError("checkpoint scheduler state topology is invalid")
-    if sha256_json(_optimizer_topology(optimizer_state)) != metadata.optimizer_topology_hash:
+    if (
+        sha256_json(_optimizer_topology(optimizer_state))
+        != metadata.optimizer_topology_hash
+    ):
         raise ValueError("checkpoint optimizer topology hash differs from metadata")
-    if sha256_json(_scheduler_topology(scheduler_state)) != metadata.scheduler_topology_hash:
+    if (
+        sha256_json(_scheduler_topology(scheduler_state))
+        != metadata.scheduler_topology_hash
+    ):
         raise ValueError("checkpoint scheduler topology hash differs from metadata")
     cursor = BatonTrainingCursor.from_dict(
         _read_json(checkpoint / "cursor.json", label="checkpoint cursor")
@@ -352,9 +419,7 @@ def _validate_local_artifact_contract(
                 f"{label} hash mismatch: expected {expected}, got {actual}"
             )
     if token_ids != metadata.added_token_ids:
-        raise ValueError(
-            "tokenizer added-token IDs differ from checkpoint metadata"
-        )
+        raise ValueError("tokenizer added-token IDs differ from checkpoint metadata")
 
 
 def _validate_siglip2_artifact_contract(
@@ -379,9 +444,7 @@ def _validate_siglip2_artifact_contract(
             f"expected {metadata.siglip2_artifact_hash}, got {artifact_hash}"
         )
     if artifact_hash != metadata.teacher_preprocessing_hash:
-        raise ValueError(
-            "SigLIP2 preprocessing hash differs from checkpoint metadata"
-        )
+        raise ValueError("SigLIP2 preprocessing hash differs from checkpoint metadata")
     from qwen35_baton.cli.preflight import _siglip_geometry
 
     geometry = _siglip_geometry(siglip2_model_path)
@@ -467,8 +530,7 @@ def _validate_model_topology(checkpoint: Path, planner: nn.Module) -> None:
         device="cpu",
     ) as handle:
         saved = {
-            name: tuple(handle.get_slice(name).get_shape())
-            for name in handle.keys()
+            name: tuple(handle.get_slice(name).get_shape()) for name in handle.keys()
         }
         aliases = dict(handle.metadata() or {})
     for name, shape in saved.items():
@@ -489,6 +551,8 @@ class FrozenBatonPlanner(nn.Module):
         planner: nn.Module,
         processor: Any,
         added_token_ids: tuple[int, ...],
+        camera_names: tuple[str, ...] = ("main", "wrist"),
+        temporal_policy: BatonTemporalPolicy | None = None,
     ) -> None:
         super().__init__()
         if not isinstance(planner, nn.Module):
@@ -507,17 +571,23 @@ class FrozenBatonPlanner(nn.Module):
         tokenizer = getattr(processor, "tokenizer", None)
         convert = getattr(tokenizer, "convert_tokens_to_ids", None)
         if not callable(convert):
-            raise TypeError(
-                "processor tokenizer must expose convert_tokens_to_ids"
-            )
+            raise TypeError("processor tokenizer must expose convert_tokens_to_ids")
         actual_ids = tuple(int(convert(token)) for token in ADDED_TOKENS)
         if actual_ids != added_token_ids:
             raise ValueError(
                 "processor tokenizer added-token IDs differ from provider contract"
             )
+        policy = (
+            BatonTemporalPolicy.libero_fixed()
+            if temporal_policy is None
+            else temporal_policy
+        )
+        _validate_camera_temporal_contract(camera_names, policy)
         self.planner = planner
         self.processor = processor
         self.added_token_ids = added_token_ids
+        self.camera_names = camera_names
+        self.temporal_policy = policy
         self.geometry = BatonGeometry()
         self._freeze_for_inference()
 
@@ -573,7 +643,9 @@ class FrozenBatonPlanner(nn.Module):
             metadata,
             siglip2_model_path=siglip_path,
         )
-        loader = _load_local_components if _component_loader is None else _component_loader
+        loader = (
+            _load_local_components if _component_loader is None else _component_loader
+        )
         processor, planner = loader(
             qwen_model_path=model_path,
             qwen_tokenizer_path=tokenizer_path,
@@ -594,6 +666,8 @@ class FrozenBatonPlanner(nn.Module):
             planner=planner,
             processor=processor,
             added_token_ids=metadata.added_token_ids,
+            camera_names=metadata.camera_names,
+            temporal_policy=metadata.temporal_policy,
         )
 
     def _freeze_for_inference(self) -> None:
@@ -620,11 +694,13 @@ class FrozenBatonPlanner(nn.Module):
         if (
             not isinstance(current_images, torch.Tensor)
             or current_images.ndim != 5
-            or tuple(current_images.shape[1:3]) != (2, 3)
+            or tuple(current_images.shape[1:3]) != (len(self.camera_names), 3)
             or current_images.shape[-2] <= 0
             or current_images.shape[-1] <= 0
         ):
-            raise ValueError("current_images must have shape [B,2,3,H,W]")
+            raise ValueError(
+                f"current_images must have shape [B,{len(self.camera_names)},3,H,W]"
+            )
         if current_images.dtype != torch.uint8:
             raise TypeError("current_images must contain uint8 RGB")
         batch_size = int(current_images.shape[0])
@@ -667,13 +743,14 @@ class FrozenBatonPlanner(nn.Module):
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         collator = BatonPlannerCollator(
             self.processor,
+            camera_names=self.camera_names,
             plan_pad_token_id=self.added_token_ids[5],
         )
         sequences: list[torch.Tensor] = []
         processed_rows: list[Mapping[str, torch.Tensor]] = []
         cpu_images = current_images.detach().to(device="cpu")
         for sample_index, instruction in enumerate(instructions):
-            for camera_index in range(2):
+            for camera_index, _ in enumerate(self.camera_names):
                 sequence, processed = collator._process_row(
                     cpu_images[sample_index, camera_index],
                     instruction,
@@ -715,7 +792,7 @@ class FrozenBatonPlanner(nn.Module):
         flat = getattr(output, "flat", None)
         expected = (
             rows,
-            len(self.geometry.future_indices),
+            self.temporal_policy.target_count,
             self.geometry.tokens_per_frame,
             self.geometry.feature_dim,
         )
@@ -738,10 +815,7 @@ class FrozenBatonPlanner(nn.Module):
                     "planner allocated cross-attention maps when not requested"
                 )
             return flat, None
-        if (
-            not isinstance(maps, tuple)
-            or len(maps) != self.geometry.query_layers
-        ):
+        if not isinstance(maps, tuple) or len(maps) != self.geometry.query_layers:
             raise RuntimeError(
                 "planner must return the Baton alignment cross-attention map"
             )
@@ -785,7 +859,8 @@ class FrozenBatonPlanner(nn.Module):
             current_images,
             positive,
         )
-        rows = batch_size * 2
+        camera_count = len(self.camera_names)
+        rows = batch_size * camera_count
         with self._autocast_context():
             output = self.planner.forward_rows(
                 qwen_inputs,
@@ -798,14 +873,18 @@ class FrozenBatonPlanner(nn.Module):
             return_attention=return_attention,
         )
         tokens = flat.reshape(
-            self.geometry.output_shape(batch_size)
+            batch_size,
+            camera_count,
+            self.temporal_policy.target_count,
+            self.geometry.tokens_per_frame,
+            self.geometry.feature_dim,
         )
         attention_maps = None
         if raw_maps is not None:
             attention_maps = tuple(
                 attention.reshape(
                     batch_size,
-                    2,
+                    camera_count,
                     self.geometry.tokens_per_camera,
                     self.geometry.tokens_per_camera,
                 )
@@ -813,15 +892,23 @@ class FrozenBatonPlanner(nn.Module):
             )
         return BatonSemanticPlan(
             tokens=tokens.detach(),
-            future_indices=self.geometry.future_indices,
+            future_indices=(
+                self.temporal_policy.resolve_future_indices()
+                if self.temporal_policy.kind == "fixed_offsets"
+                else None
+            ),
             positions_xy=build_patch_center_positions(
                 batch_size,
                 device=tokens.device,
+                camera_names=self.camera_names,
+                temporal_policy=self.temporal_policy,
             ),
             cross_attention_maps=(
                 None
                 if attention_maps is None
                 else tuple(value.detach() for value in attention_maps)
             ),
+            camera_names=self.camera_names,
+            temporal_policy=self.temporal_policy,
             instruction_sensitivity=None,
         )
