@@ -36,6 +36,7 @@ from qwen35_baton.ownership import (
     configure_stage1_trainable_modules,
 )
 from qwen35_baton.sequence import ADDED_TOKENS, build_plan_text
+from qwen35_baton.training_telemetry import CudaEventTimer, Stage1MetricAccumulator
 from qwen35_baton.worker_lifecycle import (
     append_worker_lifecycle_event,
     recycle_persistent_dataloader_workers,
@@ -1280,8 +1281,47 @@ def run_training(
     last_metrics: dict[str, float] = {}
     last_batch_end = time.perf_counter()
     window_started = last_batch_end
-    window_sums: dict[str, float] = {}
+    window_metrics = Stage1MetricAccumulator()
+    window_data_time = 0.0
     window_microbatches = 0
+    window_finite: torch.Tensor | None = None
+    cuda_timer = CudaEventTimer(enabled=accelerator.device.type == "cuda")
+    cpu_timing_sums = {
+        "planner": 0.0,
+        "teacher": 0.0,
+        "query_tower": 0.0,
+        "backward": 0.0,
+    }
+    cpu_active_timers: dict[str, float] = {}
+
+    def start_timing(name: str) -> None:
+        if accelerator.device.type == "cuda":
+            cuda_timer.start(name)
+        else:
+            cpu_active_timers[name] = time.perf_counter()
+
+    def stop_timing(name: str) -> None:
+        if accelerator.device.type == "cuda":
+            cuda_timer.stop(name)
+        else:
+            started = cpu_active_timers.pop(name)
+            cpu_timing_sums[name] += time.perf_counter() - started
+
+    query_tower = getattr(
+        accelerator.unwrap_model(planner),
+        "query_tower",
+        None,
+    )
+    query_handles = []
+    if isinstance(query_tower, nn.Module):
+        query_handles = [
+            query_tower.register_forward_pre_hook(
+                lambda _module, _inputs: start_timing("query_tower")
+            ),
+            query_tower.register_forward_hook(
+                lambda _module, _inputs, _output: stop_timing("query_tower")
+            ),
+        ]
     consecutive_skipped_updates = 0
     save_steps = frozenset(
         checkpoint_steps(
@@ -1318,53 +1358,15 @@ def run_training(
             if window_microbatches == 0:
                 window_started = last_batch_end
             with accelerator.accumulate(planner):
-                _synchronize_device(accelerator.device)
-                planner_start = time.perf_counter()
-                query_elapsed = [0.0]
-                query_started = [0.0]
-                query_tower = getattr(
-                    accelerator.unwrap_model(planner), "query_tower", None
-                )
-                handles = []
-                if isinstance(query_tower, nn.Module):
-                    def _query_pre_hook(_module: nn.Module, _inputs: Any) -> None:
-                        _synchronize_device(accelerator.device)
-                        query_started[0] = time.perf_counter()
-
-                    def _query_hook(
-                        _module: nn.Module, _inputs: Any, _output: Any
-                    ) -> None:
-                        _synchronize_device(accelerator.device)
-                        query_elapsed[0] = time.perf_counter() - query_started[0]
-
-                    handles = [
-                        query_tower.register_forward_pre_hook(_query_pre_hook),
-                        query_tower.register_forward_hook(_query_hook),
-                    ]
-                try:
-                    planner_output = planner(batch)
-                finally:
-                    for handle in handles:
-                        handle.remove()
-                _synchronize_device(accelerator.device)
-                planner_time = time.perf_counter() - planner_start
-                teacher_start = time.perf_counter()
+                start_timing("planner")
+                planner_output = planner(batch)
+                stop_timing("planner")
+                start_timing("teacher")
                 with torch.no_grad():
                     future_teacher = artifacts.teacher.encode_future(
                         batch.future_images
                     )
-                _synchronize_device(accelerator.device)
-                teacher_time = time.perf_counter() - teacher_start
-                if not all(
-                    bool(torch.isfinite(value).all())
-                    for value in (
-                        planner_output.positive,
-                        future_teacher,
-                    )
-                ):
-                    raise FloatingPointError(
-                        "Stage-1 predictions or teacher targets are nonfinite"
-                    )
+                stop_timing("teacher")
                 # Keep strict standalone loss validation while doing all Stage-1
                 # regression math in stable fp32 across bf16 model boundaries.
                 positive_for_loss = planner_output.positive.float()
@@ -1372,26 +1374,25 @@ def run_training(
                 losses = compute_baton_planner_loss(
                     positive_for_loss,
                     future_for_loss,
+                    validate_finite=False,
                 )
-                if not all(
-                    bool(torch.isfinite(value).all())
-                    for value in (
-                        losses.total,
-                        losses.mse,
-                    )
-                ):
-                    raise FloatingPointError("Stage-1 loss is nonfinite")
-                backward_start = time.perf_counter()
+                finite = torch.isfinite(losses.total.detach())
+                window_finite = (
+                    finite if window_finite is None else window_finite & finite
+                )
+                start_timing("backward")
                 # Accelerate performs accumulation normalization exactly once.
                 accelerator.backward(losses.total)
-                _synchronize_device(accelerator.device)
-                backward_time = time.perf_counter() - backward_start
-                if accelerator.sync_gradients:
+                stop_timing("backward")
+                synchronized = bool(accelerator.sync_gradients)
+                if synchronized:
+                    assert window_finite is not None
+                    if not bool(window_finite):
+                        raise FloatingPointError("Stage-1 loss is nonfinite")
                     accelerator.clip_grad_norm_(
                         planner.parameters(), config.gradient_clip_norm
                     )
                 optimizer.step()
-                synchronized = bool(accelerator.sync_gradients)
                 completed_update = synchronized and not bool(
                     accelerator.optimizer_step_was_skipped
                 )
@@ -1422,35 +1423,56 @@ def run_training(
                             "consumed_microbatches="
                             f"{cursor.consumed_microbatches}"
                         )
-            micro_metrics = _loss_metrics(
-                losses,
-                positive=planner_output.positive,
+            window_metrics.add_loss(
+                losses.total,
+                prediction=planner_output.positive,
                 target=future_teacher,
                 camera_names=getattr(
                     batch,
                     "camera_names",
                     artifacts.metadata.camera_names,
                 ),
+                mse=losses.mse,
             )
-            micro_metrics.update(
-                {
-                    "data_time": data_time,
-                    "qwen_time": max(planner_time - query_elapsed[0], 0.0),
-                    "teacher_time": teacher_time,
-                    "query_tower_time": query_elapsed[0],
-                    "backward_time": backward_time,
-                }
-            )
-            for name, value in micro_metrics.items():
-                window_sums[name] = window_sums.get(name, 0.0) + value
+            window_data_time += data_time
             window_microbatches += 1
+            if synchronized:
+                timing_sums = (
+                    cuda_timer.resolve()
+                    if accelerator.device.type == "cuda"
+                    else dict(cpu_timing_sums)
+                )
+                query_time = timing_sums.get("query_tower", 0.0)
+                window_metrics.add_scalar(
+                    "data_time",
+                    window_data_time,
+                    device=accelerator.device,
+                )
+                window_metrics.add_scalar(
+                    "qwen_time",
+                    max(timing_sums.get("planner", 0.0) - query_time, 0.0),
+                    device=accelerator.device,
+                )
+                window_metrics.add_scalar(
+                    "teacher_time",
+                    timing_sums.get("teacher", 0.0),
+                    device=accelerator.device,
+                )
+                window_metrics.add_scalar(
+                    "query_tower_time",
+                    query_time,
+                    device=accelerator.device,
+                )
+                window_metrics.add_scalar(
+                    "backward_time",
+                    timing_sums.get("backward", 0.0),
+                    device=accelerator.device,
+                )
             if completed_update:
-                _synchronize_device(accelerator.device)
                 elapsed = max(time.perf_counter() - window_started, 1e-12)
-                last_metrics = _average_metrics(
+                last_metrics = window_metrics.flush(
                     accelerator,
-                    window_sums,
-                    microbatches=window_microbatches,
+                    divisor=window_microbatches,
                 )
                 gathered_elapsed = accelerator.gather(
                     torch.tensor(
@@ -1503,8 +1525,12 @@ def run_training(
                         cursor=cursor,
                     )
             if synchronized:
-                window_sums = {}
+                window_metrics.sums.clear()
+                window_data_time = 0.0
                 window_microbatches = 0
+                window_finite = None
+                for name in cpu_timing_sums:
+                    cpu_timing_sums[name] = 0.0
             last_batch_end = time.perf_counter()
             if cursor.global_step >= target_step:
                 break
@@ -1536,6 +1562,8 @@ def run_training(
                     elapsed_seconds=elapsed,
                 )
             continue
+    for handle in query_handles:
+        handle.remove()
     return Stage1TrainingResult(
         global_step=cursor.global_step,
         cursor=cursor,

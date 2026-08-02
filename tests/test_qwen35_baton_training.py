@@ -938,6 +938,32 @@ def test_four_microbatches_make_one_optimizer_and_scheduler_update(
     )
 
 
+def test_stage1_does_not_force_device_synchronization_per_microbatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import qwen35_baton.cli.train_semantic_planner as training_module
+
+    baseline = _config(tmp_path)
+    config = Stage1TrainingConfig(
+        **{
+            **baseline.to_dict(),
+            "gradient_accumulation_steps": 4,
+        }
+    )
+    synchronization_calls: list[torch.device] = []
+    monkeypatch.setattr(
+        training_module,
+        "_synchronize_device",
+        lambda device: synchronization_calls.append(device),
+    )
+
+    result = run_training(config, artifacts=_artifacts(config))
+
+    assert result.global_step == 1
+    assert len(synchronization_calls) <= 1
+
+
 def test_skipped_optimizer_update_does_not_advance_step_scheduler_or_metrics(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -15,7 +15,12 @@ class BatonPlannerLoss:
     total: torch.Tensor
 
 
-def _validate_feature_tensor(name: str, tensor: torch.Tensor) -> None:
+def _validate_feature_tensor(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    validate_finite: bool,
+) -> None:
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
     if not tensor.is_floating_point():
@@ -24,18 +29,30 @@ def _validate_feature_tensor(name: str, tensor: torch.Tensor) -> None:
         raise ValueError(
             f"{name} must be nonempty [batch,camera,frame,patch,feature]"
         )
-    if not bool(torch.isfinite(tensor).all()):
+    if validate_finite and not bool(torch.isfinite(tensor).all()):
         raise ValueError(f"{name} must contain only finite values")
 
 
 def compute_baton_planner_loss(
     prediction: torch.Tensor,
     future_teacher: torch.Tensor,
+    *,
+    validate_finite: bool = True,
 ) -> BatonPlannerLoss:
     """Compute Baton's pointwise L2 feature loss from Equation 8."""
 
-    _validate_feature_tensor("prediction", prediction)
-    _validate_feature_tensor("future_teacher", future_teacher)
+    if type(validate_finite) is not bool:
+        raise TypeError("validate_finite must be boolean")
+    _validate_feature_tensor(
+        "prediction",
+        prediction,
+        validate_finite=validate_finite,
+    )
+    _validate_feature_tensor(
+        "future_teacher",
+        future_teacher,
+        validate_finite=validate_finite,
+    )
     if prediction.shape != future_teacher.shape:
         raise ValueError("prediction and future_teacher must have the same shape")
     if prediction.dtype != future_teacher.dtype:

@@ -61,6 +61,19 @@ def test_loss_rejects_incompatible_or_nonfinite_features(
         compute_baton_planner_loss(prediction, target)
 
 
+def test_training_loss_can_defer_finite_check_to_optimizer_boundary() -> None:
+    prediction = torch.full((1, 1, 1, 1, 2), float("nan"))
+    target = torch.zeros_like(prediction)
+
+    loss = compute_baton_planner_loss(
+        prediction,
+        target,
+        validate_finite=False,
+    )
+
+    assert bool(torch.isnan(loss.total))
+
+
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 def test_low_precision_inputs_use_finite_fp32_loss_and_gradients(
     dtype: torch.dtype,
