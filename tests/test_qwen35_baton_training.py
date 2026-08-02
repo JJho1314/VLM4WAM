@@ -25,6 +25,7 @@ from qwen35_baton.cli.train_semantic_planner import (
     Stage1TrainingArtifacts,
     Stage1TrainingConfig,
     build_cosine_warmup_scheduler,
+    build_accelerator,
     build_stage1_dataloader,
     build_stage1_optimizer,
     build_stage1_optimizer_groups,
@@ -637,6 +638,20 @@ def test_runtime_input_validation_requires_boolean(tmp_path: Path) -> None:
         )
 
 
+def test_distributed_strategy_is_explicit_and_validated(tmp_path: Path) -> None:
+    worldarena = json.loads(
+        (REPO_ROOT / "qwen35_baton/configs/worldarena_stage1.json").read_text()
+    )
+    libero = json.loads(
+        (REPO_ROOT / "qwen35_baton/configs/libero_stage1.json").read_text()
+    )
+    assert worldarena["distributed_strategy"] == "ddp"
+    assert libero["distributed_strategy"] == "ddp"
+
+    with pytest.raises(ValueError, match="distributed_strategy"):
+        replace(_config(tmp_path), distributed_strategy="zero3")
+
+
 def test_zero2_runtime_config_is_explicit() -> None:
     config = json.loads(
         (REPO_ROOT / "qwen35_baton/configs/deepspeed_zero2.json").read_text()
@@ -677,6 +692,197 @@ def test_deepspeed_runtime_config_resolves_micro_and_global_batch(
     assert resolved["gradient_accumulation_steps"] == 4
     assert resolved["train_batch_size"] == 64
     assert resolved["zero_optimization"]["stage"] == 2
+
+
+def test_ddp_builds_accelerator_without_deepspeed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import accelerate
+    import accelerate.utils
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        accelerate,
+        "Accelerator",
+        lambda **kwargs: captured.update(kwargs) or SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        accelerate.utils,
+        "GradientAccumulationPlugin",
+        lambda **kwargs: ("gradient", kwargs),
+    )
+    monkeypatch.setattr(
+        accelerate.utils,
+        "DeepSpeedPlugin",
+        lambda **kwargs: pytest.fail("DDP must not build a DeepSpeed plugin"),
+    )
+
+    build_accelerator(_config(tmp_path), world_size=1)
+
+    assert "deepspeed_plugin" not in captured
+
+
+def test_zero2_builds_accelerator_with_resolved_global_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import accelerate
+    import accelerate.utils
+
+    accelerator_kwargs: dict[str, Any] = {}
+    plugin_kwargs: dict[str, Any] = {}
+    monkeypatch.setattr(
+        accelerate,
+        "Accelerator",
+        lambda **kwargs: accelerator_kwargs.update(kwargs) or SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        accelerate.utils,
+        "GradientAccumulationPlugin",
+        lambda **kwargs: ("gradient", kwargs),
+    )
+    plugin = object()
+    monkeypatch.setattr(
+        accelerate.utils,
+        "DeepSpeedPlugin",
+        lambda **kwargs: plugin_kwargs.update(kwargs) or plugin,
+    )
+    config = replace(
+        _config(tmp_path),
+        distributed_strategy="zero2",
+        per_device_batch=8,
+        gradient_accumulation_steps=2,
+        deepspeed_config_path=str(
+            REPO_ROOT / "qwen35_baton/configs/deepspeed_zero2.json"
+        ),
+    )
+
+    build_accelerator(config, world_size=8)
+
+    assert accelerator_kwargs["deepspeed_plugin"] is plugin
+    resolved = plugin_kwargs["hf_ds_config"]
+    assert resolved["zero_optimization"]["stage"] == 2
+    assert resolved["train_micro_batch_size_per_gpu"] == 8
+    assert resolved["gradient_accumulation_steps"] == 2
+    assert resolved["train_batch_size"] == 128
+
+
+def test_zero2_checkpoint_saves_engine_shards_before_atomic_publish(
+    tmp_path: Path,
+) -> None:
+    import qwen35_baton.cli.train_semantic_planner as training_module
+    from qwen35_baton.checkpoint import (
+        BatonTrainingCursor,
+        planner_module_topology,
+    )
+    from qwen35_baton.hashing import sha256_json
+
+    config = replace(_config(tmp_path), distributed_strategy="zero2")
+    artifacts = _artifacts(config)
+    artifacts.metadata = replace(
+        artifacts.metadata,
+        distributed_strategy="zero2",
+        planner_topology_hash=sha256_json(
+            planner_module_topology(artifacts.planner)
+        ),
+    )
+
+    class _Engine(nn.Module):
+        def __init__(self, module: nn.Module) -> None:
+            super().__init__()
+            self.module = module
+            self.calls: list[tuple[str, str, dict[str, Any]]] = []
+
+        def save_checkpoint(
+            self,
+            root: str,
+            *,
+            tag: str,
+            client_state: dict[str, Any],
+        ) -> bool:
+            self.calls.append((root, tag, client_state))
+            shard = Path(root) / tag / "mp_rank_00_model_states.pt"
+            shard.parent.mkdir(parents=True)
+            shard.write_bytes(b"zero2")
+            (Path(root) / "latest").write_text(tag + "\n")
+            return True
+
+    engine = _Engine(artifacts.planner)
+
+    class _Accelerator:
+        process_index = 0
+        num_processes = 1
+        is_main_process = True
+        scaler = None
+
+        @staticmethod
+        def wait_for_everyone() -> None:
+            pass
+
+        @staticmethod
+        def unwrap_model(_engine: nn.Module) -> nn.Module:
+            assert _engine is engine
+            return engine.module
+
+    cursor = BatonTrainingCursor(
+        global_step=0,
+        epoch=0,
+        consumed_microbatches=0,
+        microbatches_per_epoch=25,
+        sampler_seed=config.seed,
+    )
+
+    checkpoint = training_module._save_training_checkpoint(
+        accelerator=_Accelerator(),
+        config=config,
+        artifacts=artifacts,
+        planner=engine,
+        optimizer=artifacts.optimizer,
+        scheduler=artifacts.scheduler,
+        cursor=cursor,
+    )
+
+    assert checkpoint == tmp_path / "step_000000"
+    assert len(engine.calls) == 1
+    assert (checkpoint / "deepspeed/state/mp_rank_00_model_states.pt").is_file()
+
+
+def test_zero2_resume_restores_engine_optimizer_shards(tmp_path: Path) -> None:
+    import qwen35_baton.cli.train_semantic_planner as training_module
+    from qwen35_baton.checkpoint import BatonTrainingCursor
+
+    cursor = BatonTrainingCursor(
+        global_step=20,
+        epoch=1,
+        consumed_microbatches=3,
+        microbatches_per_epoch=25,
+        sampler_seed=17,
+    )
+    checkpoint = tmp_path / "step_000020"
+    (checkpoint / "deepspeed/state").mkdir(parents=True)
+    calls: list[tuple[Any, ...]] = []
+
+    class _Engine:
+        def load_checkpoint(self, root: str, **kwargs: Any):
+            calls.append((root, kwargs))
+            return str(Path(root) / "state"), {"baton_cursor": cursor.to_dict()}
+
+    training_module._restore_zero2_optimizer_shards(
+        _Engine(), checkpoint, cursor=cursor
+    )
+
+    assert calls == [
+        (
+            str(checkpoint / "deepspeed"),
+            {
+                "tag": "state",
+                "load_optimizer_states": True,
+                "load_lr_scheduler_states": False,
+                "load_module_only": False,
+            },
+        )
+    ]
 
 
 def test_production_stage1_uses_checkpoint_compatible_ddp(

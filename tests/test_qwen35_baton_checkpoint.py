@@ -28,6 +28,7 @@ from qwen35_baton.checkpoint import (
     migrate_legacy_head_checkpoint_v4,
     planner_module_topology,
     planner_safetensors_topology,
+    publish_baton_zero2_checkpoint,
     publish_trusted_planner_topology,
     save_baton_checkpoint,
     trusted_planner_topology_payload,
@@ -225,6 +226,99 @@ def _save_valid_checkpoint(
         rank_rng_state=rank_states,
     )
     return planner, optimizer, scheduler
+
+
+def test_checkpoint_rejects_distributed_strategy_mismatch(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    planner, optimizer, scheduler = _save_valid_checkpoint(checkpoint)
+
+    with pytest.raises(ValueError, match="distributed_strategy mismatch"):
+        load_baton_checkpoint(
+            checkpoint,
+            planner=planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            expected_contract=replace(
+                BatonCheckpointMetadata.example(),
+                distributed_strategy="zero2",
+            ),
+        )
+
+
+def test_zero2_checkpoint_binds_shards_and_loads_model_contract(
+    tmp_path: Path,
+) -> None:
+    planner, optimizer, scheduler = _runtime()
+    staging = tmp_path / ".zero2.incomplete"
+    shard_dir = staging / "deepspeed"
+    shard_dir.mkdir(parents=True)
+    (shard_dir / "latest").write_text("state\n")
+    state_dir = shard_dir / "state"
+    state_dir.mkdir()
+    (state_dir / "mp_rank_00_model_states.pt").write_bytes(b"zero2-shard")
+    destination = tmp_path / "step_000001"
+    metadata = _metadata_for_planner(
+        planner,
+        BatonCheckpointMetadata.example(distributed_strategy="zero2"),
+    )
+
+    publish_baton_zero2_checkpoint(
+        staging,
+        destination,
+        planner=planner,
+        scheduler=scheduler,
+        metadata=metadata,
+        cursor=_cursor(),
+        rank_rng_state={0: capture_rank_rng_state(distributed_rank=0)},
+    )
+    resumed = load_baton_checkpoint(
+        destination,
+        planner=planner,
+        optimizer=None,
+        scheduler=scheduler,
+        expected_contract=metadata,
+    )
+
+    assert resumed.cursor == _cursor()
+    marker = torch.load(
+        destination / "optimizer.pt", weights_only=True, map_location="cpu"
+    )
+    assert marker["distributed_strategy"] == "zero2"
+    assert (destination / "deepspeed/state/mp_rank_00_model_states.pt").is_file()
+
+
+def test_zero2_checkpoint_rejects_mutated_shard(tmp_path: Path) -> None:
+    planner, _, scheduler = _runtime()
+    staging = tmp_path / ".zero2.incomplete"
+    shard_dir = staging / "deepspeed/state"
+    shard_dir.mkdir(parents=True)
+    shard = shard_dir / "mp_rank_00_model_states.pt"
+    shard.write_bytes(b"valid")
+    destination = tmp_path / "step_000001"
+    metadata = _metadata_for_planner(
+        planner,
+        BatonCheckpointMetadata.example(distributed_strategy="zero2"),
+    )
+    publish_baton_zero2_checkpoint(
+        staging,
+        destination,
+        planner=planner,
+        scheduler=scheduler,
+        metadata=metadata,
+        cursor=_cursor(),
+        rank_rng_state={0: capture_rank_rng_state(distributed_rank=0)},
+    )
+    shard = destination / "deepspeed/state/mp_rank_00_model_states.pt"
+    shard.write_bytes(b"mutated")
+
+    with pytest.raises(ValueError, match="DeepSpeed shard hash"):
+        load_baton_checkpoint(
+            destination,
+            planner=planner,
+            optimizer=None,
+            scheduler=scheduler,
+            expected_contract=metadata,
+        )
 
 
 def _rewrite_checkpoint_metadata_as_v3(

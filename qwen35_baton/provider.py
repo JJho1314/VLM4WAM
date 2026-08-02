@@ -307,6 +307,7 @@ def _validate_checkpoint_envelope(checkpoint: Path) -> BatonCheckpointMetadata:
         _validate_persisted_steps,
         _validate_rank_rng_state,
         _validate_scheduler_state_values,
+        _validate_zero2_marker,
     )
 
     optimizer_state = torch.load(
@@ -323,7 +324,13 @@ def _validate_checkpoint_envelope(checkpoint: Path) -> BatonCheckpointMetadata:
         raise ValueError("checkpoint optimizer state topology is invalid")
     if not isinstance(scheduler_state, Mapping):
         raise ValueError("checkpoint scheduler state topology is invalid")
-    if (
+    if metadata.distributed_strategy == "zero2":
+        _validate_zero2_marker(
+            checkpoint,
+            optimizer_state,
+            expected_hash=metadata.optimizer_topology_hash,
+        )
+    elif (
         sha256_json(_optimizer_topology(optimizer_state))
         != metadata.optimizer_topology_hash
     ):
@@ -359,9 +366,13 @@ def _validate_checkpoint_envelope(checkpoint: Path) -> BatonCheckpointMetadata:
         metadata,
         world_size=rng_payload["world_size"],
     )
-    _validate_persisted_steps(optimizer_state, scheduler_state, cursor)
     _validate_scheduler_state_values(scheduler_state)
-    _validate_optimizer_scheduler_lrs(optimizer_state, scheduler_state)
+    if metadata.distributed_strategy == "zero2":
+        if scheduler_state.get("last_epoch") != cursor.global_step:
+            raise ValueError("scheduler step differs from checkpoint cursor")
+    else:
+        _validate_persisted_steps(optimizer_state, scheduler_state, cursor)
+        _validate_optimizer_scheduler_lrs(optimizer_state, scheduler_state)
     return metadata
 
 

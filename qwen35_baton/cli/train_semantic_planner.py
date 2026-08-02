@@ -24,6 +24,7 @@ from qwen35_baton.checkpoint import (
     load_baton_checkpoint,
     load_trusted_planner_topology,
     planner_module_topology,
+    publish_baton_zero2_checkpoint,
     publish_trusted_planner_topology,
     restore_rank_rng_state,
     save_baton_checkpoint,
@@ -118,6 +119,7 @@ class Stage1TrainingConfig:
     mixed_precision: str = "bf16"
     gradient_checkpointing: bool = False
     runtime_input_validation: bool = False
+    distributed_strategy: str = "ddp"
     deepspeed_config_path: str = "qwen35_baton/configs/deepspeed_zero2.json"
     num_workers: int = 4
     persistent_workers: bool = True
@@ -183,6 +185,8 @@ class Stage1TrainingConfig:
             raise ValueError("gradient_checkpointing must be boolean")
         if type(self.runtime_input_validation) is not bool:
             raise ValueError("runtime_input_validation must be boolean")
+        if self.distributed_strategy not in {"ddp", "zero2"}:
+            raise ValueError("distributed_strategy must be 'ddp' or 'zero2'")
         if not isinstance(self.dataset_type, str) or self.dataset_type not in {
             "libero_hdf5",
             "worldarena_hdf5",
@@ -350,6 +354,14 @@ def resolve_deepspeed_runtime_config(
         ) from error
     if not isinstance(payload, dict):
         raise ValueError("DeepSpeed config must contain an object")
+    zero = payload.get("zero_optimization")
+    if not isinstance(zero, Mapping) or zero.get("stage") != 2:
+        raise ValueError("DeepSpeed runtime config must use ZeRO stage 2")
+    if "offload_optimizer" in zero or "offload_param" in zero:
+        raise ValueError("DeepSpeed ZeRO-2 CPU/NVMe offload is not supported")
+    bf16 = payload.get("bf16")
+    if not isinstance(bf16, Mapping) or bf16.get("enabled") is not True:
+        raise ValueError("DeepSpeed runtime config must enable bf16")
     payload["train_micro_batch_size_per_gpu"] = config.per_device_batch
     payload["gradient_accumulation_steps"] = config.gradient_accumulation_steps
     payload["train_batch_size"] = (
@@ -358,6 +370,41 @@ def resolve_deepspeed_runtime_config(
         * config.gradient_accumulation_steps
     )
     return payload
+
+
+def build_accelerator(
+    config: Stage1TrainingConfig,
+    *,
+    world_size: int,
+) -> Any:
+    """Construct explicit DDP or ZeRO-2 Accelerate runtime state."""
+
+    if not isinstance(config, Stage1TrainingConfig):
+        raise TypeError("config must be Stage1TrainingConfig")
+    if type(world_size) is not int or world_size <= 0:
+        raise ValueError("world_size must be a positive integer")
+    from accelerate import Accelerator
+    from accelerate.utils import GradientAccumulationPlugin
+
+    options: dict[str, Any] = {
+        "gradient_accumulation_plugin": GradientAccumulationPlugin(
+            num_steps=config.gradient_accumulation_steps,
+            sync_with_dataloader=False,
+        ),
+        "mixed_precision": config.mixed_precision,
+        "cpu": config.tiny_test,
+        "step_scheduler_with_optimizer": False,
+    }
+    if config.distributed_strategy == "zero2":
+        from accelerate.utils import DeepSpeedPlugin
+
+        options["deepspeed_plugin"] = DeepSpeedPlugin(
+            hf_ds_config=resolve_deepspeed_runtime_config(
+                config,
+                world_size=world_size,
+            )
+        )
+    return Accelerator(**options)
 
 
 def _owned_parameters(modules: tuple[nn.Module, ...]) -> list[nn.Parameter]:
@@ -671,7 +718,10 @@ def load_local_artifacts(
     ownership = configure_stage1_trainable_modules(planner)
     optimizer = build_stage1_optimizer(planner, ownership, config)
     scheduler = build_cosine_warmup_scheduler(optimizer, config)
-    example = BatonCheckpointMetadata.example(camera_names=camera_names)
+    example = BatonCheckpointMetadata.example(
+        camera_names=camera_names,
+        distributed_strategy=config.distributed_strategy,
+    )
     metadata = replace(
         example,
         qwen_config_hash=sha256_file(Path(config.qwen_model_path) / "config.json"),
@@ -877,6 +927,39 @@ def _save_training_checkpoint(
     accelerator.wait_for_everyone()
     states = _rank_states(accelerator)
     destination = Path(config.output_dir) / f"step_{cursor.global_step:06d}"
+    if config.distributed_strategy == "zero2":
+        staging = destination.parent / f".{destination.name}.incomplete-zero2"
+        if accelerator.is_main_process:
+            if destination.exists() or staging.exists():
+                raise FileExistsError(
+                    f"ZeRO-2 checkpoint staging or destination exists: {destination}"
+                )
+            staging.mkdir(parents=True)
+        accelerator.wait_for_everyone()
+        save_shards = getattr(planner, "save_checkpoint", None)
+        if not callable(save_shards):
+            raise RuntimeError("prepared ZeRO-2 planner has no save_checkpoint API")
+        saved = save_shards(
+            str(staging / "deepspeed"),
+            tag="state",
+            client_state={"baton_cursor": cursor.to_dict()},
+        )
+        if saved is False:
+            raise RuntimeError("DeepSpeed failed to save ZeRO-2 checkpoint shards")
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            publish_baton_zero2_checkpoint(
+                staging,
+                destination,
+                planner=accelerator.unwrap_model(planner),
+                scheduler=_scheduler_for_checkpoint(scheduler),
+                scaler=getattr(accelerator, "scaler", None),
+                metadata=artifacts.metadata,
+                cursor=cursor,
+                rank_rng_state=states,
+            )
+        accelerator.wait_for_everyone()
+        return destination
     if accelerator.is_main_process:
         save_baton_checkpoint(
             destination,
@@ -890,6 +973,37 @@ def _save_training_checkpoint(
         )
     accelerator.wait_for_everyone()
     return destination
+
+
+def _restore_zero2_optimizer_shards(
+    planner: Any,
+    checkpoint: str | Path,
+    *,
+    cursor: BatonTrainingCursor,
+) -> None:
+    """Restore DeepSpeed optimizer partitions after the engine is prepared."""
+
+    load_shards = getattr(planner, "load_checkpoint", None)
+    if not callable(load_shards):
+        raise RuntimeError("prepared ZeRO-2 planner has no load_checkpoint API")
+    shard_root = Path(checkpoint) / "deepspeed"
+    if not shard_root.is_dir():
+        raise FileNotFoundError("ZeRO-2 checkpoint has no DeepSpeed shard tree")
+    restored = load_shards(
+        str(shard_root),
+        tag="state",
+        load_optimizer_states=True,
+        load_lr_scheduler_states=False,
+        load_module_only=False,
+    )
+    if (
+        not isinstance(restored, tuple)
+        or len(restored) != 2
+        or not restored[0]
+        or not isinstance(restored[1], Mapping)
+        or restored[1].get("baton_cursor") != cursor.to_dict()
+    ):
+        raise ValueError("DeepSpeed shard client state differs from Baton cursor")
 
 
 def _loss_metrics(
@@ -1186,17 +1300,9 @@ def run_training(
             enabled=config.gradient_checkpointing,
         )
 
-    from accelerate import Accelerator
-    from accelerate.utils import GradientAccumulationPlugin
-
-    accelerator = Accelerator(
-        gradient_accumulation_plugin=GradientAccumulationPlugin(
-            num_steps=config.gradient_accumulation_steps,
-            sync_with_dataloader=False,
-        ),
-        mixed_precision=config.mixed_precision,
-        cpu=config.tiny_test,
-        step_scheduler_with_optimizer=False,
+    accelerator = build_accelerator(
+        config,
+        world_size=world_size,
     )
     if not config.tiny_test:
         require_stage1_global_batch(
@@ -1263,11 +1369,16 @@ def run_training(
     )
     metrics_path = Path(config.output_dir) / "training_metrics.jsonl"
     worker_lifecycle_path = Path(config.output_dir) / "worker_lifecycle.jsonl"
+    resumed = None
     if config.resume_from is not None:
         resumed = load_baton_checkpoint(
             Path(config.resume_from),
             planner=artifacts.planner,
-            optimizer=artifacts.optimizer,
+            optimizer=(
+                None
+                if config.distributed_strategy == "zero2"
+                else artifacts.optimizer
+            ),
             scheduler=artifacts.scheduler,
             scaler=getattr(accelerator, "scaler", None),
             expected_contract=artifacts.metadata,
@@ -1289,6 +1400,15 @@ def run_training(
         artifacts.planner,
         artifacts.optimizer,
     )
+    if resumed is not None and config.distributed_strategy == "zero2":
+        assert config.resume_from is not None
+        _restore_zero2_optimizer_shards(
+            planner,
+            config.resume_from,
+            cursor=resumed.cursor,
+        )
+        # DeepSpeed initialization and shard loading may consume RNG streams.
+        restore_rank_rng_state(resumed.rank_rng_state)
     scheduler = artifacts.scheduler
     teacher_model = getattr(artifacts.teacher, "model", None)
     teacher_to = getattr(artifacts.teacher, "to", None)

@@ -23,6 +23,7 @@
   "mixed_precision": "bf16",
   "gradient_checkpointing": false,
   "runtime_input_validation": false,
+  "distributed_strategy": "ddp",
   "deepspeed_config_path": "qwen35_baton/configs/deepspeed_zero2.json",
   "num_workers": 8,
   "persistent_workers": true,

@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 
 from qwen35_baton.config import BatonCheckpointMetadata
-from qwen35_baton.hashing import sha256_file, sha256_json
+from qwen35_baton.hashing import sha256_artifact, sha256_file, sha256_json
 
 
 _CHECKPOINT_FILES = (
@@ -297,6 +297,26 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _fsync_tree(root: Path) -> None:
+    """Durably flush a completed shard tree without following symlinks."""
+
+    paths = tuple(root.rglob("*"))
+    if any(path.is_symlink() for path in paths):
+        raise ValueError("checkpoint shard trees must not contain symlinks")
+    for path in paths:
+        if path.is_file():
+            _fsync_file(path)
+        elif not path.is_dir():
+            raise ValueError(f"checkpoint shard entry is invalid: {path}")
+    for directory in sorted(
+        (path for path in paths if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        _fsync_directory(directory)
+    _fsync_directory(root)
 
 
 def _validate_checkpoint_hash_envelope(
@@ -1143,6 +1163,8 @@ def save_baton_checkpoint(
         raise TypeError("optimizer must be a torch optimizer")
     if not isinstance(metadata, BatonCheckpointMetadata):
         raise TypeError("metadata must be BatonCheckpointMetadata")
+    if metadata.distributed_strategy != "ddp":
+        raise ValueError("regular Baton checkpoints require DDP metadata")
     if not isinstance(cursor, BatonTrainingCursor):
         raise TypeError("cursor must be BatonTrainingCursor")
     if destination.exists():
@@ -1226,6 +1248,142 @@ def save_baton_checkpoint(
         _fsync_directory(destination.parent)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def _validate_zero2_marker(
+    checkpoint: Path,
+    marker: Any,
+    *,
+    expected_hash: str,
+) -> Mapping[str, Any]:
+    required = {
+        "format_version",
+        "distributed_strategy",
+        "deepspeed_artifact_hash",
+    }
+    if (
+        not isinstance(marker, Mapping)
+        or set(marker) != required
+        or marker.get("format_version") != 1
+        or marker.get("distributed_strategy") != "zero2"
+        or not isinstance(marker.get("deepspeed_artifact_hash"), str)
+        or len(marker["deepspeed_artifact_hash"]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in marker["deepspeed_artifact_hash"]
+        )
+    ):
+        raise ValueError("ZeRO-2 checkpoint optimizer marker is invalid")
+    if sha256_json(marker) != expected_hash:
+        raise ValueError("ZeRO-2 optimizer marker differs from metadata")
+    shard_root = checkpoint / "deepspeed"
+    if not shard_root.is_dir() or sha256_artifact(shard_root) != marker[
+        "deepspeed_artifact_hash"
+    ]:
+        raise ValueError("DeepSpeed shard hash differs from checkpoint marker")
+    return marker
+
+
+def publish_baton_zero2_checkpoint(
+    staging_dir: str | Path,
+    checkpoint_dir: str | Path,
+    *,
+    planner: nn.Module,
+    scheduler: Any,
+    metadata: BatonCheckpointMetadata,
+    cursor: BatonTrainingCursor,
+    rank_rng_state: Mapping[Any, Any],
+    scaler: Any | None = None,
+) -> None:
+    """Publish a pre-written DeepSpeed shard tree as one atomic Baton checkpoint."""
+
+    staging = Path(staging_dir)
+    destination = Path(checkpoint_dir)
+    if destination.exists():
+        raise FileExistsError(f"checkpoint already exists: {destination}")
+    if not staging.is_dir() or not (staging / "deepspeed").is_dir():
+        raise FileNotFoundError("ZeRO-2 staging must contain a deepspeed shard tree")
+    if not isinstance(planner, nn.Module):
+        raise TypeError("planner must be a torch module")
+    if not isinstance(metadata, BatonCheckpointMetadata):
+        raise TypeError("metadata must be BatonCheckpointMetadata")
+    if metadata.distributed_strategy != "zero2":
+        raise ValueError("ZeRO-2 checkpoint metadata must declare zero2")
+    if not isinstance(cursor, BatonTrainingCursor):
+        raise TypeError("cursor must be BatonTrainingCursor")
+    trusted_topology = planner_module_topology(planner)
+    if sha256_json(trusted_topology) != metadata.planner_topology_hash:
+        raise ValueError("planner topology differs from ZeRO-2 metadata")
+    states = _normalized_rank_states(rank_rng_state)
+    try:
+        save_model(
+            planner,
+            str(staging / "planner.safetensors"),
+            metadata={"format": BatonCheckpointMetadata.ARCHITECTURE_KIND},
+        )
+        if (
+            planner_safetensors_topology(staging / "planner.safetensors")
+            != trusted_topology
+        ):
+            raise ValueError("written ZeRO-2 planner topology differs from metadata")
+        marker = {
+            "format_version": 1,
+            "distributed_strategy": "zero2",
+            "deepspeed_artifact_hash": sha256_artifact(staging / "deepspeed"),
+        }
+        torch.save(marker, staging / "optimizer.pt")
+        scheduler_state = scheduler.state_dict()
+        _validate_scheduler_state_values(scheduler_state)
+        if scheduler_state.get("last_epoch") != cursor.global_step:
+            raise ValueError("scheduler step differs from checkpoint cursor")
+        torch.save(scheduler_state, staging / "scheduler.pt")
+        torch.save(
+            {
+                "enabled": scaler is not None,
+                "state_dict": None if scaler is None else scaler.state_dict(),
+            },
+            staging / "scaler.pt",
+        )
+        torch.save(
+            {
+                "format_version": 1,
+                "world_size": len(states),
+                "states": [states[rank] for rank in range(len(states))],
+            },
+            staging / "rank_rng.pt",
+        )
+        for name in (
+            "planner.safetensors",
+            "optimizer.pt",
+            "scheduler.pt",
+            "scaler.pt",
+            "rank_rng.pt",
+        ):
+            _fsync_file(staging / name)
+        _json_write(staging / "cursor.json", cursor.to_dict())
+        runtime_metadata = _metadata_cursor(
+            metadata,
+            cursor,
+            world_size=len(states),
+            optimizer_hash=sha256_json(marker),
+            scheduler_hash=sha256_json(_scheduler_topology(scheduler_state)),
+            rng_hash=sha256_file(staging / "rank_rng.pt"),
+        )
+        _json_write(staging / "metadata.json", runtime_metadata.to_dict())
+        hashes = {name: sha256_file(staging / name) for name in _CHECKPOINT_FILES}
+        _json_write(
+            staging / "manifest.json",
+            {"format_version": 2, "files": hashes},
+        )
+        _fsync_tree(staging / "deepspeed")
+        _fsync_directory(staging)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staging, destination)
+        _fsync_directory(destination.parent)
+    except Exception:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
         raise
 
 
@@ -1598,6 +1756,42 @@ def load_baton_checkpoint(
         raise ValueError("optimizer state topology is invalid")
     if not isinstance(scheduler_state, Mapping):
         raise ValueError("scheduler state topology is invalid")
+    if metadata.distributed_strategy == "zero2":
+        _validate_zero2_marker(
+            checkpoint,
+            optimizer_state,
+            expected_hash=metadata.optimizer_topology_hash,
+        )
+        if optimizer is not None:
+            raise ValueError(
+                "ZeRO-2 optimizer shards must be restored after DeepSpeed prepare"
+            )
+        if scheduler_state.get("last_epoch") != cursor.global_step:
+            raise ValueError("scheduler step differs from checkpoint cursor")
+        if (
+            sha256_json(_scheduler_topology(scheduler_state))
+            != metadata.scheduler_topology_hash
+        ):
+            raise ValueError("scheduler topology hash differs from checkpoint metadata")
+        _validate_model_topology(checkpoint, planner)
+        if scheduler is not None:
+            _validate_scheduler_runtime(
+                scheduler_state,
+                scheduler,
+                expected_hash=metadata.scheduler_topology_hash,
+            )
+        _validate_scaler_runtime(scaler_state, scaler)
+        load_model(planner, str(checkpoint / "planner.safetensors"), strict=True)
+        if scheduler is not None:
+            scheduler.load_state_dict(scheduler_state)
+        if scaler is not None:
+            scaler.load_state_dict(scaler_state["state_dict"])
+        restore_rank_rng_state(selected_rng)
+        return BatonResumeState(
+            metadata=metadata,
+            cursor=cursor,
+            rank_rng_state=selected_rng,
+        )
     _validate_persisted_steps(optimizer_state, scheduler_state, cursor)
     _validate_scheduler_state_values(scheduler_state)
     _validate_optimizer_scheduler_lrs(optimizer_state, scheduler_state)

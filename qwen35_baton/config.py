@@ -300,6 +300,7 @@ class BatonCheckpointMetadata:
     _REQUIRED_FIELDS: ClassVar[tuple[str, ...]] = (
         "format_version",
         "architecture_kind",
+        "distributed_strategy",
         "qwen_backbone",
         "qwen_config_hash",
         "tokenizer_hash",
@@ -353,6 +354,7 @@ class BatonCheckpointMetadata:
 
     format_version: int
     architecture_kind: str
+    distributed_strategy: str
     qwen_backbone: str
     qwen_config_hash: str
     tokenizer_hash: str
@@ -414,6 +416,8 @@ class BatonCheckpointMetadata:
         _require_equal(
             "architecture_kind", self.architecture_kind, self.ARCHITECTURE_KIND
         )
+        if self.distributed_strategy not in {"ddp", "zero2"}:
+            raise ValueError("distributed_strategy must be 'ddp' or 'zero2'")
         _require_equal("qwen_backbone", self.qwen_backbone, self.QWEN_BACKBONE)
         _require_sha256(self, self._HASH_FIELDS)
         _require_nonempty_strings(self, ("teacher_dtype", "query_mask_version"))
@@ -504,12 +508,16 @@ class BatonCheckpointMetadata:
 
     @classmethod
     def example(
-        cls, *, camera_names: tuple[str, ...] = ("main", "wrist")
+        cls,
+        *,
+        camera_names: tuple[str, ...] = ("main", "wrist"),
+        distributed_strategy: str = "ddp",
     ) -> BatonCheckpointMetadata:
         geometry = BatonGeometry()
         return cls(
             format_version=cls.FORMAT_VERSION,
             architecture_kind=cls.ARCHITECTURE_KIND,
+            distributed_strategy=distributed_strategy,
             qwen_backbone=cls.QWEN_BACKBONE,
             qwen_config_hash=_example_sha256("qwen-config"),
             tokenizer_hash=_example_sha256("tokenizer"),
@@ -582,6 +590,12 @@ class BatonCheckpointMetadata:
             )
         if isinstance(payload, Mapping) and payload.get("format_version") == 3:
             return cls._from_legacy_v3(payload, allow_head=False)
+        if (
+            isinstance(payload, Mapping)
+            and payload.get("format_version") == cls.FORMAT_VERSION
+            and "distributed_strategy" not in payload
+        ):
+            payload = {**payload, "distributed_strategy": "ddp"}
         _require_keys(payload, cls._REQUIRED_FIELDS)
         values = {name: payload[name] for name in cls._REQUIRED_FIELDS}
         values["added_tokens"] = tuple(values["added_tokens"])
@@ -605,12 +619,17 @@ class BatonCheckpointMetadata:
         *,
         allow_head: bool,
     ) -> BatonCheckpointMetadata:
+        legacy_payload = dict(payload)
+        if "distributed_strategy" not in legacy_payload:
+            legacy_payload["distributed_strategy"] = "ddp"
+        elif legacy_payload["distributed_strategy"] != "ddp":
+            raise ValueError("legacy Baton v3 checkpoints must use DDP")
         required = tuple(
             "future_indices" if name == "temporal_policy" else name
             for name in cls._REQUIRED_FIELDS
         )
-        _require_keys(payload, required)
-        camera_names = payload.get("camera_names")
+        _require_keys(legacy_payload, required)
+        camera_names = legacy_payload.get("camera_names")
         if camera_names == ["head"] or camera_names == ("head",):
             if not allow_head:
                 raise ValueError(
@@ -620,9 +639,12 @@ class BatonCheckpointMetadata:
             temporal_policy = BatonTemporalPolicy.worldarena_normalized()
         else:
             temporal_policy = BatonTemporalPolicy.libero_fixed()
-        if payload.get("future_indices") not in ([0, 3, 5, 8], (0, 3, 5, 8)):
+        if legacy_payload.get("future_indices") not in (
+            [0, 3, 5, 8],
+            (0, 3, 5, 8),
+        ):
             raise ValueError("legacy Baton v3 future_indices must be (0,3,5,8)")
-        migrated = dict(payload)
+        migrated = legacy_payload
         migrated["format_version"] = cls.FORMAT_VERSION
         migrated["temporal_policy"] = temporal_policy.to_dict()
         del migrated["future_indices"]

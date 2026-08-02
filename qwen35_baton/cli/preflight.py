@@ -315,13 +315,18 @@ def preflight_stage1(
         (qwen, processor, tokenizer, siglip, manifest, statistics),
     )
     fast_path = require_qwen35_fast_path()
-    from qwen35_baton.cli.train_semantic_planner import require_stage1_global_batch
+    from qwen35_baton.cli.train_semantic_planner import (
+        require_stage1_global_batch,
+        resolve_deepspeed_runtime_config,
+    )
 
     global_batch = require_stage1_global_batch(
         per_device_batch=config.per_device_batch,
         world_size=world_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
     )
+    if config.distributed_strategy == "zero2":
+        resolve_deepspeed_runtime_config(config, world_size=world_size)
     report = {
         "tiny_test": False,
         "global_batch": global_batch,
@@ -334,7 +339,7 @@ def preflight_stage1(
         "siglip2_artifact_hash": actual_siglip_artifact_hash,
         "hdf5_manifest_hash": actual_manifest_hash,
         "qwen35_fast_path": fast_path,
-        "distributed_strategy": "ddp",
+        "distributed_strategy": config.distributed_strategy,
     }
     if worldarena_cache_audit is not None:
         report["worldarena_cache_audit"] = worldarena_cache_audit

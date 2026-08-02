@@ -72,6 +72,8 @@ def test_continuous_metadata_round_trips_the_complete_contract() -> None:
 
     payload = metadata.to_dict()
 
+    assert metadata.distributed_strategy == "ddp"
+
     assert set(payload) == {
         "format_version",
         "architecture_kind",
@@ -110,6 +112,7 @@ def test_continuous_metadata_round_trips_the_complete_contract() -> None:
         "global_step",
         "distributed_cursor",
         "rng_state_hash",
+        "distributed_strategy",
     }
     assert payload["architecture_kind"] == "qwen35_baton_continuous"
     assert payload["qwen_backbone"] == "dense Qwen3.5-2B"
@@ -132,6 +135,15 @@ def test_continuous_metadata_round_trips_the_complete_contract() -> None:
         "mse": 1.0,
     }
     assert BatonCheckpointMetadata.from_dict(payload) == metadata
+
+
+def test_legacy_v4_metadata_without_strategy_migrates_to_ddp() -> None:
+    payload = BatonCheckpointMetadata.example().to_dict()
+    del payload["distributed_strategy"]
+
+    restored = BatonCheckpointMetadata.from_dict(payload)
+
+    assert restored.distributed_strategy == "ddp"
 
 
 def test_checkpoint_metadata_accepts_truthful_head_camera_shape() -> None:
