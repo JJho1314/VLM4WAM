@@ -59,6 +59,52 @@ class _Processor:
         }
 
 
+class _SiglipProcessor:
+    def __call__(
+        self,
+        *,
+        images: list[torch.Tensor],
+        return_tensors: str,
+    ) -> dict[str, torch.Tensor]:
+        assert return_tensors == "pt"
+        return {
+            "pixel_values": torch.stack(images).float().div(255).mul(2).sub(1)
+        }
+
+
+class _BatchProcessor:
+    def __init__(self) -> None:
+        self.tokenizer = _Tokenizer()
+        self.call_batch_sizes: list[int] = []
+
+    def __call__(
+        self,
+        *,
+        text: list[str],
+        images: list[torch.Tensor],
+        return_tensors: str,
+        padding: bool,
+    ) -> dict[str, torch.Tensor]:
+        assert return_tensors == "pt"
+        assert len(text) == len(images)
+        self.call_batch_sizes.append(len(text))
+        rows = [torch.tensor(self.tokenizer.encode(value)) for value in text]
+        maximum = max(row.numel() for row in rows)
+        input_ids = torch.zeros((len(rows), maximum), dtype=torch.long)
+        attention_mask = torch.zeros_like(input_ids)
+        for index, row in enumerate(rows):
+            input_ids[index, : row.numel()] = row
+            attention_mask[index, : row.numel()] = 1
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": torch.stack(images).float(),
+            "image_grid_thw": torch.tensor(
+                [[1, 16, 16]] * len(images), dtype=torch.long
+            ),
+        }
+
+
 class _BaseDataset:
     n_previous = 4
 
@@ -190,6 +236,69 @@ def test_collator_builds_one_head_row_per_worldarena_sample() -> None:
     assert batch.camera_names == ("head",)
     assert batch.row_labels == ((0, "head"), (1, "head"))
     assert batch.qwen_inputs["input_ids"].shape[0] == 2
+
+
+def test_collator_emits_future_teacher_pixels_without_raw_future_transfer() -> None:
+    from qwen35_baton.data import BatonPlannerCollator
+
+    collator = BatonPlannerCollator(
+        _Processor(),
+        camera_names=("head",),
+        siglip_processor=_SiglipProcessor(),
+    )
+    sample = {
+        "current_images": torch.zeros((1, 3, 256, 256), dtype=torch.uint8),
+        "future_images": torch.full(
+            (1, 4, 3, 256, 256), 127, dtype=torch.uint8
+        ),
+        "instruction": "pick up the green bottle",
+        "suite": "worldarena",
+    }
+
+    batch = collator([sample])
+
+    assert batch.future_images is None
+    assert batch.future_pixel_values is not None
+    assert batch.future_pixel_values.shape == (1, 1, 4, 3, 256, 256)
+    assert batch.future_pixel_values.dtype == torch.bfloat16
+
+
+def test_batched_qwen_rows_match_reference_rowwise_collation() -> None:
+    from qwen35_baton.data import BatonPlannerCollator
+
+    samples = [
+        {
+            "current_images": torch.full(
+                (1, 3, 256, 256), value, dtype=torch.uint8
+            ),
+            "future_images": torch.full(
+                (1, 4, 3, 256, 256), value + 1, dtype=torch.uint8
+            ),
+            "instruction": instruction,
+            "suite": "worldarena",
+        }
+        for value, instruction in (
+            (3, "pick up the green bottle"),
+            (7, "move the red mug onto the white plate"),
+        )
+    ]
+    reference = BatonPlannerCollator(
+        _BatchProcessor(), camera_names=("head",), batch_qwen_rows=False
+    )(samples)
+    processor = _BatchProcessor()
+    batched = BatonPlannerCollator(
+        processor, camera_names=("head",), batch_qwen_rows=True
+    )(samples)
+
+    assert processor.call_batch_sizes == [2]
+    assert reference.qwen_inputs.keys() == batched.qwen_inputs.keys()
+    for key in reference.qwen_inputs:
+        torch.testing.assert_close(
+            batched.qwen_inputs[key], reference.qwen_inputs[key], rtol=0, atol=0
+        )
+    torch.testing.assert_close(
+        batched.plan_positions, reference.plan_positions, rtol=0, atol=0
+    )
 
 
 def test_batch_contract_exposes_fixed_geometry(dataset) -> None:

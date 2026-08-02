@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import random
@@ -23,14 +23,81 @@ class BatonPlannerBatch:
     qwen_inputs: Mapping[str, torch.Tensor]
     plan_positions: torch.Tensor
     current_images: torch.Tensor
-    future_images: torch.Tensor
+    future_images: torch.Tensor | None
     instructions: tuple[str, ...]
     row_labels: tuple[tuple[int, str], ...]
     camera_names: tuple[str, ...] = ("main", "wrist")
+    future_pixel_values: torch.Tensor | None = None
 
     @property
     def batch_size(self) -> int:
         return len(self.instructions)
+
+    @staticmethod
+    def _map_tensors(
+        values: Mapping[str, torch.Tensor],
+        operation: Any,
+    ) -> dict[str, torch.Tensor]:
+        return {key: operation(value) for key, value in values.items()}
+
+    def pin_memory(self) -> "BatonPlannerBatch":
+        """Pin only tensors consumed by the GPU training hot path."""
+
+        return replace(
+            self,
+            qwen_inputs=self._map_tensors(
+                self.qwen_inputs, lambda value: value.pin_memory()
+            ),
+            plan_positions=self.plan_positions.pin_memory(),
+            future_images=(
+                None
+                if self.future_images is None
+                else self.future_images.pin_memory()
+            ),
+            future_pixel_values=(
+                None
+                if self.future_pixel_values is None
+                else self.future_pixel_values.pin_memory()
+            ),
+        )
+
+    def to(
+        self,
+        device: torch.device | str,
+        *,
+        non_blocking: bool = False,
+    ) -> "BatonPlannerBatch":
+        """Move model inputs and teacher pixels without copying unused current RGB."""
+
+        resolved = torch.device(device)
+
+        def move(value: torch.Tensor) -> torch.Tensor:
+            return value.to(device=resolved, non_blocking=non_blocking)
+
+        return replace(
+            self,
+            qwen_inputs=self._map_tensors(self.qwen_inputs, move),
+            plan_positions=move(self.plan_positions),
+            future_images=(
+                None if self.future_images is None else move(self.future_images)
+            ),
+            future_pixel_values=(
+                None
+                if self.future_pixel_values is None
+                else move(self.future_pixel_values)
+            ),
+        )
+
+    def record_stream(self, stream: Any) -> None:
+        """Associate asynchronously transferred tensors with the consumer stream."""
+
+        for value in self.qwen_inputs.values():
+            value.record_stream(stream)
+        self.plan_positions.record_stream(stream)
+        if self.future_images is not None:
+            self.future_images.record_stream(stream)
+        if self.future_pixel_values is not None:
+            self.future_pixel_values.record_stream(stream)
 
 
 class BatonLiberoDataset(Dataset[dict[str, Any]]):
@@ -176,6 +243,9 @@ class BatonPlannerCollator:
         *,
         camera_names: tuple[str, ...] = ("main", "wrist"),
         plan_pad_token_id: int | None = None,
+        siglip_processor: Any | None = None,
+        siglip_dtype: torch.dtype = torch.bfloat16,
+        batch_qwen_rows: bool = False,
     ) -> None:
         if (
             not camera_names
@@ -185,6 +255,15 @@ class BatonPlannerCollator:
             raise ValueError("camera_names must contain unique nonempty strings")
         self.camera_names = camera_names
         self.processor = processor
+        if siglip_processor is not None and not callable(siglip_processor):
+            raise TypeError("siglip_processor must be callable")
+        if not isinstance(siglip_dtype, torch.dtype):
+            raise TypeError("siglip_dtype must be a torch dtype")
+        self.siglip_processor = siglip_processor
+        self.siglip_dtype = siglip_dtype
+        if type(batch_qwen_rows) is not bool:
+            raise TypeError("batch_qwen_rows must be boolean")
+        self.batch_qwen_rows = batch_qwen_rows
         if plan_pad_token_id is None:
             tokenizer = getattr(processor, "tokenizer", None)
             convert = getattr(tokenizer, "convert_tokens_to_ids", None)
@@ -200,22 +279,7 @@ class BatonPlannerCollator:
     def _process_row(
         self, image: torch.Tensor, instruction: str
     ) -> tuple[torch.Tensor, Mapping[str, torch.Tensor]]:
-        text = build_plan_text(instruction)
-        apply_chat_template = getattr(self.processor, "apply_chat_template", None)
-        if callable(apply_chat_template):
-            text = apply_chat_template(
-                [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": image},
-                            {"type": "text", "text": text},
-                        ],
-                    }
-                ],
-                tokenize=False,
-                add_generation_prompt=True,
-            )
+        text = self._render_row_text(image, instruction)
         processed = self.processor(
             text=[text], images=[image], return_tensors="pt", padding=False
         )
@@ -239,6 +303,97 @@ class BatonPlannerCollator:
         else:
             input_ids = input_ids[0]
         return input_ids, processed
+
+    def _render_row_text(self, image: torch.Tensor, instruction: str) -> str:
+        text = build_plan_text(instruction)
+        apply_chat_template = getattr(self.processor, "apply_chat_template", None)
+        if callable(apply_chat_template):
+            text = apply_chat_template(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": image},
+                            {"type": "text", "text": text},
+                        ],
+                    }
+                ],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        return text
+
+    def _process_rows_batched(
+        self,
+        rows: Sequence[tuple[int, str, torch.Tensor, str]],
+    ) -> tuple[list[torch.Tensor], dict[str, torch.Tensor]]:
+        texts = [
+            self._render_row_text(image, instruction)
+            for _, _, image, instruction in rows
+        ]
+        images = [image for _, _, image, _ in rows]
+        processed = self.processor(
+            text=texts,
+            images=images,
+            return_tensors="pt",
+            padding=True,
+        )
+        if not isinstance(processed, Mapping) or "input_ids" not in processed:
+            raise ValueError("Qwen processor must return input_ids")
+        input_ids = processed["input_ids"]
+        if (
+            not isinstance(input_ids, torch.Tensor)
+            or input_ids.ndim != 2
+            or input_ids.shape[0] != len(rows)
+        ):
+            raise ValueError("Qwen processor must return one input_ids row per image")
+        attention = processed.get("attention_mask")
+        if attention is not None:
+            if (
+                not isinstance(attention, torch.Tensor)
+                or attention.shape != input_ids.shape
+            ):
+                raise ValueError("processor attention_mask must match input_ids")
+            sequences = [
+                row[mask.bool()] for row, mask in zip(input_ids, attention)
+            ]
+        else:
+            sequences = list(input_ids)
+        maximum = max(sequence.numel() for sequence in sequences)
+        canonical_ids = torch.full(
+            (len(sequences), maximum),
+            self.processor.tokenizer.pad_token_id,
+            dtype=input_ids.dtype,
+        )
+        canonical_attention = torch.zeros_like(canonical_ids)
+        for index, sequence in enumerate(sequences):
+            canonical_ids[index, : sequence.numel()] = sequence
+            canonical_attention[index, : sequence.numel()] = 1
+        merged = {
+            key: value
+            for key, value in processed.items()
+            if key not in {"input_ids", "attention_mask"}
+        }
+        for key, value in tuple(merged.items()):
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"processor field {key} must be a tensor")
+            if value.ndim == 2 and value.shape == input_ids.shape:
+                canonical = torch.zeros(
+                    (len(sequences), maximum), dtype=value.dtype
+                )
+                for index, row in enumerate(value):
+                    selected = (
+                        row
+                        if attention is None
+                        else row[attention[index].bool()]
+                    )
+                    canonical[index, : selected.numel()] = selected
+                merged[key] = canonical
+        return sequences, {
+            "input_ids": canonical_ids,
+            "attention_mask": canonical_attention,
+            **merged,
+        }
 
     @staticmethod
     def _merge_processor_values(
@@ -321,36 +476,53 @@ class BatonPlannerCollator:
 
         sequences: list[torch.Tensor] = []
         processed_rows: list[Mapping[str, torch.Tensor]] = []
-        for _, _, image, instruction in rows:
-            sequence, processed = self._process_row(image, instruction)
-            sequences.append(sequence)
-            processed_rows.append(processed)
+        if self.batch_qwen_rows:
+            sequences, qwen_inputs = self._process_rows_batched(rows)
+        else:
+            for _, _, image, instruction in rows:
+                sequence, processed = self._process_row(image, instruction)
+                sequences.append(sequence)
+                processed_rows.append(processed)
         pad_token_id = getattr(
             getattr(self.processor, "tokenizer", None), "pad_token_id", 0
         )
         if type(pad_token_id) is not int:
             raise ValueError("processor tokenizer pad_token_id must be an integer")
-        maximum = max(sequence.numel() for sequence in sequences)
-        input_ids = torch.full(
-            (len(sequences), maximum), pad_token_id, dtype=sequences[0].dtype
-        )
-        attention_mask = torch.zeros_like(input_ids)
-        for index, sequence in enumerate(sequences):
-            input_ids[index, : sequence.numel()] = sequence
-            attention_mask[index, : sequence.numel()] = 1
-        qwen_inputs = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            **self._merge_processor_values(processed_rows, sequences),
-        }
+        if not self.batch_qwen_rows:
+            maximum = max(sequence.numel() for sequence in sequences)
+            input_ids = torch.full(
+                (len(sequences), maximum), pad_token_id, dtype=sequences[0].dtype
+            )
+            attention_mask = torch.zeros_like(input_ids)
+            for index, sequence in enumerate(sequences):
+                input_ids[index, : sequence.numel()] = sequence
+                attention_mask[index, : sequence.numel()] = 1
+            qwen_inputs = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                **self._merge_processor_values(processed_rows, sequences),
+            }
+        input_ids = qwen_inputs["input_ids"]
+        future_pixel_values = None
+        retained_future_images: torch.Tensor | None = future_images
+        if self.siglip_processor is not None:
+            from qwen35_baton.teacher import preprocess_siglip2_future
+
+            future_pixel_values = preprocess_siglip2_future(
+                self.siglip_processor,
+                future_images,
+                dtype=self.siglip_dtype,
+            )
+            retained_future_images = None
         return BatonPlannerBatch(
             qwen_inputs=qwen_inputs,
             plan_positions=find_plan_positions(input_ids, self.plan_pad_token_id),
             current_images=current_images,
-            future_images=future_images,
+            future_images=retained_future_images,
             instructions=instructions,
             row_labels=tuple(
                 (index, camera) for index, camera, _, _ in rows
             ),
             camera_names=self.camera_names,
+            future_pixel_values=future_pixel_values,
         )

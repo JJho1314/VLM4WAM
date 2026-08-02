@@ -278,6 +278,20 @@ def test_stage1_workers_use_spawn_instead_of_inheriting_the_cuda_parent(
     assert loader.multiprocessing_context.get_start_method() == "spawn"
 
 
+def test_stage1_workers_prefetch_pinned_batches(tmp_path: Path) -> None:
+    config = replace(
+        _config(tmp_path),
+        per_device_batch=1,
+        num_workers=2,
+    )
+    dataset = torch.utils.data.TensorDataset(torch.arange(4))
+
+    loader = build_stage1_dataloader(dataset, collate_fn=None, config=config)
+
+    assert loader.pin_memory is True
+    assert loader.prefetch_factor == 4
+
+
 def test_stage1_workers_can_restart_each_epoch_to_release_worker_memory(
     tmp_path: Path,
 ) -> None:
@@ -819,6 +833,7 @@ def test_training_prepares_the_dataloader_for_distributed_rank_sharding(
     )
     original_prepare_data_loader = Accelerator.prepare_data_loader
     prepared_dataloader = []
+    prepared_kwargs = []
 
     def recording_prepare_data_loader(
         self: Accelerator,
@@ -827,6 +842,7 @@ def test_training_prepares_the_dataloader_for_distributed_rank_sharding(
         **kwargs: Any,
     ):
         prepared_dataloader.append(data_loader)
+        prepared_kwargs.append(kwargs)
         return original_prepare_data_loader(self, data_loader, *args, **kwargs)
 
     monkeypatch.setattr(
@@ -836,6 +852,7 @@ def test_training_prepares_the_dataloader_for_distributed_rank_sharding(
     run_training(config, artifacts=artifacts)
 
     assert prepared_dataloader == [artifacts.train_batches]
+    assert prepared_kwargs == [{"device_placement": False}]
 
 
 def test_training_keeps_scheduler_outside_accelerate_prepare(
@@ -1880,7 +1897,9 @@ def test_worldarena_artifacts_use_one_head_camera(
             "tokenizer": tokenizer,
             "processor": _Processor(),
             "qwen": object(),
-            "siglip_processor": object(),
+            "siglip_processor": lambda *, images, return_tensors: {
+                "pixel_values": torch.stack(images).float()
+            },
             "siglip": SimpleNamespace(vision_model=nn.Linear(1, 1)),
         },
     )
@@ -1911,7 +1930,8 @@ def test_worldarena_artifacts_use_one_head_camera(
     batch = next(iter(artifacts.train_batches))
 
     assert batch.camera_names == ("head",)
-    assert batch.future_images.shape[1:3] == (1, 4)
+    assert batch.future_images is None
+    assert batch.future_pixel_values.shape[1:3] == (1, 4)
     assert artifacts.metadata.camera_names == ("head",)
 
 

@@ -9,6 +9,58 @@ import torch
 import torch.nn as nn
 
 
+def _as_uint8_rgb(frames: torch.Tensor) -> torch.Tensor:
+    if not isinstance(frames, torch.Tensor) or frames.ndim != 4 or frames.shape[1] != 3:
+        raise ValueError(f"frames must be [N,3,H,W] RGB, got {tuple(frames.shape)}")
+    if frames.dtype == torch.uint8:
+        return frames
+    if not frames.dtype.is_floating_point:
+        raise TypeError("frames must use uint8 or normalized floating RGB values")
+    if not bool(torch.isfinite(frames).all()):
+        raise ValueError("frames must contain only finite values")
+    if bool(((frames < -1) | (frames > 1)).any()):
+        raise ValueError("normalized RGB frames must be in [-1,1]")
+    return frames.add(1).mul(127.5).round().clamp(0, 255).to(torch.uint8)
+
+
+def preprocess_siglip2_future(
+    processor: Any,
+    images: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Apply the released processor once to CPU future RGB frames."""
+
+    if (
+        not isinstance(images, torch.Tensor)
+        or images.ndim != 6
+        or images.shape[1] <= 0
+        or images.shape[2:4] != (4, 3)
+    ):
+        raise ValueError("future images must be [B,C,4,3,H,W]")
+    batch_size, camera_count = images.shape[:2]
+    flat = _as_uint8_rgb(images.reshape(-1, *images.shape[-3:]))
+    processed = processor(images=list(flat.cpu()), return_tensors="pt")
+    if not isinstance(processed, Mapping) or "pixel_values" not in processed:
+        raise ValueError("SigLIP2 processor must return pixel_values")
+    pixel_values = processed["pixel_values"]
+    if (
+        not isinstance(pixel_values, torch.Tensor)
+        or pixel_values.ndim != 4
+        or pixel_values.shape[0] != flat.shape[0]
+        or pixel_values.shape[1] != 3
+    ):
+        raise ValueError("SigLIP2 processor must return [N,3,H,W] pixel_values")
+    if not bool(torch.isfinite(pixel_values).all()):
+        raise ValueError("SigLIP2 processor returned nonfinite pixel_values")
+    return pixel_values.to(dtype=dtype).reshape(
+        batch_size,
+        camera_count,
+        4,
+        *pixel_values.shape[1:],
+    )
+
+
 class FrozenSiglip2Teacher:
     """Extract detached penultimate SigLIP2 patch grids without caching targets."""
 
@@ -100,17 +152,7 @@ class FrozenSiglip2Teacher:
 
     @staticmethod
     def _as_uint8_rgb(frames: torch.Tensor) -> torch.Tensor:
-        if not isinstance(frames, torch.Tensor) or frames.ndim != 4 or frames.shape[1] != 3:
-            raise ValueError(f"frames must be [N,3,H,W] RGB, got {tuple(frames.shape)}")
-        if frames.dtype == torch.uint8:
-            return frames
-        if not frames.dtype.is_floating_point:
-            raise TypeError("frames must use uint8 or normalized floating RGB values")
-        if not bool(torch.isfinite(frames).all()):
-            raise ValueError("frames must contain only finite values")
-        if bool(((frames < -1) | (frames > 1)).any()):
-            raise ValueError("normalized RGB frames must be in [-1,1]")
-        return frames.add(1).mul(127.5).round().clamp(0, 255).to(torch.uint8)
+        return _as_uint8_rgb(frames)
 
     def _pixel_values(self, frames: torch.Tensor) -> torch.Tensor:
         rgb = self._as_uint8_rgb(frames)
@@ -130,11 +172,12 @@ class FrozenSiglip2Teacher:
         return pixel_values.to(device=self.device, dtype=self.dtype)
 
     @torch.no_grad()
-    def _encode_frames(self, frames: torch.Tensor) -> torch.Tensor:
-        """Encode [N,3,H,W] RGB into [N,256,1024] detached patch features."""
-
-        pixel_values = self._pixel_values(frames)
+    def _encode_pixel_values_flat(
+        self,
+        pixel_values: torch.Tensor,
+    ) -> torch.Tensor:
         output_chunks = []
+        pixel_values = pixel_values.to(device=self.device, dtype=self.dtype)
         for start in range(0, pixel_values.shape[0], self.frame_microbatch_size):
             outputs = self.model(
                 pixel_values[start : start + self.frame_microbatch_size],
@@ -157,8 +200,31 @@ class FrozenSiglip2Teacher:
                 raise ValueError("SigLIP2 teacher returned nonfinite patch features")
             output_chunks.append(tokens)
         if not output_chunks:
-            raise ValueError("frames must contain at least one image")
+            raise ValueError("pixel_values must contain at least one image")
         return torch.cat(output_chunks, dim=0).detach()
+
+    @torch.no_grad()
+    def _encode_frames(self, frames: torch.Tensor) -> torch.Tensor:
+        """Encode [N,3,H,W] RGB into [N,256,1024] detached patch features."""
+
+        return self._encode_pixel_values_flat(self._pixel_values(frames))
+
+    @torch.no_grad()
+    def encode_pixel_values(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Encode preprocessed ``[B,C,4,3,H,W]`` future pixels."""
+
+        if (
+            not isinstance(pixel_values, torch.Tensor)
+            or pixel_values.ndim != 6
+            or pixel_values.shape[1] <= 0
+            or pixel_values.shape[2:4] != (4, 3)
+            or not pixel_values.dtype.is_floating_point
+        ):
+            raise ValueError("future pixel_values must be floating [B,C,4,3,H,W]")
+        batch_size, camera_count = pixel_values.shape[:2]
+        return self._encode_pixel_values_flat(
+            pixel_values.reshape(-1, *pixel_values.shape[-3:])
+        ).reshape(batch_size, camera_count, 4, 256, 1024)
 
     @torch.no_grad()
     def encode_current(self, images: torch.Tensor) -> torch.Tensor:
@@ -174,15 +240,10 @@ class FrozenSiglip2Teacher:
     @torch.no_grad()
     def encode_future(self, images: torch.Tensor) -> torch.Tensor:
         """Encode ``[B,C,4,3,H,W]`` RGB into detached future patch features."""
-
-        if (
-            not isinstance(images, torch.Tensor)
-            or images.ndim != 6
-            or images.shape[1] <= 0
-            or images.shape[2:4] != (4, 3)
-        ):
-            raise ValueError("future images must be [B,C,4,3,H,W]")
-        batch_size, camera_count = images.shape[:2]
-        return self._encode_frames(images.reshape(-1, *images.shape[-3:])).reshape(
-            batch_size, camera_count, 4, 256, 1024
+        return self.encode_pixel_values(
+            preprocess_siglip2_future(
+                self.processor,
+                images,
+                dtype=self.dtype,
+            )
         )

@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from qwen35_baton.teacher import FrozenSiglip2Teacher
+from qwen35_baton.teacher import FrozenSiglip2Teacher, preprocess_siglip2_future
 
 
 ARTIFACT = Path(__file__).resolve().parents[1] / "third_party/siglip2-large-patch16-256"
@@ -73,6 +73,26 @@ def test_teacher_accepts_one_camera_future_rgb() -> None:
         torch.zeros((2, 1, 4, 3, 256, 256), dtype=torch.uint8)
     )
     assert features.shape == (2, 1, 4, 256, 1024)
+
+
+def test_preprocessed_future_matches_direct_teacher_path() -> None:
+    teacher, _ = make_teacher()
+    images = torch.randint(
+        256,
+        (2, 1, 4, 3, 256, 256),
+        dtype=torch.uint8,
+    )
+
+    pixel_values = preprocess_siglip2_future(
+        teacher.processor,
+        images,
+        dtype=teacher.dtype,
+    )
+    direct = teacher.encode_future(images)
+    prepared = teacher.encode_pixel_values(pixel_values)
+
+    assert pixel_values.shape == (2, 1, 4, 3, 256, 256)
+    torch.testing.assert_close(prepared, direct, rtol=0, atol=0)
 
 
 def test_teacher_targets_are_detached() -> None:

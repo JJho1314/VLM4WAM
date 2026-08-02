@@ -29,6 +29,7 @@ from qwen35_baton.checkpoint import (
     save_baton_checkpoint,
 )
 from qwen35_baton.config import BatonCheckpointMetadata
+from qwen35_baton.device_prefetch import enable_device_prefetch
 from qwen35_baton.hashing import sha256_artifact, sha256_file, sha256_json
 from qwen35_baton.losses import BatonPlannerLoss, compute_baton_planner_loss
 from qwen35_baton.model import BatonQwen35Planner
@@ -512,7 +513,12 @@ def build_stage1_dataloader(
     generator = torch.Generator()
     generator.manual_seed(config.seed)
     worker_options = (
-        {"multiprocessing_context": "spawn"} if config.num_workers > 0 else {}
+        {
+            "multiprocessing_context": "spawn",
+            "prefetch_factor": 4,
+        }
+        if config.num_workers > 0
+        else {}
     )
     return torch.utils.data.DataLoader(
         dataset,
@@ -522,6 +528,7 @@ def build_stage1_dataloader(
         num_workers=config.num_workers,
         drop_last=True,
         generator=generator,
+        pin_memory=True,
         persistent_workers=config.num_workers > 0 and config.persistent_workers,
         **worker_options,
     )
@@ -641,6 +648,9 @@ def load_local_artifacts(
         collate_fn=BatonPlannerCollator(
             processor,
             camera_names=camera_names,
+            siglip_processor=components["siglip_processor"],
+            siglip_dtype=torch.bfloat16,
+            batch_qwen_rows=True,
         ),
         config=config,
     )
@@ -1224,7 +1234,11 @@ def run_training(
     )
     train_batches = artifacts.train_batches
     if isinstance(train_batches, torch.utils.data.DataLoader):
-        train_batches = accelerator.prepare_data_loader(train_batches)
+        train_batches = accelerator.prepare_data_loader(
+            train_batches,
+            device_placement=False,
+        )
+    train_batches = enable_device_prefetch(train_batches, accelerator.device)
     microbatches_per_epoch = len(train_batches)  # type: ignore[arg-type]
     if microbatches_per_epoch <= 0:
         raise ValueError("Stage-1 training requires a nonempty loader")
@@ -1357,7 +1371,11 @@ def run_training(
             if cursor.global_step >= target_step:
                 break
             data_ready = time.perf_counter()
-            batch = _move_batch(raw_batch, accelerator.device)
+            batch = (
+                raw_batch
+                if accelerator.device.type == "cuda"
+                else _move_batch(raw_batch, accelerator.device)
+            )
             data_time = data_ready - last_batch_end
             if window_microbatches == 0:
                 window_started = last_batch_end
@@ -1375,9 +1393,17 @@ def run_training(
                 stop_timing("planner")
                 start_timing("teacher")
                 with torch.no_grad():
-                    future_teacher = artifacts.teacher.encode_future(
-                        batch.future_images
+                    future_pixel_values = getattr(
+                        batch, "future_pixel_values", None
                     )
+                    if future_pixel_values is None:
+                        future_teacher = artifacts.teacher.encode_future(
+                            batch.future_images
+                        )
+                    else:
+                        future_teacher = artifacts.teacher.encode_pixel_values(
+                            future_pixel_values
+                        )
                 stop_timing("teacher")
                 # Keep strict standalone loss validation while doing all Stage-1
                 # regression math in stable fp32 across bf16 model boundaries.
