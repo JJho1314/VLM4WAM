@@ -52,7 +52,7 @@ _METRICS_SCHEMA_VERSION = 1
 _METRICS_RECORD_KEYS = frozenset(
     {"schema_version", "step", "metrics", "checksum"}
 )
-_DURABLE_METRIC_BASE_NAMES = frozenset(
+_LEGACY_DURABLE_METRIC_BASE_NAMES = frozenset(
     {
         "loss/total",
         "loss/mse",
@@ -65,13 +65,25 @@ _DURABLE_METRIC_BASE_NAMES = frozenset(
         "microbatches",
     }
 )
+_DURABLE_METRIC_BASE_NAMES = _LEGACY_DURABLE_METRIC_BASE_NAMES.union(
+    {
+        "step_time",
+        "max_memory_allocated_gib",
+        "max_memory_reserved_gib",
+        "device_total_memory_gib",
+    }
+)
 _DURABLE_METRIC_NAME_SETS = frozenset(
-    _DURABLE_METRIC_BASE_NAMES.union(
+    base_names.union(
         {
             f"mse/{camera}/frame_{frame}"
             for camera in camera_names
             for frame in range(4)
         }
+    )
+    for base_names in (
+        _LEGACY_DURABLE_METRIC_BASE_NAMES,
+        _DURABLE_METRIC_BASE_NAMES,
     )
     for camera_names in (("main", "wrist"), ("head",))
 )
@@ -1286,6 +1298,8 @@ def run_training(
         teacher_model.to(accelerator.device)
         teacher_model.requires_grad_(False)
         teacher_model.eval()
+    if accelerator.device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(accelerator.device)
     target_step = config.max_steps if stop_at_step is None else stop_at_step
     if (
         type(target_step) is not int
@@ -1512,16 +1526,52 @@ def run_training(
                     accelerator,
                     divisor=window_microbatches,
                 )
-                gathered_elapsed = accelerator.gather(
-                    torch.tensor(
-                        [elapsed],
+                if accelerator.device.type == "cuda":
+                    gibibyte = float(1024**3)
+                    local_profile = torch.tensor(
+                        [
+                            elapsed,
+                            torch.cuda.max_memory_allocated(accelerator.device)
+                            / gibibyte,
+                            torch.cuda.max_memory_reserved(accelerator.device)
+                            / gibibyte,
+                            torch.cuda.get_device_properties(
+                                accelerator.device
+                            ).total_memory
+                            / gibibyte,
+                        ],
                         dtype=torch.float64,
                         device=accelerator.device,
                     )
-                )
-                reduced_elapsed = float(
-                    gathered_elapsed.detach().max().cpu()
-                )
+                    gathered_profile = accelerator.gather(local_profile).reshape(
+                        -1, 4
+                    )
+                    reduced_elapsed = float(
+                        gathered_profile[:, 0].detach().max().cpu()
+                    )
+                    memory_allocated = float(
+                        gathered_profile[:, 1].detach().max().cpu()
+                    )
+                    memory_reserved = float(
+                        gathered_profile[:, 2].detach().max().cpu()
+                    )
+                    total_memory = float(
+                        gathered_profile[:, 3].detach().min().cpu()
+                    )
+                else:
+                    gathered_elapsed = accelerator.gather(
+                        torch.tensor(
+                            [elapsed],
+                            dtype=torch.float64,
+                            device=accelerator.device,
+                        )
+                    )
+                    reduced_elapsed = float(
+                        gathered_elapsed.detach().max().cpu()
+                    )
+                    memory_allocated = 0.0
+                    memory_reserved = 0.0
+                    total_memory = 0.0
                 reduced_microbatches = float(
                     accelerator.reduce(
                         torch.tensor(
@@ -1543,6 +1593,10 @@ def run_training(
                             / max(reduced_elapsed, 1e-12)
                         ),
                         "microbatches": reduced_microbatches,
+                        "step_time": reduced_elapsed,
+                        "max_memory_allocated_gib": memory_allocated,
+                        "max_memory_reserved_gib": memory_reserved,
+                        "device_total_memory_gib": total_memory,
                     }
                 )
                 if cursor.global_step % config.log_every == 0:

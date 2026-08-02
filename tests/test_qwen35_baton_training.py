@@ -463,12 +463,38 @@ def test_worldarena_durable_metrics_accept_only_the_head_camera_contract() -> No
         "backward_time": 0.1,
         "throughput": 1.0,
         "microbatches": 8.0,
+        "step_time": 1.0,
+        "max_memory_allocated_gib": 0.0,
+        "max_memory_reserved_gib": 0.0,
+        "device_total_memory_gib": 0.0,
         **{f"mse/head/frame_{frame}": 1.0 for frame in range(4)},
     }
 
     record = training_module._durable_metrics_record(step=20, metrics=metrics)
 
     assert record["metrics"] == metrics
+
+
+def test_legacy_metrics_remain_valid_when_resuming_after_telemetry_upgrade() -> None:
+    import qwen35_baton.cli.train_semantic_planner as training_module
+    from qwen35_baton.hashing import sha256_json
+
+    metrics = {
+        "loss/total": 1.0,
+        "loss/mse": 1.0,
+        "data_time": 0.1,
+        "qwen_time": 0.1,
+        "teacher_time": 0.1,
+        "query_tower_time": 0.1,
+        "backward_time": 0.1,
+        "throughput": 1.0,
+        "microbatches": 8.0,
+        **{f"mse/head/frame_{frame}": 1.0 for frame in range(4)},
+    }
+    unsigned = {"schema_version": 1, "step": 20, "metrics": metrics}
+    record = {**unsigned, "checksum": sha256_json(unsigned)}
+
+    assert training_module._validated_durable_metrics_record(record) == record
 
 
 def test_stage1_trains_the_entire_va_planner() -> None:
@@ -549,6 +575,10 @@ def test_one_tiny_stage1_step_updates_only_owned_parameters(tmp_path: Path) -> N
         "teacher_time",
         "query_tower_time",
         "backward_time",
+        "step_time",
+        "max_memory_allocated_gib",
+        "max_memory_reserved_gib",
+        "device_total_memory_gib",
         "mse/main/frame_0",
         "mse/wrist/frame_0",
     }.issubset(result.last_metrics)
