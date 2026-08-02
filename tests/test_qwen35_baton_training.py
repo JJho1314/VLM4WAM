@@ -583,6 +583,16 @@ def test_stage1_accepts_positive_gradient_accumulation(tmp_path: Path) -> None:
     assert accumulated.gradient_accumulation_steps == 4
 
 
+def test_runtime_input_validation_requires_boolean(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="runtime_input_validation must be boolean"):
+        Stage1TrainingConfig(
+            **{
+                **_config(tmp_path).to_dict(),
+                "runtime_input_validation": 0,
+            }
+        )
+
+
 def test_zero2_runtime_config_is_explicit() -> None:
     config = json.loads(
         (REPO_ROOT / "qwen35_baton/configs/deepspeed_zero2.json").read_text()

@@ -22,6 +22,7 @@
   "gradient_clip_norm": 1.0,
   "mixed_precision": "bf16",
   "gradient_checkpointing": false,
+  "runtime_input_validation": false,
   "deepspeed_config_path": "qwen35_baton/configs/deepspeed_zero2.json",
   "num_workers": 8,
   "persistent_workers": true,

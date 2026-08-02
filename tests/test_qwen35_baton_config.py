@@ -42,6 +42,7 @@ def test_worldarena_stage1_recipe_preserves_model_provenance_and_global_batch() 
     assert worldarena["num_workers"] == 8
     assert worldarena["persistent_workers"] is True
     assert worldarena["worker_restart_interval_epochs"] == 100
+    assert worldarena["runtime_input_validation"] is False
     for field in (
         "qwen_model_path",
         "qwen_processor_path",

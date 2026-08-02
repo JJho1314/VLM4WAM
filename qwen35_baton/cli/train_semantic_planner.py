@@ -31,6 +31,7 @@ from qwen35_baton.checkpoint import (
 from qwen35_baton.config import BatonCheckpointMetadata
 from qwen35_baton.hashing import sha256_artifact, sha256_file, sha256_json
 from qwen35_baton.losses import BatonPlannerLoss, compute_baton_planner_loss
+from qwen35_baton.model import BatonQwen35Planner
 from qwen35_baton.ownership import (
     Stage1Ownership,
     configure_stage1_trainable_modules,
@@ -103,6 +104,7 @@ class Stage1TrainingConfig:
     gradient_clip_norm: float = 1.0
     mixed_precision: str = "bf16"
     gradient_checkpointing: bool = False
+    runtime_input_validation: bool = False
     deepspeed_config_path: str = "qwen35_baton/configs/deepspeed_zero2.json"
     num_workers: int = 4
     persistent_workers: bool = True
@@ -166,6 +168,8 @@ class Stage1TrainingConfig:
             )
         if type(self.gradient_checkpointing) is not bool:
             raise ValueError("gradient_checkpointing must be boolean")
+        if type(self.runtime_input_validation) is not bool:
+            raise ValueError("runtime_input_validation must be boolean")
         if not isinstance(self.dataset_type, str) or self.dataset_type not in {
             "libero_hdf5",
             "worldarena_hdf5",
@@ -1359,7 +1363,15 @@ def run_training(
                 window_started = last_batch_end
             with accelerator.accumulate(planner):
                 start_timing("planner")
-                planner_output = planner(batch)
+                unwrapped_planner = accelerator.unwrap_model(planner)
+                planner_output = (
+                    planner(
+                        batch,
+                        validate_input_contents=config.runtime_input_validation,
+                    )
+                    if isinstance(unwrapped_planner, BatonQwen35Planner)
+                    else planner(batch)
+                )
                 stop_timing("planner")
                 start_timing("teacher")
                 with torch.no_grad():

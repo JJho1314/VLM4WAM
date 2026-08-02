@@ -189,6 +189,16 @@ def test_model_reshapes_one_head_row_per_sample() -> None:
     assert output.positive.shape == (2, 1, 4, 256, 1024)
 
 
+def test_fast_row_validation_matches_strict_forward() -> None:
+    planner, _ = make_planner()
+    batch = make_batch(batch_size=1, camera_names=("head",))
+
+    strict = planner(batch, validate_input_contents=True).positive
+    fast = planner(batch, validate_input_contents=False).positive
+
+    torch.testing.assert_close(fast, strict, rtol=0, atol=0)
+
+
 def test_model_calls_multimodal_base_without_lm_logits_or_cache() -> None:
     planner, qwen = make_planner()
     batch = make_batch(batch_size=1)

@@ -188,7 +188,11 @@ class BatonQwen35Planner(nn.Module):
         self,
         qwen_inputs: Mapping[str, torch.Tensor],
         plan_positions: torch.Tensor,
+        *,
+        validate_input_contents: bool,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        if type(validate_input_contents) is not bool:
+            raise TypeError("validate_input_contents must be boolean")
         if not isinstance(qwen_inputs, Mapping):
             raise TypeError("qwen_inputs must be a tensor mapping")
         input_ids = qwen_inputs.get("input_ids")
@@ -213,26 +217,32 @@ class BatonQwen35Planner(nn.Module):
         ):
             raise TypeError("plan_positions must contain integer sequence indices")
         positions = plan_positions.to(device=input_ids.device, dtype=torch.long)
-        if bool(((positions < 0) | (positions >= sequence_length)).any()):
-            raise ValueError("plan_positions contain an out-of-range sequence index")
-        plan_pad_id = self.plan_token_adapter.plan_pad_token_id
-        pad_mask = input_ids.eq(plan_pad_id)
-        if bool(pad_mask.sum(dim=1).ne(_PLAN_TOKENS).any()):
-            raise ValueError(
-                "each Qwen row must contain exactly 1024 <PLAN_PAD> tokens"
+        if validate_input_contents:
+            if bool(((positions < 0) | (positions >= sequence_length)).any()):
+                raise ValueError(
+                    "plan_positions contain an out-of-range sequence index"
+                )
+            plan_pad_id = self.plan_token_adapter.plan_pad_token_id
+            pad_mask = input_ids.eq(plan_pad_id)
+            if bool(pad_mask.sum(dim=1).ne(_PLAN_TOKENS).any()):
+                raise ValueError(
+                    "each Qwen row must contain exactly 1024 <PLAN_PAD> tokens"
+                )
+            gathered_ids = torch.gather(input_ids, 1, positions)
+            if not bool(gathered_ids.eq(plan_pad_id).all()):
+                raise ValueError(
+                    "plan_positions must point only to <PLAN_PAD> tokens"
+                )
+            expected_positions = torch.stack(
+                tuple(
+                    torch.nonzero(row, as_tuple=False).flatten()
+                    for row in pad_mask
+                )
             )
-        gathered_ids = torch.gather(input_ids, 1, positions)
-        if not bool(gathered_ids.eq(plan_pad_id).all()):
-            raise ValueError("plan_positions must point only to <PLAN_PAD> tokens")
-        expected_positions = torch.stack(
-            tuple(
-                torch.nonzero(row, as_tuple=False).flatten() for row in pad_mask
-            )
-        )
-        if not torch.equal(positions, expected_positions):
-            raise ValueError(
-                "plan_positions must match all <PLAN_PAD> positions in sequence order"
-            )
+            if not torch.equal(positions, expected_positions):
+                raise ValueError(
+                    "plan_positions must match all <PLAN_PAD> positions in sequence order"
+                )
 
         forwarded: dict[str, torch.Tensor] = {}
         for name, value in qwen_inputs.items():
@@ -247,12 +257,14 @@ class BatonQwen35Planner(nn.Module):
         plan_positions: torch.Tensor,
         *,
         return_attention_maps: bool = False,
+        validate_input_contents: bool = True,
     ) -> BatonPlannerOutput:
         """Run one causal Qwen pass and predict one continuous grid per row."""
 
         forwarded, positions = self._validate_rows(
             qwen_inputs,
             plan_positions,
+            validate_input_contents=validate_input_contents,
         )
         forwarded["use_cache"] = False
         forwarded["output_hidden_states"] = False
@@ -310,6 +322,7 @@ class BatonQwen35Planner(nn.Module):
         batch: BatonPlannerBatch,
         *,
         return_attention_maps: bool = False,
+        validate_input_contents: bool = True,
     ) -> BatonPlannerOutput:
         if not isinstance(batch, BatonPlannerBatch):
             raise TypeError("batch must be BatonPlannerBatch")
@@ -332,6 +345,7 @@ class BatonQwen35Planner(nn.Module):
             batch.qwen_inputs,
             batch.plan_positions,
             return_attention_maps=return_attention_maps,
+            validate_input_contents=validate_input_contents,
         )
         return BatonPlannerOutput(
             flat=row_output.flat,
