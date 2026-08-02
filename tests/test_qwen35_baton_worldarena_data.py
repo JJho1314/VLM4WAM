@@ -36,7 +36,7 @@ def _write_video(path: Path, *, frame_count: int = 121) -> None:
     assert writer.isOpened()
     try:
         for index in range(frame_count):
-            y, x = np.indices((32, 48), dtype=np.uint8)
+            y, x = np.indices((32, 48), dtype=np.uint16)
             frame = np.stack(
                 (
                     np.full_like(x, index % 251),
@@ -44,7 +44,7 @@ def _write_video(path: Path, *, frame_count: int = 121) -> None:
                     (y + index * 7) % 251,
                 ),
                 axis=-1,
-            )
+            ).astype(np.uint8)
             writer.write(frame)
     finally:
         writer.release()
