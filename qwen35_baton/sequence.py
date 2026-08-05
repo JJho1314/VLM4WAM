@@ -128,6 +128,27 @@ def build_baton_conversation(
     ]
 
 
+def input_template_contract(template_kind: str) -> object:
+    """Return the canonical hash payload for a versioned input template."""
+
+    if template_kind == LEGACY_TEMPLATE_KIND:
+        return build_plan_text("{instruction}")
+    if template_kind == BATON_TEMPLATE_KIND:
+        return {
+            "kind": BATON_TEMPLATE_KIND,
+            "system": BATON_SYSTEM_TEXT,
+            "user": (
+                "Predict four future semantic keyframes for this observation.\n"
+                "Instruction: {instruction}\n"
+                "Current frame: {current}/120, normalized time {normalized_time:.6f}.\n"
+                "Target frames: {f0}/120, {f1}/120, {f2}/120, {f3}/120."
+            ),
+            "assistant": build_plan_scaffold(),
+            "add_generation_prompt": False,
+        }
+    raise ValueError(f"unsupported input template kind: {template_kind!r}")
+
+
 def find_plan_positions(
     input_ids: torch.Tensor, plan_pad_token_id: int
 ) -> torch.Tensor:

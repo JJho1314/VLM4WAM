@@ -2099,18 +2099,39 @@ def test_worldarena_artifacts_use_one_head_camera(
     class _Processor:
         tokenizer: Any = None
 
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            tokenize: bool,
+            add_generation_prompt: bool,
+        ) -> str:
+            assert tokenize is False
+            assert add_generation_prompt is False
+            return str(messages[2]["content"])
+
         def __call__(self, **_: Any) -> dict[str, torch.Tensor]:
-            identifiers = torch.full((1, 1024), token_ids[PLAN_PAD], dtype=torch.long)
+            identifiers = torch.full(
+                (1, 1024), token_ids[PLAN_PAD], dtype=torch.long
+            )
             return {
                 "input_ids": identifiers,
                 "attention_mask": torch.ones_like(identifiers),
             }
 
     class _WorldArenaDataset(torch.utils.data.Dataset[dict[str, Any]]):
-        def __init__(self, manifest_path: str, *, seed: int, split: str) -> None:
+        def __init__(
+            self,
+            manifest_path: str,
+            *,
+            seed: int,
+            split: str,
+            sampling_kind: str,
+        ) -> None:
             assert manifest_path == "unused"
             assert seed == 17
             assert split == "train"
+            assert sampling_kind == "all_windows_v1"
 
         def __len__(self) -> int:
             return 1
@@ -2119,8 +2140,11 @@ def test_worldarena_artifacts_use_one_head_camera(
             assert index == 0
             return {
                 "current_images": torch.zeros((1, 3, 256, 256), dtype=torch.uint8),
-                "future_images": torch.zeros((1, 4, 3, 256, 256), dtype=torch.uint8),
+                "future_images": torch.zeros(
+                    (1, 4, 3, 256, 256), dtype=torch.uint8
+                ),
                 "instruction": "pick up the green bottle",
+                "source_indices": (0, 30, 60, 90, 120),
                 "suite": "worldarena",
             }
 
@@ -2169,6 +2193,8 @@ def test_worldarena_artifacts_use_one_head_camera(
     assert batch.future_images is None
     assert batch.future_pixel_values.shape[1:3] == (1, 4)
     assert artifacts.metadata.camera_names == ("head",)
+    assert artifacts.metadata.input_template_kind == "baton_assistant_time_v2"
+    assert artifacts.metadata.worldarena_sampling_kind == "all_windows_v1"
 
 
 def test_stage1_recipe_requirements_and_launchers_are_fixed(tmp_path: Path) -> None:

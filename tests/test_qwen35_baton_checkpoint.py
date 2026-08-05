@@ -328,6 +328,9 @@ def _rewrite_checkpoint_metadata_as_v3(
     metadata["format_version"] = 3
     metadata["future_indices"] = [0, 3, 5, 8]
     del metadata["temporal_policy"]
+    del metadata["input_template_kind"]
+    del metadata["worldarena_sampling_kind"]
+    del metadata["instruction_rendering_kind"]
     (checkpoint / "metadata.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n"
     )
@@ -1257,7 +1260,7 @@ def test_loader_rejects_wrong_external_topology_before_mutation(
     _assert_state_equal(planner.state_dict(), before)
 
 
-def test_legacy_libero_v3_checkpoint_resumes_against_v4_contract(
+def test_legacy_libero_v3_checkpoint_resumes_against_v5_legacy_contract(
     tmp_path: Path,
 ) -> None:
     checkpoint = tmp_path / "step_000001"
@@ -1265,15 +1268,21 @@ def test_legacy_libero_v3_checkpoint_resumes_against_v4_contract(
     _rewrite_checkpoint_metadata_as_v3(checkpoint)
     planner, optimizer, scheduler = _runtime(seed=99)
 
+    expected = replace(
+        BatonCheckpointMetadata.example(),
+        input_template_kind="legacy_user_plan_v1",
+        worldarena_sampling_kind="episode_random_v1",
+        instruction_rendering_kind="verbatim_v1",
+    )
     resumed = load_baton_checkpoint(
         checkpoint,
         planner=planner,
         optimizer=optimizer,
         scheduler=scheduler,
-        expected_contract=BatonCheckpointMetadata.example(),
+        expected_contract=expected,
     )
 
-    assert resumed.metadata.format_version == 4
+    assert resumed.metadata.format_version == 5
     assert resumed.metadata.camera_names == ("main", "wrist")
 
 
@@ -1326,7 +1335,10 @@ def test_head_v3_migration_is_atomic_idempotent_and_preserves_all_state(
     assert result.migrated is True
     metadata = json.loads((checkpoint / "metadata.json").read_text())
     manifest = json.loads((checkpoint / "manifest.json").read_text())
-    assert metadata["format_version"] == 4
+    assert metadata["format_version"] == 5
+    assert metadata["input_template_kind"] == "legacy_user_plan_v1"
+    assert metadata["worldarena_sampling_kind"] == "episode_random_v1"
+    assert metadata["instruction_rendering_kind"] == "verbatim_v1"
     assert metadata["camera_names"] == ["head"]
     assert "future_indices" not in metadata
     assert metadata["temporal_policy"]["kind"] == ("normalized_remaining_horizon")
@@ -1351,7 +1363,12 @@ def test_head_v3_migration_is_atomic_idempotent_and_preserves_all_state(
         planner=planner,
         optimizer=optimizer,
         scheduler=scheduler,
-        expected_contract=BatonCheckpointMetadata.example(camera_names=("head",)),
+        expected_contract=replace(
+            BatonCheckpointMetadata.example(camera_names=("head",)),
+            input_template_kind="legacy_user_plan_v1",
+            worldarena_sampling_kind="episode_random_v1",
+            instruction_rendering_kind="verbatim_v1",
+        ),
     )
     assert resumed.metadata.camera_names == ("head",)
 
@@ -1631,7 +1648,7 @@ def test_loader_rejects_format_v1_checkpoint_before_mutation(
     planner, optimizer, scheduler = _runtime(seed=99)
     before = _clone_state(planner)
 
-    with pytest.raises(ValueError, match="versions 1 and 2.*version 4"):
+    with pytest.raises(ValueError, match="versions 1 and 2.*version 5"):
         load_baton_checkpoint(
             checkpoint,
             planner=planner,

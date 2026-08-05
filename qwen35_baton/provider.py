@@ -22,7 +22,15 @@ from qwen35_baton.config import (
 from qwen35_baton.data import BatonPlannerCollator
 from qwen35_baton.hashing import sha256_artifact, sha256_file, sha256_json
 from qwen35_baton.model import BatonPlannerOutput, BatonQwen35Planner
-from qwen35_baton.sequence import ADDED_TOKENS, build_plan_text, find_plan_positions
+from qwen35_baton.sequence import (
+    ADDED_TOKENS,
+    BATON_TEMPLATE_KIND,
+    LEGACY_TEMPLATE_KIND,
+    VERBATIM_INSTRUCTION_KIND,
+    find_plan_positions,
+    input_template_contract,
+    render_instruction,
+)
 
 
 _CHECKPOINT_FILES = (
@@ -420,7 +428,7 @@ def _validate_local_artifact_contract(
         ),
         (
             "input template",
-            sha256_json(build_plan_text("{instruction}")),
+            sha256_json(input_template_contract(metadata.input_template_kind)),
             metadata.input_template_hash,
         ),
     )
@@ -564,6 +572,9 @@ class FrozenBatonPlanner(nn.Module):
         added_token_ids: tuple[int, ...],
         camera_names: tuple[str, ...] = ("main", "wrist"),
         temporal_policy: BatonTemporalPolicy | None = None,
+        input_template_kind: str = LEGACY_TEMPLATE_KIND,
+        worldarena_sampling_kind: str = "episode_random_v1",
+        instruction_rendering_kind: str = VERBATIM_INSTRUCTION_KIND,
     ) -> None:
         super().__init__()
         if not isinstance(planner, nn.Module):
@@ -594,11 +605,33 @@ class FrozenBatonPlanner(nn.Module):
             else temporal_policy
         )
         _validate_camera_temporal_contract(camera_names, policy)
+        if input_template_kind == LEGACY_TEMPLATE_KIND:
+            expected_behavior = ("episode_random_v1", "verbatim_v1")
+        elif input_template_kind == BATON_TEMPLATE_KIND and camera_names == ("head",):
+            expected_behavior = (
+                "all_windows_v1",
+                "strip_worldarena_boilerplate_v1",
+            )
+        elif input_template_kind == BATON_TEMPLATE_KIND:
+            expected_behavior = ("episode_random_v1", "verbatim_v1")
+        else:
+            raise ValueError(f"unsupported input template kind: {input_template_kind!r}")
+        if (
+            worldarena_sampling_kind,
+            instruction_rendering_kind,
+        ) != expected_behavior:
+            raise ValueError(
+                "provider template, sampling, and instruction rendering contracts "
+                "are inconsistent"
+            )
         self.planner = planner
         self.processor = processor
         self.added_token_ids = added_token_ids
         self.camera_names = camera_names
         self.temporal_policy = policy
+        self.input_template_kind = input_template_kind
+        self.worldarena_sampling_kind = worldarena_sampling_kind
+        self.instruction_rendering_kind = instruction_rendering_kind
         self.geometry = BatonGeometry()
         self._freeze_for_inference()
 
@@ -679,6 +712,9 @@ class FrozenBatonPlanner(nn.Module):
             added_token_ids=metadata.added_token_ids,
             camera_names=metadata.camera_names,
             temporal_policy=metadata.temporal_policy,
+            input_template_kind=metadata.input_template_kind,
+            worldarena_sampling_kind=metadata.worldarena_sampling_kind,
+            instruction_rendering_kind=metadata.instruction_rendering_kind,
         )
 
     def _freeze_for_inference(self) -> None:
@@ -751,20 +787,31 @@ class FrozenBatonPlanner(nn.Module):
         self,
         current_images: torch.Tensor,
         instructions: tuple[str, ...],
+        source_indices: tuple[
+            tuple[int, int, int, int, int] | None,
+            ...,
+        ],
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         collator = BatonPlannerCollator(
             self.processor,
             camera_names=self.camera_names,
             plan_pad_token_id=self.added_token_ids[5],
+            input_template_kind=self.input_template_kind,
+            instruction_rendering_kind=self.instruction_rendering_kind,
         )
         sequences: list[torch.Tensor] = []
         processed_rows: list[Mapping[str, torch.Tensor]] = []
         cpu_images = current_images.detach().to(device="cpu")
         for sample_index, instruction in enumerate(instructions):
+            rendered_instruction = render_instruction(
+                instruction,
+                self.instruction_rendering_kind,
+            )
             for camera_index, _ in enumerate(self.camera_names):
                 sequence, processed = collator._process_row(
                     cpu_images[sample_index, camera_index],
-                    instruction,
+                    rendered_instruction,
+                    source_indices[sample_index],
                 )
                 sequences.append(sequence)
                 processed_rows.append(processed)
@@ -856,6 +903,7 @@ class FrozenBatonPlanner(nn.Module):
         instructions: Sequence[str],
         *,
         return_attention: bool = False,
+        current_canonical_indices: Sequence[int] | None = None,
     ) -> BatonSemanticPlan:
         """Predict full grids, optionally tracing Baton cross-attention."""
 
@@ -865,10 +913,45 @@ class FrozenBatonPlanner(nn.Module):
             current_images,
             instructions,
         )
+        if self.input_template_kind == LEGACY_TEMPLATE_KIND:
+            if current_canonical_indices is not None:
+                raise ValueError(
+                    "legacy_user_plan_v1 does not accept current_canonical_indices"
+                )
+            source_indices: tuple[
+                tuple[int, int, int, int, int] | None,
+                ...,
+            ] = (None,) * batch_size
+        elif self.camera_names == ("main", "wrist"):
+            if current_canonical_indices is not None:
+                raise ValueError(
+                    "fixed LIBERO Baton inputs do not accept current_canonical_indices"
+                )
+            source_indices = ((3, 4, 7, 9, 12),) * batch_size
+        else:
+            if (
+                isinstance(current_canonical_indices, (str, bytes))
+                or not isinstance(current_canonical_indices, Sequence)
+                or len(current_canonical_indices) != batch_size
+                or any(type(value) is not int for value in current_canonical_indices)
+            ):
+                raise ValueError(
+                    "current_canonical_indices must contain one integer per image"
+                )
+            source_indices = tuple(
+                (
+                    current,
+                    *self.temporal_policy.resolve_future_indices(
+                        current_index=current
+                    ),
+                )
+                for current in current_canonical_indices
+            )
         self._freeze_for_inference()
         qwen_inputs, plan_positions = self._build_rows(
             current_images,
             positive,
+            source_indices,
         )
         camera_count = len(self.camera_names)
         rows = batch_size * camera_count

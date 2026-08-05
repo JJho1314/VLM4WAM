@@ -38,7 +38,13 @@ from qwen35_baton.ownership import (
     Stage1Ownership,
     configure_stage1_trainable_modules,
 )
-from qwen35_baton.sequence import ADDED_TOKENS, build_plan_text
+from qwen35_baton.sequence import (
+    ADDED_TOKENS,
+    BATON_TEMPLATE_KIND,
+    STRIP_WORLD_ARENA_INSTRUCTION_KIND,
+    VERBATIM_INSTRUCTION_KIND,
+    input_template_contract,
+)
 from qwen35_baton.training_telemetry import CudaEventTimer, Stage1MetricAccumulator
 from qwen35_baton.worker_lifecycle import (
     append_worker_lifecycle_event,
@@ -691,15 +697,23 @@ def load_local_artifacts(
         )
         dataset = BatonLiberoDataset(base_dataset, seed=config.seed)
         camera_names = ("main", "wrist")
+        sampling_kind = "episode_random_v1"
+        instruction_rendering_kind = VERBATIM_INSTRUCTION_KIND
     elif config.dataset_type == "worldarena_hdf5":
-        from qwen35_baton.worldarena_data import WorldArenaHDF5Dataset
+        from qwen35_baton.worldarena_data import (
+            ALL_WINDOWS_SAMPLING_KIND,
+            WorldArenaHDF5Dataset,
+        )
 
         dataset = WorldArenaHDF5Dataset(
             config.hdf5_manifest_path,
             seed=config.seed,
             split="train",
+            sampling_kind=ALL_WINDOWS_SAMPLING_KIND,
         )
         camera_names = ("head",)
+        sampling_kind = ALL_WINDOWS_SAMPLING_KIND
+        instruction_rendering_kind = STRIP_WORLD_ARENA_INSTRUCTION_KIND
     else:
         raise AssertionError("validated dataset_type is unreachable")
     train_batches = build_stage1_dataloader(
@@ -710,6 +724,8 @@ def load_local_artifacts(
             siglip_processor=components["siglip_processor"],
             siglip_dtype=torch.bfloat16,
             batch_qwen_rows=True,
+            input_template_kind=BATON_TEMPLATE_KIND,
+            instruction_rendering_kind=instruction_rendering_kind,
         ),
         config=config,
     )
@@ -727,7 +743,12 @@ def load_local_artifacts(
         qwen_config_hash=sha256_file(Path(config.qwen_model_path) / "config.json"),
         tokenizer_hash=_artifact_hash(Path(config.qwen_tokenizer_path)),
         processor_hash=_artifact_hash(Path(config.qwen_processor_path)),
-        input_template_hash=sha256_json(build_plan_text("{instruction}")),
+        input_template_hash=sha256_json(
+            input_template_contract(BATON_TEMPLATE_KIND)
+        ),
+        input_template_kind=BATON_TEMPLATE_KIND,
+        worldarena_sampling_kind=sampling_kind,
+        instruction_rendering_kind=instruction_rendering_kind,
         added_token_ids=token_ids,
         siglip2_config_hash=config.siglip2_config_hash,
         siglip2_artifact_hash=config.siglip2_artifact_hash,

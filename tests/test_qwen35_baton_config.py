@@ -80,8 +80,11 @@ def test_continuous_metadata_round_trips_the_complete_contract() -> None:
         "qwen_backbone",
         "qwen_config_hash",
         "tokenizer_hash",
-        "processor_hash",
-        "input_template_hash",
+            "processor_hash",
+            "input_template_hash",
+            "input_template_kind",
+            "worldarena_sampling_kind",
+            "instruction_rendering_kind",
         "added_tokens",
         "added_token_ids",
         "camera_names",
@@ -118,7 +121,10 @@ def test_continuous_metadata_round_trips_the_complete_contract() -> None:
     assert payload["qwen_backbone"] == "dense Qwen3.5-2B"
     assert payload["trainable_qwen_layer_indices"] == list(range(24))
     assert payload["target_shape"] == [2, 4, 256, 1024]
-    assert payload["format_version"] == 4
+    assert payload["format_version"] == 5
+    assert payload["input_template_kind"] == "baton_assistant_time_v2"
+    assert payload["worldarena_sampling_kind"] == "episode_random_v1"
+    assert payload["instruction_rendering_kind"] == "verbatim_v1"
     assert payload["temporal_policy"] == {
         "kind": "fixed_offsets",
         "offsets": [0, 3, 5, 8],
@@ -135,6 +141,36 @@ def test_continuous_metadata_round_trips_the_complete_contract() -> None:
         "mse": 1.0,
     }
     assert BatonCheckpointMetadata.from_dict(payload) == metadata
+
+
+def test_v5_metadata_round_trips_versioned_input_and_sampling_contracts() -> None:
+    metadata = BatonCheckpointMetadata.example(camera_names=("head",))
+
+    payload = metadata.to_dict()
+    restored = BatonCheckpointMetadata.from_dict(payload)
+
+    assert restored.format_version == 5
+    assert restored.input_template_kind == "baton_assistant_time_v2"
+    assert restored.worldarena_sampling_kind == "all_windows_v1"
+    assert (
+        restored.instruction_rendering_kind
+        == "strip_worldarena_boilerplate_v1"
+    )
+
+
+def test_v4_metadata_migrates_to_unambiguous_legacy_behavior() -> None:
+    payload = BatonCheckpointMetadata.example(camera_names=("head",)).to_dict()
+    payload["format_version"] = 4
+    del payload["input_template_kind"]
+    del payload["worldarena_sampling_kind"]
+    del payload["instruction_rendering_kind"]
+
+    restored = BatonCheckpointMetadata.from_dict(payload)
+
+    assert restored.format_version == 5
+    assert restored.input_template_kind == "legacy_user_plan_v1"
+    assert restored.worldarena_sampling_kind == "episode_random_v1"
+    assert restored.instruction_rendering_kind == "verbatim_v1"
 
 
 def test_legacy_v4_metadata_without_strategy_migrates_to_ddp() -> None:
@@ -171,6 +207,9 @@ def _legacy_v3_payload(metadata: BatonCheckpointMetadata) -> dict[str, object]:
     payload["format_version"] = 3
     payload["future_indices"] = [0, 3, 5, 8]
     del payload["temporal_policy"]
+    del payload["input_template_kind"]
+    del payload["worldarena_sampling_kind"]
+    del payload["instruction_rendering_kind"]
     return payload
 
 
@@ -179,7 +218,7 @@ def test_legacy_v3_libero_metadata_migrates_in_memory_without_rewrite() -> None:
         _legacy_v3_payload(BatonCheckpointMetadata.example())
     )
 
-    assert restored.format_version == 4
+    assert restored.format_version == 5
     assert restored.camera_names == ("main", "wrist")
     assert restored.temporal_policy == BatonTemporalPolicy.libero_fixed()
 
@@ -258,7 +297,7 @@ def test_v4_temporal_policy_rejects_noncanonical_json_integer_types(
 @pytest.mark.parametrize(
     ("field", "value"),
     (
-        ("format_version", 4.0),
+        ("format_version", 5.0),
         ("teacher_image_size", 256.0),
         ("teacher_feature_layer", -2.0),
         ("query_dim", 2048.0),
@@ -293,11 +332,11 @@ def test_continuous_metadata_rejects_wrong_backbone_identity() -> None:
         BatonCheckpointMetadata.from_dict(payload)
 
 
-def test_format_v1_metadata_is_explicitly_incompatible_with_v4() -> None:
+def test_format_v1_metadata_is_explicitly_incompatible_with_v5() -> None:
     payload = BatonCheckpointMetadata.example().to_dict()
     payload["format_version"] = 1
 
-    with pytest.raises(ValueError, match="versions 1 and 2.*version 4"):
+    with pytest.raises(ValueError, match="versions 1 and 2.*version 5"):
         BatonCheckpointMetadata.from_dict(payload)
 
 

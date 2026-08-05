@@ -25,6 +25,12 @@ from qwen35_baton.model import BatonPlannerOutput, BatonQwen35Planner
 from qwen35_baton.provider import FrozenBatonPlanner
 from qwen35_baton.query_tower import QueryTowerOutput
 from qwen35_baton.sequence import ADDED_TOKENS
+from qwen35_baton.sequence import (
+    BATON_TEMPLATE_KIND,
+    STRIP_WORLD_ARENA_INSTRUCTION_KIND,
+    WORLD_ARENA_BOILERPLATE_PREFIX,
+    input_template_contract,
+)
 
 
 PLAN_PAD_ID = 105
@@ -75,6 +81,24 @@ class _Processor:
             "input_ids": input_ids,
             "attention_mask": torch.ones_like(input_ids),
         }
+
+
+class _BatonProcessor(_Processor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.conversations: list[Sequence[Mapping[str, Any]]] = []
+
+    def apply_chat_template(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        tokenize: bool,
+        add_generation_prompt: bool,
+    ) -> str:
+        assert not tokenize
+        assert add_generation_prompt is False
+        self.conversations.append(messages)
+        return str(messages[2]["content"])
 
 
 class _FakePlanner(nn.Module):
@@ -203,6 +227,36 @@ def test_head_provider_uses_checkpoint_camera_and_normalized_temporal_contract()
 
     with pytest.raises(ValueError, match=r"\[B,1,3,H,W\]"):
         provider.predict(_images(), ("pick cup", "open drawer"))
+
+
+def test_v5_head_provider_requires_time_and_uses_versioned_collator() -> None:
+    processor = _BatonProcessor()
+    provider = FrozenBatonPlanner(
+        planner=_FakePlanner(),
+        processor=processor,
+        added_token_ids=ADDED_TOKEN_IDS,
+        camera_names=("head",),
+        temporal_policy=BatonTemporalPolicy.worldarena_normalized(),
+        input_template_kind=BATON_TEMPLATE_KIND,
+        instruction_rendering_kind=STRIP_WORLD_ARENA_INSTRUCTION_KIND,
+        worldarena_sampling_kind="all_windows_v1",
+    )
+    instruction = WORLD_ARENA_BOILERPLATE_PREFIX + "Pick up the red cube"
+
+    with pytest.raises(ValueError, match="current_canonical_indices"):
+        provider.predict(_head_images(batch_size=1), (instruction,))
+
+    plan = provider.predict(
+        _head_images(batch_size=1),
+        (instruction,),
+        current_canonical_indices=(12,),
+    )
+
+    assert plan.tokens.shape == (1, 1, 4, 256, 1024)
+    assert len(processor.conversations) == 1
+    user_text = processor.conversations[0][1]["content"][1]["text"]
+    assert "Instruction: Pick up the red cube" in user_text
+    assert "Current frame: 12/120" in user_text
 
 
 def test_attention_trace_uses_one_positive_only_no_grad_forward() -> None:
@@ -506,13 +560,11 @@ def _metadata_for_artifacts(
         tokenizer_hash=sha256_artifact(tokenizer_path),
         processor_hash=sha256_artifact(processor_path),
         input_template_hash=sha256_json(
-            "Instruction: {instruction}\n"
-            "<PLAN_START>\n"
-            + "\n".join(
-                f"<FRAME_{index}> " + " ".join(["<PLAN_PAD>"] * 256)
-                for index in range(4)
+            input_template_contract(
+                BatonCheckpointMetadata.example(
+                    camera_names=camera_names
+                ).input_template_kind
             )
-            + "\n<PLAN_END>"
         ),
         added_token_ids=ADDED_TOKEN_IDS,
         **siglip_updates,
@@ -772,9 +824,13 @@ def test_head_checkpoint_propagates_camera_and_temporal_policy_into_provider(
         siglip2_model_path=siglip_path,
         expected_planner_topology=topology_path,
         torch_dtype=torch.float32,
-        _component_loader=lambda **_: (_Processor(), _FakePlanner()),
+        _component_loader=lambda **_: (_BatonProcessor(), _FakePlanner()),
     )
-    plan = provider.predict(_head_images(batch_size=1), ("pick cup",))
+    plan = provider.predict(
+        _head_images(batch_size=1),
+        ("pick cup",),
+        current_canonical_indices=(0,),
+    )
 
     assert provider.camera_names == ("head",)
     assert provider.temporal_policy == BatonTemporalPolicy.worldarena_normalized()

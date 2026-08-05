@@ -292,7 +292,7 @@ class BatonTemporalPolicy:
 class BatonCheckpointMetadata:
     """Serialized compatibility contract for a continuous Baton checkpoint."""
 
-    FORMAT_VERSION: ClassVar[int] = 4
+    FORMAT_VERSION: ClassVar[int] = 5
     ARCHITECTURE_KIND: ClassVar[str] = "qwen35_baton_continuous"
     QWEN_BACKBONE: ClassVar[str] = "dense Qwen3.5-2B"
     SIGLIP2_MODEL: ClassVar[str] = "SigLIP2-large-patch16-256"
@@ -306,6 +306,9 @@ class BatonCheckpointMetadata:
         "tokenizer_hash",
         "processor_hash",
         "input_template_hash",
+        "input_template_kind",
+        "worldarena_sampling_kind",
+        "instruction_rendering_kind",
         "added_tokens",
         "added_token_ids",
         "camera_names",
@@ -360,6 +363,9 @@ class BatonCheckpointMetadata:
     tokenizer_hash: str
     processor_hash: str
     input_template_hash: str
+    input_template_kind: str
+    worldarena_sampling_kind: str
+    instruction_rendering_kind: str
     added_tokens: tuple[str, ...]
     added_token_ids: tuple[int, ...]
     camera_names: tuple[str, ...]
@@ -420,7 +426,31 @@ class BatonCheckpointMetadata:
             raise ValueError("distributed_strategy must be 'ddp' or 'zero2'")
         _require_equal("qwen_backbone", self.qwen_backbone, self.QWEN_BACKBONE)
         _require_sha256(self, self._HASH_FIELDS)
-        _require_nonempty_strings(self, ("teacher_dtype", "query_mask_version"))
+        _require_nonempty_strings(
+            self,
+            (
+                "teacher_dtype",
+                "query_mask_version",
+                "input_template_kind",
+                "worldarena_sampling_kind",
+                "instruction_rendering_kind",
+            ),
+        )
+        if self.input_template_kind not in {
+            "legacy_user_plan_v1",
+            "baton_assistant_time_v2",
+        }:
+            raise ValueError("unsupported input_template_kind")
+        if self.worldarena_sampling_kind not in {
+            "episode_random_v1",
+            "all_windows_v1",
+        }:
+            raise ValueError("unsupported worldarena_sampling_kind")
+        if self.instruction_rendering_kind not in {
+            "verbatim_v1",
+            "strip_worldarena_boilerplate_v1",
+        }:
+            raise ValueError("unsupported instruction_rendering_kind")
         _require_equal("added_tokens", self.added_tokens, _PLAN_TOKENS)
         if (
             len(self.added_token_ids) != len(self.added_tokens)
@@ -464,6 +494,24 @@ class BatonCheckpointMetadata:
         if self.temporal_policy != expected_policy:
             raise ValueError(
                 "camera_names and temporal_policy must identify the same dataset contract"
+            )
+        if self.input_template_kind == "legacy_user_plan_v1":
+            expected_behaviors = ("episode_random_v1", "verbatim_v1")
+        elif self.camera_names == ("head",):
+            expected_behaviors = (
+                "all_windows_v1",
+                "strip_worldarena_boilerplate_v1",
+            )
+        else:
+            expected_behaviors = ("episode_random_v1", "verbatim_v1")
+        actual_behaviors = (
+            self.worldarena_sampling_kind,
+            self.instruction_rendering_kind,
+        )
+        if actual_behaviors != expected_behaviors:
+            raise ValueError(
+                "template, camera, sampling, and instruction rendering contracts "
+                "are inconsistent"
             )
         _require_equal("query_dim", self.query_dim, geometry.query_dim)
         _require_equal("query_layers", self.query_layers, geometry.query_layers)
@@ -523,6 +571,17 @@ class BatonCheckpointMetadata:
             tokenizer_hash=_example_sha256("tokenizer"),
             processor_hash=_example_sha256("processor"),
             input_template_hash=_example_sha256("input-template"),
+            input_template_kind="baton_assistant_time_v2",
+            worldarena_sampling_kind=(
+                "episode_random_v1"
+                if camera_names == ("main", "wrist")
+                else "all_windows_v1"
+            ),
+            instruction_rendering_kind=(
+                "verbatim_v1"
+                if camera_names == ("main", "wrist")
+                else "strip_worldarena_boilerplate_v1"
+            ),
             added_tokens=_PLAN_TOKENS,
             added_token_ids=tuple(range(151_665, 151_672)),
             camera_names=camera_names,
@@ -583,13 +642,21 @@ class BatonCheckpointMetadata:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> BatonCheckpointMetadata:
+        if (
+            isinstance(payload, Mapping)
+            and "format_version" in payload
+            and type(payload["format_version"]) is not int
+        ):
+            raise ValueError("format_version must be an integer")
         if isinstance(payload, Mapping) and payload.get("format_version") in (1, 2):
             raise ValueError(
                 "Baton checkpoint format versions 1 and 2 are incompatible "
-                "with strict Baton version 4"
+                "with strict Baton version 5"
             )
         if isinstance(payload, Mapping) and payload.get("format_version") == 3:
             return cls._from_legacy_v3(payload, allow_head=False)
+        if isinstance(payload, Mapping) and payload.get("format_version") == 4:
+            return cls._from_legacy_v4(payload)
         if (
             isinstance(payload, Mapping)
             and payload.get("format_version") == cls.FORMAT_VERSION
@@ -613,6 +680,19 @@ class BatonCheckpointMetadata:
         return cls(**values)
 
     @classmethod
+    def _from_legacy_v4(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> BatonCheckpointMetadata:
+        migrated = dict(payload)
+        migrated["format_version"] = cls.FORMAT_VERSION
+        migrated.setdefault("distributed_strategy", "ddp")
+        migrated["input_template_kind"] = "legacy_user_plan_v1"
+        migrated["worldarena_sampling_kind"] = "episode_random_v1"
+        migrated["instruction_rendering_kind"] = "verbatim_v1"
+        return cls.from_dict(migrated)
+
+    @classmethod
     def _from_legacy_v3(
         cls,
         payload: Mapping[str, Any],
@@ -624,9 +704,15 @@ class BatonCheckpointMetadata:
             legacy_payload["distributed_strategy"] = "ddp"
         elif legacy_payload["distributed_strategy"] != "ddp":
             raise ValueError("legacy Baton v3 checkpoints must use DDP")
+        behavior_fields = {
+            "input_template_kind",
+            "worldarena_sampling_kind",
+            "instruction_rendering_kind",
+        }
         required = tuple(
             "future_indices" if name == "temporal_policy" else name
             for name in cls._REQUIRED_FIELDS
+            if name not in behavior_fields
         )
         _require_keys(legacy_payload, required)
         camera_names = legacy_payload.get("camera_names")
@@ -647,6 +733,9 @@ class BatonCheckpointMetadata:
         migrated = legacy_payload
         migrated["format_version"] = cls.FORMAT_VERSION
         migrated["temporal_policy"] = temporal_policy.to_dict()
+        migrated["input_template_kind"] = "legacy_user_plan_v1"
+        migrated["worldarena_sampling_kind"] = "episode_random_v1"
+        migrated["instruction_rendering_kind"] = "verbatim_v1"
         del migrated["future_indices"]
         return cls.from_dict(migrated)
 
