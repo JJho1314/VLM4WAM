@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, fields, replace
+from itertools import zip_longest
 import json
 import math
 import os
@@ -46,6 +47,13 @@ from qwen35_baton.sequence import (
     input_template_contract,
 )
 from qwen35_baton.training_telemetry import CudaEventTimer, Stage1MetricAccumulator
+from qwen35_baton.validation import (
+    GroundingExample,
+    build_grounding_artifact,
+    compute_grounding_metrics,
+    publish_grounding_artifact,
+    task_distinct_shuffle,
+)
 from qwen35_baton.worker_lifecycle import (
     append_worker_lifecycle_event,
     recycle_persistent_dataloader_workers,
@@ -117,6 +125,8 @@ class Stage1TrainingConfig:
     warmup_steps: int = 1_000
     save_every: int = 5_000
     initial_save_step: int | None = 20
+    validation_every: int | None = None
+    evaluated_save_steps: tuple[int, ...] = ()
     log_every: int = 20
     max_consecutive_skipped_updates: int = 8
     learning_rate: float = 1e-5
@@ -173,6 +183,24 @@ class Stage1TrainingConfig:
             )
         ):
             raise ValueError("initial_save_step must be None or in (0,max_steps)")
+        if self.validation_every is not None and (
+            type(self.validation_every) is not int
+            or self.validation_every <= 0
+            or self.max_steps % self.validation_every
+        ):
+            raise ValueError(
+                "validation_every must be None or a positive divisor of max_steps"
+            )
+        if (
+            not isinstance(self.evaluated_save_steps, tuple)
+            or any(type(step) is not int for step in self.evaluated_save_steps)
+            or tuple(sorted(set(self.evaluated_save_steps)))
+            != self.evaluated_save_steps
+            or any(not 0 < step <= self.max_steps for step in self.evaluated_save_steps)
+        ):
+            raise ValueError(
+                "evaluated_save_steps must be sorted unique integers in (0,max_steps]"
+            )
         if type(self.num_workers) is not int or self.num_workers < 0:
             raise ValueError("num_workers must be a non-negative integer")
         if type(self.persistent_workers) is not bool:
@@ -211,15 +239,35 @@ class Stage1TrainingConfig:
             raise ValueError("production Stage-1 mixed_precision must be bf16")
         if self.gradient_clip_norm != 1.0:
             raise ValueError("Stage-1 gradient clipping norm must be exactly 1.0")
-        if not self.tiny_test and (
-            self.max_steps != 30_000
-            or self.save_every != 5_000
-            or self.initial_save_step != 20
-        ):
-            raise ValueError(
-                "production Stage-1 cadence must run 30000 steps, probe step 20, "
-                "then save every 5000 steps"
+        if not self.tiny_test:
+            if self.dataset_type == "worldarena_hdf5":
+                expected = (
+                    5_000,
+                    5_000,
+                    20,
+                    500,
+                    (500, 1_000, 2_000, 3_000, 4_000, 5_000),
+                )
+            else:
+                expected = (30_000, 5_000, 20, None, ())
+            actual = (
+                self.max_steps,
+                self.save_every,
+                self.initial_save_step,
+                self.validation_every,
+                self.evaluated_save_steps,
             )
+            if actual != expected:
+                if self.dataset_type == "worldarena_hdf5":
+                    raise ValueError(
+                        "production WorldArena Stage-1 cadence must run 5000 steps, "
+                        "validate every 500, probe step 20, and save only approved "
+                        "evaluated steps"
+                    )
+                raise ValueError(
+                    "production LIBERO Stage-1 cadence must run 30000 steps, "
+                    "probe step 20, then save every 5000 steps"
+                )
         if self.learning_rate != _APPROVED_LR:
             raise ValueError("Stage-1 learning rate must be exactly 1e-5")
         for name in (
@@ -246,7 +294,10 @@ class Stage1TrainingConfig:
             raise ValueError(
                 "unknown Stage-1 config fields: " + ", ".join(unknown)
             )
-        return cls(**dict(payload))
+        values = dict(payload)
+        if "evaluated_save_steps" in values:
+            values["evaluated_save_steps"] = tuple(values["evaluated_save_steps"])
+        return cls(**values)
 
     @classmethod
     def from_json(cls, path: str | Path) -> "Stage1TrainingConfig":
@@ -255,6 +306,90 @@ class Stage1TrainingConfig:
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise ValueError(f"Stage-1 config is invalid: {path}") from error
         return cls.from_mapping(payload)
+
+
+@dataclass
+class GroundingValidationData:
+    """Materialized deterministic correct/shuffled WorldArena validation rows."""
+
+    examples: tuple[GroundingExample, ...]
+    shuffled_indices: tuple[int, ...]
+    correct_batches: Iterable[Any]
+    shuffled_batches: Iterable[Any]
+
+    def __post_init__(self) -> None:
+        if len(self.examples) != 44:
+            raise ValueError("WorldArena grounding validation requires exactly 44 examples")
+        if sorted(self.shuffled_indices) != list(range(44)):
+            raise ValueError("shuffled_indices must be a permutation of 44 examples")
+        if any(
+            self.examples[index].task == self.examples[other].task
+            for index, other in enumerate(self.shuffled_indices)
+        ):
+            raise ValueError("grounding validation shuffle must be task-distinct")
+
+
+def build_worldarena_grounding_validation(
+    dataset: Any,
+    *,
+    correct_collate_fn: Any,
+    shuffled_collate_fn: Any,
+    batch_size: int,
+    seed: int,
+) -> GroundingValidationData:
+    """Materialize the 44 fixed rows and build worker-free paired loaders."""
+
+    if len(dataset) != 44:
+        raise ValueError("WorldArena validation split must contain exactly 44 rows")
+    if type(batch_size) is not int or batch_size <= 0:
+        raise ValueError("validation batch_size must be a positive integer")
+    if type(seed) is not int:
+        raise ValueError("validation seed must be an integer")
+    samples = tuple(dataset[index] for index in range(len(dataset)))
+    examples: list[GroundingExample] = []
+    for sample in samples:
+        if not isinstance(sample, Mapping):
+            raise TypeError("WorldArena validation samples must be mappings")
+        metadata = sample.get("metadata")
+        task = metadata.get("task") if isinstance(metadata, Mapping) else None
+        examples.append(
+            GroundingExample(
+                episode_id=sample.get("episode_key"),
+                task=task,
+                instruction=sample.get("instruction"),
+                source_indices=sample.get("source_indices"),
+            )
+        )
+    canonical_examples = tuple(examples)
+    shuffled_indices = task_distinct_shuffle(canonical_examples, seed=seed)
+    shuffled_samples = tuple(
+        {
+            **sample,
+            "instruction": canonical_examples[shuffled_index].instruction,
+        }
+        for sample, shuffled_index in zip(samples, shuffled_indices)
+    )
+    loader_options = {
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": 0,
+        "drop_last": False,
+        "pin_memory": False,
+    }
+    return GroundingValidationData(
+        examples=canonical_examples,
+        shuffled_indices=shuffled_indices,
+        correct_batches=torch.utils.data.DataLoader(
+            samples,
+            collate_fn=correct_collate_fn,
+            **loader_options,
+        ),
+        shuffled_batches=torch.utils.data.DataLoader(
+            shuffled_samples,
+            collate_fn=shuffled_collate_fn,
+            **loader_options,
+        ),
+    )
 
 
 @dataclass
@@ -268,6 +403,7 @@ class Stage1TrainingArtifacts:
     scheduler: Any
     metadata: BatonCheckpointMetadata
     ownership: Stage1Ownership
+    validation: GroundingValidationData | None = None
 
 
 @dataclass(frozen=True)
@@ -276,6 +412,134 @@ class Stage1TrainingResult:
     cursor: BatonTrainingCursor
     checkpoint: Path | None
     last_metrics: Mapping[str, float]
+
+
+def _validation_batch_to_device(batch: Any, device: torch.device) -> Any:
+    move = getattr(batch, "to", None)
+    if callable(move):
+        return move(device, non_blocking=False)
+    return _move_batch(batch, device)
+
+
+def run_grounding_validation(
+    *,
+    accelerator: Any,
+    planner: nn.Module,
+    teacher: Any,
+    validation: GroundingValidationData,
+    step: int,
+    output_dir: str | Path,
+    validate_input_contents: bool,
+) -> Path | None:
+    """Run correct/shuffled/persistence evaluation on rank zero and publish JSON."""
+
+    if not isinstance(validation, GroundingValidationData):
+        raise TypeError("validation must be GroundingValidationData")
+    if type(step) is not int or step < 0:
+        raise ValueError("step must be a non-negative integer")
+    if type(validate_input_contents) is not bool:
+        raise TypeError("validate_input_contents must be boolean")
+    destination = Path(output_dir) / f"step_{step:06d}.grounding_validation.json"
+    published: Path | None = None
+    error: str | None = None
+    if accelerator.is_main_process:
+        unwrapped = accelerator.unwrap_model(planner)
+        was_training = bool(unwrapped.training)
+        unwrapped.eval()
+        correct_outputs: list[torch.Tensor] = []
+        shuffled_outputs: list[torch.Tensor] = []
+        targets: list[torch.Tensor] = []
+        persistence_outputs: list[torch.Tensor] = []
+        try:
+            with torch.no_grad():
+                sentinel = object()
+                for correct_raw, shuffled_raw in zip_longest(
+                    validation.correct_batches,
+                    validation.shuffled_batches,
+                    fillvalue=sentinel,
+                ):
+                    if correct_raw is sentinel or shuffled_raw is sentinel:
+                        raise ValueError(
+                            "correct and shuffled validation loaders differ in length"
+                        )
+                    correct_batch = _validation_batch_to_device(
+                        correct_raw, accelerator.device
+                    )
+                    shuffled_batch = _validation_batch_to_device(
+                        shuffled_raw, accelerator.device
+                    )
+                    if isinstance(unwrapped, BatonQwen35Planner):
+                        correct_prediction = unwrapped(
+                            correct_batch,
+                            validate_input_contents=validate_input_contents,
+                        ).positive
+                        shuffled_prediction = unwrapped(
+                            shuffled_batch,
+                            validate_input_contents=validate_input_contents,
+                        ).positive
+                    else:
+                        correct_prediction = unwrapped(correct_batch).positive
+                        shuffled_prediction = unwrapped(shuffled_batch).positive
+                    future_pixel_values = getattr(
+                        correct_batch, "future_pixel_values", None
+                    )
+                    if future_pixel_values is None:
+                        future_images = getattr(correct_batch, "future_images", None)
+                        if future_images is None:
+                            raise ValueError(
+                                "correct validation batches require future targets"
+                            )
+                        target = teacher.encode_future(future_images)
+                    else:
+                        target = teacher.encode_pixel_values(future_pixel_values)
+                    current = teacher.encode_current(correct_batch.current_images)
+                    if target.shape[1] != 1 or current.shape[1] != 1:
+                        raise ValueError(
+                            "WorldArena grounding validation requires one head camera"
+                        )
+                    persistence = current[:, 0].unsqueeze(1).expand(
+                        -1, 4, -1, -1
+                    )
+                    correct_outputs.append(correct_prediction[:, 0].float().cpu())
+                    shuffled_outputs.append(shuffled_prediction[:, 0].float().cpu())
+                    targets.append(target[:, 0].float().cpu())
+                    persistence_outputs.append(persistence.float().cpu())
+            metrics = compute_grounding_metrics(
+                correct=torch.cat(correct_outputs),
+                shuffled=torch.cat(shuffled_outputs),
+                target=torch.cat(targets),
+                persistence=torch.cat(persistence_outputs),
+            )
+            artifact = build_grounding_artifact(
+                step=step,
+                examples=validation.examples,
+                shuffled_indices=validation.shuffled_indices,
+                metrics=metrics,
+            )
+            published = publish_grounding_artifact(destination, artifact)
+        except Exception as exception:
+            error = f"{type(exception).__name__}: {exception}"
+        finally:
+            unwrapped.train(was_training)
+    local_status = {
+        "rank": int(getattr(accelerator, "process_index", 0)),
+        "error": error,
+    }
+    if int(getattr(accelerator, "num_processes", 1)) > 1:
+        from accelerate.utils import gather_object
+
+        statuses = gather_object([local_status])
+    else:
+        statuses = [local_status]
+    failures = [
+        status["error"]
+        for status in statuses
+        if isinstance(status, Mapping) and status.get("error") is not None
+    ]
+    if failures:
+        raise RuntimeError("grounding validation failed: " + "; ".join(failures))
+    accelerator.wait_for_everyone()
+    return published
 
 
 def validate_global_batch(
@@ -322,6 +586,7 @@ def checkpoint_steps(
     max_steps: int,
     save_every: int,
     initial_save_step: int | None = None,
+    evaluated_save_steps: tuple[int, ...] = (),
 ) -> tuple[int, ...]:
     if type(max_steps) is not int or type(save_every) is not int:
         raise TypeError("checkpoint cadence values must be integers")
@@ -335,9 +600,19 @@ def checkpoint_steps(
         )
     ):
         raise ValueError("initial_save_step must be None or in (0,max_steps)")
+    if (
+        not isinstance(evaluated_save_steps, tuple)
+        or any(type(step) is not int for step in evaluated_save_steps)
+        or tuple(sorted(set(evaluated_save_steps))) != evaluated_save_steps
+        or any(not 0 < step <= max_steps for step in evaluated_save_steps)
+    ):
+        raise ValueError(
+            "evaluated_save_steps must be sorted unique integers in (0,max_steps]"
+        )
     steps = set(range(save_every, max_steps + 1, save_every))
     if initial_save_step is not None:
         steps.add(initial_save_step)
+    steps.update(evaluated_save_steps)
     return tuple(sorted(steps))
 
 
@@ -716,17 +991,18 @@ def load_local_artifacts(
         instruction_rendering_kind = STRIP_WORLD_ARENA_INSTRUCTION_KIND
     else:
         raise AssertionError("validated dataset_type is unreachable")
+    train_collator = BatonPlannerCollator(
+        processor,
+        camera_names=camera_names,
+        siglip_processor=components["siglip_processor"],
+        siglip_dtype=torch.bfloat16,
+        batch_qwen_rows=True,
+        input_template_kind=BATON_TEMPLATE_KIND,
+        instruction_rendering_kind=instruction_rendering_kind,
+    )
     train_batches = build_stage1_dataloader(
         dataset,
-        collate_fn=BatonPlannerCollator(
-            processor,
-            camera_names=camera_names,
-            siglip_processor=components["siglip_processor"],
-            siglip_dtype=torch.bfloat16,
-            batch_qwen_rows=True,
-            input_template_kind=BATON_TEMPLATE_KIND,
-            instruction_rendering_kind=instruction_rendering_kind,
-        ),
+        collate_fn=train_collator,
         config=config,
     )
     if len(train_batches) <= 0:
@@ -755,6 +1031,36 @@ def load_local_artifacts(
         teacher_preprocessing_hash=_artifact_hash(Path(config.siglip2_model_path)),
         hdf5_manifest_hash=config.hdf5_manifest_hash,
     )
+    validation = None
+    if config.dataset_type == "worldarena_hdf5" and not config.tiny_test:
+        validation_dataset = WorldArenaHDF5Dataset(
+            config.hdf5_manifest_path,
+            seed=config.seed,
+            split="validation",
+            sampling_kind=ALL_WINDOWS_SAMPLING_KIND,
+        )
+        validation = build_worldarena_grounding_validation(
+            validation_dataset,
+            correct_collate_fn=BatonPlannerCollator(
+                processor,
+                camera_names=("head",),
+                siglip_processor=components["siglip_processor"],
+                siglip_dtype=torch.bfloat16,
+                batch_qwen_rows=True,
+                input_template_kind=BATON_TEMPLATE_KIND,
+                instruction_rendering_kind=instruction_rendering_kind,
+            ),
+            shuffled_collate_fn=BatonPlannerCollator(
+                processor,
+                camera_names=("head",),
+                batch_qwen_rows=True,
+                input_template_kind=BATON_TEMPLATE_KIND,
+                instruction_rendering_kind=instruction_rendering_kind,
+                retain_future_targets=False,
+            ),
+            batch_size=config.per_device_batch,
+            seed=config.seed,
+        )
     return Stage1TrainingArtifacts(
         planner=planner,
         teacher=teacher,
@@ -763,6 +1069,7 @@ def load_local_artifacts(
         scheduler=scheduler,
         metadata=metadata,
         ownership=ownership,
+        validation=validation,
     )
 
 
@@ -1501,8 +1808,13 @@ def run_training(
             max_steps=config.max_steps,
             save_every=config.save_every,
             initial_save_step=config.initial_save_step,
+            evaluated_save_steps=config.evaluated_save_steps,
         )
     )
+    if config.validation_every is not None and artifacts.validation is None:
+        raise ValueError(
+            "configured validation_every requires grounding validation artifacts"
+        )
     while cursor.global_step < target_step:
         epoch = cursor.epoch
         _set_dataloader_epoch(
@@ -1747,6 +2059,20 @@ def run_training(
                             step=cursor.global_step,
                             metrics=last_metrics,
                         )
+                if (
+                    config.validation_every is not None
+                    and cursor.global_step % config.validation_every == 0
+                ):
+                    assert artifacts.validation is not None
+                    run_grounding_validation(
+                        accelerator=accelerator,
+                        planner=planner,
+                        teacher=artifacts.teacher,
+                        validation=artifacts.validation,
+                        step=cursor.global_step,
+                        output_dir=config.output_dir,
+                        validate_input_contents=config.runtime_input_validation,
+                    )
                 if cursor.global_step in save_steps:
                     last_checkpoint = _save_training_checkpoint(
                         accelerator=accelerator,

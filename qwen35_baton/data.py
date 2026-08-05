@@ -265,6 +265,7 @@ class BatonPlannerCollator:
         batch_qwen_rows: bool = False,
         input_template_kind: str = LEGACY_TEMPLATE_KIND,
         instruction_rendering_kind: str = VERBATIM_INSTRUCTION_KIND,
+        retain_future_targets: bool = True,
     ) -> None:
         if (
             not camera_names
@@ -297,6 +298,9 @@ class BatonPlannerCollator:
             )
         self.input_template_kind = input_template_kind
         self.instruction_rendering_kind = instruction_rendering_kind
+        if type(retain_future_targets) is not bool:
+            raise TypeError("retain_future_targets must be boolean")
+        self.retain_future_targets = retain_future_targets
         if type(batch_qwen_rows) is not bool:
             raise TypeError("batch_qwen_rows must be boolean")
         self.batch_qwen_rows = batch_qwen_rows
@@ -606,8 +610,10 @@ class BatonPlannerCollator:
             }
         input_ids = qwen_inputs["input_ids"]
         future_pixel_values = None
-        retained_future_images: torch.Tensor | None = future_images
-        if self.siglip_processor is not None:
+        retained_future_images: torch.Tensor | None = (
+            future_images if self.retain_future_targets else None
+        )
+        if self.siglip_processor is not None and self.retain_future_targets:
             from qwen35_baton.teacher import preprocess_siglip2_future
 
             future_pixel_values = preprocess_siglip2_future(

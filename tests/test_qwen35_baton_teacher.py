@@ -108,6 +108,16 @@ def test_teacher_targets_are_detached() -> None:
     assert all(parameter.requires_grad is False for parameter in teacher.model.parameters())
 
 
+def test_teacher_encodes_one_camera_worldarena_current_frame() -> None:
+    teacher, _ = make_teacher()
+    current_images = torch.randint(256, (2, 1, 3, 256, 256), dtype=torch.uint8)
+
+    current = teacher.encode_current(current_images)
+
+    assert current.shape == (2, 1, 256, 1024)
+    assert current.requires_grad is False
+
+
 def test_teacher_to_keeps_input_device_in_sync_with_vision_model() -> None:
     teacher, _ = make_teacher()
 

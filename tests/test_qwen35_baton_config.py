@@ -36,9 +36,11 @@ def test_worldarena_stage1_recipe_preserves_model_provenance_and_global_batch() 
     )
     assert worldarena["per_device_batch"] == 2
     assert worldarena["gradient_accumulation_steps"] == 8
-    assert worldarena["max_steps"] == 30_000
+    assert worldarena["max_steps"] == 5_000
     assert worldarena["initial_save_step"] == 20
     assert worldarena["save_every"] == 5_000
+    assert worldarena["validation_every"] == 500
+    assert worldarena["evaluated_save_steps"] == [500, 1000, 2000, 3000, 4000, 5000]
     assert worldarena["num_workers"] == 8
     assert worldarena["persistent_workers"] is True
     assert worldarena["worker_restart_interval_epochs"] == 100

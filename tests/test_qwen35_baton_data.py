@@ -361,6 +361,25 @@ def test_collator_emits_future_teacher_pixels_without_raw_future_transfer() -> N
     assert batch.future_pixel_values.dtype == torch.bfloat16
 
 
+def test_collator_can_discard_shuffled_validation_future_targets() -> None:
+    from qwen35_baton.data import BatonPlannerCollator
+
+    sample = {
+        "current_images": torch.zeros((1, 3, 256, 256), dtype=torch.uint8),
+        "future_images": torch.zeros((1, 4, 3, 256, 256), dtype=torch.uint8),
+        "instruction": "pick up the green bottle",
+        "suite": "worldarena",
+    }
+    batch = BatonPlannerCollator(
+        _Processor(),
+        camera_names=("head",),
+        retain_future_targets=False,
+    )([sample])
+
+    assert batch.future_images is None
+    assert batch.future_pixel_values is None
+
+
 def test_batched_qwen_rows_match_reference_rowwise_collation() -> None:
     from qwen35_baton.data import BatonPlannerCollator
 

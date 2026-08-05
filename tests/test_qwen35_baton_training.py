@@ -22,11 +22,13 @@ from qwen35_baton.cli.preflight import (
     require_qwen35_fast_path,
 )
 from qwen35_baton.cli.train_semantic_planner import (
+    GroundingValidationData,
     Stage1TrainingArtifacts,
     Stage1TrainingConfig,
     build_cosine_warmup_scheduler,
     build_accelerator,
     build_stage1_dataloader,
+    build_worldarena_grounding_validation,
     build_stage1_optimizer,
     build_stage1_optimizer_groups,
     checkpoint_steps,
@@ -34,6 +36,7 @@ from qwen35_baton.cli.train_semantic_planner import (
     load_local_artifacts,
     require_stage1_global_batch,
     resolve_deepspeed_runtime_config,
+    run_grounding_validation,
     run_training,
     validate_global_batch,
 )
@@ -993,6 +996,138 @@ def test_checkpoint_cadence_probes_step_20_then_saves_every_5000() -> None:
     )
 
 
+def test_worldarena_checkpoint_cadence_includes_only_approved_evaluated_steps() -> None:
+    assert checkpoint_steps(
+        max_steps=5_000,
+        save_every=5_000,
+        initial_save_step=20,
+        evaluated_save_steps=(500, 1_000, 2_000, 3_000, 4_000, 5_000),
+    ) == (20, 500, 1_000, 2_000, 3_000, 4_000, 5_000)
+
+
+def test_grounding_validation_runs_correct_shuffle_and_persistence(
+    tmp_path: Path,
+) -> None:
+    from qwen35_baton.validation import GroundingExample
+
+    target = torch.arange(1, 4 * 2 * 3 + 1, dtype=torch.float32).reshape(
+        1, 1, 4, 2, 3
+    ).expand(44, -1, -1, -1, -1)
+
+    @dataclass(frozen=True)
+    class _ValidationBatch:
+        prediction: torch.Tensor
+        future_pixel_values: torch.Tensor
+        current_images: torch.Tensor
+
+        def to(self, *_: Any, **__: Any) -> "_ValidationBatch":
+            return self
+
+    class _ValidationPlanner(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.probe = nn.Parameter(torch.ones(()))
+
+        def forward(self, batch: _ValidationBatch) -> Any:
+            return SimpleNamespace(positive=batch.prediction * self.probe)
+
+    class _ValidationTeacher:
+        def encode_pixel_values(self, values: torch.Tensor) -> torch.Tensor:
+            return values
+
+        def encode_current(self, values: torch.Tensor) -> torch.Tensor:
+            return values
+
+    class _ValidationAccelerator:
+        is_main_process = True
+        device = torch.device("cpu")
+
+        @staticmethod
+        def unwrap_model(model: nn.Module) -> nn.Module:
+            return model
+
+        @staticmethod
+        def wait_for_everyone() -> None:
+            return None
+
+    examples = tuple(
+        GroundingExample(
+            episode_id=f"task_{index}__episode0",
+            task=f"task_{index}",
+            instruction=f"instruction {index}",
+            source_indices=(0, 30, 60, 90, 120),
+        )
+        for index in range(44)
+    )
+    validation = GroundingValidationData(
+        examples=examples,
+        shuffled_indices=tuple(range(1, 44)) + (0,),
+        correct_batches=(
+            _ValidationBatch(target * 0.9, target, target[:, :, 0]),
+        ),
+        shuffled_batches=(
+            _ValidationBatch(target * 0.2, target, target[:, :, 0]),
+        ),
+    )
+
+    artifact_path = run_grounding_validation(
+        accelerator=_ValidationAccelerator(),
+        planner=_ValidationPlanner(),
+        teacher=_ValidationTeacher(),
+        validation=validation,
+        step=500,
+        output_dir=tmp_path,
+        validate_input_contents=False,
+    )
+
+    assert artifact_path == tmp_path / "step_000500.grounding_validation.json"
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert artifact["gate"]["eligible"] is True
+    assert artifact["metrics"]["correct_win_count"] == 44
+
+
+def test_worldarena_validation_materializes_44_rows_without_workers() -> None:
+    class _ValidationDataset(torch.utils.data.Dataset[dict[str, Any]]):
+        def __len__(self) -> int:
+            return 44
+
+        def __getitem__(self, index: int) -> dict[str, Any]:
+            task = f"task_{index}"
+            return {
+                "episode_key": f"{task}__episode0",
+                "instruction": f"instruction {index}",
+                "source_indices": (0, 30, 60, 90, 120),
+                "metadata": {"task": task},
+                "image_probe": index,
+            }
+
+    validation = build_worldarena_grounding_validation(
+        _ValidationDataset(),
+        correct_collate_fn=lambda samples: tuple(samples),
+        shuffled_collate_fn=lambda samples: tuple(samples),
+        batch_size=8,
+        seed=42,
+    )
+
+    assert validation.correct_batches.num_workers == 0
+    assert validation.shuffled_batches.num_workers == 0
+    correct = tuple(
+        sample for batch in validation.correct_batches for sample in batch
+    )
+    shuffled = tuple(
+        sample for batch in validation.shuffled_batches for sample in batch
+    )
+    assert len(correct) == len(shuffled) == 44
+    assert all(
+        correct[index]["image_probe"] == shuffled[index]["image_probe"]
+        for index in range(44)
+    )
+    assert all(
+        correct[index]["instruction"] != shuffled[index]["instruction"]
+        for index in range(44)
+    )
+
+
 def test_cosine_scheduler_uses_linear_warmup_then_reaches_zero(
     tmp_path: Path,
 ) -> None:
@@ -1053,6 +1188,37 @@ def test_training_promotes_bf16_teacher_targets_for_fp32_planner_loss(
 
     assert result.global_step == 1
     assert torch.isfinite(torch.tensor(result.last_metrics["loss/total"]))
+
+
+def test_training_invokes_grounding_validation_on_configured_cadence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import qwen35_baton.cli.train_semantic_planner as training_module
+
+    config = replace(
+        _config(tmp_path),
+        validation_every=1,
+        evaluated_save_steps=(1,),
+    )
+    artifacts = _artifacts(config)
+    artifacts.validation = object()  # type: ignore[assignment]
+    calls: list[int] = []
+
+    def record_validation(**kwargs: Any) -> Path:
+        calls.append(kwargs["step"])
+        return tmp_path / "validation.json"
+
+    monkeypatch.setattr(
+        training_module,
+        "run_grounding_validation",
+        record_validation,
+    )
+
+    result = run_training(config, artifacts=artifacts)
+
+    assert result.global_step == 1
+    assert calls == [1]
 
 
 def test_training_prepares_the_dataloader_for_distributed_rank_sharding(
@@ -1810,6 +1976,11 @@ def test_worldarena_preflight_requires_matching_manifest_and_cache_stats(
         payload.update(
             dataset_type="worldarena_hdf5",
             hdf5_manifest_hash=manifest_hash,
+            max_steps=5_000,
+            save_every=5_000,
+            initial_save_step=20,
+            validation_every=500,
+            evaluated_save_steps=[500, 1_000, 2_000, 3_000, 4_000, 5_000],
         )
         config.write_text(json.dumps(payload))
 
@@ -1838,11 +2009,17 @@ def test_worldarena_preflight_requires_matching_manifest_and_cache_stats(
     publish_worldarena([record])
 
     payload["dataset_type"] = "libero_hdf5"
+    payload["max_steps"] = 30_000
+    payload["validation_every"] = None
+    payload["evaluated_save_steps"] = []
     config.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="dataset_type"):
         preflight_stage1(config, world_size=8)
 
     payload["dataset_type"] = "worldarena_hdf5"
+    payload["max_steps"] = 5_000
+    payload["validation_every"] = 500
+    payload["evaluated_save_steps"] = [500, 1_000, 2_000, 3_000, 4_000, 5_000]
     other_stats = tmp_path / "stats.json"
     other_stats.write_text(stats.read_text())
     payload["dataset_statistics_path"] = str(other_stats)
@@ -1918,6 +2095,11 @@ def test_worldarena_preflight_checks_integrity_and_provenance_before_all_shards(
     payload.update(
         dataset_type="worldarena_hdf5",
         hdf5_manifest_hash=valid_manifest_hash,
+        max_steps=5_000,
+        save_every=5_000,
+        initial_save_step=20,
+        validation_every=500,
+        evaluated_save_steps=[500, 1_000, 2_000, 3_000, 4_000, 5_000],
     )
     config.write_text(json.dumps(payload))
 

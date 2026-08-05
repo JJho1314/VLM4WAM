@@ -228,13 +228,20 @@ class FrozenSiglip2Teacher:
 
     @torch.no_grad()
     def encode_current(self, images: torch.Tensor) -> torch.Tensor:
-        """Encode ``[B,2,3,H,W]`` RGB into detached ``[B,2,256,1024]`` features."""
+        """Encode ``[B,C,3,H,W]`` RGB into detached patch features."""
 
-        if not isinstance(images, torch.Tensor) or images.ndim != 5 or images.shape[1:3] != (2, 3):
-            raise ValueError(f"current images must be [B,2,3,H,W], got {tuple(images.shape)}")
-        batch_size = images.shape[0]
+        if (
+            not isinstance(images, torch.Tensor)
+            or images.ndim != 5
+            or images.shape[1] <= 0
+            or images.shape[2] != 3
+        ):
+            raise ValueError(
+                f"current images must be [B,C,3,H,W], got {tuple(images.shape)}"
+            )
+        batch_size, camera_count = images.shape[:2]
         return self._encode_frames(images.reshape(-1, *images.shape[-3:])).reshape(
-            batch_size, 2, 256, 1024
+            batch_size, camera_count, 256, 1024
         )
 
     @torch.no_grad()
