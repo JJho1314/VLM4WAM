@@ -24,6 +24,11 @@ from qwen35_baton.config import exact_half_even_round
 _FRAME_COUNT = 121
 _IMAGE_SIZE = 256
 _SOURCE_REPOSITORY = "worldarena2026-robotwin-data"
+EPISODE_RANDOM_SAMPLING_KIND = "episode_random_v1"
+ALL_WINDOWS_SAMPLING_KIND = "all_windows_v1"
+_SAMPLING_KINDS = frozenset(
+    (EPISODE_RANDOM_SAMPLING_KIND, ALL_WINDOWS_SAMPLING_KIND)
+)
 _SPLITS = frozenset(("train", "validation"))
 _CACHE_REQUIRED_RECORD_FIELDS = frozenset(
     (
@@ -616,9 +621,14 @@ class WorldArenaHDF5Dataset(Dataset[dict[str, Any]]):
         *,
         seed: int,
         split: str = "train",
+        sampling_kind: str = EPISODE_RANDOM_SAMPLING_KIND,
     ) -> None:
         _validate_seed(seed)
         _validate_split(split)
+        if sampling_kind not in _SAMPLING_KINDS:
+            raise ValueError(
+                f"unsupported WorldArena sampling kind: {sampling_kind!r}"
+            )
         path = Path(manifest_path).expanduser().resolve()
         if not path.is_file():
             raise FileNotFoundError(f"WorldArena cache manifest does not exist: {path}")
@@ -719,9 +729,12 @@ class WorldArenaHDF5Dataset(Dataset[dict[str, Any]]):
         self.records = tuple(parsed)
         self.seed = seed
         self.split = split
+        self.sampling_kind = sampling_kind
         self._shared_epoch = torch.zeros((), dtype=torch.int64).share_memory_()
 
     def __len__(self) -> int:
+        if self.split == "train" and self.sampling_kind == ALL_WINDOWS_SAMPLING_KIND:
+            return len(self.records) * (_FRAME_COUNT - 4)
         return len(self.records)
 
     def set_epoch(self, epoch: int) -> None:
@@ -730,14 +743,29 @@ class WorldArenaHDF5Dataset(Dataset[dict[str, Any]]):
         self._shared_epoch.fill_(epoch)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        record = self.records[index]
-        indices = _source_indices(
-            seed=self.seed,
-            epoch=int(self._shared_epoch.item()),
-            episode_id=record["episode_id"],
-            split=self.split,
-            frame_count=record["frame_count"],
-        )
+        length = len(self)
+        if type(index) is not int:
+            raise TypeError("WorldArena dataset index must be an integer")
+        if index < 0:
+            index += length
+        if index < 0 or index >= length:
+            raise IndexError("WorldArena dataset index is out of range")
+        if self.split == "train" and self.sampling_kind == ALL_WINDOWS_SAMPLING_KIND:
+            record_index, current = divmod(index, _FRAME_COUNT - 4)
+            record = self.records[record_index]
+            indices = (
+                current,
+                *future_frame_indices(current, record["frame_count"]),
+            )
+        else:
+            record = self.records[index]
+            indices = _source_indices(
+                seed=self.seed,
+                epoch=int(self._shared_epoch.item()),
+                episode_id=record["episode_id"],
+                split=self.split,
+                frame_count=record["frame_count"],
+            )
         try:
             handle_context = h5py.File(record["hdf5_path"], "r")
         except OSError as error:
@@ -1086,6 +1114,8 @@ def predecode_worldarena(
 
 
 __all__ = (
+    "ALL_WINDOWS_SAMPLING_KIND",
+    "EPISODE_RANDOM_SAMPLING_KIND",
     "WorldArenaHDF5Dataset",
     "WorldArenaMP4Dataset",
     "WorldArenaRecord",

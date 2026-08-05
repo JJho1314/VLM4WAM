@@ -538,6 +538,77 @@ def test_hdf5_sampling_is_epoch_deterministic_and_validation_is_fixed(
     assert validation[0]["source_indices"] == fixed
 
 
+def test_hdf5_all_window_sampling_enumerates_every_current_frame(
+    tmp_path: Path,
+) -> None:
+    from qwen35_baton.worldarena_data import ALL_WINDOWS_SAMPLING_KIND
+
+    manifest = _write_cache(tmp_path)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    first = payload["records"][0]
+    second = dict(first)
+    second_id = "stack_cube__episode0"
+    second["episode_id"] = second_id
+    second["task"] = "stack_cube"
+    second["instruction"] = "stack the red cube"
+    second["hdf5_path"] = f"episodes/{second_id}.h5"
+    second["source_video_path"] = str(
+        Path(second["source_dataset_root"]) / "episodes" / second_id / "video.mp4"
+    )
+    second["source_video_relative_path"] = f"episodes/{second_id}/video.mp4"
+    second.pop("actions_16d_path")
+    second.pop("actions_16d_sha256")
+    second_shard = manifest.parent / second["hdf5_path"]
+    with h5py.File(second_shard, "w") as handle:
+        handle.create_dataset(
+            "rgb",
+            shape=(121, 256, 256, 3),
+            dtype=np.uint8,
+            chunks=(1, 256, 256, 3),
+            compression="lzf",
+        )
+    payload["records"].append(second)
+    manifest.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+    dataset = WorldArenaHDF5Dataset(
+        manifest,
+        seed=42,
+        split="train",
+        sampling_kind=ALL_WINDOWS_SAMPLING_KIND,
+    )
+
+    assert len(dataset) == 2 * 117
+    assert dataset[0]["source_indices"][0] == 0
+    assert dataset[116]["source_indices"][0] == 116
+    assert dataset[117]["episode_key"] == second_id
+    assert dataset[117]["source_indices"][0] == 0
+    before = dataset[73]["source_indices"]
+    dataset.set_epoch(99)
+    assert dataset[73]["source_indices"] == before
+
+
+def test_hdf5_all_window_sampling_keeps_validation_one_row_per_episode(
+    tmp_path: Path,
+) -> None:
+    from qwen35_baton.worldarena_data import ALL_WINDOWS_SAMPLING_KIND
+
+    manifest = _write_cache(tmp_path)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["records"][0]["split"] = "validation"
+    manifest.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    dataset = WorldArenaHDF5Dataset(
+        manifest,
+        seed=42,
+        split="validation",
+        sampling_kind=ALL_WINDOWS_SAMPLING_KIND,
+    )
+
+    assert len(dataset) == 1
+    fixed = dataset[0]["source_indices"]
+    dataset.set_epoch(99)
+    assert dataset[0]["source_indices"] == fixed
+
+
 def test_predecode_publishes_atomic_sorted_manifest_stats_and_hdf5(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
