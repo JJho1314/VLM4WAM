@@ -13,7 +13,18 @@ import torch
 from torch.utils.data import Dataset
 
 from qwen35_baton.config import BatonGeometry
-from qwen35_baton.sequence import PLAN_PAD, build_plan_text, find_plan_positions
+from qwen35_baton.sequence import (
+    BATON_TEMPLATE_KIND,
+    LEGACY_TEMPLATE_KIND,
+    PLAN_PAD,
+    STRIP_WORLD_ARENA_INSTRUCTION_KIND,
+    VERBATIM_INSTRUCTION_KIND,
+    build_baton_conversation,
+    build_plan_text,
+    find_plan_positions,
+    render_instruction,
+    validate_source_indices,
+)
 
 
 @dataclass(frozen=True)
@@ -28,6 +39,8 @@ class BatonPlannerBatch:
     row_labels: tuple[tuple[int, str], ...]
     camera_names: tuple[str, ...] = ("main", "wrist")
     future_pixel_values: torch.Tensor | None = None
+    rendered_instructions: tuple[str, ...] = ()
+    source_indices: tuple[tuple[int, int, int, int, int], ...] | None = None
 
     @property
     def batch_size(self) -> int:
@@ -229,6 +242,10 @@ class BatonLiberoDataset(Dataset[dict[str, Any]]):
             "current_images": rgb[:, self.n_previous - 1],
             "future_images": rgb[:, list(future_positions)],
             "instruction": record.caption,
+            "source_indices": (
+                self.n_previous - 1,
+                *future_positions,
+            ),
             "suite": record.domain,
             "episode_key": record.key,
         }
@@ -246,6 +263,8 @@ class BatonPlannerCollator:
         siglip_processor: Any | None = None,
         siglip_dtype: torch.dtype = torch.bfloat16,
         batch_qwen_rows: bool = False,
+        input_template_kind: str = LEGACY_TEMPLATE_KIND,
+        instruction_rendering_kind: str = VERBATIM_INSTRUCTION_KIND,
     ) -> None:
         if (
             not camera_names
@@ -261,6 +280,23 @@ class BatonPlannerCollator:
             raise TypeError("siglip_dtype must be a torch dtype")
         self.siglip_processor = siglip_processor
         self.siglip_dtype = siglip_dtype
+        if input_template_kind not in {
+            LEGACY_TEMPLATE_KIND,
+            BATON_TEMPLATE_KIND,
+        }:
+            raise ValueError(
+                f"unsupported input template kind: {input_template_kind!r}"
+            )
+        if instruction_rendering_kind not in {
+            VERBATIM_INSTRUCTION_KIND,
+            STRIP_WORLD_ARENA_INSTRUCTION_KIND,
+        }:
+            raise ValueError(
+                "unsupported instruction rendering kind: "
+                f"{instruction_rendering_kind!r}"
+            )
+        self.input_template_kind = input_template_kind
+        self.instruction_rendering_kind = instruction_rendering_kind
         if type(batch_qwen_rows) is not bool:
             raise TypeError("batch_qwen_rows must be boolean")
         self.batch_qwen_rows = batch_qwen_rows
@@ -277,9 +313,12 @@ class BatonPlannerCollator:
         self.plan_pad_token_id = plan_pad_token_id
 
     def _process_row(
-        self, image: torch.Tensor, instruction: str
+        self,
+        image: torch.Tensor,
+        instruction: str,
+        source_indices: tuple[int, int, int, int, int] | None = None,
     ) -> tuple[torch.Tensor, Mapping[str, torch.Tensor]]:
-        text = self._render_row_text(image, instruction)
+        text = self._render_row_text(image, instruction, source_indices)
         processed = self.processor(
             text=[text], images=[image], return_tensors="pt", padding=False
         )
@@ -304,34 +343,68 @@ class BatonPlannerCollator:
             input_ids = input_ids[0]
         return input_ids, processed
 
-    def _render_row_text(self, image: torch.Tensor, instruction: str) -> str:
-        text = build_plan_text(instruction)
+    def _render_row_text(
+        self,
+        image: torch.Tensor,
+        instruction: str,
+        source_indices: tuple[int, int, int, int, int] | None = None,
+    ) -> str:
         apply_chat_template = getattr(self.processor, "apply_chat_template", None)
-        if callable(apply_chat_template):
-            text = apply_chat_template(
-                [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": image},
-                            {"type": "text", "text": text},
-                        ],
-                    }
-                ],
-                tokenize=False,
-                add_generation_prompt=True,
+        if self.input_template_kind == LEGACY_TEMPLATE_KIND:
+            text = build_plan_text(instruction)
+            if callable(apply_chat_template):
+                text = apply_chat_template(
+                    [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image", "image": image},
+                                {"type": "text", "text": text},
+                            ],
+                        }
+                    ],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            return text
+        if not callable(apply_chat_template):
+            raise ValueError(
+                "baton_assistant_time_v2 requires processor.apply_chat_template"
             )
-        return text
+        if source_indices is None:
+            raise ValueError(
+                "baton_assistant_time_v2 requires sample source_indices"
+            )
+        conversation = build_baton_conversation(instruction, source_indices)
+        user_content = conversation[1]["content"]
+        if not isinstance(user_content, list) or not isinstance(
+            user_content[0], dict
+        ):
+            raise AssertionError("Baton conversation image content is malformed")
+        user_content[0]["image"] = image
+        return apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
 
     def _process_rows_batched(
         self,
-        rows: Sequence[tuple[int, str, torch.Tensor, str]],
+        rows: Sequence[
+            tuple[
+                int,
+                str,
+                torch.Tensor,
+                str,
+                tuple[int, int, int, int, int] | None,
+            ]
+        ],
     ) -> tuple[list[torch.Tensor], dict[str, torch.Tensor]]:
         texts = [
-            self._render_row_text(image, instruction)
-            for _, _, image, instruction in rows
+            self._render_row_text(image, instruction, source_indices)
+            for _, _, image, instruction, source_indices in rows
         ]
-        images = [image for _, _, image, _ in rows]
+        images = [image for _, _, image, _, _ in rows]
         processed = self.processor(
             text=texts,
             images=images,
@@ -461,9 +534,33 @@ class BatonPlannerCollator:
             for value in instructions + suites
         ):
             raise ValueError("sample instructions and suites must be nonempty strings")
+        rendered_instructions = tuple(
+            render_instruction(instruction, self.instruction_rendering_kind)
+            for instruction in instructions
+        )
+        raw_source_indices = tuple(sample.get("source_indices") for sample in samples)
+        source_indices: tuple[tuple[int, int, int, int, int], ...] | None
+        if self.input_template_kind == BATON_TEMPLATE_KIND or any(
+            value is not None for value in raw_source_indices
+        ):
+            if any(value is None for value in raw_source_indices):
+                raise ValueError("all samples must provide source_indices together")
+            source_indices = tuple(
+                validate_source_indices(value) for value in raw_source_indices
+            )
+        else:
+            source_indices = None
 
-        rows: list[tuple[int, str, torch.Tensor, str]] = []
-        for sample_index, instruction in enumerate(instructions):
+        rows: list[
+            tuple[
+                int,
+                str,
+                torch.Tensor,
+                str,
+                tuple[int, int, int, int, int] | None,
+            ]
+        ] = []
+        for sample_index, instruction in enumerate(rendered_instructions):
             for camera_index, camera in enumerate(self.camera_names):
                 rows.append(
                     (
@@ -471,6 +568,7 @@ class BatonPlannerCollator:
                         camera,
                         current_images[sample_index, camera_index],
                         instruction,
+                        None if source_indices is None else source_indices[sample_index],
                     )
                 )
 
@@ -479,8 +577,12 @@ class BatonPlannerCollator:
         if self.batch_qwen_rows:
             sequences, qwen_inputs = self._process_rows_batched(rows)
         else:
-            for _, _, image, instruction in rows:
-                sequence, processed = self._process_row(image, instruction)
+            for _, _, image, instruction, indices in rows:
+                sequence, processed = self._process_row(
+                    image,
+                    instruction,
+                    indices,
+                )
                 sequences.append(sequence)
                 processed_rows.append(processed)
         pad_token_id = getattr(
@@ -521,8 +623,10 @@ class BatonPlannerCollator:
             future_images=retained_future_images,
             instructions=instructions,
             row_labels=tuple(
-                (index, camera) for index, camera, _, _ in rows
+                (index, camera) for index, camera, _, _, _ in rows
             ),
             camera_names=self.camera_names,
             future_pixel_values=future_pixel_values,
+            rendered_instructions=rendered_instructions,
+            source_indices=source_indices,
         )

@@ -59,6 +59,35 @@ class _Processor:
         }
 
 
+class _ChatProcessor(_Processor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.chat_calls: list[tuple[list[dict[str, object]], bool]] = []
+
+    def apply_chat_template(
+        self,
+        conversation: list[dict[str, object]],
+        *,
+        tokenize: bool,
+        add_generation_prompt: bool,
+    ) -> str:
+        assert tokenize is False
+        self.chat_calls.append((conversation, add_generation_prompt))
+        rendered: list[str] = []
+        for message in conversation:
+            content = message["content"]
+            if isinstance(content, str):
+                rendered.append(content)
+                continue
+            assert isinstance(content, list)
+            rendered.extend(
+                item["text"]
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        return "\n".join(rendered)
+
+
 class _SiglipProcessor:
     def __call__(
         self,
@@ -154,6 +183,7 @@ def test_dataset_selects_current_and_four_future_frames(dataset) -> None:
     )
     assert sample["suite"] == "libero_object"
     assert sample["instruction"] == "put the red mug on the plate"
+    assert sample["source_indices"] == (3, 4, 7, 9, 12)
     assert "negative_instruction" not in sample
 
 
@@ -236,6 +266,74 @@ def test_collator_builds_one_head_row_per_worldarena_sample() -> None:
     assert batch.camera_names == ("head",)
     assert batch.row_labels == ((0, "head"), (1, "head"))
     assert batch.qwen_inputs["input_ids"].shape[0] == 2
+
+
+def test_baton_collator_uses_assistant_template_and_carries_provenance() -> None:
+    from qwen35_baton.data import BatonPlannerCollator
+    from qwen35_baton.sequence import (
+        BATON_TEMPLATE_KIND,
+        STRIP_WORLD_ARENA_INSTRUCTION_KIND,
+        WORLD_ARENA_BOILERPLATE_PREFIX,
+    )
+
+    processor = _ChatProcessor()
+    collator = BatonPlannerCollator(
+        processor,
+        camera_names=("head",),
+        input_template_kind=BATON_TEMPLATE_KIND,
+        instruction_rendering_kind=STRIP_WORLD_ARENA_INSTRUCTION_KIND,
+    )
+    original = WORLD_ARENA_BOILERPLATE_PREFIX + "Pick up the red cube"
+    sample = {
+        "current_images": torch.zeros((1, 3, 256, 256), dtype=torch.uint8),
+        "future_images": torch.zeros((1, 4, 3, 256, 256), dtype=torch.uint8),
+        "instruction": original,
+        "source_indices": (12, 39, 66, 93, 120),
+        "suite": "worldarena",
+    }
+
+    batch = collator([sample])
+
+    assert batch.instructions == (original,)
+    assert batch.rendered_instructions == ("Pick up the red cube",)
+    assert batch.source_indices == ((12, 39, 66, 93, 120),)
+    assert batch.plan_positions.shape == (1, 1024)
+    assert len(processor.chat_calls) == 1
+    conversation, add_generation_prompt = processor.chat_calls[0]
+    assert add_generation_prompt is False
+    assert [message["role"] for message in conversation] == [
+        "system",
+        "user",
+        "assistant",
+    ]
+    torch.testing.assert_close(
+        conversation[1]["content"][0]["image"], sample["current_images"][0]
+    )
+    assert conversation[2]["content"].count("<PLAN_PAD>") == 1024
+
+
+def test_baton_collator_rejects_bad_time_before_processor_invocation() -> None:
+    from qwen35_baton.data import BatonPlannerCollator
+    from qwen35_baton.sequence import BATON_TEMPLATE_KIND
+
+    processor = _ChatProcessor()
+    collator = BatonPlannerCollator(
+        processor,
+        camera_names=("head",),
+        input_template_kind=BATON_TEMPLATE_KIND,
+    )
+    sample = {
+        "current_images": torch.zeros((1, 3, 256, 256), dtype=torch.uint8),
+        "future_images": torch.zeros((1, 4, 3, 256, 256), dtype=torch.uint8),
+        "instruction": "pick up the red cube",
+        "source_indices": (12, 39, 39, 93, 120),
+        "suite": "worldarena",
+    }
+
+    with pytest.raises(ValueError, match="source_indices"):
+        collator([sample])
+    assert processor.calls == []
+    assert processor.chat_calls == []
 
 
 def test_collator_emits_future_teacher_pixels_without_raw_future_transfer() -> None:
