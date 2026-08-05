@@ -4,6 +4,13 @@ import argparse
 from utils import import_custom_class
 
 
+def positive_int(value):
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
 def main():
 
     parser = argparse.ArgumentParser(
@@ -18,6 +25,12 @@ def main():
     parser.add_argument('--n_chunk_action', type=int, default=1, help='num of action chunks to predict, used in action inference stage only')
     parser.add_argument('--output_path', type=str, default=None, help='Path to save outputs, used in inference stage only')
     parser.add_argument('--domain_name', type=str, default="agibotworld", help='Domain name of the validation dataset, used in inference stage only')
+    parser.add_argument(
+        '--max_train_steps',
+        type=positive_int,
+        default=None,
+        help='bounded training-step override for smoke tests',
+    )
 
     args = parser.parse_args()
     Runner = import_custom_class(
@@ -28,6 +41,8 @@ def main():
     if args.mode == "train":
         ### Trainer
         runner = Runner(args.config_file)
+        if args.max_train_steps is not None:
+            runner.args.train_steps = args.max_train_steps
         runner.prepare_dataset()
         runner.prepare_models()
         runner.prepare_trainable_parameters()
@@ -57,6 +72,4 @@ def main():
 
 
 if __name__ == "__main__":
-  
     main()
-    

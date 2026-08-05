@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import io
 import sys
 from pathlib import Path
 
@@ -13,6 +15,7 @@ if str(GE_ACT_ROOT) not in sys.path:
     sys.path.insert(0, str(GE_ACT_ROOT))
 
 from runner.ge_trainer import (
+    build_vlm_semantic_condition,
     build_optimizer_parameter_groups,
     compute_effective_video_fps,
     compute_ltx_latent_frames,
@@ -21,6 +24,7 @@ from runner.ge_trainer import (
     should_save_checkpoint,
 )
 from utils.model_utils import forward_pass, resolve_checkpoint_files
+from utils import Tee
 from models.ltx_models.transformer_ltx_multiview import LTXVideoTransformer3DModel
 from runner import ge_trainer as ge_trainer_module
 
@@ -32,6 +36,24 @@ class TinySemanticModel(nn.Module):
         self.semantic_adapter = nn.Linear(2, 2)
         self.semantic_attn = nn.Linear(2, 2)
         self.action_proj = nn.Linear(2, 2)
+
+
+class RecordingPlannerProvider:
+    def __init__(self) -> None:
+        self.images = None
+        self.instructions = None
+
+    def predict(self, images, instructions):
+        self.images = images.clone()
+        self.instructions = list(instructions)
+        return type(
+            "Plan",
+            (),
+            {
+                "semantic_tokens": torch.zeros(2, 2, 1, 256, 1024),
+                "times": torch.ones(4, 1),
+            },
+        )()
 
 
 def test_deepspeed_config_preserves_requested_gradient_accumulation() -> None:
@@ -96,6 +118,79 @@ def test_semantic_dropout_is_shared_between_views() -> None:
     assert mask.shape == (16,)
     assert torch.equal(mask.reshape(8, 2)[:, 0], mask.reshape(8, 2)[:, 1])
     assert set(mask.tolist()) == {0.0, 1.0}
+
+
+def test_build_vlm_semantic_condition_uses_current_observation_only() -> None:
+    video = torch.arange(2 * 3 * 2 * 13 * 2 * 2).reshape(
+        2, 3, 2, 13, 2, 2
+    ).float()
+    provider = RecordingPlannerProvider()
+
+    tokens, times = build_vlm_semantic_condition(
+        provider,
+        video,
+        ["pick", "place"],
+        n_previous=4,
+    )
+
+    torch.testing.assert_close(
+        provider.images,
+        video[:, :, :, 3].permute(0, 2, 1, 3, 4),
+    )
+    assert provider.instructions == ["pick", "place"]
+    assert tokens.shape == (2, 2, 1, 256, 1024)
+    assert times.shape == (4, 1)
+
+
+def test_main_exposes_a_positive_bounded_smoke_step_override() -> None:
+    source = (GE_ACT_ROOT / "main.py").read_text()
+
+    assert "--max_train_steps" in source
+    assert "runner.args.train_steps = args.max_train_steps" in source
+
+
+def test_training_loop_checks_step_limit_before_entering_each_epoch() -> None:
+    tree = ast.parse((GE_ACT_ROOT / "runner" / "ge_trainer.py").read_text())
+    trainer = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Trainer"
+    )
+    train_method = next(
+        node
+        for node in trainer.body
+        if isinstance(node, ast.FunctionDef) and node.name == "train"
+    )
+    epoch_loop = next(
+        node
+        for node in train_method.body
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "epoch"
+    )
+
+    epoch_guard = epoch_loop.body[0]
+    assert isinstance(epoch_guard, ast.If)
+    assert ast.unparse(epoch_guard.test) == "global_step >= self.state.train_steps"
+    assert any(isinstance(statement, ast.Break) for statement in epoch_guard.body)
+
+
+def test_tee_flush_skips_streams_that_are_already_closed(tmp_path: Path) -> None:
+    live_stream = io.StringIO()
+    closed_stream = (tmp_path / "closed.log").open("w")
+    closed_stream.close()
+
+    Tee(live_stream, closed_stream).flush()
+
+
+def test_tee_write_skips_streams_that_are_already_closed(tmp_path: Path) -> None:
+    live_stream = io.StringIO()
+    closed_stream = (tmp_path / "closed.log").open("w")
+    closed_stream.close()
+
+    Tee(live_stream, closed_stream).write("still logged")
+
+    assert live_stream.getvalue() == "still logged"
 
 
 def test_forward_pass_uses_real_frame_rate_and_forwards_semantics() -> None:

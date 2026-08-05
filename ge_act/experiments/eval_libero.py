@@ -44,6 +44,12 @@ from utils.memory_utils import get_memory_statistics, free_memory
 from torch.utils.tensorboard import SummaryWriter
 from utils import init_logging, import_custom_class, save_video
 from utils.data_utils import get_latents, get_text_conditions, gen_noise_from_condition_frame_latent, randn_tensor, apply_color_jitter_to_video
+from runner.ge_trainer import (
+    build_baton_semantic_condition,
+    compute_ltx_latent_frames,
+    prepare_baton_conditioning,
+)
+from runner.ge_inferencer import validate_baton_inference_source
 
 
 class InferenceLibero:
@@ -75,6 +81,7 @@ class InferenceLibero:
 
         # Scheduler
         self.scheduler = None
+        self.baton_components = None
 
         self.args.output_dir = Path(self.args.output_dir)
         self.args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -155,6 +162,15 @@ class InferenceLibero:
         print("Initializing models")
         device = self.device
         dtype = self.weight_dtype
+        semantic = getattr(self.args, "semantic_plan", {})
+        baton_source = validate_baton_inference_source(vars(self.args))
+        if baton_source is not None:
+            self.baton_components = prepare_baton_conditioning(
+                vars(self.args),
+                dataset=None,
+                device=device,
+                dtype=dtype,
+            )
 
         ### Load Tokenizer
         tokenizer_class = import_custom_class(
@@ -291,6 +307,39 @@ class InferenceLibero:
 
         obs_tensor = rearrange(obs_tensor, "v t c h w -> c v t h w")  # c,t,h,w
         obs_tensor = obs_tensor.unsqueeze(0)  # b,c,v,t,h,w
+        semantic_plan = None
+        semantic_plan_times = None
+        semantic_plan_positions = None
+        semantic_plan_mask = None
+        semantic_plan_relevance = None
+        semantic_condition_mask = None
+        if self.baton_components is not None:
+            latent_num_frames = compute_ltx_latent_frames(
+                self.chunk,
+                temporal_compression_ratio=self.TEMPORAL_DOWN_RATIO,
+                n_previous=self.n_prev,
+            )
+            condition = build_baton_semantic_condition(
+                self.baton_components,
+                self.args.semantic_plan,
+                obs_tensor,
+                (str(prompt),),
+                n_previous=self.n_prev,
+                num_future_frames=self.chunk,
+                num_latent_frames=latent_num_frames,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            semantic_plan = condition.tokens
+            semantic_plan_times = condition.times
+            semantic_plan_positions = condition.positions
+            semantic_plan_mask = condition.mask
+            semantic_plan_relevance = condition.relevance
+            semantic_condition_mask = torch.ones(
+                v,
+                device=self.device,
+                dtype=self.dtype,
+            )
         obs_tensor = rearrange(obs_tensor, "b c v t h w -> (b v) c t h w")
 
         negative_prompt = ""
@@ -315,6 +364,12 @@ class InferenceLibero:
             n_chunk=1,
             n_prev=self.n_prev,
             action_dim=self.action_dim,
+            semantic_plan=semantic_plan,
+            semantic_plan_times=semantic_plan_times,
+            semantic_plan_positions=semantic_plan_positions,
+            semantic_plan_mask=semantic_plan_mask,
+            semantic_plan_relevance=semantic_plan_relevance,
+            semantic_condition_mask=semantic_condition_mask,
         )[0]
 
         actions_pred = pred_all["action"].detach().cpu()[0]

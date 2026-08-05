@@ -47,6 +47,7 @@ def configure_qwen3vl_processor(
 def load_qwen3vl_model_and_processor(
     model_path: str | Path,
     *,
+    processor_path: str | Path | None = None,
     device: torch.device | str | None = None,
     dtype: str = "bf16",
     attn_implementation: str = "sdpa",
@@ -59,8 +60,12 @@ def load_qwen3vl_model_and_processor(
     from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
     model_path = str(model_path)
+    processor_path = str(processor_path) if processor_path is not None else model_path
     torch_dtype = torch_dtype_from_name(dtype)
-    processor = AutoProcessor.from_pretrained(model_path, local_files_only=local_files_only)
+    processor = AutoProcessor.from_pretrained(
+        processor_path,
+        local_files_only=local_files_only,
+    )
     processor = configure_qwen3vl_processor(
         processor,
         target_short_side=target_short_side,
@@ -68,7 +73,7 @@ def load_qwen3vl_model_and_processor(
     )
 
     model_kwargs: dict[str, Any] = {
-        "dtype": torch_dtype,
+        "torch_dtype": torch_dtype,
         "local_files_only": local_files_only,
         "attn_implementation": attn_implementation,
     }

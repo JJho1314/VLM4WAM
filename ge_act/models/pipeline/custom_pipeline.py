@@ -13,21 +13,16 @@
 # limitations under the License.
 
 import inspect
-import os
-import sys
-from importlib import import_module
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 from dataclasses import dataclass
-import time
 import numpy as np
 import torch
 
-from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import PipelineImageInput
 from diffusers.loaders import FromSingleFileMixin
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-from diffusers.utils import is_torch_xla_available, logging, replace_example_docstring
+from diffusers.utils import is_torch_xla_available, logging
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.utils import BaseOutput
 
@@ -80,18 +75,40 @@ def prepare_pipeline_semantic_conditioning(
     semantic_plan_times: Optional[torch.Tensor],
     semantic_condition_mask: Optional[torch.Tensor],
     *,
+    semantic_plan_positions: Optional[torch.Tensor] = None,
+    semantic_plan_mask: Optional[torch.Tensor] = None,
+    semantic_plan_relevance: Optional[torch.Tensor] = None,
     batch_size: int,
     n_view: int,
     num_keyframes: int,
     do_classifier_free_guidance: bool,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> tuple[Optional[torch.Tensor], ...]:
     """Validate semantic input and mirror the video CFG batch order."""
 
+    grounding_requested = any(
+        value is not None
+        for value in (
+            semantic_plan_positions,
+            semantic_plan_mask,
+            semantic_plan_relevance,
+        )
+    )
     if semantic_plan is None:
-        if semantic_plan_times is not None or semantic_condition_mask is not None:
-            raise ValueError("semantic times/mask cannot be provided without semantic_plan")
+        if any(
+            value is not None
+            for value in (
+                semantic_plan_times,
+                semantic_condition_mask,
+                semantic_plan_positions,
+                semantic_plan_mask,
+                semantic_plan_relevance,
+            )
+        ):
+            raise ValueError(
+                "semantic metadata cannot be provided without semantic_plan"
+            )
         return None, None, None
     if semantic_plan_times is None:
         raise ValueError("semantic_plan_times is required with semantic_plan")
@@ -107,6 +124,39 @@ def prepare_pipeline_semantic_conditioning(
         raise ValueError("semantic keyframe dimension does not match num_keyframes")
 
     semantic_plan = semantic_plan.to(device=device, dtype=dtype)
+    num_patches = (
+        semantic_plan.shape[3]
+        if semantic_plan.ndim == 5
+        else semantic_plan.shape[2] // num_keyframes
+    )
+    metadata_shape = (batch_size, n_view, num_keyframes, num_patches)
+    if semantic_plan_positions is not None:
+        if tuple(semantic_plan_positions.shape) != (*metadata_shape, 2):
+            raise ValueError(
+                "semantic_plan_positions must align with compressed tokens"
+            )
+        semantic_plan_positions = semantic_plan_positions.to(
+            device=device,
+            dtype=torch.float32,
+        )
+    if semantic_plan_mask is not None:
+        if (
+            tuple(semantic_plan_mask.shape) != metadata_shape
+            or semantic_plan_mask.dtype != torch.bool
+        ):
+            raise ValueError(
+                "semantic_plan_mask must be aligned boolean metadata"
+            )
+        semantic_plan_mask = semantic_plan_mask.to(device=device)
+    if semantic_plan_relevance is not None:
+        if tuple(semantic_plan_relevance.shape) != metadata_shape:
+            raise ValueError(
+                "semantic_plan_relevance must align with compressed tokens"
+            )
+        semantic_plan_relevance = semantic_plan_relevance.to(
+            device=device,
+            dtype=dtype,
+        )
     if semantic_plan_times.ndim == 3:
         if tuple(semantic_plan_times.shape) != (batch_size, n_view, num_keyframes):
             raise ValueError("semantic_plan_times must align with semantic batch/view/keyframes")
@@ -129,7 +179,34 @@ def prepare_pipeline_semantic_conditioning(
         semantic_plan = torch.cat((semantic_plan, semantic_plan), dim=0)
         semantic_plan_times = torch.cat((semantic_plan_times, semantic_plan_times), dim=0)
         semantic_condition_mask = torch.cat((semantic_condition_mask, semantic_condition_mask), dim=0)
-    return semantic_plan, semantic_plan_times, semantic_condition_mask
+        if semantic_plan_positions is not None:
+            semantic_plan_positions = torch.cat(
+                (semantic_plan_positions, semantic_plan_positions),
+                dim=0,
+            )
+        if semantic_plan_mask is not None:
+            semantic_plan_mask = torch.cat(
+                (semantic_plan_mask, semantic_plan_mask),
+                dim=0,
+            )
+        if semantic_plan_relevance is not None:
+            semantic_plan_relevance = torch.cat(
+                (semantic_plan_relevance, semantic_plan_relevance),
+                dim=0,
+            )
+    legacy = (
+        semantic_plan,
+        semantic_plan_times,
+        semantic_condition_mask,
+    )
+    if not grounding_requested:
+        return legacy
+    return (
+        *legacy,
+        semantic_plan_positions,
+        semantic_plan_mask,
+        semantic_plan_relevance,
+    )
 
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
@@ -656,7 +733,11 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
         show_progress: bool = False,
         semantic_plan: Optional[torch.Tensor] = None,
         semantic_plan_times: Optional[torch.Tensor] = None,
+        semantic_plan_positions: Optional[torch.Tensor] = None,
+        semantic_plan_mask: Optional[torch.Tensor] = None,
+        semantic_plan_relevance: Optional[torch.Tensor] = None,
         semantic_condition_mask: Optional[torch.Tensor] = None,
+        capture_validation_trace: bool = False,
         **kwargs,
     ):
         r"""
@@ -799,10 +880,13 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)  # b,l,c ?
             prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
 
-        semantic_plan, semantic_plan_times, semantic_condition_mask = prepare_pipeline_semantic_conditioning(
+        prepared_semantic = prepare_pipeline_semantic_conditioning(
             semantic_plan,
             semantic_plan_times,
             semantic_condition_mask,
+            semantic_plan_positions=semantic_plan_positions,
+            semantic_plan_mask=semantic_plan_mask,
+            semantic_plan_relevance=semantic_plan_relevance,
             batch_size=batch_size,
             n_view=n_view,
             num_keyframes=int(getattr(self.transformer.config, "semantic_plan_num_keyframes", 4)),
@@ -810,6 +894,24 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
             device=device,
             dtype=prompt_embeds.dtype,
         )
+        if len(prepared_semantic) == 3:
+            (
+                semantic_plan,
+                semantic_plan_times,
+                semantic_condition_mask,
+            ) = prepared_semantic
+            semantic_plan_positions = None
+            semantic_plan_mask = None
+            semantic_plan_relevance = None
+        else:
+            (
+                semantic_plan,
+                semantic_plan_times,
+                semantic_condition_mask,
+                semantic_plan_positions,
+                semantic_plan_mask,
+                semantic_plan_relevance,
+            ) = prepared_semantic
 
         if len(image.shape) == 4:  # in this case, a single image act as input
             image = image.unsqueeze(2)
@@ -839,6 +941,21 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
             actions = randn_tensor((batch_size, action_chunk, action_dim), device=device, dtype=prompt_embeds.dtype, generator=action_generator)
         else:
             actions = None
+        validation_trace = (
+            {
+                "prompt_embeds": prompt_embeds.detach().clone(),
+                "prompt_attention_mask": (
+                    prompt_attention_mask.detach().clone()
+                ),
+                "initial_actions": (
+                    actions.detach().clone()
+                    if actions is not None
+                    else torch.empty(0, device=device)
+                )
+            }
+            if capture_validation_trace
+            else None
+        )
 
 
         # 5. Prepare timesteps
@@ -873,6 +990,8 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
             self.scheduler.sigmas[-1] = self.scheduler.sigmas[-2]
 
         self._num_timesteps = len(timesteps)
+        if validation_trace is not None:
+            validation_trace["timesteps"] = timesteps.detach().clone()
 
         # 6. Prepare micro-conditions
         latent_frame_rate = frame_rate / self.vae_temporal_compression_ratio
@@ -895,6 +1014,10 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
             latents, conditioning_mask, cond_indicator = gen_noise_from_condition_frame_latent(
                 init_latents, latent_num_frames, latent_height, latent_width, video_generator, noise_to_condition_frames=0
             )
+            if validation_trace is not None and i_chunk == 0:
+                validation_trace["initial_video_noise"] = (
+                    latents.detach().clone()
+                )
 
             if self.do_classifier_free_guidance:
                 conditioning_mask = torch.cat([conditioning_mask, conditioning_mask], dim=0)
@@ -973,6 +1096,9 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
                         condition_mask=conditioning_mask,
                         semantic_plan=semantic_plan,
                         semantic_plan_times=semantic_plan_times,
+                        semantic_plan_positions=semantic_plan_positions,
+                        semantic_plan_mask=semantic_plan_mask,
+                        semantic_plan_relevance=semantic_plan_relevance,
                         semantic_condition_mask=semantic_condition_mask,
                     )[0]
 
@@ -1068,6 +1194,8 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
 
         if return_action:
             preds["action"] = actions
+        if validation_trace is not None:
+            preds["validation_trace"] = validation_trace
 
         self.transformer.train()
 

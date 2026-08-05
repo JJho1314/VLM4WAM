@@ -1,0 +1,1468 @@
+#!/usr/bin/env python3
+"""Parity and CPU/DataLoader benchmark for the optional LIBERO HDF5 backend."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import importlib
+import importlib.util
+import json
+import math
+import multiprocessing as multiprocessing
+import os
+import queue
+import re
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterator, Sequence
+
+import numpy as np
+import torch
+import yaml
+from torch.utils.data import DataLoader, Dataset
+
+try:
+    import psutil as _psutil
+except ModuleNotFoundError:  # pragma: no cover - exercised through fallback tests
+    _psutil = None
+
+
+GE_ACT_ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = GE_ACT_ROOT.parent
+EXPECTED_SAMPLE_KEYS = {"video", "actions", "caption", "state"}
+EXACT_FIELDS = ["actions", "state", "caption", "shape", "dtype"]
+RGB_ERROR_BOUND = 1.0 / 255.0 + 1e-6
+EPISODE_PATTERN = re.compile(r"episode_(\d{6})(?:\.[^/]*)?$")
+
+
+class SampleComparisonError(AssertionError):
+    """Assertion carrying machine-readable comparison details."""
+
+    def __init__(self, message: str, details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.details = details or {}
+
+
+def _assert_sample_tensor(value: Any, field: str) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor):
+        raise SampleComparisonError(f"{field} must be a torch.Tensor")
+    return value
+
+
+def compare_samples(old: dict, new: dict) -> dict[str, Any]:
+    """Compare one old/HDF5 sample at the normalized model-input boundary."""
+    if type(old) is not dict or type(new) is not dict:
+        raise SampleComparisonError("samples must be dict objects")
+    if set(old) != EXPECTED_SAMPLE_KEYS or set(new) != EXPECTED_SAMPLE_KEYS:
+        raise SampleComparisonError(
+            "sample keys must be exactly video/actions/caption/state; "
+            f"old={sorted(old)} new={sorted(new)}"
+        )
+
+    for field in ("video", "actions", "state"):
+        old_tensor = _assert_sample_tensor(old[field], f"old {field}")
+        new_tensor = _assert_sample_tensor(new[field], f"new {field}")
+        if old_tensor.shape != new_tensor.shape:
+            raise SampleComparisonError(
+                f"{field} shape mismatch: {tuple(old_tensor.shape)} != "
+                f"{tuple(new_tensor.shape)}"
+            )
+        if old_tensor.dtype != new_tensor.dtype:
+            raise SampleComparisonError(
+                f"{field} dtype mismatch: {old_tensor.dtype} != {new_tensor.dtype}"
+            )
+
+    if old["caption"] != new["caption"]:
+        raise SampleComparisonError(
+            f"caption mismatch: {old['caption']!r} != {new['caption']!r}"
+        )
+    for field in ("actions", "state"):
+        if not torch.equal(old[field], new[field]):
+            raise SampleComparisonError(f"{field} values are not exactly identical")
+
+    old_video = old["video"]
+    new_video = new["video"]
+    if old_video.ndim < 2 or old_video.shape[1] != 2:
+        raise SampleComparisonError(
+            "video shape must contain exactly two cameras at dimension 1"
+        )
+    errors = {
+        "main": float((old_video[:, 0] - new_video[:, 0]).abs().max().item()),
+        "wrist": float((old_video[:, 1] - new_video[:, 1]).abs().max().item()),
+    }
+    maximum = max(errors.values())
+    details = {
+        "normalized_rgb_error": errors,
+        "max_normalized_rgb_error": maximum,
+        "exact_fields": EXACT_FIELDS.copy(),
+    }
+    if not all(math.isfinite(value) for value in errors.values()):
+        raise SampleComparisonError(
+            "RGB comparison produced a non-finite error", details
+        )
+
+    swapped_errors = {
+        "main_to_wrist": float((old_video[:, 0] - new_video[:, 1]).abs().max().item()),
+        "wrist_to_main": float((old_video[:, 1] - new_video[:, 0]).abs().max().item()),
+    }
+    if maximum > RGB_ERROR_BOUND and max(swapped_errors.values()) <= RGB_ERROR_BOUND:
+        details["swapped_normalized_rgb_error"] = swapped_errors
+        raise SampleComparisonError(
+            "camera order failure: apparent main/wrist camera swap", details
+        )
+    for camera, error in errors.items():
+        if error > RGB_ERROR_BOUND:
+            raise SampleComparisonError(
+                f"{camera} normalized RGB error {error:.9g} exceeds "
+                f"{RGB_ERROR_BOUND:.9g}",
+                details,
+            )
+    return details
+
+
+def choose_compression(results: dict[str, float]) -> str:
+    """Choose LZF when it is no more than five percent slower than none."""
+    if type(results) is not dict:
+        raise ValueError("compression results must be a dict")
+    values: dict[str, float] = {}
+    for name in ("none", "lzf"):
+        if name not in results or isinstance(results[name], bool):
+            raise ValueError(f"compression result {name} must be finite and positive")
+        try:
+            value = float(results[name])
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"compression result {name} must be finite and positive"
+            ) from error
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"compression result {name} must be finite and positive")
+        values[name] = value
+    return "lzf" if values["lzf"] >= 0.95 * values["none"] else "none"
+
+
+def _best_hdf5_throughput(report: dict[str, Any]) -> dict[str, float | int]:
+    throughput = report.get("throughput")
+    if type(throughput) is not list or not throughput:
+        raise ValueError("compression report throughput must be a non-empty list")
+    candidates = []
+    for entry in throughput:
+        try:
+            workers = entry["workers"]
+            speed = entry["backends"]["hdf5"]["samples_per_second"]
+        except (KeyError, TypeError) as error:
+            raise ValueError("compression report throughput is malformed") from error
+        if type(workers) is not int or workers < 0 or isinstance(speed, bool):
+            raise ValueError("compression report throughput is malformed")
+        speed = float(speed)
+        if not math.isfinite(speed) or speed <= 0:
+            raise ValueError(
+                "compression report throughput must be finite and positive"
+            )
+        candidates.append((speed, workers))
+    speed, workers = max(candidates)
+    return {"best_samples_per_second": speed, "workers": workers}
+
+
+def merge_compression_reports(
+    current: dict[str, Any], other: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate comparable none/LZF runs and select the production candidate."""
+    if type(current) is not dict or type(other) is not dict:
+        raise ValueError("compression reports must be dicts")
+    compressions = {current.get("compression"), other.get("compression")}
+    if compressions != {"none", "lzf"}:
+        raise ValueError("compression reports must contain exactly none and lzf")
+    for report in (current, other):
+        if report.get("parity", {}).get("passed") is not True:
+            raise ValueError("compression report parity must pass")
+    if current.get("run_label") != other.get("run_label"):
+        raise ValueError("compression report run_label values must match")
+    if current.get("arguments") != other.get("arguments"):
+        raise ValueError("compression report arguments must match")
+
+    host = current.get("host")
+    if type(host) is not str or not host or other.get("host") != host:
+        raise ValueError("compression report host values must be present and match")
+    for report in (current, other):
+        git = report.get("git")
+        if (
+            type(git) is not dict
+            or type(git.get("sha")) is not str
+            or not git["sha"]
+            or type(git.get("dirty")) is not bool
+        ):
+            raise ValueError("compression report git sha/dirty must be present")
+        if "fingerprint" not in git:
+            raise ValueError("compression report git fingerprint must be present")
+        fingerprint = git["fingerprint"]
+        if git["dirty"]:
+            if (
+                type(fingerprint) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+            ):
+                raise ValueError(
+                    "compression report dirty git fingerprint must be sha256"
+                )
+        elif fingerprint is not None:
+            raise ValueError("compression report clean git fingerprint must be null")
+    if current["git"] != other["git"]:
+        raise ValueError("compression report git metadata must match")
+
+    def pair_projection(report: dict[str, Any], section: str, fields: tuple[str, ...]):
+        pairs = report.get(section, {}).get("pairs")
+        if type(pairs) is not list or not pairs:
+            raise ValueError(f"compression report {section} pairs must be present")
+        try:
+            return [{field: pair[field] for field in fields} for pair in pairs]
+        except (KeyError, TypeError) as error:
+            raise ValueError(
+                f"compression report {section} pairs are malformed"
+            ) from error
+
+    mapping_fields = (
+        "domain",
+        "episode_index",
+        "old_index",
+        "hdf5_index",
+        "caption",
+        "length",
+    )
+    identity_fields = ("domain", "episode_index", "old_index", "hdf5_index")
+    parity_fields = (*identity_fields, "frame_indexes", "action_indexes")
+    if pair_projection(current, "mapping", mapping_fields) != pair_projection(
+        other, "mapping", mapping_fields
+    ):
+        raise ValueError("compression report mapping pairs must match")
+    if pair_projection(current, "parity", parity_fields) != pair_projection(
+        other, "parity", parity_fields
+    ):
+        raise ValueError("compression report parity pairs must match")
+
+    def filesystem_projection(report: dict[str, Any]) -> dict[str, Any]:
+        filesystem = report.get("filesystem")
+        if type(filesystem) is not dict:
+            raise ValueError("compression report filesystem context must be present")
+        old_data = filesystem.get("old_data")
+        shards = filesystem.get("hdf5_shards")
+        manifest = filesystem.get("manifest")
+        predecoded = filesystem.get("old_predecoded_video_root")
+        if (
+            type(manifest) is not str
+            or not manifest
+            or type(predecoded) is not str
+            or not predecoded
+            or type(old_data) is not dict
+            or not old_data
+            or type(shards) is not dict
+            or not shards
+            or any(type(value) is not str or not value for value in old_data.values())
+            or any(type(value) is not str or not value for value in shards.values())
+        ):
+            raise ValueError("compression report filesystem context is malformed")
+        return {
+            "manifest": manifest,
+            "old_data": sorted(old_data.items()),
+            "old_predecoded_video_root": predecoded,
+            "hdf5_shard_filesystems": sorted(shards.values()),
+        }
+
+    if filesystem_projection(current) != filesystem_projection(other):
+        raise ValueError("compression report filesystem contexts must match")
+
+    reports = {report["compression"]: report for report in (current, other)}
+    by_compression = {
+        name: _best_hdf5_throughput(reports[name]) for name in ("none", "lzf")
+    }
+    selected = choose_compression(
+        {
+            name: details["best_samples_per_second"]
+            for name, details in by_compression.items()
+        }
+    )
+    return {
+        "by_compression": by_compression,
+        "selected_format": selected,
+        "selected_workers": by_compression[selected]["workers"],
+        "threshold": 0.95,
+    }
+
+
+def atomic_write_json(path: str | Path, payload: Any) -> None:
+    """Write one JSON report atomically and remove temporary files on failure."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            json.dump(payload, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def percentile(values: Sequence[float], q: float) -> float:
+    """Return the linear percentile used in benchmark summaries."""
+    if not values:
+        raise ValueError("percentile values must not be empty")
+    if isinstance(q, bool) or not math.isfinite(float(q)) or not 0 <= float(q) <= 100:
+        raise ValueError("percentile q must be finite and in [0, 100]")
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 1 or not np.isfinite(array).all():
+        raise ValueError("percentile values must be a finite one-dimensional sequence")
+    return float(np.percentile(array, float(q), method="linear"))
+
+
+def _proc_status_path(pid: int) -> Path:
+    return Path("/proc") / str(pid) / "status"
+
+
+def _proc_io_path(pid: int) -> Path:
+    return Path("/proc") / str(pid) / "io"
+
+
+def _proc_stat_path(pid: int) -> Path:
+    return Path("/proc") / str(pid) / "stat"
+
+
+def _read_status_kib(pid: int, field: str) -> int:
+    try:
+        status = _proc_status_path(pid).read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return 0
+    prefix = f"{field}:"
+    for line in status.splitlines():
+        if line.startswith(prefix):
+            fields = line.split()
+            if len(fields) >= 2:
+                return int(fields[1]) * 1024
+    return 0
+
+
+def read_process_rss_bytes(pid: int) -> int:
+    """Read RSS through psutil, falling back to /proc; vanished PIDs return zero."""
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("pid must be a positive integer")
+    if _psutil is not None:
+        try:
+            return int(_psutil.Process(pid).memory_info().rss)
+        except (_psutil.NoSuchProcess, _psutil.ZombieProcess, ProcessLookupError):
+            return 0
+        except (_psutil.AccessDenied, PermissionError):
+            pass
+    return _read_status_kib(pid, "VmRSS")
+
+
+def read_process_peak_rss_bytes(pid: int) -> int:
+    """Read Linux high-water RSS; vanished or unsupported processes return zero."""
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("pid must be a positive integer")
+    return _read_status_kib(pid, "VmHWM")
+
+
+def aggregate_worker_rss_bytes(pids: Sequence[int]) -> int:
+    return sum(read_process_rss_bytes(int(pid)) for pid in pids)
+
+
+def aggregate_worker_peak_rss_bytes(pids: Sequence[int]) -> int:
+    return sum(read_process_peak_rss_bytes(int(pid)) for pid in pids)
+
+
+class PeakWorkerRSSMonitor:
+    """Poll aggregate worker RSS while retaining kernel VmHWM as corroboration."""
+
+    def __init__(self, pids: Sequence[int], interval_seconds: float = 0.01):
+        self.pids = list(pids)
+        self.interval_seconds = float(interval_seconds)
+        if not math.isfinite(self.interval_seconds) or self.interval_seconds <= 0:
+            raise ValueError("RSS polling interval must be finite and positive")
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._samples: list[int] = []
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._samples.append(aggregate_worker_rss_bytes(self.pids))
+            self._stop.wait(self.interval_seconds)
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError("RSS monitor already started")
+        self._thread = threading.Thread(
+            target=self._run, name="libero-rss-monitor", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> dict[str, Any]:
+        if self._thread is None:
+            raise RuntimeError("RSS monitor was not started")
+        self._stop.set()
+        self._thread.join()
+        self._samples.append(aggregate_worker_rss_bytes(self.pids))
+        hwm = aggregate_worker_peak_rss_bytes(self.pids)
+        polled_peak = max(self._samples, default=0)
+        return {
+            "peak_aggregate_worker_rss_bytes": max(polled_peak, hwm),
+            "aggregate_worker_rss_bytes": self._samples[-1],
+            "worker_peak_rss_hwm_bytes": hwm,
+            "rss_sample_count": len(self._samples),
+            "peak_rss_method": (
+                f"{self.interval_seconds * 1000:g}ms aggregate RSS poll + /proc VmHWM"
+            ),
+            "peak_rss_window": "full_stream_including_warmup_measurement_drain",
+            "peak_rss_caveat": (
+                "sum of per-worker VmHWM is a conservative corroborating bound"
+            ),
+        }
+
+
+class _WorkerStartGate:
+    """Block each worker before its first dataset read until counters are sampled."""
+
+    def __init__(self, release_event: Any, ready_queue: Any):
+        self.release_event = release_event
+        self.ready_queue = ready_queue
+
+    def __call__(self, worker_id: int) -> None:
+        self.ready_queue.put(worker_id)
+        self.release_event.wait()
+
+
+def read_process_counters(pid: int) -> dict[str, Any]:
+    """Read process I/O and CPU counters with a Linux /proc fallback."""
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("pid must be a positive integer")
+    if _psutil is not None:
+        try:
+            process = _psutil.Process(pid)
+            io_counters = process.io_counters()
+            cpu = process.cpu_times()
+            return {
+                "read_bytes": int(getattr(io_counters, "read_bytes", 0)),
+                "read_chars": int(getattr(io_counters, "read_chars", 0)),
+                "cpu_seconds": float(cpu.user + cpu.system),
+                "method": "psutil",
+            }
+        except (_psutil.NoSuchProcess, _psutil.ZombieProcess, ProcessLookupError):
+            return {
+                "read_bytes": 0,
+                "read_chars": 0,
+                "cpu_seconds": 0.0,
+                "method": "vanished",
+            }
+        except (_psutil.AccessDenied, PermissionError, AttributeError):
+            pass
+    try:
+        io_text = _proc_io_path(pid).read_text(encoding="utf-8")
+        stat_text = _proc_stat_path(pid).read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return {
+            "read_bytes": 0,
+            "read_chars": 0,
+            "cpu_seconds": 0.0,
+            "method": "vanished",
+        }
+    io_values = {}
+    for line in io_text.splitlines():
+        if ":" in line:
+            name, value = line.split(":", 1)
+            io_values[name] = int(value.strip())
+    closing = stat_text.rfind(")")
+    stat_fields = stat_text[closing + 2 :].split()
+    if closing < 0 or len(stat_fields) <= 12:
+        raise ValueError(f"malformed /proc stat for pid {pid}")
+    ticks = float(os.sysconf("SC_CLK_TCK"))
+    cpu_seconds = (int(stat_fields[11]) + int(stat_fields[12])) / ticks
+    return {
+        "read_bytes": int(io_values.get("read_bytes", 0)),
+        "read_chars": int(io_values.get("rchar", 0)),
+        "cpu_seconds": cpu_seconds,
+        "method": "proc",
+    }
+
+
+def aggregate_process_counters(pids: Sequence[int]) -> dict[str, Any]:
+    counters = [read_process_counters(int(pid)) for pid in pids]
+    methods = sorted({counter["method"] for counter in counters})
+    return {
+        "read_bytes": sum(counter["read_bytes"] for counter in counters),
+        "read_chars": sum(counter["read_chars"] for counter in counters),
+        "cpu_seconds": sum(counter["cpu_seconds"] for counter in counters),
+        "method": "+".join(methods),
+    }
+
+
+def counter_delta(
+    before: dict[str, Any], after: dict[str, Any], *, elapsed_seconds: float
+) -> dict[str, Any]:
+    if not math.isfinite(elapsed_seconds) or elapsed_seconds <= 0:
+        raise ValueError("counter elapsed_seconds must be finite and positive")
+    read_bytes = max(0, int(after["read_bytes"]) - int(before["read_bytes"]))
+    read_chars = max(0, int(after["read_chars"]) - int(before["read_chars"]))
+    cpu_seconds = max(0.0, float(after["cpu_seconds"]) - float(before["cpu_seconds"]))
+    core_equivalents = cpu_seconds / elapsed_seconds
+    return {
+        "read_bytes": read_bytes,
+        "read_chars": read_chars,
+        "cpu_seconds": cpu_seconds,
+        "cpu_core_equivalents": core_equivalents,
+        "cpu_utilization_percent": core_equivalents * 100.0,
+        "counter_method": after["method"],
+        "counter_window": "measurement",
+        "io_counter_caveat": (
+            "read_bytes is kernel-accounted storage I/O and may exclude cached/NFS "
+            "traffic; read_chars is the logical read syscall byte count"
+        ),
+        "cpu_utilization_caveat": (
+            "one-core convention: 100% equals one fully utilized CPU core; "
+            "values may exceed 100%"
+        ),
+    }
+
+
+@dataclass(frozen=True)
+class EpisodePair:
+    domain: str
+    episode_index: int
+    caption: str
+    length: int
+    old_index: int
+    hdf5_index: int
+
+
+@dataclass(frozen=True)
+class DeterministicSamplePlan:
+    pair: EpisodePair
+    fix_sidx: int
+    fix_mem_idx: list[int]
+    frame_indexes: list[int]
+    action_indexes: list[int]
+
+
+def _episode_index_from_path(path: Any, field: str) -> int:
+    if type(path) is not str:
+        raise ValueError(f"old episode {field} path must be a string")
+    match = EPISODE_PATTERN.search(path)
+    if match is None:
+        raise ValueError(f"old episode {field} path is not canonical: {path!r}")
+    return int(match.group(1))
+
+
+def _old_episode_metadata(record: Any, index: int) -> tuple[str, int, str, int]:
+    if not isinstance(record, (list, tuple)) or len(record) < 8:
+        raise ValueError(f"old episode record {index} is malformed")
+    video_index = _episode_index_from_path(record[0], "video")
+    parquet_index = _episode_index_from_path(record[2], "parquet")
+    if video_index != parquet_index:
+        raise ValueError(
+            f"old episode record {index} video/parquet episode index mismatch"
+        )
+    domain, caption, length = record[3], record[6], record[7]
+    if type(domain) is not str or not domain:
+        raise ValueError(f"old episode record {index} domain is invalid")
+    if type(caption) is not str or not caption:
+        raise ValueError(f"old episode record {index} caption is invalid")
+    if type(length) is not int or length < 2:
+        raise ValueError(f"old episode record {index} length is invalid")
+    return domain, video_index, caption, length
+
+
+def map_episode_pairs(
+    old_dataset: Any,
+    hdf5_dataset: Any,
+    *,
+    episode_limit: int,
+) -> list[EpisodePair]:
+    """Map HDF5 manifest order onto canonical old dataset identities."""
+    if type(episode_limit) is not int or episode_limit <= 0:
+        raise ValueError("episode_limit must be a positive integer")
+    old_records = getattr(old_dataset, "dataset", None)
+    new_records = getattr(hdf5_dataset, "records", None)
+    if not isinstance(old_records, list) or not isinstance(new_records, list):
+        raise ValueError("datasets must expose old dataset and HDF5 records lists")
+
+    old_by_identity: dict[tuple[str, int], tuple[int, str, int]] = {}
+    for old_index, record in enumerate(old_records):
+        domain, episode_index, caption, length = _old_episode_metadata(
+            record, old_index
+        )
+        identity = (domain, episode_index)
+        if identity in old_by_identity:
+            raise ValueError(f"duplicate old episode pair: {identity!r}")
+        old_by_identity[identity] = (old_index, caption, length)
+
+    seen_new: set[tuple[str, int]] = set()
+    pairs: list[EpisodePair] = []
+    for hdf5_index, record in enumerate(new_records):
+        identity = (record.domain, record.episode_index)
+        if identity in seen_new:
+            raise ValueError(f"duplicate HDF5 episode pair: {identity!r}")
+        seen_new.add(identity)
+        if identity not in old_by_identity:
+            raise ValueError(f"missing old episode pair for HDF5 record: {identity!r}")
+        old_index, old_caption, old_length = old_by_identity[identity]
+        if old_caption != record.caption:
+            raise ValueError(
+                f"caption mismatch for pair {identity!r}: "
+                f"{old_caption!r} != {record.caption!r}"
+            )
+        if old_length != record.length:
+            raise ValueError(
+                f"length mismatch for pair {identity!r}: "
+                f"{old_length} != {record.length}"
+            )
+        pairs.append(
+            EpisodePair(
+                domain=record.domain,
+                episode_index=record.episode_index,
+                caption=record.caption,
+                length=record.length,
+                old_index=old_index,
+                hdf5_index=hdf5_index,
+            )
+        )
+        if len(pairs) == episode_limit:
+            break
+    if len(pairs) != episode_limit:
+        raise ValueError(
+            "insufficient mapped episode pairs: "
+            f"requested={episode_limit} available={len(pairs)}"
+        )
+    return pairs
+
+
+def _fixed_inputs(length: int) -> tuple[int, list[int]]:
+    if type(length) is not int or length < 2:
+        raise ValueError("episode length must be at least two")
+    maximum = length - 1
+    return min(12, maximum), [min(index, maximum) for index in (1, 4, 8, 11)]
+
+
+def build_sample_plans(
+    old_dataset: Any,
+    hdf5_dataset: Any,
+    pairs: Sequence[EpisodePair],
+) -> list[DeterministicSamplePlan]:
+    """Build fixed indexes and prove both samplers produce identical indexes."""
+    plans = []
+    old_state = (
+        getattr(old_dataset, "fix_sidx", None),
+        getattr(old_dataset, "fix_mem_idx", None),
+    )
+    new_state = (
+        getattr(hdf5_dataset, "fix_sidx", None),
+        getattr(hdf5_dataset, "fix_mem_idx", None),
+    )
+    try:
+        for pair in pairs:
+            fix_sidx, fix_mem_idx = _fixed_inputs(pair.length)
+            old_dataset.fix_sidx = fix_sidx
+            old_dataset.fix_mem_idx = fix_mem_idx
+            hdf5_dataset.fix_sidx = fix_sidx
+            hdf5_dataset.fix_mem_idx = fix_mem_idx
+            old_indexes = old_dataset.get_frame_indexes(pair.length)
+            new_indexes = hdf5_dataset.get_frame_indexes(pair.length)
+            old_indexes = (list(old_indexes[0]), list(old_indexes[1]))
+            new_indexes = (list(new_indexes[0]), list(new_indexes[1]))
+            if old_indexes != new_indexes:
+                raise AssertionError(
+                    "fixed frame/action indexes differ for "
+                    f"{pair.domain}:{pair.episode_index:06d}: "
+                    f"old={old_indexes} hdf5={new_indexes}"
+                )
+            plans.append(
+                DeterministicSamplePlan(
+                    pair=pair,
+                    fix_sidx=fix_sidx,
+                    fix_mem_idx=fix_mem_idx,
+                    frame_indexes=old_indexes[0],
+                    action_indexes=old_indexes[1],
+                )
+            )
+    finally:
+        old_dataset.fix_sidx, old_dataset.fix_mem_idx = old_state
+        hdf5_dataset.fix_sidx, hdf5_dataset.fix_mem_idx = new_state
+    return plans
+
+
+class _DeterministicView(Dataset):
+    """Each forked worker owns its mutable fixed-index dataset state."""
+
+    def __init__(
+        self, dataset: Any, plans: Sequence[DeterministicSamplePlan], sample_count: int
+    ):
+        if not plans:
+            raise ValueError("plans must not be empty")
+        if type(sample_count) is not int or sample_count <= 0:
+            raise ValueError("sample_count must be a positive integer")
+        self.dataset = dataset
+        self.plans = list(plans)
+        self.sample_count = sample_count
+
+    def __len__(self) -> int:
+        return self.sample_count
+
+    def _plan(self, index: int) -> DeterministicSamplePlan:
+        if type(index) is not int or index < 0 or index >= self.sample_count:
+            raise IndexError(index)
+        return self.plans[index % len(self.plans)]
+
+    def close(self) -> None:
+        close = getattr(self.dataset, "close", None)
+        if callable(close):
+            close()
+
+
+class DeterministicOldView(_DeterministicView):
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        plan = self._plan(index)
+        self.dataset.fix_sidx = plan.fix_sidx
+        self.dataset.fix_mem_idx = plan.fix_mem_idx
+        try:
+            video, actions, caption, state = self.dataset.get_batch(plan.pair.old_index)
+        except Exception as error:
+            raise RuntimeError(
+                "old loader read failed for "
+                f"{plan.pair.domain}:{plan.pair.episode_index:06d} "
+                f"old_index={plan.pair.old_index}: {error}"
+            ) from error
+        return {
+            "video": video,
+            "actions": actions,
+            "caption": caption,
+            "state": state,
+        }
+
+
+class DeterministicHDF5View(_DeterministicView):
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        plan = self._plan(index)
+        try:
+            return self.dataset.read_by_indexes(
+                plan.pair.hdf5_index,
+                plan.frame_indexes,
+                plan.action_indexes,
+            )
+        except Exception as error:
+            raise RuntimeError(
+                "HDF5 loader read failed for "
+                f"{plan.pair.domain}:{plan.pair.episode_index:06d} "
+                f"hdf5_index={plan.pair.hdf5_index}: {error}"
+            ) from error
+
+
+def run_parity(
+    old_dataset: Any,
+    hdf5_dataset: Any,
+    plans: Sequence[DeterministicSamplePlan],
+) -> dict[str, Any]:
+    old_view = DeterministicOldView(old_dataset, plans, len(plans))
+    new_view = DeterministicHDF5View(hdf5_dataset, plans, len(plans))
+    checked = []
+    failures = []
+    try:
+        for index, plan in enumerate(plans):
+            entry: dict[str, Any] = {
+                "domain": plan.pair.domain,
+                "episode_index": plan.pair.episode_index,
+                "old_index": plan.pair.old_index,
+                "hdf5_index": plan.pair.hdf5_index,
+                "frame_indexes": plan.frame_indexes,
+                "action_indexes": plan.action_indexes,
+            }
+            try:
+                entry.update(compare_samples(old_view[index], new_view[index]))
+                entry["passed"] = True
+            except Exception as error:
+                entry.update(getattr(error, "details", {}))
+                entry["passed"] = False
+                entry["error"] = str(error)
+                failures.append(
+                    {
+                        "domain": plan.pair.domain,
+                        "episode_index": plan.pair.episode_index,
+                        "old_index": plan.pair.old_index,
+                        "hdf5_index": plan.pair.hdf5_index,
+                        "error": str(error),
+                    }
+                )
+            checked.append(entry)
+    finally:
+        old_view.close()
+        new_view.close()
+    return {
+        "passed": not failures,
+        "exact_fields": EXACT_FIELDS.copy(),
+        "checked_pairs": len(checked),
+        "pairs": checked,
+        "failures": failures,
+    }
+
+
+def _batch_size(batch: Any) -> int:
+    if isinstance(batch, dict):
+        video = batch.get("video")
+        if isinstance(video, torch.Tensor) and video.ndim:
+            return int(video.shape[0])
+        caption = batch.get("caption")
+        if isinstance(caption, (list, tuple)):
+            return len(caption)
+    raise RuntimeError("cannot determine observed DataLoader batch size")
+
+
+def _next_batch(iterator: Iterator[Any], phase: str, index: int) -> Any:
+    try:
+        return next(iterator)
+    except StopIteration as error:
+        raise RuntimeError(
+            f"insufficient samples during {phase} batch {index}"
+        ) from error
+
+
+def measure_dataloader(
+    dataset: Dataset,
+    *,
+    workers: int,
+    batch_size: int,
+    warmup_batches: int,
+    measure_batches: int,
+    prefetch_factor: int,
+) -> dict[str, Any]:
+    """Measure a fresh CPU-only DataLoader and synchronously clean it up."""
+    if type(workers) is not int or workers < 0:
+        raise ValueError("workers must be a non-negative integer")
+    for name, value, minimum in (
+        ("batch_size", batch_size, 1),
+        ("warmup_batches", warmup_batches, 0),
+        ("measure_batches", measure_batches, 1),
+        ("prefetch_factor", prefetch_factor, 1),
+    ):
+        if type(value) is not int or value < minimum:
+            raise ValueError(f"{name} must be an integer >= {minimum}")
+
+    process_context = multiprocessing.get_context()
+    release_event = process_context.Event() if workers > 0 else None
+    ready_queue = process_context.Queue() if workers > 0 else None
+    worker_init_fn = (
+        _WorkerStartGate(release_event, ready_queue) if workers > 0 else None
+    )
+    loader = DataLoader(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=workers,
+        pin_memory=True,
+        persistent_workers=workers > 0,
+        prefetch_factor=prefetch_factor if workers > 0 else None,
+        worker_init_fn=worker_init_fn,
+    )
+    iterator = None
+    worker_processes = []
+    rss_monitor: PeakWorkerRSSMonitor | None = None
+    rss_result: dict[str, Any] | None = None
+    result: dict[str, Any] | None = None
+    try:
+        iterator = iter(loader)
+        worker_processes = list(getattr(iterator, "_workers", []) or [])
+        worker_pids = [process.pid for process in worker_processes]
+        if workers > 0:
+            try:
+                ready_workers = {ready_queue.get(timeout=30.0) for _ in range(workers)}
+            except queue.Empty as error:
+                raise RuntimeError(
+                    "DataLoader workers did not reach start gate"
+                ) from error
+            if ready_workers != set(range(workers)):
+                raise RuntimeError(
+                    f"unexpected workers at start gate: {sorted(ready_workers)}"
+                )
+        counter_pids = [os.getpid(), *worker_pids]
+        counters_before = aggregate_process_counters(counter_pids)
+        rss_monitor = PeakWorkerRSSMonitor(worker_pids)
+        rss_monitor.start()
+        resource_start = time.perf_counter()
+        if release_event is not None:
+            release_event.set()
+
+        warmup_samples = 0
+        for index in range(warmup_batches):
+            warmup_samples += _batch_size(_next_batch(iterator, "warmup", index))
+
+        measurement_start = time.perf_counter()
+        durations = []
+        observed_samples = 0
+        for index in range(measure_batches):
+            start = time.perf_counter()
+            batch = _next_batch(iterator, "measurement", index)
+            durations.append(time.perf_counter() - start)
+            observed_samples += _batch_size(batch)
+        measurement_elapsed = time.perf_counter() - measurement_start
+        drain_batches = 0
+        drain_samples = 0
+        while True:
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                break
+            drain_batches += 1
+            drain_samples += _batch_size(batch)
+        resource_elapsed = time.perf_counter() - resource_start
+        counters_after = aggregate_process_counters(counter_pids)
+        counter_result = counter_delta(
+            counters_before,
+            counters_after,
+            elapsed_seconds=resource_elapsed,
+        )
+        counter_result["counter_window"] = (
+            "full_stream_including_warmup_measurement_drain"
+        )
+        rss_result = rss_monitor.stop()
+        total_seconds = sum(durations)
+        if total_seconds <= 0:
+            raise RuntimeError("measured DataLoader duration must be positive")
+        result = {
+            "workers": workers,
+            "batch_size": batch_size,
+            "warmup_batches": warmup_batches,
+            "requested_measure_batches": measure_batches,
+            "observed_batches": len(durations),
+            "observed_samples": observed_samples,
+            "batch_seconds": durations,
+            "total_measure_seconds": total_seconds,
+            "measurement_elapsed_seconds": measurement_elapsed,
+            "samples_per_second": observed_samples / total_seconds,
+            "median_batch_seconds": percentile(durations, 50),
+            "p95_batch_seconds": percentile(durations, 95),
+            "worker_pids": worker_pids,
+            "main_process_rss_bytes": read_process_rss_bytes(os.getpid()),
+            "workers_shutdown": False,
+            "resource_elapsed_seconds": resource_elapsed,
+            "resource_observed_batches": (
+                warmup_batches + len(durations) + drain_batches
+            ),
+            "resource_observed_samples": (
+                warmup_samples + observed_samples + drain_samples
+            ),
+            "drain_batches": drain_batches,
+            "drain_samples": drain_samples,
+            "worker_start_gate_ready": workers,
+            **rss_result,
+            **counter_result,
+        }
+    finally:
+        if release_event is not None:
+            release_event.set()
+        if rss_monitor is not None and rss_result is None:
+            rss_result = rss_monitor.stop()
+        if iterator is not None:
+            shutdown = getattr(iterator, "_shutdown_workers", None)
+            if callable(shutdown):
+                shutdown()
+        close = getattr(dataset, "close", None)
+        if callable(close):
+            close()
+        if result is not None:
+            result["workers_shutdown"] = all(
+                not process.is_alive() for process in worker_processes
+            )
+        if ready_queue is not None:
+            ready_queue.close()
+            ready_queue.join_thread()
+    if result is None:  # pragma: no cover - exceptions leave through the try block
+        raise RuntimeError("DataLoader benchmark did not produce a result")
+    return result
+
+
+@contextmanager
+def _ge_act_import_context() -> Iterator[None]:
+    original = list(sys.path)
+    try:
+        for path in (str(REPOSITORY_ROOT), str(GE_ACT_ROOT)):
+            if path not in sys.path:
+                sys.path.insert(0, path)
+        yield
+    finally:
+        sys.path[:] = original
+
+
+def _load_class(class_name: str, source: str) -> type:
+    with _ge_act_import_context():
+        if not source.endswith(".py") and not os.path.isabs(source):
+            module = importlib.import_module(source)
+        else:
+            path = Path(source)
+            if not path.is_absolute():
+                path = GE_ACT_ROOT / path
+            path = path.resolve()
+            if not path.is_file():
+                raise FileNotFoundError(f"dataset class source not found: {path}")
+            digest = hashlib.sha256(str(path).encode()).hexdigest()[:12]
+            module_name = f"_ge_act_benchmark_{path.stem}_{digest}"
+            module = sys.modules.get(module_name)
+            if module is None:
+                spec = importlib.util.spec_from_file_location(module_name, path)
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"cannot import dataset source: {path}")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                try:
+                    spec.loader.exec_module(module)
+                except Exception:
+                    sys.modules.pop(module_name, None)
+                    raise
+        dataset_class = getattr(module, class_name, None)
+        if not isinstance(dataset_class, type):
+            raise ImportError(f"class {class_name!r} not found in {source!r}")
+        return dataset_class
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        payload = yaml.safe_load(stream)
+    if type(payload) is not dict:
+        raise ValueError(f"config must contain a mapping: {path}")
+    return payload
+
+
+def construct_train_dataset(
+    config_path: str | Path,
+    *,
+    manifest_override: str | Path | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Construct one train dataset without changing the YAML on disk."""
+    config_path = Path(config_path).expanduser().resolve()
+    config = _load_yaml(config_path)
+    class_name = config.get("train_data_class")
+    class_source = config.get("train_data_class_path")
+    data = config.get("data")
+    if type(class_name) is not str or type(class_source) is not str:
+        raise ValueError(f"config lacks train dataset class fields: {config_path}")
+    if type(data) is not dict or type(data.get("train")) is not dict:
+        raise ValueError(f"config lacks data.train mapping: {config_path}")
+    arguments = copy.deepcopy(data["train"])
+    stat_path = arguments.get("stat_file")
+    if type(stat_path) is str and not Path(stat_path).is_absolute():
+        arguments["stat_file"] = str((GE_ACT_ROOT / stat_path).resolve())
+    if manifest_override is not None:
+        arguments["manifest_path"] = str(Path(manifest_override).expanduser().resolve())
+    dataset_class = _load_class(class_name, class_source)
+    return dataset_class(**arguments), config
+
+
+def load_benchmark_datasets(
+    old_config: str | Path,
+    hdf5_config: str | Path,
+    hdf5_manifest: str | Path,
+) -> tuple[Any, Any, dict[str, Any], dict[str, Any]]:
+    old_dataset, old_payload = construct_train_dataset(old_config)
+    try:
+        hdf5_dataset, hdf5_payload = construct_train_dataset(
+            hdf5_config, manifest_override=hdf5_manifest
+        )
+    except Exception:
+        close = getattr(old_dataset, "close", None)
+        if callable(close):
+            close()
+        raise
+    return old_dataset, hdf5_dataset, old_payload, hdf5_payload
+
+
+def run_throughput_benchmarks(
+    old_dataset: Any,
+    hdf5_dataset: Any,
+    plans: Sequence[DeterministicSamplePlan],
+    *,
+    workers: Sequence[int],
+    sample_count: int,
+    batch_size: int,
+    warmup_batches: int,
+    measure_batches: int,
+    prefetch_factor: int,
+) -> list[dict[str, Any]]:
+    """Alternate backend order and ensure their worker lifetimes never overlap."""
+    output = []
+    for worker_position, worker_count in enumerate(workers):
+        order = ["old", "hdf5"] if worker_position % 2 == 0 else ["hdf5", "old"]
+        entry: dict[str, Any] = {
+            "workers": worker_count,
+            "execution_order": order,
+            "backends": {},
+        }
+        for backend in order:
+            if backend == "old":
+                view = DeterministicOldView(old_dataset, plans, sample_count)
+            else:
+                close = getattr(hdf5_dataset, "close", None)
+                if callable(close):
+                    close()
+                view = DeterministicHDF5View(hdf5_dataset, plans, sample_count)
+            entry["backends"][backend] = measure_dataloader(
+                view,
+                workers=worker_count,
+                batch_size=batch_size,
+                warmup_batches=warmup_batches,
+                measure_batches=measure_batches,
+                prefetch_factor=prefetch_factor,
+            )
+        output.append(entry)
+    return output
+
+
+def _filesystem_type(path: str | Path) -> str:
+    target = Path(path).expanduser().resolve()
+    if not target.exists():
+        target = target.parent
+    if _psutil is not None:
+        candidates = []
+        for partition in _psutil.disk_partitions(all=True):
+            try:
+                target.relative_to(Path(partition.mountpoint).resolve())
+            except ValueError:
+                continue
+            candidates.append((len(partition.mountpoint), partition.fstype))
+        if candidates:
+            return max(candidates)[1] or "unknown"
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return "unknown"
+    candidates = []
+    for line in lines:
+        fields = line.split()
+        if "-" not in fields:
+            continue
+        separator = fields.index("-")
+        mountpoint = Path(fields[4].replace("\\040", " "))
+        try:
+            target.relative_to(mountpoint)
+        except ValueError:
+            continue
+        candidates.append((len(str(mountpoint)), fields[separator + 1]))
+    return max(candidates)[1] if candidates else "unknown"
+
+
+def _hash_component(hasher: Any, label: bytes, payload: bytes) -> None:
+    """Hash one length-framed binary component without ambiguous concatenation."""
+    hasher.update(len(label).to_bytes(4, "big"))
+    hasher.update(label)
+    hasher.update(len(payload).to_bytes(8, "big"))
+    hasher.update(payload)
+
+
+def _git_diff_digest() -> tuple[int, bytes]:
+    """Stream the complete HEAD-to-worktree binary diff into a nested digest."""
+    process = subprocess.Popen(
+        [
+            "git",
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "HEAD",
+            "--",
+        ],
+        cwd=REPOSITORY_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None and process.stderr is not None
+    digest = hashlib.sha256()
+    byte_count = 0
+    while True:
+        chunk = process.stdout.read(1024 * 1024)
+        if not chunk:
+            break
+        byte_count += len(chunk)
+        digest.update(chunk)
+    stderr = process.stderr.read()
+    return_code = process.wait()
+    if return_code:
+        raise subprocess.CalledProcessError(
+            return_code,
+            process.args,
+            stderr=stderr,
+        )
+    return byte_count, digest.digest()
+
+
+def _untracked_paths() -> list[bytes]:
+    result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z", "--"],
+        cwd=REPOSITORY_ROOT,
+        check=True,
+        capture_output=True,
+    )
+    return sorted(path for path in result.stdout.split(b"\0") if path)
+
+
+def _stream_file_digest(path: bytes) -> bytes:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.digest()
+
+
+def _dirty_tree_fingerprint() -> tuple[bool, str | None]:
+    """Fingerprint tracked changes and complete non-ignored untracked objects."""
+    diff_size, diff_digest = _git_diff_digest()
+    untracked_paths = _untracked_paths()
+    if diff_size == 0 and not untracked_paths:
+        return False, None
+
+    hasher = hashlib.sha256()
+    _hash_component(hasher, b"format", b"libero-benchmark-dirty-tree-v1")
+    _hash_component(hasher, b"git-diff-size", str(diff_size).encode("ascii"))
+    _hash_component(hasher, b"git-diff-sha256", diff_digest)
+    repository_bytes = os.fsencode(REPOSITORY_ROOT)
+    for relative_path in untracked_paths:
+        full_path = os.path.join(repository_bytes, relative_path)
+        metadata = os.lstat(full_path)
+        file_type = stat.S_IFMT(metadata.st_mode)
+        permissions = stat.S_IMODE(metadata.st_mode)
+        _hash_component(hasher, b"untracked-path", relative_path)
+        _hash_component(hasher, b"untracked-type", str(file_type).encode("ascii"))
+        _hash_component(
+            hasher, b"untracked-permissions", format(permissions, "04o").encode("ascii")
+        )
+        if stat.S_ISREG(metadata.st_mode):
+            _hash_component(
+                hasher, b"untracked-size", str(metadata.st_size).encode("ascii")
+            )
+            _hash_component(
+                hasher, b"untracked-content-sha256", _stream_file_digest(full_path)
+            )
+        elif stat.S_ISLNK(metadata.st_mode):
+            _hash_component(hasher, b"untracked-symlink-target", os.readlink(full_path))
+        else:
+            _hash_component(
+                hasher, b"untracked-size", str(metadata.st_size).encode("ascii")
+            )
+            _hash_component(
+                hasher, b"untracked-device", str(metadata.st_rdev).encode("ascii")
+            )
+    return True, hasher.hexdigest()
+
+
+def _git_metadata() -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPOSITORY_ROOT,
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        dirty, fingerprint = _dirty_tree_fingerprint()
+        return {
+            "sha": result.stdout.strip(),
+            "dirty": dirty,
+            "fingerprint": fingerprint,
+        }
+    except (OSError, subprocess.CalledProcessError):
+        return {"sha": None, "dirty": None, "fingerprint": None}
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--old-config", type=Path, required=True)
+    parser.add_argument("--hdf5-config", type=Path, required=True)
+    parser.add_argument("--hdf5-manifest", type=Path, required=True)
+    parser.add_argument("--output-json", type=Path, required=True)
+    parser.add_argument(
+        "--mode", choices=("parity", "throughput", "both"), default="both"
+    )
+    parser.add_argument("--episodes", type=_positive_int, default=64)
+    parser.add_argument("--samples", type=_positive_int, default=1024)
+    parser.add_argument(
+        "--workers", type=_non_negative_int, nargs="+", default=[0, 2, 4, 8]
+    )
+    parser.add_argument("--batch-size", type=_positive_int, default=8)
+    parser.add_argument("--warmup-batches", type=_non_negative_int, default=20)
+    parser.add_argument("--measure-batches", type=_positive_int, default=100)
+    parser.add_argument("--prefetch-factor", type=_positive_int, default=4)
+    parser.add_argument("--run-label", choices=("cold", "warm"), required=True)
+    parser.add_argument("--compression", choices=("none", "lzf"), required=True)
+    parser.add_argument("--compare-report", type=Path)
+    return parser
+
+
+def _base_report(args: argparse.Namespace) -> dict[str, Any]:
+    old_config = args.old_config.expanduser().resolve()
+    hdf5_config = args.hdf5_config.expanduser().resolve()
+    manifest = args.hdf5_manifest.expanduser().resolve()
+    return {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "host": socket.gethostname(),
+        "git": _git_metadata(),
+        "paths": {
+            "old_config": str(old_config),
+            "hdf5_config": str(hdf5_config),
+            "hdf5_manifest": str(manifest),
+            "output_json": str(args.output_json.expanduser().resolve()),
+            "compare_report": (
+                None
+                if args.compare_report is None
+                else str(args.compare_report.expanduser().resolve())
+            ),
+        },
+        "mode": args.mode,
+        "compression": args.compression,
+        "run_label": args.run_label,
+        "cache_state_claim": None,
+        "arguments": {
+            "episodes": args.episodes,
+            "samples": args.samples,
+            "workers": args.workers,
+            "batch_size": args.batch_size,
+            "warmup_batches": args.warmup_batches,
+            "measure_batches": args.measure_batches,
+            "prefetch_factor": args.prefetch_factor,
+        },
+        "filesystem": {
+            "manifest": _filesystem_type(manifest),
+            "old_data": {},
+            "old_predecoded_video_root": None,
+            "hdf5_shards": {},
+        },
+    }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    report = _base_report(args)
+    old_dataset = None
+    hdf5_dataset = None
+    exit_code = 0
+    try:
+        old_dataset, hdf5_dataset, old_config, _ = load_benchmark_datasets(
+            args.old_config, args.hdf5_config, args.hdf5_manifest
+        )
+        manifest_payload = getattr(hdf5_dataset, "manifest", None)
+        if type(manifest_payload) is not dict:
+            raise ValueError("HDF5 dataset does not expose its validated manifest")
+        if manifest_payload.get("compression") != args.compression:
+            raise ValueError(
+                "CLI compression does not match manifest compression: "
+                f"{args.compression!r} != {manifest_payload.get('compression')!r}"
+            )
+        old_train_config = old_config.get("data", {}).get("train", {})
+        source_roots = old_train_config.get("data_roots", [])
+        report["filesystem"]["old_data"] = {
+            str(Path(path).expanduser().resolve()): _filesystem_type(path)
+            for path in dict.fromkeys(source_roots)
+        }
+        predecoded_root = old_train_config.get("predecoded_video_root")
+        if type(predecoded_root) is str:
+            report["filesystem"]["old_predecoded_video_root"] = _filesystem_type(
+                predecoded_root
+            )
+        report["filesystem"]["hdf5_shards"] = {
+            str(record.shard_path): _filesystem_type(record.shard_path)
+            for record in hdf5_dataset.records
+        }
+        pairs = map_episode_pairs(
+            old_dataset, hdf5_dataset, episode_limit=args.episodes
+        )
+        plans = build_sample_plans(old_dataset, hdf5_dataset, pairs)
+        report["mapping"] = {
+            "selected_pairs": len(pairs),
+            "requested_episodes": args.episodes,
+            "manifest_episode_count": len(hdf5_dataset.records),
+            "pairs": [
+                {
+                    "domain": pair.domain,
+                    "episode_index": pair.episode_index,
+                    "old_index": pair.old_index,
+                    "hdf5_index": pair.hdf5_index,
+                    "caption": pair.caption,
+                    "length": pair.length,
+                }
+                for pair in pairs
+            ],
+        }
+        if args.mode in ("parity", "both"):
+            report["parity"] = run_parity(old_dataset, hdf5_dataset, plans)
+            if not report["parity"]["passed"]:
+                exit_code = 1
+        if args.mode in ("throughput", "both"):
+            report["throughput"] = run_throughput_benchmarks(
+                old_dataset,
+                hdf5_dataset,
+                plans,
+                workers=args.workers,
+                sample_count=args.samples,
+                batch_size=args.batch_size,
+                warmup_batches=args.warmup_batches,
+                measure_batches=args.measure_batches,
+                prefetch_factor=args.prefetch_factor,
+            )
+        if args.compare_report is not None:
+            with (
+                args.compare_report.expanduser()
+                .resolve()
+                .open(encoding="utf-8") as stream
+            ):
+                compare_report = json.load(stream)
+            report["compression_selection"] = merge_compression_reports(
+                report, compare_report
+            )
+    except Exception as error:
+        report["fatal_error"] = f"{type(error).__name__}: {error}"
+        exit_code = 1
+    finally:
+        for dataset in (old_dataset, hdf5_dataset):
+            close = getattr(dataset, "close", None)
+            if callable(close):
+                close()
+    atomic_write_json(args.output_json, report)
+    if exit_code:
+        print(f"LIBERO HDF5 benchmark failed; report: {args.output_json}")
+    else:
+        print(f"LIBERO HDF5 benchmark passed; report: {args.output_json}")
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

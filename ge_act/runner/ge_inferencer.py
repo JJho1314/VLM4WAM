@@ -37,6 +37,34 @@ from utils import init_logging, import_custom_class, save_video
 from utils.data_utils import get_latents, get_text_conditions, gen_noise_from_condition_frame_latent, randn_tensor, apply_color_jitter_to_video
 
 from data.utils.statistics import StatisticInfo
+from runner.ge_trainer import (
+    BATON_PREDICTION_SOURCE,
+    BATON_SOURCES,
+    apply_baton_validation_mode,
+    build_baton_semantic_condition,
+    compute_ltx_latent_frames,
+    prepare_baton_conditioning,
+)
+
+
+def validate_baton_inference_source(config) -> str | None:
+    """Accept the frozen predicted Baton source without changing old defaults."""
+
+    if isinstance(config, argparse.Namespace):
+        config = vars(config)
+    if not isinstance(config, dict):
+        raise TypeError("inference config must be a mapping")
+    semantic = config.get("semantic_plan", {})
+    if not isinstance(semantic, dict) or not semantic.get("enabled", False):
+        return None
+    source = semantic.get("source")
+    if source in BATON_SOURCES:
+        if source != BATON_PREDICTION_SOURCE:
+            raise ValueError(
+                "deployment inference requires qwen35_baton_prediction"
+            )
+        return source
+    return None
 
 
 
@@ -45,6 +73,7 @@ class Inferencer:
     def __init__(self, config_file, output_dir=None, weight_dtype=torch.bfloat16, device="cuda:0", action_norm_type="meanstd") -> None:
         
         cd = load(open(config_file, "r"), Loader=Loader)
+        self.raw_config = deepcopy(cd)
         args = argparse.Namespace(**cd)
         args.lr = float(args.lr)
         args.epsilon = float(args.epsilon)
@@ -73,6 +102,7 @@ class Inferencer:
 
         # Scheduler
         self.scheduler = None
+        self.baton_components = None
 
         self.args.output_dir = Path(self.args.output_dir)
         self.args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -123,6 +153,13 @@ class Inferencer:
         print("Initializing models")
         device = self.device
         dtype = self.weight_dtype
+        if validate_baton_inference_source(self.raw_config) is not None:
+            self.baton_components = prepare_baton_conditioning(
+                self.raw_config,
+                getattr(self, "val_dataset", None),
+                device=device,
+                dtype=dtype,
+            )
 
         ### Load Tokenizer
         tokenizer_class = import_custom_class(
@@ -248,6 +285,50 @@ class Inferencer:
 
                 image = image[:batch_size]
 
+                semantic_plan = None
+                semantic_plan_times = None
+                semantic_plan_positions = None
+                semantic_plan_mask = None
+                semantic_plan_relevance = None
+                semantic_condition_mask = None
+                if self.baton_components is not None:
+                    raw_future_frames = self.args.data["train"]["chunk"]
+                    latent_num_frames = compute_ltx_latent_frames(
+                        raw_future_frames,
+                        temporal_compression_ratio=self.TEMPORAL_DOWN_RATIO,
+                        n_previous=self.args.data["train"]["n_previous"],
+                    )
+                    condition = build_baton_semantic_condition(
+                        self.baton_components,
+                        self.args.semantic_plan,
+                        gt_video[:batch_size],
+                        prompt[:batch_size],
+                        n_previous=self.args.data["train"]["n_previous"],
+                        num_future_frames=raw_future_frames,
+                        num_latent_frames=latent_num_frames,
+                        device=self.device,
+                        dtype=self.weight_dtype,
+                    )
+                    mode = self.args.semantic_plan.get(
+                        "validation_mode",
+                        "prediction",
+                    )
+                    selection = apply_baton_validation_mode(
+                        self.baton_components,
+                        tokens=condition.tokens,
+                        mode=mode,
+                        batch_size=batch_size,
+                        n_view=v,
+                        device=self.device,
+                        dtype=self.weight_dtype,
+                    )
+                    semantic_plan = selection.tokens
+                    semantic_plan_times = condition.times
+                    semantic_plan_positions = condition.positions
+                    semantic_plan_mask = condition.mask
+                    semantic_plan_relevance = condition.relevance
+                    semantic_condition_mask = selection.condition_mask
+
                 image = rearrange(image, 'b c v t h w -> (b v) c t h w')
 
                 if getattr(self.args, "add_state", False):
@@ -279,6 +360,12 @@ class Inferencer:
                     pixel_wise_timestep = self.args.pixel_wise_timestep,
                     n_chunk=n_chunk_video,
                     action_dim=self.args.diffusion_model["config"]["action_in_channels"] if self.args.return_action else None,
+                    semantic_plan=semantic_plan,
+                    semantic_plan_times=semantic_plan_times,
+                    semantic_plan_positions=semantic_plan_positions,
+                    semantic_plan_mask=semantic_plan_mask,
+                    semantic_plan_relevance=semantic_plan_relevance,
+                    semantic_condition_mask=semantic_condition_mask,
                 )[0]
 
                 save_cap = f'Validation_{i_validation}'

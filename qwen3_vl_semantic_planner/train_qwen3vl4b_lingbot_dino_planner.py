@@ -44,7 +44,16 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from qwen3vl_wrapper import load_qwen3vl_model_and_processor, move_qwen_inputs_to_device
+try:  # package import for GE-Act provider; flat fallback for script entry point
+    from .qwen3vl_wrapper import (
+        load_qwen3vl_model_and_processor,
+        move_qwen_inputs_to_device,
+    )
+except ImportError:  # pragma: no cover - exercised by the production script entry point
+    from qwen3vl_wrapper import (
+        load_qwen3vl_model_and_processor,
+        move_qwen_inputs_to_device,
+    )
 
 # 4B-specific modules live in the lingbot_dino_4b/ subpackage; add it to the path (flat import,
 # matching how lingbot_dino_head imports lingbot_resampler).
@@ -54,17 +63,256 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "din
 from lingbot_dino_head import LingbotDinoPlanHead  # noqa: E402
 from dino_video_target import DinoVideoTargetEncoder  # noqa: E402
 from depth_target import DepthTargetEncoder  # noqa: E402
-from distributed_runtime import (  # noqa: E402
-    accumulation_context,
-    build_accelerator,
-    checkpoint_module,
-    is_deepspeed,
-    is_optimizer_update,
-    should_save_periodic_checkpoint,
-    validate_runtime_contract,
-)
+try:  # package import in tests/libraries; flat fallback when launched as a script
+    from .ge_act_dual_camera import (  # type: ignore[import-not-found]
+        DualCameraPlannerCollator,
+        GEActDualCameraPlannerDataset,
+    )
+except ImportError:  # pragma: no cover - exercised by the production script entry point
+    from ge_act_dual_camera import (  # noqa: E402
+        DualCameraPlannerCollator,
+        GEActDualCameraPlannerDataset,
+    )
+try:  # package import for GE-Act provider; flat fallback for script entry point
+    from .distributed_runtime import (  # type: ignore[import-not-found]
+        accumulation_context,
+        build_accelerator,
+        checkpoint_module,
+        is_deepspeed,
+        is_optimizer_update,
+        should_save_periodic_checkpoint,
+        validate_runtime_contract,
+    )
+except ImportError:  # pragma: no cover - exercised by the production script entry point
+    from distributed_runtime import (  # noqa: E402
+        accumulation_context,
+        build_accelerator,
+        checkpoint_module,
+        is_deepspeed,
+        is_optimizer_update,
+        should_save_periodic_checkpoint,
+        validate_runtime_contract,
+    )
 
 import contextlib  # noqa: E402
+
+
+HEAD_FILES = {
+    "plan_head": "plan_head.pt",
+    "depth_head": "depth_head.pt",
+    "current_plan_head": "current_plan_head.pt",
+    "current_depth_head": "current_depth_head.pt",
+}
+
+DUAL_CAMERA_EXPORT_METADATA = {
+    "planner_input_layout": "separate_camera_images",
+    "camera_names": ["main", "wrist"],
+    "num_camera_views": 2,
+    "camera_head_sharing": "shared_head_per_view_image_context",
+    "semantic_output_layout": "batch_view_token_feature",
+    "semantic_teacher": "siglip2-large-patch16-256",
+    "future_keyframe_offsets": [8],
+}
+
+_INITIALIZATION_METADATA = {
+    "use_current_alignment": True,
+    "independent_modality_task_tokens": True,
+    "num_task_tokens": 64,
+    "num_latent_per_keyframe": 64,
+    "branch_latent_per_keyframe": 64,
+    "num_keyframes": 1,
+    "grid_size": 16,
+    "semantic_dim": 1024,
+    "target_len": 256,
+    "target_tokens": 256,
+    "video_target_type": "siglip2",
+    "has_depth_head": True,
+    "depth_grid_size": 16,
+    "depth_feature_dim": 2048,
+    "depth_target_type": "da3",
+    "plan_head_type": "lingbot_dino",
+    "sequence_length": 9,
+    "keyframe_offsets": [8],
+    "latent_len": 4 * 64,
+    "total_unique_latent_per_keyframe": 4 * 64,
+    "query_layout": (
+        "current_dino_64_then_current_depth_64_then_"
+        "future_dino_64_then_future_depth_64"
+    ),
+}
+
+
+def _metadata_value_matches(actual: Any, expected: Any) -> bool:
+    if isinstance(expected, bool):
+        return type(actual) is bool and actual == expected
+    if isinstance(expected, int):
+        return type(actual) is int and actual == expected
+    if isinstance(expected, list):
+        return (
+            isinstance(actual, list)
+            and len(actual) == len(expected)
+            and all(
+                _metadata_value_matches(item, expected_item)
+                for item, expected_item in zip(actual, expected, strict=True)
+            )
+        )
+    return actual == expected
+
+
+def validate_dual_camera_export_metadata(
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Reject exports that cannot preserve separate main/wrist view context."""
+    if not isinstance(metadata, dict):
+        raise ValueError("dual-camera planner metadata must be a dictionary")
+    for field, expected in DUAL_CAMERA_EXPORT_METADATA.items():
+        actual = metadata.get(field)
+        if not _metadata_value_matches(actual, expected):
+            raise ValueError(
+                f"incompatible dual-camera metadata field {field}: "
+                f"expected {expected!r}, got {actual!r}"
+            )
+    legacy_input_frame = metadata.get("planner_input_frame")
+    if legacy_input_frame not in (None, "separate_camera_images"):
+        raise ValueError(
+            "incompatible dual-camera metadata field planner_input_frame: "
+            "expected 'separate_camera_images', "
+            f"got {legacy_input_frame!r}"
+        )
+    return metadata
+
+
+def _validate_planner_initialization_metadata(metadata: dict[str, Any]) -> None:
+    for field, expected in _INITIALIZATION_METADATA.items():
+        actual = metadata.get(field)
+        if not _metadata_value_matches(actual, expected):
+            raise ValueError(
+                f"incompatible planner initialization metadata field {field}: "
+                f"expected {expected!r}, got {actual!r}"
+            )
+
+    plan_token_ids = metadata.get("plan_token_ids")
+    if (
+        not isinstance(plan_token_ids, list)
+        or len(plan_token_ids) != 4 * 64
+        or any(type(token_id) is not int or token_id < 0 for token_id in plan_token_ids)
+        or len(set(plan_token_ids)) != 4 * 64
+    ):
+        raise ValueError(
+            "incompatible planner initialization metadata field plan_token_ids: "
+            "expected 256 unique non-negative integers"
+        )
+    expected_token_strings = [f"<|sem_plan_{index}|>" for index in range(4 * 64)]
+    if metadata.get("plan_token_strings") != expected_token_strings:
+        raise ValueError(
+            "incompatible planner initialization metadata field plan_token_strings: "
+            "expected four independent groups of 64 ordered plan tokens"
+        )
+
+
+def load_planner_initialization(
+    wrapper: nn.Module,
+    checkpoint_dir: str | Path,
+) -> dict[str, Any]:
+    """Strict-load the four legacy alignment heads into an existing wrapper."""
+    checkpoint_dir = Path(checkpoint_dir)
+    required_files = ["planner_meta.json", *HEAD_FILES.values()]
+    missing = [name for name in required_files if not (checkpoint_dir / name).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"incomplete planner initialization {checkpoint_dir}: missing {missing}"
+        )
+
+    try:
+        metadata = json.loads(
+            (checkpoint_dir / "planner_meta.json").read_text(encoding="utf-8")
+        )
+    except (json.JSONDecodeError, OSError) as error:
+        raise ValueError(
+            f"invalid planner initialization metadata in {checkpoint_dir}"
+        ) from error
+    if not isinstance(metadata, dict):
+        raise ValueError("planner initialization metadata must be a dictionary")
+    _validate_planner_initialization_metadata(metadata)
+
+    wrapper_fields = {
+        "use_current_alignment": True,
+        "independent_modality_task_tokens": True,
+        "use_depth": True,
+        "plan_head_type": "lingbot_dino",
+        "num_task_tokens": 64,
+        "num_latent_per_keyframe": 64,
+        "branch_latent_per_keyframe": 64,
+        "num_keyframes": 1,
+        "target_len": 256,
+        "latent_len": 4 * 64,
+    }
+    for field, expected in wrapper_fields.items():
+        actual = getattr(wrapper, field, None)
+        if not _metadata_value_matches(actual, expected):
+            raise ValueError(
+                f"incompatible planner wrapper field {field}: "
+                f"expected {expected!r}, got {actual!r}"
+            )
+
+    wrapper_plan_token_ids = getattr(wrapper, "plan_token_ids", None)
+    if (
+        not isinstance(wrapper_plan_token_ids, list)
+        or metadata["plan_token_ids"] != wrapper_plan_token_ids
+    ):
+        raise ValueError(
+            "incompatible planner initialization metadata field plan_token_ids: "
+            "checkpoint token IDs must exactly match the wrapper in order and value"
+        )
+
+    head_geometry = {
+        "plan_head": 1024,
+        "depth_head": 2048,
+        "current_plan_head": 1024,
+        "current_depth_head": 2048,
+    }
+    for attribute, expected_dim_out in head_geometry.items():
+        head = getattr(wrapper, attribute, None)
+        if head is None:
+            raise ValueError(f"planner wrapper is missing required head {attribute}")
+        expected_fields = {
+            "num_keyframes": 1,
+            "num_latent_per_keyframe": 64,
+            "num_backbone_tokens": 256,
+            "dim_out": expected_dim_out,
+        }
+        for field, expected in expected_fields.items():
+            actual = getattr(head, field, None)
+            if not _metadata_value_matches(actual, expected):
+                raise ValueError(
+                    f"incompatible planner wrapper field {attribute}.{field}: "
+                    f"expected {expected!r}, got {actual!r}"
+                )
+        query_embs = getattr(head, "query_embs", None)
+        if (
+            not torch.is_tensor(query_embs)
+            or query_embs.ndim != 2
+            or query_embs.shape[0] != 256
+        ):
+            shape = tuple(query_embs.shape) if torch.is_tensor(query_embs) else None
+            raise ValueError(
+                f"incompatible planner wrapper field {attribute}.query_embs: "
+                f"expected [256, hidden], got {shape}"
+            )
+
+    loaded = []
+    for attribute, filename in HEAD_FILES.items():
+        head = getattr(wrapper, attribute, None)
+        state = torch.load(
+            checkpoint_dir / filename,
+            map_location="cpu",
+            weights_only=True,
+        )
+        if not isinstance(state, dict):
+            raise ValueError(f"planner head file {filename} must contain a state dictionary")
+        head.load_state_dict(state, strict=True)
+        loaded.append(attribute)
+    return {"loaded_heads": loaded, "source": str(checkpoint_dir)}
 
 
 def _bidirectional_prefix_mask(config, input_embeds, attention_mask, cache_position,
@@ -151,6 +399,207 @@ def _nonnegative_int(value: str) -> int:
     return parsed
 
 
+def validate_dataset_source_selection(
+    *,
+    dataset_root: Path | None,
+    fastwam_data_config: Path | None,
+    ge_act_data_config: Path | None,
+) -> str:
+    sources = {
+        "legacy": dataset_root,
+        "fastwam": fastwam_data_config,
+        "ge_act": ge_act_data_config,
+    }
+    selected = [name for name, value in sources.items() if value is not None]
+    if len(selected) != 1:
+        raise ValueError(
+            "exactly one of --dataset-root, --fastwam-data-config, or "
+            "--ge-act-data-config is required"
+        )
+    return selected[0]
+
+
+GE_ACT_DUAL_CAMERA_TRAIN_CONTRACT = {
+    "valid_cam": [
+        "observation.images.image",
+        "observation.images.wrist_image",
+    ],
+    "source_fps": 20,
+    "chunk": 9,
+    "action_chunk": 36,
+    "n_previous": 4,
+    "ignore_seek": False,
+}
+
+
+def validate_ge_act_dual_camera_train_config(train_config: dict[str, Any]) -> None:
+    """Reject GE-Act configs whose view order or temporal endpoints differ."""
+    for field, expected in GE_ACT_DUAL_CAMERA_TRAIN_CONTRACT.items():
+        actual = train_config.get(field, False if field == "ignore_seek" else None)
+        if type(actual) is not type(expected) or actual != expected:
+            raise ValueError(
+                "GE-Act dual-camera planner requires "
+                f"data.train.{field}={expected!r}, got {actual!r}"
+            )
+
+
+def load_ge_act_dual_camera_planner_dataset(
+    config_path: str | Path,
+) -> GEActDualCameraPlannerDataset:
+    import yaml
+
+    config_path = Path(config_path)
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = yaml.load(handle, Loader=yaml.Loader)
+    if not isinstance(config, dict):
+        raise ValueError(f"GE-Act config must be a mapping: {config_path}")
+    try:
+        class_name = str(config["train_data_class"])
+        class_source = str(config["train_data_class_path"])
+        train_config = dict(config["data"]["train"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            "GE-Act config must define train_data_class, train_data_class_path, "
+            "and mapping data.train"
+        ) from error
+    validate_ge_act_dual_camera_train_config(train_config)
+
+    ge_act_root = Path(__file__).resolve().parents[1] / "ge_act"
+    source_path = Path(class_source)
+    if source_path.suffix == ".py" and not source_path.is_absolute():
+        class_source = str(ge_act_root / source_path)
+    ge_act_root_string = str(ge_act_root)
+    previous_sys_path = list(sys.path)
+    previous_working_directory = Path.cwd()
+    try:
+        if ge_act_root_string not in sys.path:
+            sys.path.insert(0, ge_act_root_string)
+        from ge_act.utils import import_custom_class
+
+        dataset_class = import_custom_class(class_name, class_source)
+        # GE-Act runners construct datasets from the ge_act directory, and their
+        # YAML train split may contain paths such as configs/ltx_model/....
+        os.chdir(ge_act_root)
+        dataset = dataset_class(**train_config)
+    finally:
+        os.chdir(previous_working_directory)
+        sys.path[:] = previous_sys_path
+    return GEActDualCameraPlannerDataset(
+        dataset,
+        n_previous=4,
+        future_offset=8,
+    )
+
+
+def flatten_camera_teacher_frames(frames: torch.Tensor) -> torch.Tensor:
+    if frames.ndim != 5 or frames.shape[-1] != 3:
+        raise ValueError(
+            f"camera teacher frames must be [B,V,H,W,3], got {tuple(frames.shape)}"
+        )
+    batch_size, num_views, height, width, _channels = frames.shape
+    return frames.permute(0, 1, 4, 2, 3).reshape(
+        batch_size * num_views,
+        3,
+        height,
+        width,
+    ).contiguous()
+
+
+def restore_camera_teacher_features(
+    encoded: torch.Tensor,
+    *,
+    batch_size: int,
+    num_views: int,
+) -> torch.Tensor:
+    expected = int(batch_size) * int(num_views)
+    if encoded.ndim < 2 or encoded.shape[0] != expected:
+        raise ValueError(
+            "encoded camera teacher features must have leading dimension "
+            f"B*V={expected}, got {tuple(encoded.shape)}"
+        )
+    return encoded.reshape(int(batch_size), int(num_views), *encoded.shape[1:])
+
+
+def encode_dual_camera_teacher_targets(
+    current_camera_images: torch.Tensor,
+    future_camera_images: torch.Tensor,
+    *,
+    appearance_encoder: Any,
+    depth_encoder: Any,
+) -> dict[str, torch.Tensor]:
+    """Encode normalized main/wrist frames without losing the view dimension."""
+    for name, frames in (
+        ("current", current_camera_images),
+        ("future", future_camera_images),
+    ):
+        if frames.ndim != 5 or frames.shape[1] != 2 or frames.shape[-1] != 3:
+            raise ValueError(
+                f"{name} camera teacher frames must be [B,2,H,W,3], "
+                f"got {tuple(frames.shape)}"
+            )
+        if not torch.isfinite(frames).all():
+            raise ValueError(f"{name} camera teacher frames must be finite")
+        if frames.min() < -1.0001 or frames.max() > 1.0001:
+            raise ValueError(
+                f"{name} camera teacher frames must be normalized to [-1,1]"
+            )
+    if current_camera_images.shape != future_camera_images.shape:
+        raise ValueError(
+            "current and future camera teacher frames must have the same shape, got "
+            f"{tuple(current_camera_images.shape)} and "
+            f"{tuple(future_camera_images.shape)}"
+        )
+
+    batch_size, num_views = current_camera_images.shape[:2]
+    current_bv = (
+        flatten_camera_teacher_frames(current_camera_images).float() + 1.0
+    ).mul_(0.5).clamp_(0.0, 1.0)
+    future_bv = (
+        flatten_camera_teacher_frames(future_camera_images).float() + 1.0
+    ).mul_(0.5).clamp_(0.0, 1.0)
+    with torch.no_grad():
+        current_appearance, future_appearance = (
+            appearance_encoder.encode_current_and_future(current_bv, future_bv)
+        )
+        current_depth, future_depth = depth_encoder.encode_current_and_future(
+            current_bv,
+            future_bv,
+        )
+
+    expected_shapes = {
+        "appearance current": (batch_size * num_views, 256, 1024),
+        "appearance future": (batch_size * num_views, 256, 1024),
+        "depth current": (batch_size * num_views, 256, 2048),
+        "depth future": (batch_size * num_views, 256, 2048),
+    }
+    features = {
+        "appearance current": current_appearance,
+        "appearance future": future_appearance,
+        "depth current": current_depth,
+        "depth future": future_depth,
+    }
+    for name, encoded in features.items():
+        expected = expected_shapes[name]
+        if tuple(encoded.shape) != expected:
+            raise ValueError(
+                f"{name} teacher features must be {expected}, got {tuple(encoded.shape)}"
+            )
+
+    def restore(encoded: torch.Tensor) -> torch.Tensor:
+        return restore_camera_teacher_features(
+            encoded,
+            batch_size=batch_size,
+            num_views=num_views,
+        ).float()
+
+    return {
+        "current_dino_labels": restore(current_appearance),
+        "semantic_plan_labels": restore(future_appearance),
+        "current_depth_labels": restore(current_depth),
+        "depth_plan_labels": restore(future_depth),
+    }
+
+
 def configure_gradient_checkpointing(model: nn.Module, *, enabled: bool) -> None:
     if not enabled:
         if hasattr(model, "gradient_checkpointing_disable"):
@@ -169,9 +618,19 @@ def configure_gradient_checkpointing(model: nn.Module, *, enabled: bool) -> None
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=Path, required=True)
+    parser.add_argument("--model-path", type=Path, default=None)
+    parser.add_argument(
+        "--init-planner-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "initialize the Qwen model, processor, token embeddings, and exactly four "
+            "alignment heads from an exported planner checkpoint"
+        ),
+    )
     parser.add_argument("--dataset-root", type=Path, default=None)
     parser.add_argument("--fastwam-data-config", type=Path, default=None)
+    parser.add_argument("--ge-act-data-config", type=Path, default=None)
     parser.add_argument("--fastwam-dataset-dir", action="append", default=[])
     parser.add_argument(
         "--fastwam-text-embedding-cache-dir",
@@ -334,9 +793,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260622)
     parser.add_argument("--log-steps", type=int, default=10)
     args = parser.parse_args()
-    if (args.dataset_root is None) == (args.fastwam_data_config is None):
+    if args.model_path is None and args.init_planner_checkpoint is None:
+        parser.error("one of --model-path or --init-planner-checkpoint is required")
+    if (
+        args.init_planner_checkpoint is not None
+        and args.head_warmstart_ckpt is not None
+    ):
         parser.error(
-            "exactly one of --dataset-root or --fastwam-data-config is required"
+            "--init-planner-checkpoint is mutually exclusive with --head-warmstart-ckpt"
+        )
+    try:
+        validate_dataset_source_selection(
+            dataset_root=args.dataset_root,
+            fastwam_data_config=args.fastwam_data_config,
+            ge_act_data_config=args.ge_act_data_config,
+        )
+    except ValueError as error:
+        parser.error(
+            str(error)
         )
     if args.fastwam_dataset_dir and args.fastwam_data_config is None:
         parser.error("--fastwam-dataset-dir requires --fastwam-data-config")
@@ -1213,8 +1687,12 @@ class PlannerWrapper(nn.Module):
         da3_align_strategy: str = "last_layer",
         da3_num_layers: int = 1,
         da3_layer_weights: Sequence[float] | None = None,
+        num_camera_views: int = 1,
     ) -> None:
         super().__init__()
+        self.num_camera_views = int(num_camera_views)
+        if self.num_camera_views not in (1, 2):
+            raise ValueError("num_camera_views must be 1 or 2")
         if sem_mlp_hidden_size < 0:
             sem_mlp_hidden_size = hidden_size
         self.mse_loss_weight = float(mse_loss_weight)
@@ -1535,6 +2013,14 @@ class PlannerWrapper(nn.Module):
     ) -> "PlannerWrapper":
         """Rebuild and freeze a planner from the files written by ``save_checkpoint``."""
         checkpoint_dir = Path(checkpoint_dir)
+        num_camera_views = metadata.get("num_camera_views", 1)
+        if type(num_camera_views) is not int or num_camera_views not in (1, 2):
+            raise ValueError(
+                "incompatible planner metadata field num_camera_views: "
+                f"expected 1 or 2, got {num_camera_views!r}"
+            )
+        if num_camera_views == 2:
+            validate_dual_camera_export_metadata(metadata)
         text_config = getattr(model.config, "text_config", model.config)
         hidden_size = int(text_config.hidden_size)
         query_embedding_source = metadata.get("query_embedding_source")
@@ -1600,6 +2086,7 @@ class PlannerWrapper(nn.Module):
             da3_align_strategy=str(metadata.get("da3_align_strategy", "last_layer")),
             da3_num_layers=int(metadata.get("da3_num_layers", 1)),
             da3_layer_weights=metadata.get("da3_layer_weights", None),
+            num_camera_views=num_camera_views,
         )
         wrapper.plan_head.load_state_dict(
             torch.load(
@@ -1725,6 +2212,40 @@ class PlannerWrapper(nn.Module):
         batch, _, hidden_dim = hidden.shape
         return hidden[mask].reshape(batch, n_img, hidden_dim)
 
+    def collect_image_hidden_by_view(
+        self,
+        hidden: torch.Tensor,
+        input_ids: torch.Tensor,
+        *,
+        num_views: int,
+    ) -> torch.Tensor:
+        if self.image_token_id is None:
+            raise RuntimeError("lingbot_dino head needs model.config.image_token_id, which is unset")
+        rows = []
+        for batch_index in range(input_ids.shape[0]):
+            positions = torch.nonzero(
+                input_ids[batch_index] == int(self.image_token_id),
+                as_tuple=False,
+            ).flatten()
+            split_points = torch.nonzero(
+                positions[1:] != positions[:-1] + 1,
+                as_tuple=False,
+            ).flatten() + 1
+            spans = torch.tensor_split(positions, split_points.cpu().tolist())
+            if len(spans) != num_views or any(span.numel() == 0 for span in spans):
+                raise RuntimeError(
+                    f"expected {num_views} image-token spans, got {len(spans)}"
+                )
+            if len({int(span.numel()) for span in spans}) != 1:
+                raise RuntimeError("dual-camera image-token spans must have equal length")
+            rows.append(
+                torch.stack(
+                    [hidden[batch_index, span] for span in spans],
+                    dim=0,
+                )
+            )
+        return torch.stack(rows, dim=0)
+
     def _forward_hiddens(self, **inputs: Any) -> tuple[torch.Tensor | None, torch.Tensor]:
         """One VLM forward -> live ``(image_hidden|None, plan_hidden)`` tensors.
 
@@ -1739,7 +2260,15 @@ class PlannerWrapper(nn.Module):
         plan_hidden = self.collect_plan_hidden(hidden, input_ids, self.latent_len)
         image_hidden = None
         if self.plan_head_type == "lingbot_dino":
-            image_hidden = self.collect_image_hidden(hidden, input_ids)
+            num_views = getattr(self, "num_camera_views", 1)
+            if num_views == 1:
+                image_hidden = self.collect_image_hidden(hidden, input_ids)
+            else:
+                image_hidden = self.collect_image_hidden_by_view(
+                    hidden,
+                    input_ids,
+                    num_views=num_views,
+                )
         return image_hidden, plan_hidden
 
     @staticmethod
@@ -1973,19 +2502,37 @@ class PlannerWrapper(nn.Module):
             "future_depth": (self.depth_head, hidden_by_branch["future_depth"]),
         }
         plans = {}
+        num_views = getattr(self, "num_camera_views", 1)
         for name, (head, hidden) in heads_and_hiddens.items():
             head_dtype = next(head.parameters()).dtype
-            branch_image_hidden = self.image_hidden_for_alignment_branch(
-                image_hidden,
-                name,
+            head_hidden = hidden.to(dtype=head_dtype)
+            if num_views == 1:
+                image_hiddens = (image_hidden,)
+            else:
+                if image_hidden.ndim != 4 or image_hidden.shape[1] != num_views:
+                    raise RuntimeError(
+                        f"expected image hidden [B,{num_views},N,H], got "
+                        f"{tuple(image_hidden.shape)}"
+                    )
+                image_hiddens = image_hidden.unbind(dim=1)
+            view_plans = []
+            for view_image_hidden in image_hiddens:
+                branch_image_hidden = self.image_hidden_for_alignment_branch(
+                    view_image_hidden,
+                    name,
+                )
+                plan = head(
+                    branch_image_hidden.to(dtype=head_dtype),
+                    head_hidden,
+                ).float()
+                if name in ("current_depth", "future_depth"):
+                    plan = self._reshape_depth_plan(plan)  # [B,tok,L*D] -> [B,tok,L,D] for wsa_multilayer
+                view_plans.append(plan)
+            plans[name] = (
+                view_plans[0]
+                if num_views == 1
+                else torch.stack(view_plans, dim=1)
             )
-            plan = head(
-                branch_image_hidden.to(dtype=head_dtype),
-                hidden.to(dtype=head_dtype),
-            ).float()
-            if name in ("current_depth", "future_depth"):
-                plan = self._reshape_depth_plan(plan)  # [B,tok,L*D] -> [B,tok,L,D] for wsa_multilayer
-            plans[name] = plan
         return plans
 
     def predict_semantic_plan(self, **inputs: Any) -> torch.Tensor:
@@ -2068,7 +2615,8 @@ class PlannerWrapper(nn.Module):
         current_depth_labels: torch.Tensor | None = None,
         **inputs: Any,
     ) -> dict[str, torch.Tensor]:
-        batch, target_len, _ = semantic_plan_labels.shape
+        batch = semantic_plan_labels.shape[0]
+        target_len = semantic_plan_labels.shape[-2]
         if target_len != self.target_len:
             raise RuntimeError(f"Batch has {target_len} target tokens, wrapper expects {self.target_len}")
         if self.plan_head_type == "lingbot_dino":
@@ -2427,6 +2975,7 @@ def save_checkpoint(
     if not is_main(rank):
         return
     module = wrapper
+    num_camera_views = int(getattr(module, "num_camera_views", 1))
     fastwam_data_config = getattr(args, "fastwam_data_config", None)
     fastwam_offsets = None
     if fastwam_data_config is not None:
@@ -2612,12 +3161,19 @@ def save_checkpoint(
             ],
             "token_order": "keyframe_major_row_major",
             "planner_input_frame": (
-                "fastwam_current_multicamera_composite"
-                if fastwam_data_config is not None
-                else "legacy_single_current_frame"
+                "separate_camera_images"
+                if num_camera_views == 2
+                else (
+                    "fastwam_current_multicamera_composite"
+                    if fastwam_data_config is not None
+                    else "legacy_single_current_frame"
+                )
             ),
         }
     )
+    if num_camera_views == 2:
+        meta.update(DUAL_CAMERA_EXPORT_METADATA)
+        validate_dual_camera_export_metadata(meta)
     (ckpt / "planner_meta.json").write_text(
         json.dumps(meta, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -2675,8 +3231,28 @@ def main() -> None:
     random.seed(args.seed + rank)
     torch.manual_seed(args.seed + rank)
 
+    model_path = args.model_path
+    processor_path = None
+    if args.init_planner_checkpoint is not None:
+        initialization_dir = Path(args.init_planner_checkpoint)
+        model_path = initialization_dir / "qwen3vl_lora_or_model"
+        processor_path = initialization_dir / "processor"
+        missing = [
+            str(path.name)
+            for path in (model_path, processor_path)
+            if not path.is_dir()
+        ]
+        if missing:
+            raise FileNotFoundError(
+                f"incomplete planner initialization {initialization_dir}: "
+                f"missing directories {missing}"
+            )
+        # Save metadata must identify the model actually used for this fresh run.
+        args.model_path = model_path
+
     model, processor = load_qwen3vl_model_and_processor(
-        args.model_path,
+        model_path,
+        processor_path=processor_path,
         device=None,
         dtype=args.dtype,
         attn_implementation="sdpa",
@@ -2734,7 +3310,11 @@ def main() -> None:
     if args.plan_head_type == "lingbot_dino":
         if not args.online_plan_labels:
             raise ValueError("lingbot_dino requires --online-plan-labels (online DINO-video targets)")
-        if args.frame_ranges_json is None and args.fastwam_data_config is None:
+        if (
+            args.frame_ranges_json is None
+            and args.fastwam_data_config is None
+            and args.ge_act_data_config is None
+        ):
             args.frame_ranges_json = args.dataset_root / "frame_ranges.json"
         if args.video_target_type == "dinov3":
             from dinov3_target import Dinov3TargetEncoder  # noqa: E402
@@ -2814,7 +3394,11 @@ def main() -> None:
 
         if args.siglip2_encoder_path is None:
             raise ValueError("--online-plan-labels requires --siglip2-encoder-path")
-        if args.frame_ranges_json is None and args.fastwam_data_config is None:
+        if (
+            args.frame_ranges_json is None
+            and args.fastwam_data_config is None
+            and args.ge_act_data_config is None
+        ):
             args.frame_ranges_json = args.dataset_root / "frame_ranges.json"
         sig_model, sig_processor = load_siglip2(args.siglip2_encoder_path, device, "bf16")
         sig_model.requires_grad_(False)
@@ -2880,8 +3464,19 @@ def main() -> None:
         da3_align_strategy=getattr(args, "da3_align_strategy", "last_layer"),
         da3_num_layers=int(getattr(args, "da3_num_layers", 1)),
         da3_layer_weights=getattr(args, "da3_layer_weights_resolved", None),
+        num_camera_views=2 if args.ge_act_data_config is not None else 1,
     )
-    if args.plan_head_type == "lingbot_dino" and args.head_warmstart_ckpt is not None:
+    if args.init_planner_checkpoint is not None:
+        initialization_report = load_planner_initialization(
+            wrapper,
+            args.init_planner_checkpoint,
+        )
+        if accelerator.is_main_process:
+            print(
+                json.dumps({"planner_initialization": initialization_report}),
+                flush=True,
+            )
+    elif args.plan_head_type == "lingbot_dino" and args.head_warmstart_ckpt is not None:
         head_state = _load_lingbot_head_state(args.head_warmstart_ckpt)
         report = wrapper.plan_head.load_lingbot_warmstart(head_state, head_name="future_video_align_head")
         if wrapper.depth_head is not None:
@@ -2926,7 +3521,27 @@ def main() -> None:
             flush=True,
         )
 
-    if args.online_plan_labels:
+    if args.ge_act_data_config is not None:
+        dataset = load_ge_act_dual_camera_planner_dataset(args.ge_act_data_config)
+        collator = DualCameraPlannerCollator(
+            processor=processor,
+            plan_sequence=plan_sequence,
+        )
+        if accelerator.is_main_process:
+            print(
+                json.dumps(
+                    {
+                        "online_plan_labels": True,
+                        "dataset_source": "ge_act",
+                        "stems": len(dataset),
+                        "keyframe_offsets": [8],
+                        "num_camera_views": 2,
+                        "feature_type": args.sample_feature_type,
+                    }
+                ),
+                flush=True,
+            )
+    elif args.online_plan_labels:
         if args.fastwam_data_config is not None:
             dataset = FastWAMOnlinePlannerDataset.from_config(
                 args.fastwam_data_config,
@@ -2954,6 +3569,10 @@ def main() -> None:
                 max_samples=args.max_samples,
                 seed=args.seed,
             )
+        collator = Collator(
+            processor=processor,
+            plan_sequence=plan_sequence,
+        )
         if accelerator.is_main_process:
             print(
                 json.dumps(
@@ -2977,15 +3596,16 @@ def main() -> None:
             max_samples=args.max_samples,
             sample_one_window_per_stem=args.sample_one_window_per_stem,
         )
+        collator = Collator(
+            processor=processor,
+            plan_sequence=plan_sequence,
+        )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=Collator(
-            processor=processor,
-            plan_sequence=plan_sequence,
-        ),
+        collate_fn=collator,
         pin_memory=True,
     )
 
@@ -3025,6 +3645,13 @@ def main() -> None:
             batch.pop("stems", None)
             keyframes = batch.pop("keyframe_images", None)
             current = batch.pop("current_image", None)
+            current_camera_images = batch.pop("current_camera_images", None)
+            future_camera_images = batch.pop("future_camera_images", None)
+            if (current_camera_images is None) != (future_camera_images is None):
+                raise RuntimeError(
+                    "dual-camera batches must contain both current_camera_images "
+                    "and future_camera_images"
+                )
             future_video_effective_fps = batch.pop(
                 "future_video_effective_fps",
                 None,
@@ -3032,7 +3659,20 @@ def main() -> None:
             module = accelerator.unwrap_model(wrapper)
             model_dtype = next(module.model.parameters()).dtype
             batch = move_qwen_inputs_to_device(batch, device, model_dtype=model_dtype)
-            if keyframes is not None:
+            if current_camera_images is not None:
+                if dino_encoder is None or depth_encoder is None:
+                    raise RuntimeError(
+                        "GE-Act dual-camera training requires both appearance and depth teachers"
+                    )
+                batch.update(
+                    encode_dual_camera_teacher_targets(
+                        current_camera_images,
+                        future_camera_images,
+                        appearance_encoder=dino_encoder,
+                        depth_encoder=depth_encoder,
+                    )
+                )
+            elif keyframes is not None:
                 with torch.no_grad():
                     if dino_encoder is not None:
                         # Online DINO-video targets: teacher over [current, current, keyframe_k] clips

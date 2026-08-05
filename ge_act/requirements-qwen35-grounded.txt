@@ -1,0 +1,3 @@
+# Reproducible GE-Act + Qwen3.5 entrypoint. The base file pins the complete
+# PyTorch, Transformers, Accelerate, Diffusers, DeepSpeed, HDF5, and CV stack.
+-r requirements.txt

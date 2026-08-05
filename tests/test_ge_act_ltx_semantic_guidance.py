@@ -57,15 +57,18 @@ def test_semantic_adapter_keeps_16_by_16_tokens_per_frame() -> None:
     tokens = torch.randn(1, 2, 4, 16 * 16, 8)
     times = torch.tensor([[0.8, 0.875, 0.925, 1.0]]).repeat(2, 1)
 
-    adapted, positions = adapter(
+    context = adapter(
         tokens,
         semantic_plan_times=times,
         latent_height=32,
         latent_width=32,
     )
+    adapted, positions = context
 
     assert adapted.shape == (2, 4 * 16 * 16, 12)
     assert positions.shape == (2, 4 * 16 * 16, 3)
+    assert context.key_mask is None
+    assert context.relevance is None
     torch.testing.assert_close(positions[0, : 16 * 16, 0], torch.full((16 * 16,), 4.0))
     torch.testing.assert_close(positions[0, -16 * 16 :, 0], torch.full((16 * 16,), 5.0))
     assert positions[..., 1].min() == 0

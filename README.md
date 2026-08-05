@@ -27,6 +27,10 @@ lines: **CoVT·SigLIP·2B** (baseline), **tasktoken·SigLIP·2B** (rich-KV head 
 **lingbot-DINO·4B** (`lingbot_dino_4b/`, aligns to DINO-video via the open `robbyant/lingbot-vla-v2-6b`
 weights — needs a matching DINO-conditioned WM). See that README for details.
 
+The Qwen3.5 continuous Baton planner and its repaired WorldArena Stage-1
+training/validation contract are documented in
+[`qwen35_baton/`](qwen35_baton/README.md).
+
 ## World model (Cosmos)
 
 Main files:
