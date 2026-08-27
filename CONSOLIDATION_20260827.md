@@ -283,3 +283,80 @@ LFT `workspace/VLM4WAM`：**8.4G → 3.9G**（`.git` 4.7G → 94M）。
 | LFT 两个 snapshot 目录 | 229M | 未确认是否还需要其中的 eval 结果 |
 
 **合计释放约 91.5G**（HPC3 87G + LFT 4.5G）。
+
+---
+
+## 8. 仓库合并与第二轮清理 (2026-08-27)
+
+### 8.1 归属确认：62G 全部属于退役的 Plan-X 线
+
+第 6 节标为"归属存疑"的 62G 已查实，**与 Baton 无关**：
+
+HPC3 `logs/q35-train-*.out` 显示 2026-07-24 那批 6 个作业（job 435419–435886）用的是同一套配置：
+`codes=2048` + `codebook k-means initialized (frozen)`，损失是 **`code-CE`**（离散码本交叉熵），
+`qwen35_ft_mw4/step_5000.pt` 里带 `code_head` 权重。而 Baton 是**连续** MSE
+（`qwen35_baton/losses.py`：*"Baton Equation-8 continuous visual-feature regression"*），
+全包 grep `code_head|codebook|kmeans|cross_entropy` 零命中。A 线有个分支就叫
+`planner/planx-discrete-ce`，正对应这个目标函数。
+
+precompute 日志确认 `data/qwen35_train`(1712 窗口) 与 `data/qwen35_train_mw`(22278 窗口)
+是这批 run 的唯一数据源（各 run 日志的 `data N=` 与之对应），内容是 LIBERO 四套件
+（object/spatial/goal/10）的 SigLIP2 特征。且 `qwen35_baton/teacher.py` 是
+*"**Online**, frozen SigLIP2 patch-feature teacher"* —— 训练时在线编码，包里没有任何
+`.npy`/cache 读取路径，所以 Baton 用不上这份预计算。
+
+已删除：`outputs/qwen35_ft_mw4` 5.5G · `outputs/qwen35_ftmini` · `data/qwen35_train_mw` 47G ·
+`data/qwen35_train` 3.6G。HPC3 `VLM4WAM`：**265G → 209G**（`data/` 已空，
+`outputs/` 只剩 `cosmos_semantic_plan`）。
+
+### 8.2 两个仓库合并为一
+
+LFT 上原有两个 checkout 指向同一个 GitHub 仓库。现已合并为单一仓库
+`/data/LFT-W02_data/junjie/VLA_WM/VLM4WAM`，B 线作为 worktree 共存：
+
+```
+VLA_WM/VLM4WAM                                    ge-act-dual-camera-planner   (A 线主干)
+VLA_WM/VLM4WAM/.worktrees/baton-only              baton-only-20260827          (B 线)
+VLA_WM/VLM4WAM/.worktrees/frame80-action-attention
+VLA_WM/VLM4WAM/.worktrees/joint-vlm-geact-libero-eval
+VLA_WM/VLM4WAM/.worktrees/libero-episode-feature-export
+```
+
+B 的未跟踪数据（`artifacts/` 3.4G、`outputs/` 23M 含 `worldarena_eval_step015000_20260805`、
+`logs/`）已移入 `.worktrees/baton-only/`。`workspace/VLM4WAM` 已整个删除；
+删除前逐一验证其 11 个分支都能从某个 `origin/*` 引用到。A 里指向它的 `wsB` remote 已移除。
+
+### 8.3 删除前的四批抢救
+
+每个待删目录都做了逐文件 `git hash-object` 比对，只要内容在别处找不到就先归档：
+
+| 批次 | 文件数 | 内容 |
+|---|---|---|
+| `lft_planx_tatok_untracked/` | 4 | planx worktree 里从未提交的 TA-Tok 训练器（`ta_tok_trainer.py`、`cli/train_ta_tok.py`、`cli/preflight.py` 及测试），`qwen35-planx-implementation` 分支里也没有 |
+| `lft_repoB_sdd_history/` | 82 | B 线 `.superpowers/sdd/` —— Baton 从 07-27 到 08-05 的逐任务简报、完成报告、review diff、阶段快照。被 gitignore，任何分支都没有 |
+| `lft_whatwhere_snapshot_only/` | 34 | what-where 快照里独有的文件：`target_attention_viz.py` + 33 个 sbatch 启动器/可视化/分析脚本（比对 1176 个文件，1142 个能在别处找到） |
+| `lft_train_snapshot_20260611_only/` | 6 | 2026-06-11 训练版改动过的 Cosmos 核心文件，含 `minimal_v4_dit.py` 与 `experiments/base/robointer.py`（比对 1065 个文件，1059 个能在别处找到） |
+
+### 8.4 已删除
+
+| 对象 | 大小 |
+|---|---|
+| `VLA_WM/VLM4WAM/outputs/qwen3vl_semantic_planner` | 59G（退役 qwen3vl 线在 LFT 上的另一份） |
+| `workspace/VLM4WAM`（整个 checkout，含 3 个 worktree 与 132M `.git`） | 459M |
+| `VLA_WM/VLM4WAM_train_snapshot_20260611` | 198M |
+| `VLA_WM/VLM4WAM_what_where_softlogit_snapshot` | 31M |
+
+LFT `VLM4WAM`：**213G + 3.9G + 229M → 158G**（含并入的 3.8G worktree）。
+
+### 8.5 当前总账
+
+| 位置 | 清理前 | 清理后 |
+|---|---|---|
+| HPC3 `workspace/VLM4WAM` + 7 个副本目录 | 352G | 209G |
+| LFT `VLA_WM/VLM4WAM` + `workspace/VLM4WAM` + 2 个快照 | 217G | 158G |
+| **合计** | **569G** | **367G** |
+
+累计释放约 **202G**，代码全部收敛到单一仓库与单一 GitHub 远端（25 个分支）。
+
+剩余占用的大头：LFT `cosmos-predict2.5/outputs` 83G、`checkpoints` 57G、
+HPC3 `outputs/cosmos_semantic_plan` 190G —— 都是仍在用的世界模型训练产物，不在清理范围内。
