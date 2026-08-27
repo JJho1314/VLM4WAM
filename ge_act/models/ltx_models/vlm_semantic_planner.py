@@ -262,7 +262,7 @@ class FrozenDualCameraVLMPlanner:
             load_qwen3vl_model_and_processor,
             move_qwen_inputs_to_device,
         )
-        from qwen3_vl_semantic_planner.train_qwen3vl4b_lingbot_dino_planner import (
+        from qwen3_vl_semantic_planner.train_semantic_planner import (
             PlannerWrapper,
         )
 

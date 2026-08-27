@@ -44,6 +44,34 @@ JOINT_FORMAL_RECIPE = {
         "libero_spatial_no_noops_lerobot",
     ],
 }
+HPC3_ACTION_FORMAL_RECIPE = {
+    "ltx_components": "/data/user/jhe724/junjie/weights/LTX-Video",
+    "ltx_checkpoint": (
+        "/data/user/jhe724/junjie/vlm4wam_joint_assets/ltx_step_50000"
+    ),
+    "planner_checkpoint": (
+        "/data/user/jhe724/junjie/vlm4wam_joint_assets/planner_step_030000"
+    ),
+    "siglip2_teacher": (
+        "/data/user/jhe724/junjie/weights/siglip2-large-patch16-256"
+    ),
+    "da3_checkpoint": (
+        "/data/user/jhe724/junjie/vlm4wam_joint_assets/DA3-LARGE-1.1"
+    ),
+    "da3_code_root": (
+        "/data/user/jhe724/junjie/vlm4wam_joint_assets/Depth-Anything-3"
+    ),
+    "data_root": "/data/user/jhe724/junjie/datasets/LIBERO-fastwam",
+    "predecoded_root": (
+        "/data/user/jhe724/junjie/datasets/LIBERO-fastwam-predecoded-rgb"
+    ),
+    "domains": [
+        "libero_10_no_noops_lerobot",
+        "libero_goal_no_noops_lerobot",
+        "libero_object_no_noops_lerobot",
+        "libero_spatial_no_noops_lerobot",
+    ],
+}
 
 
 def _nearest_existing_parent(path: Path) -> Path:
@@ -72,6 +100,23 @@ def collect_preflight_errors(
     semantic_source = semantic.get("source", "gt_siglip2")
     joint = config.get("joint_training", {})
     joint_enabled = isinstance(joint, dict) and bool(joint.get("enabled", False))
+    formal_recipe_name = joint.get("formal_recipe", "ola_video") if joint_enabled else None
+    semantic_only_k2_profile = (
+        formal_recipe_name == "hpc3_action_k2_semantic_only"
+    )
+    action_profile = formal_recipe_name in (
+        "hpc3_action",
+        "hpc3_action_k2_semantic_only",
+    )
+    formal_recipe = (
+        HPC3_ACTION_FORMAL_RECIPE if action_profile else JOINT_FORMAL_RECIPE
+    )
+    if joint_enabled and formal_recipe_name not in (
+        "ola_video",
+        "hpc3_action",
+        "hpc3_action_k2_semantic_only",
+    ):
+        errors.append(f"unknown joint formal recipe: {formal_recipe_name}")
     if require_joint_formal and not joint_enabled:
         errors.append("formal joint preflight requires joint_training.enabled=true")
     hdf5_backend = config.get("train_data_class") == "LiberoFastWAMHDF5Dataset"
@@ -86,8 +131,14 @@ def collect_preflight_errors(
             errors.append("semantic_plan.model_name_or_path is required")
     elif semantic_source == "vlm_planner":
         if joint_enabled:
-            if keyframes != [2, 4, 6, 8]:
-                errors.append("joint VLM planner keyframe offsets must be [2, 4, 6, 8]")
+            expected_keyframes = (
+                [4, 8] if semantic_only_k2_profile else [2, 4, 6, 8]
+            )
+            if keyframes != expected_keyframes:
+                errors.append(
+                    "joint VLM planner keyframe offsets must be "
+                    f"{expected_keyframes}"
+                )
         elif keyframes != [8]:
             errors.append("VLM planner semantic keyframes must be [8]")
         if semantic.get("validation_mode") != "planner":
@@ -142,10 +193,14 @@ def collect_preflight_errors(
         * int(config.get("gradient_accumulation_steps", 0))
         * int(world_size)
     )
-    if global_batch != 128:
-        errors.append(f"global batch must be 128, got {global_batch}")
-    if config.get("train_steps") != 30_000:
-        errors.append("train_steps must be 30000")
+    expected_global_batch = 256 if action_profile else 128
+    if global_batch != expected_global_batch:
+        errors.append(
+            f"global batch must be {expected_global_batch}, got {global_batch}"
+        )
+    expected_train_steps = 25_000 if action_profile else 30_000
+    if config.get("train_steps") != expected_train_steps:
+        errors.append(f"train_steps must be {expected_train_steps}")
     if not joint_enabled and not config.get("gradient_checkpointing", False):
         errors.append("gradient checkpointing must be enabled for the initial run")
 
@@ -153,10 +208,28 @@ def collect_preflight_errors(
         expected_offsets = [2, 4, 6, 8]
         if semantic_source != "vlm_planner":
             errors.append("joint training requires semantic_plan.source=vlm_planner")
-        if joint.get("future_keyframe_offsets") != expected_offsets:
-            errors.append("joint planner future_keyframe_offsets must be [2, 4, 6, 8]")
-        if joint.get("num_keyframes") != 4:
-            errors.append("joint training requires four semantic keyframes")
+        if semantic_only_k2_profile:
+            if joint.get("semantic_only") is not True:
+                errors.append("semantic-only K2 profile requires semantic_only=true")
+            if joint.get("planner_num_keyframes") != 4:
+                errors.append("semantic-only K2 native planner must remain K4")
+            if joint.get("selected_planner_keyframe_indices") != [1, 3]:
+                errors.append("semantic-only K2 planner indices must be [1, 3]")
+            if joint.get("selected_future_keyframe_offsets") != [4, 8]:
+                errors.append("semantic-only K2 future offsets must be [4, 8]")
+            if joint.get("num_keyframes") != 2:
+                errors.append("semantic-only joint training requires two keyframes")
+            if any(str(key).startswith("da3_") for key in joint):
+                errors.append(
+                    "semantic-only joint config must not contain DA3 fields"
+                )
+        else:
+            if joint.get("future_keyframe_offsets") != expected_offsets:
+                errors.append(
+                    "joint planner future_keyframe_offsets must be [2, 4, 6, 8]"
+                )
+            if joint.get("num_keyframes") != 4:
+                errors.append("joint training requires four semantic keyframes")
         if (
             model_config.get("semantic_plan_num_views") != 2
             or joint.get("num_camera_views") != 2
@@ -173,19 +246,29 @@ def collect_preflight_errors(
             or joint.get("semantic_feature_dim") != 1024
         ):
             errors.append("joint semantic feature width must be 1024")
-        if joint.get("da3_align_strategy") != "wsa_multilayer":
-            errors.append("joint DA3 teacher must use four-layer WSA")
-        if joint.get("da3_teacher_layers") != [11, 15, 19, 23]:
-            errors.append("joint DA3 teacher layers must be [11, 15, 19, 23]")
-        if joint.get("da3_feature_dim") != 2048:
-            errors.append("joint DA3 feature width must be 2048")
+        if not semantic_only_k2_profile:
+            if joint.get("da3_align_strategy") != "wsa_multilayer":
+                errors.append("joint DA3 teacher must use four-layer WSA")
+            if joint.get("da3_teacher_layers") != [11, 15, 19, 23]:
+                errors.append("joint DA3 teacher layers must be [11, 15, 19, 23]")
+            if joint.get("da3_feature_dim") != 2048:
+                errors.append("joint DA3 feature width must be 2048")
         if int(world_size) != 8:
             errors.append("joint formal training requires world size 8")
-        if (
-            config.get("batch_size") != 4
-            or config.get("gradient_accumulation_steps") != 4
-        ):
-            errors.append("joint training requires per-GPU batch 4 and accumulation 4")
+        batch_contract = ((4, 8),) if action_profile else ((4, 4),)
+        batch_shape = (
+            config.get("batch_size"),
+            config.get("gradient_accumulation_steps"),
+        )
+        if batch_shape not in batch_contract:
+            if action_profile:
+                errors.append(
+                    "joint action training requires batch/accumulation 4/8"
+                )
+            else:
+                errors.append(
+                    "joint training requires per-GPU batch 4 and accumulation 4"
+                )
         if bool(config.get("enable_slicing", True)):
             errors.append("joint training requires VAE slicing to be disabled")
         if (
@@ -198,8 +281,12 @@ def collect_preflight_errors(
             errors.append("joint LTX base lr must be 2e-5")
         if config.get("semantic_lr") != 1e-4:
             errors.append("joint LTX semantic lr must be 1e-4")
-        if joint.get("qwen_lr") != 1e-6:
-            errors.append("joint Qwen lr must be 1e-6")
+        expected_qwen_lr = 1e-4 if action_profile else 1e-6
+        if joint.get("qwen_lr") != expected_qwen_lr:
+            expected_qwen_lr_text = "1e-4" if action_profile else "1e-6"
+            errors.append(f"joint Qwen lr must be {expected_qwen_lr_text}")
+        if action_profile and joint.get("qwen_vision_lr") != 1e-4:
+            errors.append("joint Qwen vision lr must be 1e-4")
         if joint.get("planner_head_lr") != 3e-5:
             errors.append("joint planner head lr must be 3e-5")
         if joint.get("planner_loss_weight") != 0.1:
@@ -225,52 +312,141 @@ def collect_preflight_errors(
             errors.append("joint formal training requires DeepSpeed ZeRO-2")
         if not deepspeed.get("bf16", {}).get("enabled", False):
             errors.append("joint DeepSpeed bf16 must be enabled")
-        if config.get("lr_warmup_steps") != 1_000:
-            errors.append("joint lr_warmup_steps must be 1000")
-        if config.get("save_steps") != [20_000, 25_000, 30_000]:
-            errors.append("joint save_steps must be [20000, 25000, 30000]")
+        expected_warmup_steps = 1_500 if action_profile else 1_000
+        if config.get("lr_warmup_steps") != expected_warmup_steps:
+            if action_profile:
+                errors.append(
+                    "joint action training requires lr_warmup_steps=1500"
+                )
+            else:
+                errors.append("joint lr_warmup_steps must be 1000")
+        expected_save_steps = (
+            [5_000, 10_000, 15_000, 20_000, 25_000]
+            if action_profile
+            else [20_000, 25_000, 30_000]
+        )
+        if config.get("save_steps") != expected_save_steps:
+            errors.append(f"joint save_steps must be {expected_save_steps}")
+        if action_profile:
+            if config.get("return_video") is not True:
+                errors.append("joint action training requires return_video=true")
+            if config.get("return_action") is not True:
+                errors.append("joint action training requires return_action=true")
+            if config.get("train_mode") != "all":
+                errors.append("joint action training requires train_mode=all")
+            if config.get("action_loss_scale") != 1.0:
+                errors.append("joint action loss scale must be 1.0")
+            if joint.get("action_lr") != 5e-5:
+                errors.append("joint action lr must be 5e-5")
+            if joint.get("freeze_qwen_vision") is not False:
+                errors.append(
+                    "joint action training requires trainable Qwen vision"
+                )
+            if (
+                joint.get("freeze_qwen_embeddings") is not True
+                or joint.get("freeze_qwen_lm_head") is not True
+            ):
+                errors.append(
+                    "joint action training must freeze Qwen embeddings and LM head"
+                )
+            if joint.get("keep_qwen_first_n_layers") != 16:
+                errors.append(
+                    "joint action training must freeze the first 16 Qwen language layers"
+                )
+            if config.get("lr_scheduler") != "cosine_with_min_lr":
+                errors.append(
+                    "joint action training requires cosine_with_min_lr"
+                )
+            if config.get("lr_min") != 5e-7:
+                errors.append("joint action training requires lr_min=5e-7")
+            if config.get("weight_decay") != 1e-8:
+                errors.append(
+                    "joint action training requires weight_decay=1e-8"
+                )
+            if config.get("seed") != 2026:
+                errors.append("joint action training requires seed=2026")
+            if config.get("add_state") is not True:
+                errors.append("joint action training requires add_state=true")
+            if config.get("rand_init_action") is not False:
+                errors.append(
+                    "joint action training must load checkpoint action weights"
+                )
+            if config.get("noisy_video") is not False:
+                errors.append(
+                    "joint action training requires noisy_video=false"
+                )
+            expected_action_geometry = {
+                "action_expert": True,
+                "action_in_channels": 15,
+                "action_out_channels": 15,
+                "action_num_attention_heads": 16,
+                "action_attention_head_dim": 32,
+            }
+            for key, expected in expected_action_geometry.items():
+                if model_config.get(key) != expected:
+                    errors.append(
+                        f"joint action model {key} must be {expected}"
+                    )
+            for split, data_config in (
+                ("training", train_data),
+                ("validation", val_data),
+            ):
+                if data_config.get("pack_action_state") is not True:
+                    errors.append(
+                        f"joint action {split} data requires pack_action_state=true"
+                    )
+                if data_config.get("action_chunk") != 36:
+                    errors.append(
+                        f"joint action {split} data requires action_chunk=36"
+                    )
         if not joint.get("siglip2_model_dir"):
             errors.append("joint SigLIP2 teacher path is required")
-        if not joint.get("da3_ckpt_dir"):
-            errors.append("joint DA3 teacher checkpoint is required")
-        if not joint.get("da3_code_root"):
-            errors.append("joint DA3 code root is required")
-        formal_path_contract = (
+        if not semantic_only_k2_profile:
+            if not joint.get("da3_ckpt_dir"):
+                errors.append("joint DA3 teacher checkpoint is required")
+            if not joint.get("da3_code_root"):
+                errors.append("joint DA3 code root is required")
+        formal_path_contract = [
             (
                 config.get("pretrained_model_name_or_path"),
-                JOINT_FORMAL_RECIPE["ltx_components"],
+                formal_recipe["ltx_components"],
                 "joint formal LTX components path does not match the approved recipe",
             ),
             (
                 config.get("diffusion_model", {}).get("model_path"),
-                JOINT_FORMAL_RECIPE["ltx_checkpoint"],
+                formal_recipe["ltx_checkpoint"],
                 "joint formal LTX checkpoint path does not match the approved recipe",
             ),
             (
                 semantic.get("planner_checkpoint"),
-                JOINT_FORMAL_RECIPE["planner_checkpoint"],
+                formal_recipe["planner_checkpoint"],
                 "joint formal planner checkpoint path does not match the approved recipe",
             ),
             (
                 joint.get("siglip2_model_dir"),
-                JOINT_FORMAL_RECIPE["siglip2_teacher"],
+                formal_recipe["siglip2_teacher"],
                 "joint formal SigLIP2 teacher path does not match the approved recipe",
             ),
-            (
-                joint.get("da3_ckpt_dir"),
-                JOINT_FORMAL_RECIPE["da3_checkpoint"],
-                "joint formal DA3 checkpoint path does not match the approved recipe",
-            ),
-            (
-                joint.get("da3_code_root"),
-                JOINT_FORMAL_RECIPE["da3_code_root"],
-                "joint formal DA3 code root does not match the approved recipe",
-            ),
-        )
+        ]
+        if not semantic_only_k2_profile:
+            formal_path_contract.extend(
+                [
+                    (
+                        joint.get("da3_ckpt_dir"),
+                        formal_recipe["da3_checkpoint"],
+                        "joint formal DA3 checkpoint path does not match the approved recipe",
+                    ),
+                    (
+                        joint.get("da3_code_root"),
+                        formal_recipe["da3_code_root"],
+                        "joint formal DA3 code root does not match the approved recipe",
+                    ),
+                ]
+            )
         for actual, expected, message in formal_path_contract:
             if actual != expected:
                 errors.append(message)
-        expected_data_roots = [JOINT_FORMAL_RECIPE["data_root"]] * 4
+        expected_data_roots = [formal_recipe["data_root"]] * 4
         if any(
             data_config.get("data_roots") != expected_data_roots
             for data_config in (train_data, val_data)
@@ -280,14 +456,14 @@ def collect_preflight_errors(
             )
         if any(
             data_config.get("predecoded_video_root")
-            != JOINT_FORMAL_RECIPE["predecoded_root"]
+            != formal_recipe["predecoded_root"]
             for data_config in (train_data, val_data)
         ):
             errors.append(
                 "joint formal predecoded root does not match the approved recipe"
             )
         if any(
-            data_config.get("domains") != JOINT_FORMAL_RECIPE["domains"]
+            data_config.get("domains") != formal_recipe["domains"]
             for data_config in (train_data, val_data)
         ):
             errors.append("joint formal domains do not match the approved recipe")
@@ -315,6 +491,8 @@ def collect_preflight_errors(
     required_modules = list(REQUIRED_MODULES)
     if config.get("use_deepspeed", False):
         required_modules.append("deepspeed")
+    if joint_enabled:
+        required_modules.append("omegaconf")
     for module_name in dict.fromkeys(required_modules):
         if importlib.util.find_spec(module_name) is None:
             errors.append(f"missing Python module: {module_name}")
@@ -330,13 +508,16 @@ def collect_preflight_errors(
     elif semantic_source == "vlm_planner":
         required_paths["dual-camera VLM planner"] = semantic.get("planner_checkpoint")
     if joint_enabled:
-        required_paths.update(
-            {
-                "joint SigLIP2 teacher": joint.get("siglip2_model_dir"),
-                "joint DA3 teacher": joint.get("da3_ckpt_dir"),
-                "joint DA3 code root": joint.get("da3_code_root"),
-            }
+        required_paths["joint SigLIP2 teacher"] = joint.get(
+            "siglip2_model_dir"
         )
+        if not semantic_only_k2_profile:
+            required_paths.update(
+                {
+                    "joint DA3 teacher": joint.get("da3_ckpt_dir"),
+                    "joint DA3 code root": joint.get("da3_code_root"),
+                }
+            )
     for label, raw_path in required_paths.items():
         if not raw_path or not Path(raw_path).exists():
             errors.append(f"missing {label}: {raw_path}")

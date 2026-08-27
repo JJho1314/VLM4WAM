@@ -32,6 +32,7 @@ from models.ltx_models.joint_vlm_geact import (  # noqa: E402
     _require_tensor_shape,
     build_joint_optimizer_parameter_groups,
 )
+from models.ltx_models import joint_vlm_geact as joint_vlm_geact_module  # noqa: E402
 
 
 NUM_KEYFRAMES = 4
@@ -66,6 +67,7 @@ def _load_ge_trainer_symbols(*names: str) -> SimpleNamespace:
         "build_joint_optimizer_parameter_groups": (
             build_joint_optimizer_parameter_groups
         ),
+        "is_action_parameter_name": joint_vlm_geact_module.is_action_parameter_name,
         "datetime": datetime,
         "deepcopy": deepcopy,
         "dist": SimpleNamespace(broadcast=lambda *_args, **_kwargs: None),
@@ -91,6 +93,37 @@ def _finite_nonzero(value: torch.Tensor | None) -> bool:
         and torch.isfinite(value).all()
         and torch.count_nonzero(value) > 0
     )
+
+
+def test_cosine_with_min_lr_scheduler_respects_each_group_floor() -> None:
+    symbols = _load_ge_trainer_symbols("build_cosine_with_min_lr_scheduler")
+    first = nn.Parameter(torch.tensor(1.0))
+    second = nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [first], "lr": 1e-4},
+            {"params": [second], "lr": 2e-5},
+        ]
+    )
+    scheduler = symbols.build_cosine_with_min_lr_scheduler(
+        optimizer,
+        num_warmup_steps=2,
+        num_training_steps=6,
+        min_lr=5e-7,
+    )
+
+    assert scheduler.get_last_lr() == pytest.approx([0.0, 0.0])
+    optimizer.step()
+    scheduler.step()
+    assert scheduler.get_last_lr() == pytest.approx([5e-5, 1e-5])
+    optimizer.step()
+    scheduler.step()
+    assert scheduler.get_last_lr() == pytest.approx([1e-4, 2e-5])
+    for _ in range(4):
+        optimizer.step()
+        scheduler.step()
+
+    assert scheduler.get_last_lr() == pytest.approx([5e-7, 5e-7])
 
 
 def test_scalar_metric_reduction_skips_gradient_accumulation_microsteps() -> None:
@@ -276,13 +309,32 @@ def test_offloaded_module_is_restored_only_for_bounded_validation() -> None:
     ]
 
 
+class TinyQwenLanguageModel(nn.Module):
+    def __init__(self, num_layers: int = 20) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(4, 1)
+        self.layers = nn.ModuleList(
+            nn.Linear(1, 1, bias=False) for _ in range(num_layers)
+        )
+
+
+class TinyQwenBackbone(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.language_model = TinyQwenLanguageModel()
+
+
 class TinyQwenModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
+        self.model = TinyQwenBackbone()
         self.proj = nn.Linear(1, 1, bias=False)
         self.visual = nn.Linear(1, 1, bias=False)
         self.lm_head = nn.Linear(1, 1, bias=False)
         nn.init.constant_(self.proj.weight, 0.5)
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.language_model.embed_tokens
 
 
 class TinyPlanner(nn.Module):
@@ -346,13 +398,90 @@ class TinyPlanner(nn.Module):
         )
 
 
+class SemanticOnlyTinyPlanner(TinyPlanner):
+    def predict_semantic_plan_with_losses(
+        self,
+        *,
+        semantic_plan_labels: torch.Tensor,
+        selected_keyframe_indices: tuple[int, ...],
+        input_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        self.forward_calls += 1
+        assert selected_keyframe_indices == (1, 3)
+        batch_size = input_ids.shape[0]
+        qwen_hidden = self.model.proj(input_ids.float()).mean(dim=1)
+        plan_value = self.plan_head(qwen_hidden)
+        semantic_base = plan_value.new_zeros(SEMANTIC_DIM)
+        semantic_base[1] = 1.0
+        semantic_direction = plan_value.new_zeros(SEMANTIC_DIM)
+        semantic_direction[0] = 1.0
+        semantic_features = (
+            semantic_base.unsqueeze(0)
+            + plan_value * semantic_direction.unsqueeze(0)
+        )
+        semantic = semantic_features.reshape(
+            batch_size, 1, 1, SEMANTIC_DIM
+        ).expand(
+            batch_size,
+            2,
+            2 * self.tokens_per_keyframe,
+            SEMANTIC_DIM,
+        )
+        semantic_loss = (semantic - semantic_plan_labels).square().mean()
+        return semantic, {
+            "loss": semantic_loss,
+            "semantic_mse": semantic_loss.detach(),
+        }
+
+
+def test_lawam_qwen_policy_trains_vision_and_freezes_lower_language() -> None:
+    symbols = _load_ge_trainer_symbols(
+        "_resolve_qwen_language_model",
+        "configure_joint_planner_trainability",
+    )
+    planner = TinyPlanner()
+
+    symbols.configure_joint_planner_trainability(
+        planner,
+        freeze_qwen_vision=False,
+        freeze_qwen_lm_head=True,
+        freeze_qwen_embeddings=True,
+        keep_qwen_first_n_layers=16,
+    )
+
+    language_model = planner.model.model.language_model
+    assert all(
+        parameter.requires_grad for parameter in planner.model.visual.parameters()
+    )
+    assert all(
+        not parameter.requires_grad
+        for parameter in language_model.embed_tokens.parameters()
+    )
+    assert all(
+        not parameter.requires_grad
+        for layer in language_model.layers[:16]
+        for parameter in layer.parameters()
+    )
+    assert all(
+        parameter.requires_grad
+        for layer in language_model.layers[16:]
+        for parameter in layer.parameters()
+    )
+    assert all(
+        not parameter.requires_grad
+        for parameter in planner.model.lm_head.parameters()
+    )
+
+
 class TinyGateOpenLTX(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.base_proj = nn.Linear(2, 2, bias=False)
         self.semantic_attn = nn.Linear(SEMANTIC_DIM, 2, bias=False)
+        self.action_proj = nn.Linear(2, 2, bias=False)
         nn.init.constant_(self.base_proj.weight, 0.25)
         nn.init.constant_(self.semantic_attn.weight, 0.01)
+        nn.init.constant_(self.action_proj.weight, 0.02)
         self.forward_calls = 0
 
     def forward(
@@ -520,6 +649,50 @@ def test_gate_open_tiny_contract_reaches_qwen_and_semantic_parameters() -> None:
     assert output.planner_losses["loss"].requires_grad
     assert _finite_nonzero(joint.planner.model.proj.weight.grad)
     assert _finite_nonzero(joint.ltx.semantic_attn.weight.grad)
+
+
+def test_semantic_only_k2_joint_routes_gradients_without_depth() -> None:
+    planner = SemanticOnlyTinyPlanner()
+    joint = JointVLMGEActModel(
+        planner,
+        TinyGateOpenLTX(),
+        num_keyframes=2,
+        planner_num_keyframes=4,
+        selected_planner_keyframe_indices=(1, 3),
+        tokens_per_keyframe=TOKENS_PER_KEYFRAME,
+        semantic_only=True,
+    )
+    semantic_labels = torch.zeros(
+        1,
+        2,
+        2 * TOKENS_PER_KEYFRAME,
+        SEMANTIC_DIM,
+    )
+    ltx_inputs = _ltx_inputs()
+    ltx_inputs["semantic_plan_times"] = torch.tensor([[0.5, 1.0]]).repeat(2, 1)
+
+    output = joint(
+        planner_inputs={"input_ids": torch.ones(1, 1, dtype=torch.long)},
+        semantic_labels=semantic_labels,
+        depth_labels=None,
+        ltx_inputs=ltx_inputs,
+    )
+    (
+        output.ltx_predictions["video"].square().mean()
+        + 0.1 * output.planner_losses["loss"]
+    ).backward()
+
+    assert output.semantic_plan.shape == (
+        1,
+        2,
+        2,
+        TOKENS_PER_KEYFRAME,
+        SEMANTIC_DIM,
+    )
+    assert output.depth_plan is None
+    assert _finite_nonzero(planner.model.proj.weight.grad)
+    assert _finite_nonzero(joint.ltx.semantic_attn.weight.grad)
+    assert planner.depth_head.weight.grad is None
 
 
 def test_real_ltx_first_video_backward_only_opens_zero_gate(real_ltx_class) -> None:
@@ -699,22 +872,38 @@ def test_joint_rejects_inconsistent_ltx_latent_geometry_before_ltx() -> None:
 
 def test_joint_optimizer_groups_are_disjoint_complete_and_ordered() -> None:
     joint = _make_tiny_joint_model()
+    language_model = joint.planner.model.model.language_model
+    language_model.embed_tokens.requires_grad_(False)
+    for layer in language_model.layers[:16]:
+        layer.requires_grad_(False)
+    joint.planner.model.lm_head.requires_grad_(False)
 
     groups = build_joint_optimizer_parameter_groups(
         joint,
         ltx_lr=2e-5,
         semantic_lr=1e-4,
-        qwen_lr=1e-6,
+        action_lr=5e-5,
+        qwen_vision_lr=1e-4,
+        qwen_lr=1e-4,
         planner_head_lr=3e-5,
     )
 
     assert [group["name"] for group in groups] == [
         "base_ltx",
         "semantic_ltx",
+        "action_ltx",
+        "qwen_vision",
         "qwen",
         "planner_heads",
     ]
-    assert [group["lr"] for group in groups] == [2e-5, 1e-4, 1e-6, 3e-5]
+    assert [group["lr"] for group in groups] == [
+        2e-5,
+        1e-4,
+        5e-5,
+        1e-4,
+        1e-4,
+        3e-5,
+    ]
     parameter_ids = [id(parameter) for group in groups for parameter in group["params"]]
     assert len(parameter_ids) == len(set(parameter_ids))
     assert set(parameter_ids) == {
@@ -727,8 +916,10 @@ def test_joint_optimizer_groups_are_disjoint_complete_and_ordered() -> None:
     }
     assert id(joint.ltx.base_proj.weight) in ids_by_group["base_ltx"]
     assert id(joint.ltx.semantic_attn.weight) in ids_by_group["semantic_ltx"]
-    assert id(joint.planner.model.visual.weight) in ids_by_group["qwen"]
-    assert id(joint.planner.model.lm_head.weight) in ids_by_group["qwen"]
+    assert id(joint.ltx.action_proj.weight) in ids_by_group["action_ltx"]
+    assert id(joint.planner.model.visual.weight) in ids_by_group["qwen_vision"]
+    assert id(joint.planner.model.proj.weight) in ids_by_group["qwen"]
+    assert id(joint.planner.model.lm_head.weight) not in parameter_ids
     assert id(joint.planner.plan_head.weight) in ids_by_group["planner_heads"]
     assert id(joint.planner.depth_head.weight) in ids_by_group["planner_heads"]
     assert (
@@ -737,6 +928,37 @@ def test_joint_optimizer_groups_are_disjoint_complete_and_ordered() -> None:
     )
     assert id(joint.planner.shared_query_bank) in ids_by_group["planner_heads"]
     assert id(joint.planner.private_query_bank) in ids_by_group["planner_heads"]
+
+
+def test_semantic_only_trainability_freezes_depth_head() -> None:
+    symbols = _load_ge_trainer_symbols(
+        "_resolve_qwen_language_model",
+        "configure_joint_planner_trainability",
+    )
+    planner = TinyPlanner()
+
+    symbols.configure_joint_planner_trainability(
+        planner,
+        freeze_qwen_vision=False,
+        freeze_qwen_lm_head=True,
+        freeze_depth_head=True,
+    )
+
+    assert all(
+        not parameter.requires_grad for parameter in planner.depth_head.parameters()
+    )
+    assert not planner.depth_head.training
+
+
+def test_action_parameter_name_classifier_matches_geact_modules() -> None:
+    assert hasattr(joint_vlm_geact_module, "is_action_parameter_name")
+    classifier = joint_vlm_geact_module.is_action_parameter_name
+
+    assert classifier("action_proj_in.weight")
+    assert classifier("transformer_blocks.0.action_attn1.to_q.weight")
+    assert classifier("action_transformer_blocks.0.attn1.to_q.weight")
+    assert not classifier("transformer_blocks.0.attn1.to_q.weight")
+    assert not classifier("semantic_plan_proj.weight")
 
 
 def test_joint_optimizer_groups_reject_cross_group_parameter_aliases() -> None:
@@ -748,7 +970,9 @@ def test_joint_optimizer_groups_reject_cross_group_parameter_aliases() -> None:
             joint,
             ltx_lr=2e-5,
             semantic_lr=1e-4,
-            qwen_lr=1e-6,
+            action_lr=5e-5,
+            qwen_vision_lr=1e-4,
+            qwen_lr=3e-6,
             planner_head_lr=3e-5,
         )
 
@@ -762,7 +986,9 @@ def test_joint_optimizer_groups_reject_unclassified_parameters() -> None:
             joint,
             ltx_lr=2e-5,
             semantic_lr=1e-4,
-            qwen_lr=1e-6,
+            action_lr=5e-5,
+            qwen_vision_lr=1e-4,
+            qwen_lr=3e-6,
             planner_head_lr=3e-5,
         )
 
@@ -849,20 +1075,48 @@ def test_joint_teacher_targets_are_encoded_under_no_grad() -> None:
     assert all(not value.requires_grad for value in targets.values())
 
 
-def test_joint_loss_uses_configured_planner_weight() -> None:
+def test_semantic_only_joint_targets_do_not_require_depth_teacher() -> None:
+    contracts = _load_ge_trainer_symbols("encode_joint_planner_targets")
+    grad_states: list[bool] = []
+
+    def target_encoder(current, future, *, appearance_encoder):
+        grad_states.append(torch.is_grad_enabled())
+        assert appearance_encoder == "siglip"
+        return {
+            "semantic_plan_labels": future.new_zeros(1, 2, 512, 1024),
+        }
+
+    targets = contracts.encode_joint_planner_targets(
+        torch.zeros(1, 2, 2, 2, 3, requires_grad=True),
+        torch.zeros(1, 2, 2, 2, 2, 3, requires_grad=True),
+        semantic_teacher="siglip",
+        depth_teacher=None,
+        target_encoder=target_encoder,
+    )
+
+    assert grad_states == [False]
+    assert set(targets) == {"semantic_plan_labels"}
+    assert not targets["semantic_plan_labels"].requires_grad
+
+
+def test_joint_loss_uses_action_and_configured_weights() -> None:
     contracts = _load_ge_trainer_symbols("combine_joint_training_loss")
     video_loss = torch.tensor(2.0, requires_grad=True)
+    action_loss = torch.tensor(4.0, requires_grad=True)
     planner_loss = torch.tensor(3.0, requires_grad=True)
 
     total = contracts.combine_joint_training_loss(
         video_loss,
+        action_loss,
         {"loss": planner_loss},
+        action_loss_scale=1.0,
         planner_loss_weight=0.1,
     )
 
-    torch.testing.assert_close(total, torch.tensor(2.3))
+    torch.testing.assert_close(total, torch.tensor(6.3))
     total.backward()
     torch.testing.assert_close(video_loss.grad, torch.tensor(1.0))
+    torch.testing.assert_close(action_loss.grad, torch.tensor(1.0))
     torch.testing.assert_close(planner_loss.grad, torch.tensor(0.1))
 
 
@@ -871,6 +1125,8 @@ def test_joint_teacher_parameters_are_frozen_and_excluded() -> None:
         "State",
         "Trainer",
         "_configure_qwen_gradient_checkpointing",
+        "_resolve_qwen_language_model",
+        "configure_joint_planner_trainability",
         "_joint_training_enabled",
         "compute_effective_video_fps",
         "freeze_conditioning_modules",
@@ -888,6 +1144,11 @@ def test_joint_teacher_parameters_are_frozen_and_excluded() -> None:
         planner.model,
         "input_grads_enabled",
         True,
+    )
+    planner.model.gradient_checkpointing_disable = lambda: setattr(
+        planner.model,
+        "is_gradient_checkpointing",
+        False,
     )
     ltx = TinyGateOpenLTX()
     ltx.enable_gradient_checkpointing = lambda: setattr(
@@ -910,12 +1171,18 @@ def test_joint_teacher_parameters_are_frozen_and_excluded() -> None:
     )
     trainer.args = SimpleNamespace(
         joint_training={
-            "enabled": True,
-            "qwen_gradient_checkpointing": True,
-            "qwen_lr": 1e-6,
-            "planner_head_lr": 3e-5,
+                "enabled": True,
+                "qwen_gradient_checkpointing": False,
+                "freeze_qwen_vision": False,
+                "freeze_qwen_lm_head": True,
+                "freeze_qwen_embeddings": True,
+                "keep_qwen_first_n_layers": 16,
+                "action_lr": 5e-5,
+                "qwen_vision_lr": 1e-4,
+                "qwen_lr": 1e-4,
+                "planner_head_lr": 3e-5,
         },
-        gradient_checkpointing=True,
+        gradient_checkpointing=False,
         allow_tf32=False,
         train_epochs=1,
         train_steps=1,
@@ -967,18 +1234,42 @@ def test_joint_teacher_parameters_are_frozen_and_excluded() -> None:
     assert not trainer.semantic_teacher.training
     assert not trainer.depth_teacher.training
     assert planner.training
-    assert all(parameter.requires_grad for parameter in planner.parameters())
-    assert planner.model.is_gradient_checkpointing
-    assert planner.model.input_grads_enabled
-    assert ltx.gradient_checkpointing_enabled
+    assert planner.model.proj.weight.requires_grad
+    assert planner.model.visual.weight.requires_grad
+    assert not planner.model.lm_head.weight.requires_grad
+    assert planner.model.visual.training
+    assert not planner.model.lm_head.training
+    assert not planner.model.model.language_model.embed_tokens.weight.requires_grad
+    assert all(
+        not parameter.requires_grad
+        for layer in planner.model.model.language_model.layers[:16]
+        for parameter in layer.parameters()
+    )
+    assert all(
+        parameter.requires_grad
+        for layer in planner.model.model.language_model.layers[16:]
+        for parameter in layer.parameters()
+    )
+    assert planner.model.is_gradient_checkpointing is False
+    assert not hasattr(planner.model, "input_grads_enabled")
+    assert not hasattr(ltx, "gradient_checkpointing_enabled")
     groups = captured["groups"]
     assert [group["name"] for group in groups] == [
         "base_ltx",
         "semantic_ltx",
+        "action_ltx",
+        "qwen_vision",
         "qwen",
         "planner_heads",
     ]
-    assert [group["lr"] for group in groups] == [2e-5, 1e-4, 1e-6, 3e-5]
+    assert [group["lr"] for group in groups] == [
+        2e-5,
+        1e-4,
+        5e-5,
+        1e-4,
+        1e-4,
+        3e-5,
+    ]
     optimized_ids = {id(parameter) for group in groups for parameter in group["params"]}
     teacher_ids = {
         id(parameter)
@@ -1307,6 +1598,8 @@ def test_main_smoke_flags_are_forwarded_as_constructor_overrides(
             "1",
             "--gradient_accumulation_steps_override",
             "1",
+            "--lr_warmup_steps_override",
+            "0",
             "--disable_deepspeed",
             "--enable_8bit_optimizer",
             "--resume_from_checkpoint",
@@ -1320,6 +1613,7 @@ def test_main_smoke_flags_are_forwarded_as_constructor_overrides(
         "train_steps": 1,
         "batch_size": 1,
         "gradient_accumulation_steps": 1,
+        "lr_warmup_steps": 0,
         "use_deepspeed": False,
         "optimizer_8bit": True,
         "resume_from_checkpoint": str(tmp_path / "step_000010"),
@@ -1365,8 +1659,10 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
         wrapper=planner,
         processor=_SaveableModule("processor"),
     )
+    ltx = _SaveableModule("ltx")
+    ltx.action_proj = nn.Linear(1, 1, bias=False)
     composite = SimpleNamespace(
-        ltx=_SaveableModule("ltx"),
+        ltx=ltx,
         planner=planner,
     )
     saved_states: list[Path] = []
@@ -1383,9 +1679,17 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
         joint_training={
             "planner_loss_weight": 0.1,
             "lm_plan_loss_weight": 1e-3,
-            "qwen_lr": 1e-6,
+            "semantic_only": True,
+            "planner_num_keyframes": 4,
+            "num_keyframes": 2,
+            "selected_planner_keyframe_indices": [1, 3],
+            "selected_future_keyframe_offsets": [4, 8],
+            "action_lr": 5e-5,
+            "qwen_lr": 3e-6,
             "planner_head_lr": 3e-5,
         },
+        action_loss_scale=1.0,
+        train_mode="all",
         lr=2e-5,
         semantic_lr=1e-4,
         batch_size=1,
@@ -1396,7 +1700,9 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
         param_groups=[
             {"name": "base_ltx", "lr": 4e-5},
             {"name": "semantic_ltx", "lr": 2e-4},
-            {"name": "qwen", "lr": 2e-6},
+            {"name": "action_ltx", "lr": 5e-5},
+            {"name": "qwen_vision", "lr": 1e-4},
+            {"name": "qwen", "lr": 3e-6},
             {"name": "planner_heads", "lr": 6e-5},
         ]
     )
@@ -1431,13 +1737,22 @@ def test_joint_checkpoint_exports_both_models_metadata_and_training_state(
     assert joint_meta["global_step"] == 20000
     assert joint_meta["source_planner_checkpoint"] == str(source_planner)
     assert joint_meta["lm_plan_loss_weight"] == 7e-4
+    assert joint_meta["action_loss_scale"] == 1.0
+    assert joint_meta["train_mode"] == "all"
     assert joint_meta["optimizer_group_lrs"] == {
+        "action_ltx": 5e-5,
         "base_ltx": 4e-5,
-        "semantic_ltx": 2e-4,
-        "qwen": 2e-6,
-        "planner_heads": 6e-5,
+            "semantic_ltx": 2e-4,
+            "qwen_vision": 1e-4,
+            "qwen": 3e-6,
+            "planner_heads": 6e-5,
     }
-    assert joint_meta["future_keyframe_offsets"] == [2, 4, 6, 8]
+    assert joint_meta["trainable_parameters"]["action_ltx"] == 1
+    assert joint_meta["future_keyframe_offsets"] == [4, 8]
+    assert joint_meta["num_keyframes"] == 2
+    assert joint_meta["planner_num_keyframes"] == 4
+    assert joint_meta["selected_planner_keyframe_indices"] == [1, 3]
+    assert joint_meta["semantic_only"] is True
     trainer_state = json.loads(
         (step_dir / "trainer_state.json").read_text(encoding="utf-8")
     )
@@ -1792,13 +2107,18 @@ def test_joint_train_source_has_single_composite_and_required_logs() -> None:
     source = GE_TRAINER_PATH.read_text(encoding="utf-8")
     required_log_keys = (
         '"loss_video"',
+        '"loss_action"',
         '"planner_loss"',
         '"planner_semantic_mse"',
         '"planner_depth_wsa_loss"',
         '"vlm_grad_norm"',
         '"ltx_grad_norm"',
+        '"action_grad_norm"',
+        '"global_grad_norm"',
         '"lr/base_ltx"',
         '"lr/semantic_ltx"',
+        '"lr/action_ltx"',
+        '"lr/qwen_vision"',
         '"lr/qwen"',
         '"lr/planner_heads"',
         '"samples_per_second"',
@@ -1816,3 +2136,27 @@ def test_joint_train_source_has_single_composite_and_required_logs() -> None:
     assert "_configure_joint_lm_plan_objective(" in source
     for key in required_log_keys:
         assert key in source
+
+
+def test_deepspeed_gradient_norm_uses_engine_value_after_backward() -> None:
+    contracts = _load_ge_trainer_symbols("_deepspeed_global_gradient_norm")
+    accelerator = SimpleNamespace(device=torch.device("cpu"))
+
+    class FakeDeepSpeedEngine:
+        def get_global_grad_norm(self):
+            return 7.5
+
+    norm = contracts._deepspeed_global_gradient_norm(
+        FakeDeepSpeedEngine(),
+        accelerator=accelerator,
+    )
+
+    torch.testing.assert_close(norm, torch.tensor(7.5))
+
+
+def test_joint_train_reapplies_qwen_freeze_after_composite_train_mode() -> None:
+    source = GE_TRAINER_PATH.read_text(encoding="utf-8")
+    after_composite_train = source.split("self.joint_model.train()", 1)[1]
+    joint_epoch_branch = after_composite_train.split("else:", 1)[0]
+
+    assert "configure_joint_planner_trainability(" in joint_epoch_branch

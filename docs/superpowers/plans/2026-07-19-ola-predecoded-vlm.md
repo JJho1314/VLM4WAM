@@ -65,7 +65,7 @@ Expected: PASS.
 
 **Files:**
 - Modify: `tests/test_ge_act_dual_camera_planner.py`
-- Modify: `qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py`
+- Modify: `qwen3_vl_semantic_planner/train_semantic_planner.py`
 
 **Interfaces:**
 - Consumes: CLI `args.num_workers: int`.
@@ -74,7 +74,7 @@ Expected: PASS.
 - [ ] **Step 1: Add a source-level regression assertion for persistent workers**
 
 ```python
-source = (PLANNER_ROOT / "train_qwen3vl4b_lingbot_dino_planner.py").read_text()
+source = (PLANNER_ROOT / "train_semantic_planner.py").read_text()
 assert "persistent_workers=args.num_workers > 0" in source
 ```
 

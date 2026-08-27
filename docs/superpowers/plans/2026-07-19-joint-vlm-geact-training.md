@@ -94,7 +94,7 @@ git commit -m "fix(ge-act): make VLM conditioning geometry metadata-driven"
 ### Task 2: One-pass planner predictions and alignment losses
 
 **Files:**
-- Modify: `qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py`
+- Modify: `qwen3_vl_semantic_planner/train_semantic_planner.py`
 - Modify: `ge_act/models/ltx_models/vlm_semantic_planner.py`
 - Test: `tests/test_ge_act_dual_camera_planner.py`
 - Test: `tests/test_ge_act_vlm_semantic_planner.py`
@@ -182,7 +182,7 @@ Expected: all tests pass.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py ge_act/models/ltx_models/vlm_semantic_planner.py tests/test_ge_act_dual_camera_planner.py tests/test_ge_act_vlm_semantic_planner.py
+git add qwen3_vl_semantic_planner/train_semantic_planner.py ge_act/models/ltx_models/vlm_semantic_planner.py tests/test_ge_act_dual_camera_planner.py tests/test_ge_act_vlm_semantic_planner.py
 git commit -m "feat(planner): return K4 predictions with alignment losses"
 ```
 
