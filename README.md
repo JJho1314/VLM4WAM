@@ -19,17 +19,28 @@ semantic_plan [B, L, 1152]
 -> video prediction
 ```
 
-## Semantic planner (Qwen3-VL)
+## Semantic planner (Qwen3.5 Baton)
 
-The `semantic_plan` fed to the world model is produced by a Qwen3-VL planner trained under
-[`qwen3_vl_semantic_planner/`](qwen3_vl_semantic_planner/README.md). Three independent
-lines: **CoVT·SigLIP·2B** (baseline), **tasktoken·SigLIP·2B** (rich-KV head variant), and
-**lingbot-DINO·4B** (`lingbot_dino_4b/`, aligns to DINO-video via the open `robbyant/lingbot-vla-v2-6b`
-weights — needs a matching DINO-conditioned WM). See that README for details.
+The `semantic_plan` fed to the world model is produced by the Qwen3.5 continuous
+Baton planner. It and its repaired WorldArena Stage-1 training/validation
+contract are documented in [`qwen35_baton/`](qwen35_baton/README.md).
 
-The Qwen3.5 continuous Baton planner and its repaired WorldArena Stage-1
-training/validation contract are documented in
-[`qwen35_baton/`](qwen35_baton/README.md).
+### Retired planner lines (2026-08-27)
+
+Two earlier planner generations were removed from this branch. Neither is
+maintained; both remain in full on the branches listed below.
+
+| Package | What it was | Where it lives now |
+|---|---|---|
+| `qwen3_vl_semantic_planner/` | Qwen3-VL planner, three sub-lines: CoVT·SigLIP·2B (baseline), tasktoken·SigLIP·2B (rich-KV head), lingbot-DINO·4B | `worldArena`, `semantic-guidance-ws-20260805` |
+| `qwen35_planx/` | Plan-X discrete TA-Tok grounded planner, with the video-hindsight cache | `worldArena`, `qwen35-planx-implementation` |
+
+The `vlm_planner` and `qwen35_grounded` routes in `ge_act/runner/ge_trainer.py`
+selected these two packages. Their imports are function-local, so the Baton
+route imports and runs unaffected; selecting a retired `semantic_source` now
+raises `ImportError` instead of silently training a dead configuration. The
+dispatch code was deliberately left in place rather than refactored out, since
+no test environment was available on this box to verify a trainer rewrite.
 
 ## World model (Cosmos)
 
