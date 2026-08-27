@@ -180,7 +180,7 @@ git -C /data/LFT-W02_data/junjie/workspace/VLM4WAM gc --prune=now --aggressive  
 ## 6. 追加：退役 planner 线的磁盘产物清单 (2026-08-27)
 
 代码侧已在分支 `baton-only-20260827` 删除 `qwen3_vl_semantic_planner/` 和 `qwen35_planx/`
-（113 个文件，-38,238 行）。以下是 HPC3 上对应的磁盘产物。**本节只列清单，未执行任何删除。**
+（113 个文件，-38,238 行）。以下是 HPC3 上对应的磁盘产物。**本节列出清单；执行记录见第 7 节。**
 
 ### 明确属于已退役的 qwen3vl 线 —— 约 79.6G
 
@@ -234,3 +234,52 @@ git -C /data/LFT-W02_data/junjie/workspace/VLM4WAM gc --prune=now --aggressive  
 
 > 附带发现：`ge_act/scripts/benchmark_libero_fastwam_hdf5.py:1445` 用了 PEP 617 括号化 `with`
 > （需 Python 3.10+），在 3.8 下无法解析。这是预先存在的，与本次删除无关。
+
+---
+
+## 7. 清理执行记录 (2026-08-27)
+
+第 6 节的清单已执行。执行前用 `git ls-remote` 直接向 GitHub 核对，确认
+`hpc3/joint-geact-attention`(9a57f58)、`hpc3/tgt-sdd-libero-target-text`(5211cc3)、
+`archive/loose-files-20260827`、`baton-only-20260827` 均已在远端，且三个 clean 副本的
+HEAD（`a200628` / `95b1992` / `b607f0d`）都被远端分支包含。
+
+### 已删除 —— HPC3 `/data/user/jhe724/workspace`
+
+7 个副本目录（940M）：`VLM4WAM_geact_semantic_d0ec565` · `VLM4WAM_hdf5_benchmark_95b1992` ·
+`VLM4WAM_hdf5_pilot_b607f0d` · `VLM4WAM_qwen35_worldarena` · `VLM4WAM_qwen35_baton_strict` ·
+`VLM4WAM_joint_geact_02b89af` · `VLM4WAM_tgt_sdd_20260724`
+
+11 个产物目录（86G）：`outputs/qwen3vl_semantic_planner` 37G ·
+`outputs/qwen3vl4b_lingbot_dino_depth_uniform_k5_fullft{,_gbs64,_gbs64_lat128s128o}` 25.4G ·
+`outputs/smoke_lat128` 8.5G · `outputs/smoke_depth_hpc3` 8.4G · `outputs/qwen35_ftsmoke` 5.5G ·
+`outputs/qwen35_discrete_plan` 417M · `outputs/qwen35_discrete_plan_mw2` 417M ·
+`outputs/qwen35_smoke` 417M · `outputs/eval_lingbot_dino_gbs64` 21M
+
+HPC3 `VLM4WAM`：**351G → 265G**。
+
+### 已删除 —— LFT `workspace/VLM4WAM`
+
+`git gc --prune=now` 只回收 0.1G —— 第 4 节"gc 后应降到 ~170MB"的估计是错的。
+实际 `.git` 的 4.6G 是 **Git LFS 对象缓存**，git objects 本身只有 92M。
+
+扫描全仓库所有 blob 收集 LFS 指针后确认：本地 214 个 LFS 对象中**只有 2 个**被任何 commit
+引用（`third_party/siglip2-so400m-patch14-384/tokenizer.{json,model}`），其余 **212 个是孤儿，
+共 4.47 GB**，其中单个 4.2G 的对象在任何分支的任何指针里都查不到。`git lfs prune` 删除这 212 个。
+
+LFT `workspace/VLM4WAM`：**8.4G → 3.9G**（`.git` 4.7G → 94M）。
+删除后校验：23 个 ref 不变，`git fsck` 无输出，剩余 LFS 对象数为 2。
+
+### 保留未动
+
+| 对象 | 大小 | 原因 |
+|---|---|---|
+| `outputs/cosmos_semantic_plan` | 190G | Cosmos 世界模型自身训练，与退役 planner 无关 |
+| `data/qwen35_train_mw` | 47G | 归属存疑，非 Baton 数据格式但无法确证属于哪条退役线 |
+| `data/qwen35_train` | 3.6G | 同上 |
+| `outputs/qwen35_ft_mw4` | 5.5G | 同上 |
+| `third_party` / `models` / `mg_eval` / `attention_vis` | 18.8G | 不在本次范围 |
+| LFT `VLA_WM/VLM4WAM` (A 线) | 213G | A 线保留 |
+| LFT 两个 snapshot 目录 | 229M | 未确认是否还需要其中的 eval 结果 |
+
+**合计释放约 91.5G**（HPC3 87G + LFT 4.5G）。
