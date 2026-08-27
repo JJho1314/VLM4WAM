@@ -174,3 +174,63 @@ git -C /data/LFT-W02_data/junjie/workspace/VLM4WAM gc --prune=now --aggressive  
 需要各自判断、本报告不做建议的：`outputs/cosmos_semantic_plan` (190G)、
 `checkpoints` (57G)、`data/qwen35_train_mw` (47G) —— 取决于哪些实验还要复现。
 `data/qwen35_train` (3.6G) 已被 `_mw` 版本取代。
+
+---
+
+## 6. 追加：退役 planner 线的磁盘产物清单 (2026-08-27)
+
+代码侧已在分支 `baton-only-20260827` 删除 `qwen3_vl_semantic_planner/` 和 `qwen35_planx/`
+（113 个文件，-38,238 行）。以下是 HPC3 上对应的磁盘产物。**本节只列清单，未执行任何删除。**
+
+### 明确属于已退役的 qwen3vl 线 —— 约 79.6G
+
+| 目录 | 大小 | 归属依据 |
+|---|---|---|
+| `outputs/qwen3vl_semantic_planner` | 37G | 子目录名全为 `qwen3vl2b_baton_siglip2_*`（此处 `baton` 是 head 类型，非 `qwen35_baton` 包） |
+| `outputs/qwen3vl4b_lingbot_dino_depth_uniform_k5_fullft` | 8.4G | lingbot-DINO·4B 子线 |
+| `outputs/qwen3vl4b_lingbot_dino_depth_uniform_k5_fullft_gbs64` | 8.6G | 同上 |
+| `outputs/qwen3vl4b_lingbot_dino_depth_uniform_k5_fullft_gbs64_lat128s128o` | 8.6G | 同上 |
+| `outputs/smoke_lat128` | 8.6G | `planner_meta.json` 含 `<\|sem_plan\|>` token，为 qwen3vl planner smoke |
+| `outputs/smoke_depth_hpc3` | 8.4G | 同上 |
+| `outputs/eval_lingbot_dino_gbs64` | 21M | lingbot-DINO 评测 |
+
+### 明确属于已退役的 planx 线 —— 约 834M
+
+| 目录 | 大小 | 归属依据 |
+|---|---|---|
+| `outputs/qwen35_discrete_plan` | 417M | "discrete plan" 即 Plan-X 的离散 TA-Tok 形式 |
+| `outputs/qwen35_discrete_plan_mw2` | 417M | 同上 |
+
+### 格式上不属于 Baton，但归属无法确证 —— 约 62G
+
+`qwen35_baton/configs/worldarena_stage1.json` 声明 `dataset_type: worldarena_hdf5`，
+数据经 `hdf5_manifest_path` 读取。下列产物是 `.npy`（`*_kf.npy` / `*_prompt.npy` / `*_rgb.npy`）
+或 2026-07-24 的早期 qwen35 实验（早于 planx 07-25 与 Baton 07-27 的 SDD），
+**不是 Baton 数据格式**，但也没有足够元数据把它们确证归到某一条已退役线上。删除前请自行确认：
+
+`data/qwen35_train_mw` 47G · `data/qwen35_train` 3.6G · `outputs/qwen35_ft_mw4` 5.5G ·
+`outputs/qwen35_ftsmoke` 5.5G · `outputs/qwen35_smoke` 417M · `outputs/qwen35_ftmini` 4K
+
+### 不属于本次退役范围
+
+`outputs/cosmos_semantic_plan` (190G) 是 **Cosmos 世界模型自身**的训练输出，
+其中 `2b_semplan_gt_online_*` 系列直接用 GT SigLIP2 plan 训练，与用哪个 planner 无关。
+虽然体积最大，但不应按"退役 qwen3vl planner"的理由删除。
+
+### Baton 线需要保留的
+
+`qwen35_baton/` 与 `ge_act/` 双向依赖，两者都保留：`ge_act/runner/ge_trainer.py:81-82`
+顶层 `from qwen35_baton.hashing/teacher import ...`，而 `qwen35_baton/cli` 反向 import
+`ge_act.data.libero_fastwam_hdf5_*`。GE-Act LTX 就是 Baton planner 的 Stage-2 消费方
+（`ge_act/models/ltx_models/baton_semantic_planner.py`）。
+
+### 代码删除的验证方式
+
+无法运行测试（LFT 登录节点无 torch，`python3` 为 3.8）。改用 AST 静态验证：解析全部 118 个
+存活 `.py` 文件，检查模块级 import 节点 —— **对已删模块的顶层 import 为 0**。
+残留的 17 处引用全部是 `vlm_planner` / `qwen35_grounded` 两条退役分派路线里的函数内延迟 import，
+选中这两条路线时才会 `ImportError`。`ge_trainer.py` 的分派代码**刻意未重构**，
+因为无法在本机验证一次约 400 行的 trainer 改写。
+
+> 附带发现：`ge_act/scripts/benchmark_libero_fastwam_hdf5.py:1445` 用了 PEP 617 括号化 `with`
+> （需 Python 3.10+），在 3.8 下无法解析。这是预先存在的，与本次删除无关。
