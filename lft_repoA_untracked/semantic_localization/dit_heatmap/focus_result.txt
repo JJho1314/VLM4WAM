@@ -1,0 +1,5 @@
+plan_off           carrot-focus=0.014 (chance 0.006)  banana-focus=0.007 (chance 0.003)
+plan_on            carrot-focus=0.014 (chance 0.006)  banana-focus=0.007 (chance 0.003)
+plan_on_planattn   carrot-focus=0.007 (chance 0.006)  banana-focus=0.000 (chance 0.003)
+carrot-focus gain (ON - OFF) = +0.000
+plan-attention target vs distractor: carrot 0.007 vs banana 0.000 -> ratio 6944.44x

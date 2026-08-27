@@ -1,0 +1,13 @@
+blocks=[20, 27]  entropy is over L plan tokens; max possible = ln(L)
+block20: calls=36 T=24 L=3645 heads=16 entropy mean=7.815 min=7.768 max=7.854 (ln L=8.201)
+  sharpness focus ratio  carrot=0.858  banana=0.826
+  plan-token attention: uniform=0.00027 max=0.00060 (x2.19 uniform)  top-idx=[1324, 595, 111, 516, 3458]
+  fraction of plan mass in top-10% tokens = 0.135
+block27: calls=36 T=24 L=3645 heads=16 entropy mean=7.813 min=7.746 max=7.874 (ln L=8.201)
+  sharpness focus ratio  carrot=1.038  banana=1.029
+  plan-token attention: uniform=0.00027 max=0.00043 (x1.57 uniform)  top-idx=[2683, 3252, 2764, 370, 1977]
+  fraction of plan mass in top-10% tokens = 0.127
+
+block27 sharpness ratio across 36 denoise calls:
+  carrot: 0.99 1.00 1.08 1.14 1.17 1.08
+  banana: 0.97 0.99 1.09 1.16 1.18 1.09

@@ -1,0 +1,38 @@
+{
+  "rgb_maps": "/data/LFT-W02_data/junjie/fastwam_sg_ckpt/wam_part_rgb_main.npz",
+  "sg_maps": "/data/LFT-W02_data/junjie/fastwam_sg_ckpt/wam_part_sg_main.npz",
+  "selection": [
+    {
+      "index": 269,
+      "prompt": "put the white mug on the left plate and put the yellow and white mug on the right plate",
+      "score": -0.010691918816150905,
+      "rgb_concentration": 0.14195477060431896,
+      "sg_concentration": 0.23889344833454473
+    },
+    {
+      "index": 173,
+      "prompt": "put both the alphabet soup and the cream cheese box in the basket",
+      "score": -0.026177324039113783,
+      "rgb_concentration": 0.15844458400038344,
+      "sg_concentration": 0.24698069356614424
+    },
+    {
+      "index": 19,
+      "prompt": "put the white mug on the plate and put the chocolate pudding to the right of the plate",
+      "score": -0.03398841835962428,
+      "rgb_concentration": 0.14228784830964059,
+      "sg_concentration": 0.21386430085436145
+    },
+    {
+      "index": 235,
+      "prompt": "put both the cream cheese box and the butter in the basket",
+      "score": -0.04842674218483632,
+      "rgb_concentration": 0.14742006041175734,
+      "sg_concentration": 0.20659899838647916
+    }
+  ],
+  "outputs": [
+    "/data/LFT-W02_data/junjie/VLA_WM/VLM4WAM/semantic_localization/figs/sgwam_maskwam_style.png",
+    "/data/LFT-W02_data/junjie/VLA_WM/VLM4WAM/semantic_localization/figs/sgwam_maskwam_style.pdf"
+  ]
+}

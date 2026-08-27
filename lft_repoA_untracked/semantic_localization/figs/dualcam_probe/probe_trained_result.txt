@@ -1,0 +1,6 @@
+loc-head trained on THIS checkpoint's features; split by sample; test examples=40
+mask positive rate (chance for AP) = 0.0443
+                   arm  peak-hit      AP
+       teacher SigLIP2    0.7275  0.6868
+        PREDICTED plan    0.8345  0.6586
+     shuffled (chance)    0.3504  0.3011

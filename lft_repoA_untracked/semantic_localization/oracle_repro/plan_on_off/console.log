@@ -1,0 +1,14 @@
+[07-25 19:20:35|INFO|cosmos_predict2/_src/imaginaire/utils/checkpoint_db.py:370:download] Downloading checkpoint Wan2.1/vae(685afcaa-4de2-42fe-b7b9-69f7a2dee4d8)
+[07-25 19:20:35|INFO|cosmos_predict2/_src/imaginaire/utils/checkpoint_db.py:161:_hf_download] Using local Hugging Face mirror: /data/LFT-W02_data/junjie/weights/Cosmos-Predict2.5-2B/tokenizer.pth
+[07-25 19:20:37|INFO|cosmos_predict2/_src/imaginaire/utils/checkpoint_db.py:370:download] Downloading checkpoint Qwen/Qwen2.5-VL-7B-Instruct(7219c6c7-f878-4137-bbdb-76842ea85e70)
+[07-25 19:20:37|INFO|cosmos_predict2/_src/imaginaire/utils/checkpoint_db.py:161:_hf_download] Using local Hugging Face mirror: /data/LFT-W02_data/junjie/weights/Cosmos-Reason1-7B
+[07-25 19:20:38|INFO|cosmos_predict2/_src/imaginaire/utils/checkpoint_db.py:370:download] Downloading checkpoint nvidia/Cosmos-Reason1.1-7B(cb3e3ffa-7b08-4c34-822d-61c7aa31a14f)
+[07-25 19:20:38|INFO|cosmos_predict2/_src/imaginaire/utils/checkpoint_db.py:161:_hf_download] Using local Hugging Face mirror: /data/LFT-W02_data/junjie/weights/Cosmos-Reason1-7B
+[07-25 19:21:14|INFO|cosmos_predict2/inference.py:60:__init__] Saved config to /data/LFT-W02_data/junjie/VLA_WM/VLM4WAM/semantic_localization/oracle_repro/plan_on_off/config.yaml
+[07-25 19:21:14|INFO|cosmos_predict2/inference.py:82:generate] Generating 1 samples: ['plan_off']
+[07-25 19:21:14|INFO|cosmos_predict2/inference.py:86:generate] [1/1] Processing sample plan_off
+[07-25 19:21:14|INFO|cosmos_predict2/inference.py:99:_generate_sample] Saved arguments to /data/LFT-W02_data/junjie/VLA_WM/VLM4WAM/semantic_localization/oracle_repro/plan_on_off/plan_off.json
+[07-25 19:21:14|WARNING|cosmos_predict2/inference.py:113:_generate_sample] Guardrail checks on prompt are disabled
+[07-25 19:21:14|INFO|cosmos_predict2/inference.py:135:_generate_sample] Generating video with standard mode...
+[07-25 19:29:19|WARNING|cosmos_predict2/inference.py:171:_generate_sample] Guardrail checks on video are disabled
+[07-25 19:29:22|SUCCESS|cosmos_predict2/inference.py:174:_generate_sample] Saved video to /data/LFT-W02_data/junjie/VLA_WM/VLM4WAM/semantic_localization/oracle_repro/plan_on_off/plan_off.mp4

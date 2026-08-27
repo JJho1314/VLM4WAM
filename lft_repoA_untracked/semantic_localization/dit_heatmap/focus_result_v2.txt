@@ -1,0 +1,17 @@
+focus ratio = mean saliency inside mask / outside  (1.0 = no preference)
+plan_off           carrot=1.170  banana=1.200
+plan_on            carrot=1.205  banana=1.233
+plan_on_planattn   carrot=0.991  banana=0.963
+
+per-block:
+  block14 plan_off           carrot=1.140 banana=1.155
+  block14 plan_on            carrot=1.168 banana=1.184
+  block14 plan_on_planattn   carrot=1.054 banana=1.062
+  block20 plan_off           carrot=1.187 banana=1.187
+  block20 plan_on            carrot=1.174 banana=1.172
+  block20 plan_on_planattn   carrot=0.923 banana=0.868
+  block27 plan_off           carrot=1.019 banana=1.067
+  block27 plan_on            carrot=1.048 banana=1.098
+  block27 plan_on_planattn   carrot=0.993 banana=0.987
+
+ON-OFF diff map: carrot=1.007 banana=1.006 |d|mean=0.1046 (feat scale ~1.0 after standardize)

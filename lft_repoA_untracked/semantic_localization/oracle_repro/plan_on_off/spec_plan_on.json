@@ -1,0 +1,12 @@
+{
+  "name": "plan_on",
+  "inference_type": "image2world",
+  "input_path": "/data/LFT-W02_data/junjie/VLA_WM/VLM4WAM/semantic_localization/oracle_repro/yc74616_f0.png",
+  "semantic_plan_path": "/data/LFT-W02_data/junjie/VLA_WM/VLM4WAM/semantic_localization/oracle_repro/yc74616_s0_oracle.pt",
+  "prompt": "A Franka robotic arm with a parallel-jaw gripper carefully grasp only the [TGT] yellow carrot in the sink basin and place it into the black pot next to the banana, without moving the banana.",
+  "resolution": "none",
+  "num_output_frames": 49,
+  "num_steps": 35,
+  "guidance": 7,
+  "seed": 0
+}

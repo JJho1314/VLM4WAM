@@ -1,0 +1,38 @@
+{
+  "camera_names": [
+    "head"
+  ],
+  "checkpoint_steps": [
+    20,
+    5000,
+    10000,
+    15000,
+    20000,
+    25000,
+    30000
+  ],
+  "estimated_completion": "2026-08-01T17:35:32.135975+08:00",
+  "eta_hours": 19.14515189692999,
+  "eta_seconds": 68922.54682894796,
+  "global_batch": 128,
+  "latest_durable_step": 45,
+  "loss_total": 5.109985172748566,
+  "metrics_steps": [
+    20,
+    25,
+    30,
+    35,
+    40,
+    45
+  ],
+  "prediction_target_shape": [
+    "B",
+    1,
+    4,
+    256,
+    1024
+  ],
+  "resume_from": "/data/user/jhe724/junjie/outputs/qwen35_worldarena_acd1_58_30k/step_000020",
+  "throughput_samples_per_s": 55.631142150272254
+}
+FORMAL_EARLY_STEPS_VALIDATION_OK

@@ -1,0 +1,201 @@
+[transformers] Model config: bos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49406. This may result in unexpected behavior.
+[transformers] Model config: eos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49407. This may result in unexpected behavior.
+Current Python version 3.10 is below the recommended 3.11 version. It is recommended to upgrade to Python 3.11 or higher for the best experience.
+{
+  "added_token_ids": [
+    248077,
+    248078,
+    248079,
+    248080,
+    248081,
+    248082,
+    248083
+  ],
+  "camera_names": [
+    "head"
+  ],
+  "dataset_type": "worldarena_hdf5",
+  "distributed_strategy": "ddp",
+  "global_batch": 128,
+  "hdf5_manifest_hash": "481a70c34d874c3c32d464e9f79b65a617a4551f99d706c1722864b263482d67",
+  "qwen35_fast_path": {
+    "causal_conv1d": "1.6.2.post1",
+    "fla": "0.5.2"
+  },
+  "qwen_backbone": "dense Qwen3.5-2B",
+  "siglip2_artifact_hash": "fe8ffab6303ce1cf1a1f8aa8a965ff604045004cd3c2d3a6cb53e0f75d201d17",
+  "siglip2_config_hash": "172e39dbf0143b8fe22d2f08921730eb8c397967e58cb37d133161e28aa34104",
+  "siglip2_geometry": {
+    "hidden_size": 1024,
+    "image_size": 256,
+    "patch_size": 16
+  },
+  "tiny_test": false
+}
+[transformers] Model config: bos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49406. This may result in unexpected behavior.
+[transformers] Model config: eos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49407. This may result in unexpected behavior.
+Current Python version 3.10 is below the recommended 3.11 version. It is recommended to upgrade to Python 3.11 or higher for the best experience.
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/617 [00:00<?, ?it/s]Loading weights:  20%|██        | 126/617 [00:00<00:00, 1259.86it/s]Loading weights:  41%|████      | 252/617 [00:00<00:00, 971.27it/s] Loading weights:  57%|█████▋    | 354/617 [00:00<00:00, 974.84it/s]Loading weights:  90%|████████▉ | 554/617 [00:00<00:00, 1339.55it/s]Loading weights: 100%|██████████| 617/617 [00:00<00:00, 1253.75it/s]
+[transformers] The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+Loading weights:   0%|          | 0/792 [00:00<?, ?it/s]Loading weights:   7%|▋         | 53/792 [00:00<00:01, 529.86it/s]Loading weights:  13%|█▎        | 106/792 [00:00<00:01, 376.99it/s]Loading weights:  19%|█▉        | 150/792 [00:00<00:01, 353.02it/s]Loading weights:  24%|██▎       | 187/792 [00:00<00:02, 299.81it/s]Loading weights:  30%|███       | 239/792 [00:00<00:01, 332.26it/s]Loading weights:  35%|███▌      | 281/792 [00:00<00:01, 335.03it/s]Loading weights:  43%|████▎     | 340/792 [00:00<00:01, 381.94it/s]Loading weights:  51%|█████     | 403/792 [00:01<00:00, 446.05it/s]Loading weights:  57%|█████▋    | 450/792 [00:01<00:00, 394.42it/s]Loading weights:  64%|██████▍   | 507/792 [00:01<00:00, 438.46it/s]Loading weights:  78%|███████▊  | 619/792 [00:01<00:00, 614.29it/s]Loading weights:  86%|████████▋ | 685/792 [00:01<00:00, 522.17it/s]Loading weights:  95%|█████████▌| 753/792 [00:01<00:00, 551.92it/s]Loading weights: 100%|██████████| 792/792 [00:01<00:00, 428.39it/s]
+Detected kernel version 4.18.0, which is below the recommended minimum of 5.5.0; this can cause the process to hang. It is recommended to upgrade the kernel to the minimum version or higher.
+[rank0]:[W731 22:06:39.511923530 ProcessGroupNCCL.cpp:4715] [PG ID 0 PG GUID 0 Rank 0]  using GPU 0 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can pecify device_id in init_process_group() to force use of a particular device.
+[2026-07-31 22:06:42,596] [INFO] [real_accelerator.py:222:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+gcc: error trying to exec 'cc1': execvp: No such file or directory
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+[rank0]:     return _run_code(code, main_globals, None,
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/runpy.py", line 86, in _run_code
+[rank0]:     exec(code, run_globals)
+[rank0]:   File "/data/user/jhe724/workspace/VLM4WAM_qwen35_worldarena/qwen35_baton/cli/train_semantic_planner.py", line 1608, in <module>
+[rank0]:     raise SystemExit(main())
+[rank0]:   File "/data/user/jhe724/workspace/VLM4WAM_qwen35_worldarena/qwen35_baton/cli/train_semantic_planner.py", line 1589, in main
+[rank0]:     result = run_training(config, stop_at_step=args.stop_at_step)
+[rank0]:   File "/data/user/jhe724/workspace/VLM4WAM_qwen35_worldarena/qwen35_baton/cli/train_semantic_planner.py", line 1345, in run_training
+[rank0]:     planner_output = planner(batch)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/nn/parallel/distributed.py", line 1637, in forward
+[rank0]:     else self._run_ddp_forward(*inputs, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/nn/parallel/distributed.py", line 1464, in _run_ddp_forward
+[rank0]:     return self.module(*inputs, **kwargs)  # type: ignore[index]
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/accelerate/utils/operations.py", line 823, in forward
+[rank0]:     return model_forward(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/accelerate/utils/operations.py", line 811, in __call__
+[rank0]:     return convert_to_fp32(self.model_forward(*args, **kwargs))
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/amp/autocast_mode.py", line 44, in decorate_autocast
+[rank0]:     return func(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/workspace/VLM4WAM_qwen35_worldarena/qwen35_baton/model.py", line 331, in forward
+[rank0]:     row_output = self.forward_rows(
+[rank0]:   File "/data/user/jhe724/workspace/VLM4WAM_qwen35_worldarena/qwen35_baton/model.py", line 260, in forward_rows
+[rank0]:     qwen_output = _multimodal_base_model(self.backbone)(**forwarded)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/transformers/utils/generic.py", line 911, in wrapper
+[rank0]:     output = func(self, *args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/transformers/models/qwen3_5/modeling_qwen3_5.py", line 1586, in forward
+[rank0]:     outputs = self.language_model(
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/transformers/utils/generic.py", line 1040, in wrapper
+[rank0]:     output = func(self, *args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/transformers/utils/output_capturing.py", line 262, in wrapper
+[rank0]:     outputs = func(self, *args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/transformers/models/qwen3_5/modeling_qwen3_5.py", line 1212, in forward
+[rank0]:     hidden_states = decoder_layer(
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/transformers/modeling_layers.py", line 110, in __call__
+[rank0]:     return super().__call__(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/transformers/models/qwen3_5/modeling_qwen3_5.py", line 788, in forward
+[rank0]:     hidden_states = self.linear_attn(
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/transformers/integrations/accelerate.py", line 941, in wrapped
+[rank0]:     output = forward_func(self, *args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/transformers/models/qwen3_5/modeling_qwen3_5.py", line 539, in forward
+[rank0]:     core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/_dynamo/eval_frame.py", line 838, in _fn
+[rank0]:     return fn(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/fla/ops/gated_delta_rule/chunk.py", line 567, in chunk_gated_delta_rule
+[rank0]:     o, final_state = ChunkGatedDeltaRuleFunction.apply(
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/autograd/function.py", line 575, in apply
+[rank0]:     return super().apply(*args, **kwargs)  # type: ignore[misc]
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/fla/utils/_decorators.py", line 152, in wrapper
+[rank0]:     return fn(*processed_args, **processed_kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/amp/autocast_mode.py", line 510, in decorate_fwd
+[rank0]:     return fwd(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/fla/ops/gated_delta_rule/chunk.py", line 292, in forward
+[rank0]:     g, o, A, final_state, initial_state, g_input = chunk_gated_delta_rule_fwd(
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/fla/ops/gated_delta_rule/chunk.py", line 63, in chunk_gated_delta_rule_fwd
+[rank0]:     g = chunk_local_cumsum(
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/fla/utils/_decorators.py", line 152, in wrapper
+[rank0]:     return fn(*processed_args, **processed_kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/_dynamo/eval_frame.py", line 838, in _fn
+[rank0]:     return fn(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/fla/ops/backends/__init__.py", line 214, in wrapper
+[rank0]:     return func(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/fla/ops/utils/cumsum.py", line 460, in chunk_local_cumsum
+[rank0]:     return chunk_local_cumsum_scalar(
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/fla/ops/utils/cumsum.py", line 283, in chunk_local_cumsum_scalar
+[rank0]:     chunk_local_cumsum_scalar_kernel[grid](
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+[rank0]:     return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/triton/runtime/autotuner.py", line 395, in run
+[rank0]:     return self.fn.run(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/fla/ops/utils/cache.py", line 378, in run
+[rank0]:     return super().run(*args, **kwargs)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/triton/runtime/autotuner.py", line 192, in run
+[rank0]:     timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+[rank0]:     timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+[rank0]:     return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/triton/testing.py", line 145, in do_bench
+[rank0]:     fn()
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/triton/runtime/autotuner.py", line 156, in kernel_call
+[rank0]:     self.fn.run(
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/triton/runtime/jit.py", line 591, in run
+[rank0]:     kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata,
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/triton/compiler/compiler.py", line 413, in __getattribute__
+[rank0]:     self._init_handles()
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/triton/compiler/compiler.py", line 397, in _init_handles
+[rank0]:     self.run = driver.active.launcher_cls(self.src, self.metadata)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/triton/backends/nvidia/driver.py", line 516, in __init__
+[rank0]:     mod = compile_module_from_src(src, "__triton_launcher")
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/triton/backends/nvidia/driver.py", line 66, in compile_module_from_src
+[rank0]:     so = _build(name, src_path, tmpdir, library_dirs(), include_dir, libraries)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/triton/runtime/build.py", line 36, in _build
+[rank0]:     subprocess.check_call(cc_cmd, stdout=subprocess.DEVNULL)
+[rank0]:   File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/subprocess.py", line 369, in check_call
+[rank0]:     raise CalledProcessError(retcode, cmd)
+[rank0]: subprocess.CalledProcessError: Command '['/data/user/jhe724/bin/gcc', '/tmp/tmp9ujq9mt4/main.c', '-O3', '-shared', '-fPIC', '-Wno-psabi', '-o', '/tmp/tmp9ujq9mt4/__triton_launcher.cpython-310-x86_64-linux-gnu.so', '-lcuda', '-L/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/triton/backends/nvidia/lib', '-L/lib64', '-L/lib', '-I/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/triton/backends/nvidia/include', '-I/tmp/tmp9ujq9mt4', '-I/data/user/jhe724/.conda/envs/qwen35/include/python3.10']' returned non-zero exit status 1.
+E0731 22:06:59.342000 619260 site-packages/torch/distributed/elastic/multiprocessing/api.py:874] failed (exitcode: 1) local_rank: 0 (pid: 619339) of binary: /data/user/jhe724/.conda/envs/qwen35/bin/python
+Traceback (most recent call last):
+  File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/distributed/run.py", line 896, in <module>
+    main()
+  File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 355, in wrapper
+    return f(*args, **kwargs)
+  File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/distributed/run.py", line 892, in main
+    run(args)
+  File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/distributed/run.py", line 883, in run
+    elastic_launch(
+  File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 139, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 270, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+qwen35_baton.cli.train_semantic_planner FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-07-31_22:06:59
+  host      : ACD1-58
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 619339)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

@@ -1,0 +1,8 @@
+block20  L=3645 heads=16 dim=128  ln(L)=8.201
+  logit std=0.9101   top1-minus-mean gap=3.0366
+  entropy vs temperature: T=1.0:7.810  T=0.5:6.706  T=0.2:3.040  T=0.1:1.206  T=0.05:0.513
+  spatial correspondence: corr_y=-0.6543 corr_x=-0.0401 (centroid spread y=0.0066 x=0.0045)
+block27  L=3645 heads=16 dim=128  ln(L)=8.201
+  logit std=0.9576   top1-minus-mean gap=3.0321
+  entropy vs temperature: T=1.0:7.807  T=0.5:6.712  T=0.2:3.070  T=0.1:1.225  T=0.05:0.520
+  spatial correspondence: corr_y=-0.2924 corr_x=+0.0965 (centroid spread y=0.0076 x=0.0081)

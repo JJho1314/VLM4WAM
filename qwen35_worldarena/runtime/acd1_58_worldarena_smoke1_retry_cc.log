@@ -1,0 +1,55 @@
+[transformers] Model config: bos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49406. This may result in unexpected behavior.
+[transformers] Model config: eos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49407. This may result in unexpected behavior.
+Current Python version 3.10 is below the recommended 3.11 version. It is recommended to upgrade to Python 3.11 or higher for the best experience.
+{
+  "added_token_ids": [
+    248077,
+    248078,
+    248079,
+    248080,
+    248081,
+    248082,
+    248083
+  ],
+  "camera_names": [
+    "head"
+  ],
+  "dataset_type": "worldarena_hdf5",
+  "distributed_strategy": "ddp",
+  "global_batch": 128,
+  "hdf5_manifest_hash": "481a70c34d874c3c32d464e9f79b65a617a4551f99d706c1722864b263482d67",
+  "qwen35_fast_path": {
+    "causal_conv1d": "1.6.2.post1",
+    "fla": "0.5.2"
+  },
+  "qwen_backbone": "dense Qwen3.5-2B",
+  "siglip2_artifact_hash": "fe8ffab6303ce1cf1a1f8aa8a965ff604045004cd3c2d3a6cb53e0f75d201d17",
+  "siglip2_config_hash": "172e39dbf0143b8fe22d2f08921730eb8c397967e58cb37d133161e28aa34104",
+  "siglip2_geometry": {
+    "hidden_size": 1024,
+    "image_size": 256,
+    "patch_size": 16
+  },
+  "tiny_test": false
+}
+[transformers] Model config: bos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49406. This may result in unexpected behavior.
+[transformers] Model config: eos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49407. This may result in unexpected behavior.
+Current Python version 3.10 is below the recommended 3.11 version. It is recommended to upgrade to Python 3.11 or higher for the best experience.
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/617 [00:00<?, ?it/s]Loading weights: 100%|██████████| 617/617 [00:00<00:00, 14933.41it/s]
+[transformers] The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+Loading weights:   0%|          | 0/792 [00:00<?, ?it/s]Loading weights:  38%|███▊      | 301/792 [00:00<00:00, 3007.93it/s]Loading weights:  80%|████████  | 635/792 [00:00<00:00, 3195.73it/s]Loading weights: 100%|██████████| 792/792 [00:00<00:00, 3125.84it/s]
+Detected kernel version 4.18.0, which is below the recommended minimum of 5.5.0; this can cause the process to hang. It is recommended to upgrade the kernel to the minimum version or higher.
+[rank0]:[W731 22:08:51.077995311 ProcessGroupNCCL.cpp:4715] [PG ID 0 PG GUID 0 Rank 0]  using GPU 0 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can pecify device_id in init_process_group() to force use of a particular device.
+[2026-07-31 22:08:53,784] [INFO] [real_accelerator.py:222:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+{
+  "checkpoint": null,
+  "cursor": {
+    "consumed_microbatches": 64,
+    "epoch": 0,
+    "global_step": 1,
+    "microbatches_per_epoch": 232,
+    "sampler_seed": 42
+  },
+  "global_step": 1
+}

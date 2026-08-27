@@ -1,0 +1,2 @@
+keys=['plan_off_b14', 'plan_off_b20', 'plan_off_b27', 'plan_on_b14', 'plan_on_b20', 'plan_on_b27', 'plan_on_planattn_b14', 'plan_on_planattn_b20', 'plan_on_planattn_b27']
+res=320,576 nframes=49

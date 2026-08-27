@@ -1,0 +1,50 @@
+{
+  "0": {
+    "max_mem_MiB": 44774.0,
+    "max_power_W": 458.19,
+    "max_util_pct": 100.0,
+    "samples": 71
+  },
+  "1": {
+    "max_mem_MiB": 44774.0,
+    "max_power_W": 459.91,
+    "max_util_pct": 100.0,
+    "samples": 71
+  },
+  "2": {
+    "max_mem_MiB": 44788.0,
+    "max_power_W": 455.12,
+    "max_util_pct": 100.0,
+    "samples": 71
+  },
+  "3": {
+    "max_mem_MiB": 44778.0,
+    "max_power_W": 467.26,
+    "max_util_pct": 100.0,
+    "samples": 71
+  },
+  "4": {
+    "max_mem_MiB": 44778.0,
+    "max_power_W": 449.24,
+    "max_util_pct": 100.0,
+    "samples": 71
+  },
+  "5": {
+    "max_mem_MiB": 44776.0,
+    "max_power_W": 454.29,
+    "max_util_pct": 100.0,
+    "samples": 71
+  },
+  "6": {
+    "max_mem_MiB": 44794.0,
+    "max_power_W": 464.27,
+    "max_util_pct": 100.0,
+    "samples": 71
+  },
+  "7": {
+    "max_mem_MiB": 44746.0,
+    "max_power_W": 462.1,
+    "max_util_pct": 100.0,
+    "samples": 71
+  }
+}

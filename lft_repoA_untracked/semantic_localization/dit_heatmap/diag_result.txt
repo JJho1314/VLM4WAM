@@ -1,0 +1,25 @@
+id(pipe.model.net)=140612353796192 type=MinimalV1LVGDiT
+has net_ema=False
+GEN-OK
+total distinct module types fired: 44
+  Linear: 3808
+  SiLU: 1583
+  Identity: 1208
+  CausalConv3d: 972
+  RMS_norm: 874
+  RMSNorm: 846
+  Sequential: 795
+  LayerNorm: 600
+  MinimalA2AAttnOp: 420
+  Dropout: 406
+  ResidualBlock: 406
+  Attention: 336
+  GELU: 180
+  CheckpointWrapper: 174
+  GPT2FeedForward: 168
+  Block: 168
+  Conv2d: 155
+  Qwen2RMSNorm: 114
+MATCH Block: ['ResidualBlock', 'AttentionBlock', 'Block']
+MATCH Attention: ['Qwen2_5_VLFlashAttention2', 'AttentionBlock', 'Attention', 'SemanticRopeCrossAttention']
+MATCH DiT: ['Video2WorldConditioner', 'MinimalV1LVGDiT']

@@ -1,0 +1,10 @@
+[
+  {
+    "checkpoint": "/data/user/jhe724/junjie/outputs/qwen35_worldarena_acd1_58_30k/step_020000",
+    "manifest_sha256": "5b6dfbfe1c7d6bef06bf2529dcdaf0929ae517e14d5de93cf7c3cd67e4c2a7e4",
+    "migrated": false,
+    "new_metadata_sha256": "d8a016e45b48e3822ba3219f6b65ecf06f596bcff1c0983187cf81e54052ab7a",
+    "old_metadata_sha256": "d8a016e45b48e3822ba3219f6b65ecf06f596bcff1c0983187cf81e54052ab7a"
+  }
+]
+IDEMPOTENCE_ELAPSED=18.23

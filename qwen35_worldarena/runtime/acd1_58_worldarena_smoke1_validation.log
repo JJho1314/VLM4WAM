@@ -1,0 +1,28 @@
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Current Python version 3.10 is below the recommended 3.11 version. It is recommended to upgrade to Python 3.11 or higher for the best experience.
+Loading weights:   0%|          | 0/617 [00:00<?, ?it/s]Loading weights:  64%|██████▍   | 397/617 [00:00<00:00, 3870.00it/s]Loading weights: 100%|██████████| 617/617 [00:00<00:00, 4039.78it/s]
+[transformers] The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+[transformers] Model config: bos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49406. This may result in unexpected behavior.
+[transformers] Model config: eos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49407. This may result in unexpected behavior.
+Loading weights:   0%|          | 0/792 [00:00<?, ?it/s]Loading weights:  40%|███▉      | 314/792 [00:00<00:00, 3136.32it/s]Loading weights:  79%|███████▉  | 628/792 [00:00<00:00, 3121.38it/s]Loading weights: 100%|██████████| 792/792 [00:00<00:00, 3142.18it/s]
+{
+  "camera_names": [
+    "head"
+  ],
+  "global_step": 1,
+  "loss_total": 5.1918127834796906,
+  "microbatches": 64.0,
+  "planner_optimizer_parameter_tensors": 627,
+  "target_shape_per_sample": [
+    1,
+    4,
+    256,
+    1024
+  ],
+  "teacher_optimizer_overlap": 0,
+  "teacher_parameter_tensors": 400,
+  "teacher_trainable_parameter_tensors": 0,
+  "teacher_training_mode": false,
+  "throughput_samples_per_s": 0.8928005125426547
+}
+SMOKE_VALIDATION_OK

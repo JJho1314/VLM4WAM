@@ -1,0 +1,27 @@
+sharpness focus ratio per noun (1.0 = no preference); the target is 'yellow carrot'
+
+block20:
+  black pot      1.253
+  robot arm      1.004
+  faucet         0.879
+  yellow carrot  0.858  <-- TARGET
+  banana         0.826
+  sink           0.805
+  countertop     0.795
+  stove          0.755
+  controls: mean=0.902 sd=0.161 range=[0.755,1.253]
+  random masks: mean=1.003 sd=0.032
+  target z-score vs controls = -0.28
+
+block27:
+  robot arm      1.089
+  sink           1.079
+  faucet         1.069
+  countertop     1.042
+  yellow carrot  1.038  <-- TARGET
+  banana         1.029
+  stove          0.997
+  black pot      0.875
+  controls: mean=1.026 sd=0.068 range=[0.875,1.089]
+  random masks: mean=1.004 sd=0.038
+  target z-score vs controls = +0.19

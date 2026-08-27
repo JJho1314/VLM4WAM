@@ -1,0 +1,25 @@
+Traceback (most recent call last):
+  File "/data/user/jhe724/workspace/VLM4WAM_qwen35_worldarena/qwen35_baton/checkpoint.py", line 384, in _exclusive_metadata_migration_lock
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+BlockingIOError: [Errno 11] Resource temporarily unavailable
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/data/user/jhe724/workspace/VLM4WAM_qwen35_worldarena/qwen35_baton/cli/migrate_checkpoint_v4.py", line 30, in <module>
+    raise SystemExit(main())
+  File "/data/user/jhe724/workspace/VLM4WAM_qwen35_worldarena/qwen35_baton/cli/migrate_checkpoint_v4.py", line 21, in main
+    results = [
+  File "/data/user/jhe724/workspace/VLM4WAM_qwen35_worldarena/qwen35_baton/cli/migrate_checkpoint_v4.py", line 22, in <listcomp>
+    migrate_legacy_head_checkpoint_v4(checkpoint).to_dict()
+  File "/data/user/jhe724/workspace/VLM4WAM_qwen35_worldarena/qwen35_baton/checkpoint.py", line 560, in migrate_legacy_head_checkpoint_v4
+    with _exclusive_metadata_migration_lock(checkpoint):
+  File "/data/user/jhe724/.conda/envs/qwen35/lib/python3.10/contextlib.py", line 135, in __enter__
+    return next(self.gen)
+  File "/data/user/jhe724/workspace/VLM4WAM_qwen35_worldarena/qwen35_baton/checkpoint.py", line 386, in _exclusive_metadata_migration_lock
+    raise RuntimeError(
+RuntimeError: checkpoint already has an active metadata migration: /data/user/jhe724/junjie/outputs/qwen35_worldarena_acd1_58_30k/step_000020

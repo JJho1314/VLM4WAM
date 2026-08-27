@@ -1,0 +1,10 @@
+[
+  {
+    "checkpoint": "/data/user/jhe724/junjie/outputs/qwen35_worldarena_acd1_58_30k/step_010000",
+    "manifest_sha256": "dee1fe17cb99347208e99a8e690037130115474d23db68523a841700dc972f51",
+    "migrated": true,
+    "new_metadata_sha256": "2ed442a0bdbabbf9121b03279aea15d767093848819b67f7c79596b2fc7593bd",
+    "old_metadata_sha256": "c046e3f828511a811717eb6214df9bf834916ca3bb871c79c4b41bb0dd79e108"
+  }
+]
+MIGRATION_ELAPSED=41.79

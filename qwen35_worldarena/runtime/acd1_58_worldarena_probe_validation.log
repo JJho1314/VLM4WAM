@@ -1,0 +1,47 @@
+{
+  "all_manifest_hashes_match": true,
+  "atomic_no_incomplete": true,
+  "camera_names": [
+    "head"
+  ],
+  "checkpoint": "/data/user/jhe724/junjie/outputs/qwen35_worldarena_acd1_58_30k/step_000020",
+  "cursor": {
+    "consumed_microbatches": 15,
+    "epoch": 5,
+    "global_step": 20,
+    "microbatches_per_epoch": 29,
+    "sampler_seed": 42
+  },
+  "files": {
+    "cursor.json": 123,
+    "manifest.json": 662,
+    "metadata.json": 2474,
+    "optimizer.pt": 9055034452,
+    "planner.safetensors": 4527302696,
+    "rank_rng.pt": 146745,
+    "scaler.pt": 1255,
+    "scheduler.pt": 1593
+  },
+  "loss_total": 5.166835770010948,
+  "metadata_world_size": 8,
+  "metric_step": 20,
+  "rng_ranks": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "rng_world_size": 8,
+  "target_shape": [
+    1,
+    4,
+    256,
+    1024
+  ],
+  "throughput_samples_per_s": 57.67549694900467
+}
+PROBE_CHECKPOINT_VALIDATION_OK

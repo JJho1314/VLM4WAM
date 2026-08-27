@@ -1,0 +1,34 @@
+[transformers] Model config: bos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49406. This may result in unexpected behavior.
+[transformers] Model config: eos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49407. This may result in unexpected behavior.
+Current Python version 3.10 is below the recommended 3.11 version. It is recommended to upgrade to Python 3.11 or higher for the best experience.
+{
+  "added_token_ids": [
+    248077,
+    248078,
+    248079,
+    248080,
+    248081,
+    248082,
+    248083
+  ],
+  "camera_names": [
+    "head"
+  ],
+  "dataset_type": "worldarena_hdf5",
+  "distributed_strategy": "ddp",
+  "global_batch": 128,
+  "hdf5_manifest_hash": "481a70c34d874c3c32d464e9f79b65a617a4551f99d706c1722864b263482d67",
+  "qwen35_fast_path": {
+    "causal_conv1d": "1.6.2.post1",
+    "fla": "0.5.2"
+  },
+  "qwen_backbone": "dense Qwen3.5-2B",
+  "siglip2_artifact_hash": "fe8ffab6303ce1cf1a1f8aa8a965ff604045004cd3c2d3a6cb53e0f75d201d17",
+  "siglip2_config_hash": "172e39dbf0143b8fe22d2f08921730eb8c397967e58cb37d133161e28aa34104",
+  "siglip2_geometry": {
+    "hidden_size": 1024,
+    "image_size": 256,
+    "patch_size": 16
+  },
+  "tiny_test": false
+}

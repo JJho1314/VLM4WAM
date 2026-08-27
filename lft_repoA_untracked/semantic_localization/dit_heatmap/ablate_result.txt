@@ -1,0 +1,5 @@
+plan tokens kept: carrot=20/3645 banana=18
+|target - full| mean = 5.911/255
+|distract - full| mean = 6.536/255
+|none - full| mean = 7.827/255
+(scale reference) within-video frame-to-frame = 9.388/255

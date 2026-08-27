@@ -1,0 +1,3 @@
+frames: plan_on=93 plan_off=93
+|plan_on - plan_off| mean = 3.072/255  PSNR = 29.9 dB
+(scale) within-clip frame-to-frame motion = 4.769/255   ratio = 0.64x

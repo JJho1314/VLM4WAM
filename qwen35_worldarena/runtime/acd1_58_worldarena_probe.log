@@ -1,0 +1,122 @@
+[transformers] Model config: bos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49406. This may result in unexpected behavior.
+[transformers] Model config: eos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49407. This may result in unexpected behavior.
+Current Python version 3.10 is below the recommended 3.11 version. It is recommended to upgrade to Python 3.11 or higher for the best experience.
+{
+  "added_token_ids": [
+    248077,
+    248078,
+    248079,
+    248080,
+    248081,
+    248082,
+    248083
+  ],
+  "camera_names": [
+    "head"
+  ],
+  "dataset_type": "worldarena_hdf5",
+  "distributed_strategy": "ddp",
+  "global_batch": 128,
+  "hdf5_manifest_hash": "481a70c34d874c3c32d464e9f79b65a617a4551f99d706c1722864b263482d67",
+  "qwen35_fast_path": {
+    "causal_conv1d": "1.6.2.post1",
+    "fla": "0.5.2"
+  },
+  "qwen_backbone": "dense Qwen3.5-2B",
+  "siglip2_artifact_hash": "fe8ffab6303ce1cf1a1f8aa8a965ff604045004cd3c2d3a6cb53e0f75d201d17",
+  "siglip2_config_hash": "172e39dbf0143b8fe22d2f08921730eb8c397967e58cb37d133161e28aa34104",
+  "siglip2_geometry": {
+    "hidden_size": 1024,
+    "image_size": 256,
+    "patch_size": 16
+  },
+  "tiny_test": false
+}
+
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+*****************************************
+[transformers] Model config: bos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49406. This may result in unexpected behavior.
+[transformers] Model config: bos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49406. This may result in unexpected behavior.
+[transformers] Model config: bos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49406. This may result in unexpected behavior.
+[transformers] Model config: eos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49407. This may result in unexpected behavior.
+[transformers] Model config: eos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49407. This may result in unexpected behavior.
+[transformers] Model config: bos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49406. This may result in unexpected behavior.
+[transformers] Model config: eos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49407. This may result in unexpected behavior.
+[transformers] Model config: eos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49407. This may result in unexpected behavior.
+[transformers] Model config: bos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49406. This may result in unexpected behavior.
+[transformers] Model config: eos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49407. This may result in unexpected behavior.
+[transformers] Model config: bos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49406. This may result in unexpected behavior.
+[transformers] Model config: eos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49407. This may result in unexpected behavior.
+[transformers] Model config: bos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49406. This may result in unexpected behavior.
+[transformers] Model config: eos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49407. This may result in unexpected behavior.
+[transformers] Model config: bos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49406. This may result in unexpected behavior.
+[transformers] Model config: eos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49407. This may result in unexpected behavior.
+Current Python version 3.10 is below the recommended 3.11 version. It is recommended to upgrade to Python 3.11 or higher for the best experience.
+Current Python version 3.10 is below the recommended 3.11 version. It is recommended to upgrade to Python 3.11 or higher for the best experience.
+Current Python version 3.10 is below the recommended 3.11 version. It is recommended to upgrade to Python 3.11 or higher for the best experience.
+Current Python version 3.10 is below the recommended 3.11 version. It is recommended to upgrade to Python 3.11 or higher for the best experience.
+Current Python version 3.10 is below the recommended 3.11 version. It is recommended to upgrade to Python 3.11 or higher for the best experience.
+Current Python version 3.10 is below the recommended 3.11 version. It is recommended to upgrade to Python 3.11 or higher for the best experience.
+Current Python version 3.10 is below the recommended 3.11 version. It is recommended to upgrade to Python 3.11 or higher for the best experience.
+Current Python version 3.10 is below the recommended 3.11 version. It is recommended to upgrade to Python 3.11 or higher for the best experience.
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/617 [00:00<?, ?it/s]Loading weights:   0%|          | 0/617 [00:00<?, ?it/s]Loading weights:   0%|          | 0/617 [00:00<?, ?it/s]Loading weights:  64%|██████▍   | 394/617 [00:00<00:00, 3894.36it/s][transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:  65%|██████▍   | 398/617 [00:00<00:00, 3941.44it/s]Loading weights: 100%|██████████| 617/617 [00:00<00:00, 3970.22it/s]
+Loading weights:   0%|          | 0/617 [00:00<?, ?it/s]Loading weights:  65%|██████▍   | 398/617 [00:00<00:00, 3940.68it/s][transformers] The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+Loading weights: 100%|██████████| 617/617 [00:00<00:00, 4115.71it/s]
+[transformers] The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+Loading weights: 100%|██████████| 617/617 [00:00<00:00, 3983.67it/s]
+[transformers] The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+Loading weights:  54%|█████▍    | 336/617 [00:00<00:00, 3358.73it/s]Loading weights: 100%|██████████| 617/617 [00:00<00:00, 4029.24it/s]
+[transformers] The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+Loading weights:   0%|          | 0/617 [00:00<?, ?it/s][transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/792 [00:00<?, ?it/s][transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/792 [00:00<?, ?it/s]Loading weights:   0%|          | 0/792 [00:00<?, ?it/s]Loading weights:  61%|██████▏   | 378/617 [00:00<00:00, 3713.62it/s][transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights: 100%|██████████| 617/617 [00:00<00:00, 3953.16it/s]
+[transformers] The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+Loading weights:   0%|          | 0/792 [00:00<?, ?it/s]Loading weights:   1%|          | 4/792 [00:00<00:32, 23.94it/s]Loading weights:   1%|          | 4/792 [00:00<00:30, 26.19it/s]Loading weights:   1%|          | 4/792 [00:00<00:28, 27.62it/s]Loading weights:   0%|          | 0/617 [00:00<?, ?it/s]Loading weights:  85%|████████▍ | 673/792 [00:00<00:00, 3081.64it/s]Loading weights:  83%|████████▎ | 659/792 [00:00<00:00, 3177.51it/s]Loading weights: 100%|██████████| 792/792 [00:00<00:00, 2579.22it/s]
+Loading weights:  83%|████████▎ | 657/792 [00:00<00:00, 3209.65it/s]Loading weights: 100%|██████████| 792/792 [00:00<00:00, 2703.27it/s]
+Loading weights:   0%|          | 0/617 [00:00<?, ?it/s]Loading weights:  65%|██████▌   | 402/617 [00:00<00:00, 4019.26it/s]Loading weights:   1%|          | 4/792 [00:00<00:36, 21.39it/s]Loading weights: 100%|██████████| 792/792 [00:00<00:00, 2762.01it/s]
+Loading weights:   0%|          | 0/617 [00:00<?, ?it/s]Loading weights: 100%|██████████| 617/617 [00:00<00:00, 4219.59it/s]
+Loading weights:   0%|          | 0/792 [00:00<?, ?it/s]Loading weights: 100%|██████████| 617/617 [00:00<00:00, 24448.38it/s]
+[transformers] The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+[transformers] The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+Loading weights:  66%|██████▋   | 409/617 [00:00<00:00, 4060.12it/s]Loading weights:  97%|█████████▋| 769/792 [00:00<00:00, 3308.75it/s]Loading weights: 100%|██████████| 792/792 [00:00<00:00, 2682.30it/s]
+Loading weights: 100%|██████████| 617/617 [00:00<00:00, 4231.40it/s]
+[transformers] The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+Loading weights:   1%|          | 4/792 [00:00<00:38, 20.57it/s]Loading weights:   0%|          | 0/792 [00:00<?, ?it/s]Loading weights:  99%|█████████▉| 787/792 [00:00<00:00, 3297.96it/s]Loading weights: 100%|██████████| 792/792 [00:00<00:00, 2655.64it/s]
+Loading weights:   0%|          | 0/792 [00:00<?, ?it/s]Loading weights:   0%|          | 0/792 [00:00<?, ?it/s]Loading weights:   1%|          | 4/792 [00:00<00:34, 22.58it/s]Loading weights:   1%|          | 4/792 [00:00<00:33, 23.60it/s]Loading weights:   1%|          | 4/792 [00:00<00:32, 24.15it/s]Loading weights:  93%|█████████▎| 737/792 [00:00<00:00, 3281.90it/s]Loading weights: 100%|██████████| 792/792 [00:00<00:00, 2682.15it/s]
+Loading weights:  93%|█████████▎| 737/792 [00:00<00:00, 3319.24it/s]Loading weights: 100%|██████████| 792/792 [00:00<00:00, 2774.91it/s]
+Loading weights:  95%|█████████▌| 753/792 [00:00<00:00, 3478.95it/s]Loading weights: 100%|██████████| 792/792 [00:00<00:00, 2858.04it/s]
+Detected kernel version 4.18.0, which is below the recommended minimum of 5.5.0; this can cause the process to hang. It is recommended to upgrade the kernel to the minimum version or higher.
+[rank5]:[W731 22:14:40.300135486 ProcessGroupNCCL.cpp:4715] [PG ID 0 PG GUID 0 Rank 5]  using GPU 5 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can pecify device_id in init_process_group() to force use of a particular device.
+[rank4]:[W731 22:14:40.303958694 ProcessGroupNCCL.cpp:4715] [PG ID 0 PG GUID 0 Rank 4]  using GPU 4 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can pecify device_id in init_process_group() to force use of a particular device.
+[rank7]:[W731 22:14:40.496232855 ProcessGroupNCCL.cpp:4715] [PG ID 0 PG GUID 0 Rank 7]  using GPU 7 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can pecify device_id in init_process_group() to force use of a particular device.
+[rank1]:[W731 22:14:40.511127352 ProcessGroupNCCL.cpp:4715] [PG ID 0 PG GUID 0 Rank 1]  using GPU 1 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can pecify device_id in init_process_group() to force use of a particular device.
+[rank2]:[W731 22:14:40.687020600 ProcessGroupNCCL.cpp:4715] [PG ID 0 PG GUID 0 Rank 2]  using GPU 2 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can pecify device_id in init_process_group() to force use of a particular device.
+[rank0]:[W731 22:14:40.701815429 ProcessGroupNCCL.cpp:4715] [PG ID 0 PG GUID 0 Rank 0]  using GPU 0 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can pecify device_id in init_process_group() to force use of a particular device.
+[rank3]:[W731 22:14:40.712209640 ProcessGroupNCCL.cpp:4715] [PG ID 0 PG GUID 0 Rank 3]  using GPU 3 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can pecify device_id in init_process_group() to force use of a particular device.
+[rank6]:[W731 22:14:40.712538993 ProcessGroupNCCL.cpp:4715] [PG ID 0 PG GUID 0 Rank 6]  using GPU 6 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can pecify device_id in init_process_group() to force use of a particular device.
+[2026-07-31 22:16:02,752] [INFO] [real_accelerator.py:222:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+[2026-07-31 22:16:02,754] [INFO] [real_accelerator.py:222:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+[2026-07-31 22:16:02,778] [INFO] [real_accelerator.py:222:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+[2026-07-31 22:16:02,790] [INFO] [real_accelerator.py:222:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+[2026-07-31 22:16:02,792] [INFO] [real_accelerator.py:222:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+[2026-07-31 22:16:02,799] [INFO] [real_accelerator.py:222:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+[2026-07-31 22:16:02,825] [INFO] [real_accelerator.py:222:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+[2026-07-31 22:16:02,958] [INFO] [real_accelerator.py:222:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+{
+  "checkpoint": "/data/user/jhe724/junjie/outputs/qwen35_worldarena_acd1_58_30k/step_000020",
+  "cursor": {
+    "consumed_microbatches": 15,
+    "epoch": 5,
+    "global_step": 20,
+    "microbatches_per_epoch": 29,
+    "sampler_seed": 42
+  },
+  "global_step": 20
+}
