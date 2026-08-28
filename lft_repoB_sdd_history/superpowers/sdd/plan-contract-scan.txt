@@ -1,0 +1,220 @@
+5:**Goal:** Train a FastWAM-aligned 4B planner and use it online, frozen, in FastWAM Cosmos so that same-position DINO and depth features are fused into a `[B, 1024, 1024]` semantic plan with four-keyframe timing and effective-video-FPS-aware RoPE.
+7:**Architecture:** The 4B planner observes the same current multi-camera image and raw instruction as FastWAM, performs one frozen VLM forward, and emits separate DINO and depth branches for four future keyframes. At each keyframe, 32 shared VLM queries are combined with 32 modality-private queries, so each head consumes 64 of 96 unique queries. A trainable fusion module owned by the Cosmos video expert fuses the dense branch outputs before the existing Cosmos semantic adapter and cross-attention path.
+14:- Train the new planner for `sequence_length=9`. Do not reuse the existing 49-frame planner checkpoint as the production provider.
+15:- Use exactly four future semantic keyframes at RGB offsets `[2, 4, 6, 8]`. Their normalized times are `[0.25, 0.5, 0.75, 1.0]`.
+16:- For each keyframe, emit queries in `[32 shared, 32 DINO-private, 32 depth-private]` order. Each head consumes 64 queries, the VLM emits 96 unique queries per keyframe, and the four-keyframe sequence contains 384 query tokens.
+17:- Preserve keyframe-major, then row-major spatial ordering. Each branch is `[B, 4 * 16 * 16, 1024] = [B, 1024, 1024]`.
+38:  - Return DINO, depth, and normalized keyframe times.
+40:  - Pin the FastWAM-aligned nine-frame, four-keyframe training contract.
+151:    wrapper.num_keyframes = 4
+152:    wrapper.shared_latent_per_keyframe = 32
+153:    wrapper.private_latent_per_keyframe = 32
+154:    wrapper.branch_latent_per_keyframe = 64
+155:    wrapper.total_unique_latent_per_keyframe = 96
+176:    assert module.keyframe_offsets(9, 4, 'even_future', 0.6) == [
+183:        module.keyframe_offsets(9, 3, 'even_future', 0.6)
+193:    wrapper.num_keyframes = 4
+194:    wrapper.shared_latent_per_keyframe = 32
+195:    wrapper.private_latent_per_keyframe = 32
+196:    wrapper.branch_latent_per_keyframe = 64
+197:    wrapper.total_unique_latent_per_keyframe = 96
+320:        self.num_keyframes
+321:        * self.total_unique_latent_per_keyframe
+330:        self.num_keyframes,
+331:        self.total_unique_latent_per_keyframe,
+334:    shared_end = self.shared_latent_per_keyframe
+335:    dino_end = shared_end + self.private_latent_per_keyframe
+336:    depth_end = dino_end + self.private_latent_per_keyframe
+345:            self.num_keyframes * self.branch_latent_per_keyframe,
+350:            self.num_keyframes * self.branch_latent_per_keyframe,
+387:Add parser arguments `--shared-latent-per-keyframe` and `--private-latent-per-keyframe`, both positive integers for the dual-branch mode.
+389:Extend `--keyframe-scheme` with `even_future` and add this branch before the legacy `late`/rounded-linspace behavior:
+397:            f'to be divisible by {n} keyframes'
+406:self.num_keyframes = int(num_keyframes)
+407:self.shared_latent_per_keyframe = int(shared_latent_per_keyframe)
+408:self.private_latent_per_keyframe = int(private_latent_per_keyframe)
+409:self.branch_latent_per_keyframe = (
+410:    self.shared_latent_per_keyframe
+411:    + self.private_latent_per_keyframe
+413:self.total_unique_latent_per_keyframe = (
+414:    self.shared_latent_per_keyframe
+415:    + 2 * self.private_latent_per_keyframe
+417:self.num_latent_per_keyframe = self.branch_latent_per_keyframe
+418:self.latent_len = (
+419:    self.num_keyframes
+420:    * self.total_unique_latent_per_keyframe
+424:For the dual-branch `lingbot_dino` mode, construct both `LingbotDinoPlanHead` instances with `num_latent_per_keyframe=self.branch_latent_per_keyframe`. Require `use_depth=True` and require the exact production values `32/32` when exporting a FastWAM checkpoint. The generic CoVT and legacy DINO-only paths retain their current `num_latent_per_keyframe` behavior.
+426:When creating distinct plan tokens in `main`, use `wrapper.latent_len`-equivalent geometry before wrapper construction:
+432:    and args.shared_latent_per_keyframe > 0
+434:    latent_len = args.num_keyframes * (
+435:        args.shared_latent_per_keyframe
+436:        + 2 * args.private_latent_per_keyframe
+439:    latent_len = (
+440:        args.num_keyframes * args.num_latent_per_keyframe
+443:    f'<|sem_plan_{index}|>' for index in range(latent_len)
+484:    wrapper.num_keyframes = 4
+485:    wrapper.shared_latent_per_keyframe = 32
+486:    wrapper.private_latent_per_keyframe = 32
+487:    wrapper.branch_latent_per_keyframe = 64
+488:    wrapper.total_unique_latent_per_keyframe = 96
+489:    wrapper.num_latent_per_keyframe = 64
+490:    wrapper.latent_len = 384
+507:        keyframe_scheme='even_future',
+508:        keyframe_gamma=0.6,
+515:        num_keyframes=4,
+516:        shared_latent_per_keyframe=32,
+517:        private_latent_per_keyframe=32,
+546:    assert metadata['num_keyframes'] == 4
+549:    assert metadata['target_tokens'] == 1024
+550:    assert metadata['keyframe_offsets'] == [2, 4, 6, 8]
+552:    assert metadata['token_order'] == 'keyframe_major_row_major'
+554:        'keyframe_major__shared_dino_private_depth_private'
+556:    assert metadata['shared_latent_per_keyframe'] == 32
+557:    assert metadata['private_latent_per_keyframe'] == 32
+558:    assert metadata['branch_latent_per_keyframe'] == 64
+559:    assert metadata['total_unique_latent_per_keyframe'] == 96
+560:    assert metadata['plan_token_strings'] == [
+584:offsets = keyframe_offsets(
+586:    n=int(args.num_keyframes),
+587:    scheme=str(args.keyframe_scheme),
+588:    gamma=float(args.keyframe_gamma),
+593:        'num_keyframes': int(args.num_keyframes),
+596:        'target_tokens': int(module.target_len),
+597:        'keyframe_offsets': [int(offset) for offset in offsets],
+598:        'normalized_keyframe_times': [
+608:        'shared_latent_per_keyframe': int(
+609:            module.shared_latent_per_keyframe
+611:        'private_latent_per_keyframe': int(
+612:            module.private_latent_per_keyframe
+614:        'branch_latent_per_keyframe': int(
+615:            module.branch_latent_per_keyframe
+617:        'total_unique_latent_per_keyframe': int(
+618:            module.total_unique_latent_per_keyframe
+621:            'keyframe_major__shared_dino_private_depth_private'
+623:        'plan_token_strings': [
+624:            f'<|sem_plan_{index}|>' for index in range(module.latent_len)
+626:        'token_order': 'keyframe_major_row_major',
+710:        'num_keyframes': 4,
+713:        'target_tokens': 1024,
+714:        'keyframe_offsets': [2, 4, 6, 8],
+715:        'keyframe_scheme': 'even_future',
+716:        'normalized_keyframe_times': [0.25, 0.5, 0.75, 1.0],
+720:        'shared_latent_per_keyframe': 32,
+721:        'private_latent_per_keyframe': 32,
+722:        'branch_latent_per_keyframe': 64,
+723:        'total_unique_latent_per_keyframe': 96,
+724:        'latent_len': 384,
+726:            'keyframe_major__shared_dino_private_depth_private'
+730:        'plan_token_strings': [
+733:        'token_order': 'keyframe_major_row_major',
+740:    assert contract.keyframe_offsets == (2, 4, 6, 8)
+741:    assert contract.normalized_keyframe_times == (
+752:        ('sequence_length', 49),
+753:        ('num_keyframes', 5),
+756:        ('target_tokens', 486),
+757:        ('keyframe_offsets', [1, 3, 6, 8]),
+758:        ('keyframe_scheme', 'uniform'),
+760:        ('shared_latent_per_keyframe', 8),
+761:        ('private_latent_per_keyframe', 64),
+762:        ('query_layout', 'keyframe_major'),
+763:        ('latent_len', 256),
+804:    'num_keyframes': 4,
+807:    'target_tokens': 1024,
+808:    'keyframe_offsets': [2, 4, 6, 8],
+809:    'keyframe_scheme': 'even_future',
+813:    'shared_latent_per_keyframe': 32,
+814:    'private_latent_per_keyframe': 32,
+815:    'branch_latent_per_keyframe': 64,
+816:    'total_unique_latent_per_keyframe': 96,
+817:    'latent_len': 384,
+819:        'keyframe_major__shared_dino_private_depth_private'
+823:    'token_order': 'keyframe_major_row_major',
+830:    num_keyframes: int
+833:    target_tokens: int
+834:    shared_latent_per_keyframe: int
+835:    private_latent_per_keyframe: int
+836:    branch_latent_per_keyframe: int
+837:    total_unique_latent_per_keyframe: int
+838:    keyframe_offsets: tuple[int, ...]
+839:    normalized_keyframe_times: tuple[float, ...]
+840:    plan_token_strings: tuple[str, ...]
+847:    semantic_plan_times: torch.Tensor
+860:        for offset in EXPECTED_METADATA['keyframe_offsets']
+863:        'normalized_keyframe_times', ()
+870:            'incompatible planner metadata field normalized_keyframe_times: '
+876:    actual_plan_tokens = tuple(metadata.get('plan_token_strings', ()))
+879:            'incompatible planner metadata field plan_token_strings: '
+884:        num_keyframes=4,
+887:        target_tokens=1024,
+888:        shared_latent_per_keyframe=32,
+889:        private_latent_per_keyframe=32,
+890:        branch_latent_per_keyframe=64,
+891:        total_unique_latent_per_keyframe=96,
+892:        keyframe_offsets=(2, 4, 6, 8),
+893:        normalized_keyframe_times=expected_times,
+894:        plan_token_strings=expected_plan_tokens,
+992:    assert result.semantic_plan_times.shape == (2, 4)
+1146:                list(self.contract.plan_token_strings),
+1154:            self.contract.target_tokens,
+1169:            self.contract.normalized_keyframe_times,
+1176:            semantic_plan_times=times.detach(),
+1209:        target_len=int(metadata['target_tokens']),
+1210:        num_keyframes=int(metadata['num_keyframes']),
+1212:        num_latent_per_keyframe=int(
+1213:            metadata['branch_latent_per_keyframe']
+1215:        shared_latent_per_keyframe=int(
+1216:            metadata['shared_latent_per_keyframe']
+1218:        private_latent_per_keyframe=int(
+1219:            metadata['private_latent_per_keyframe']
+1370:    assert item['keyframe_images'].shape == (4, 8, 16, 3)
+1466:            'keyframe_images': selected[1:],
+1471:Add repeatable `--fastwam-dataset-dir` arguments and pass them to `from_config` so machine-local dataset locations can override the relative paths in the shared YAML. When `--online-plan-labels --fastwam-data-config PATH` is selected, construct this adapter instead of `OnlineSemanticPlanDataset`. Require `sequence_length=9`, `num_keyframes=4`, and the exact offsets. The DINO and depth teachers continue to run online over `current_image` and `keyframe_images`.
+1569:The base launcher must pass `--shared-latent-per-keyframe` and `--private-latent-per-keyframe` whenever those variables are positive. The resulting planner sequence is exactly 384 distinct `<|sem_plan_i|>` tokens; do not set the legacy `NUM_LATENT_PER_KEYFRAME` to 96 because each head consumes only 64.
+1643:        max_tokens=1024,
+1718:        max_tokens: int = 1024,
+1725:        self.max_tokens = int(max_tokens)
+1748:        expected = (self.max_tokens, self.feature_dim)
+1751:                f'each plan must have shape [B, {self.max_tokens}, '
+1799:semantic_plan_fusion_max_tokens: int = 1024,
+2012:        self.semantic_plan_times = torch.tensor(
+2042:    assert fastwam_model._current_semantic_plan_times.shape == (1, 4)
+2059:    training_sample['semantic_plan_times'] = torch.zeros(1, 4)
+2190:    semantic_plan_max_tokens=semantic_plan_max_tokens,
+2191:    semantic_plan_num_keyframes=semantic_plan_num_keyframes,
+2192:    semantic_plan_source_num_keyframes=semantic_plan_source_num_keyframes,
+2201:    semantic_plan_fusion_max_tokens=int(semantic_plan_max_tokens),
+2235:self.semantic_plan_max_tokens = int(semantic_plan_max_tokens)
+2236:self.semantic_plan_num_keyframes = int(semantic_plan_num_keyframes)
+2238:self._current_semantic_plan_times = None
+2250:        self.semantic_plan_max_tokens,
+2253:    expected_times = (batch_size, self.semantic_plan_num_keyframes)
+2261:            f'semantic_plan_times must have shape {expected_times}, '
+2267:        raise ValueError('semantic_plan_times contains non-finite values')
+2269:        raise ValueError('semantic_plan_times must lie in [0, 1]')
+2271:        raise ValueError('semantic_plan_times must be strictly increasing')
+2323:        self._current_semantic_plan_times = (
+2324:            result.semantic_plan_times.to(
+2331:            self._current_semantic_plan_times,
+2334:        expected_times = self._current_semantic_plan_times.new_tensor(
+2338:            self._current_semantic_plan_times,
+2344:                'online semantic_plan_times must equal '
+2496:    semantic_plan_times_B_N=model._current_semantic_plan_times,
+2510:    semantic_plan_times_B_N=model._current_semantic_plan_times,
+2536:semantic_plan_num_keyframes: 4
+2537:semantic_plan_source_num_keyframes: 4
+2539:semantic_plan_max_tokens: 1024
+2566:semantic_plan_max_tokens: 1024
+2605:    assert config['semantic_plan_num_keyframes'] == 4
+2606:    assert config['semantic_plan_source_num_keyframes'] == 4
+2608:    assert config['semantic_plan_max_tokens'] == 1024
+2811:  "num_keyframes": 4,
+2814:  "target_tokens": 1024,
+2815:  "keyframe_offsets": [2, 4, 6, 8],
+2816:  "shared_latent_per_keyframe": 32,
+2817:  "private_latent_per_keyframe": 32,
+2818:  "branch_latent_per_keyframe": 64,
+2819:  "total_unique_latent_per_keyframe": 96,
+2820:  "query_layout": "keyframe_major__shared_dino_private_depth_private",
+2822:  "token_order": "keyframe_major_row_major"
+2889:- [ ] Each keyframe has 32 shared plus 32 private queries per branch; each head receives 64 queries, and the full four-keyframe VLM query sequence contains exactly 384 distinct tokens.
+2893:- [ ] Semantic keyframe times are exactly `[0.25,0.5,0.75,1.0]` for offsets `[2,4,6,8]`.

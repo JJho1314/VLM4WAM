@@ -1,0 +1,399 @@
+diff --git a/.superpowers/sdd/snapshots/zero2-task-3-before/test_lingbot_zero2_runtime.py b/tests/test_lingbot_zero2_runtime.py
+index b415d30..b2e1331 100644
+--- a/.superpowers/sdd/snapshots/zero2-task-3-before/test_lingbot_zero2_runtime.py
++++ b/tests/test_lingbot_zero2_runtime.py
+@@ -21,6 +21,7 @@ CONFIG_GENERATOR = (
+     / "scripts/qwen3_vl_semantic_planner/lingbot_dino_4b"
+     / "make_zero2_config.py"
+ )
++TRAINER = ROOT / "scripts/qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py"
+ 
+ 
+ def load_runtime():
+@@ -191,3 +192,19 @@ def test_zero2_config_rejects_nonpositive_runtime_values(tmp_path, grad_accum, n
+             num_processes=num_processes,
+             output_dir=tmp_path,
+         )
++
++
++def test_trainer_uses_accelerate_runtime_without_manual_ddp():
++    source = TRAINER.read_text(encoding="utf-8")
++    assert "accelerator.prepare(wrapper, optim, loader)" in source
++    assert "accelerator.backward(out[\"loss\"])" in source
++    assert "checkpoint_module(accelerator, wrapper)" in source
++    assert "DistributedDataParallel" not in source
++    assert "DistributedSampler" not in source
++    assert ".backward()" not in source
++
++
++def test_trainer_moves_prepared_siglip_keyframes_to_cpu_before_numpy():
++    source = TRAINER.read_text(encoding="utf-8")
++    assert "keyframes[i, j].detach().cpu().numpy()" in source
++    assert "keyframes[i, j].numpy()" not in source
+diff --git a/.superpowers/sdd/snapshots/zero2-task-3-before/test_lingbot_dino_depth_contract.py b/tests/test_lingbot_dino_depth_contract.py
+index 7a0b031..ae5d6cc 100644
+--- a/.superpowers/sdd/snapshots/zero2-task-3-before/test_lingbot_dino_depth_contract.py
++++ b/tests/test_lingbot_dino_depth_contract.py
+@@ -912,7 +912,6 @@ def test_main_preflights_fastwam_before_loading_qwen(monkeypatch, tmp_path):
+     monkeypatch.setattr(module, "parse_args", lambda: args)
+     monkeypatch.setattr(module, "preflight_fastwam_data_config", fail_preflight)
+     monkeypatch.setattr(module, "load_qwen3vl_model_and_processor", fail_model_load)
+-    monkeypatch.setattr(module, "ddp_info", lambda: (0, 1, 0))
+ 
+     with pytest.raises(ExpectedPreflightFailure, match="bad FastWAM config"):
+         module.main()
+@@ -984,6 +983,19 @@ def test_gradient_checkpointing_cli_flag_enables_opt_in(monkeypatch):
+     assert module.parse_args().gradient_checkpointing is True
+ 
+ 
++def test_expected_global_batch_cli_defaults_to_unconstrained_and_accepts_128(monkeypatch):
++    module = load_trainer_module()
++    monkeypatch.setattr(sys, "argv", _fastwam_parser_argv())
++    assert module.parse_args().expected_global_batch == 0
++
++    monkeypatch.setattr(
++        sys,
++        "argv",
++        _fastwam_parser_argv("--expected-global-batch", "128"),
++    )
++    assert module.parse_args().expected_global_batch == 128
++
++
+ def test_independent_modality_task_token_cli_flag_is_opt_in(monkeypatch):
+     module = load_trainer_module()
+     monkeypatch.setattr(sys, "argv", _fastwam_parser_argv())
+diff --git a/.superpowers/sdd/snapshots/zero2-task-3-before/train_qwen3vl4b_lingbot_dino_planner.py b/scripts/qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py
+index 36fe24b..2d45c23 100755
+--- a/.superpowers/sdd/snapshots/zero2-task-3-before/train_qwen3vl4b_lingbot_dino_planner.py
++++ b/scripts/qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py
+@@ -37,12 +37,10 @@ if _local_rank is not None:
+             os.environ[_cache_var] = os.path.join(_base, f"rank{_local_rank}")
+ 
+ import torch
+-import torch.distributed as dist
+ import torch.nn as nn
+ import torch.nn.functional as F
+ from PIL import Image
+-from torch.nn.parallel import DistributedDataParallel as DDP
+-from torch.utils.data import DataLoader, Dataset, DistributedSampler
++from torch.utils.data import DataLoader, Dataset
+ from tqdm import tqdm
+ 
+ from qwen3vl_wrapper import load_qwen3vl_model_and_processor, move_qwen_inputs_to_device
+@@ -53,6 +51,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lin
+ from lingbot_dino_head import LingbotDinoPlanHead  # noqa: E402
+ from dino_video_target import DinoVideoTargetEncoder  # noqa: E402
+ from depth_target import DepthTargetEncoder  # noqa: E402
++from distributed_runtime import (  # noqa: E402
++    accumulation_context,
++    build_accelerator,
++    checkpoint_module,
++    is_deepspeed,
++    is_optimizer_update,
++    validate_runtime_contract,
++)
+ 
+ 
+ def _load_lingbot_head_state(src_6b_dir: Path) -> dict:
+@@ -159,6 +165,7 @@ def parse_args() -> argparse.Namespace:
+     parser.add_argument("--semantic-dim", type=int, default=0)
+     parser.add_argument("--batch-size", type=int, default=1)
+     parser.add_argument("--grad-accum", type=int, default=8)
++    parser.add_argument("--expected-global-batch", type=int, default=0)
+     parser.add_argument("--max-steps", type=int, default=1000)
+     parser.add_argument("--lr", type=float, default=2e-5)
+     parser.add_argument("--head-lr", type=float, default=1e-4)
+@@ -240,7 +247,6 @@ def parse_args() -> argparse.Namespace:
+     parser.add_argument("--no-freeze-lm-head", action="store_false", dest="freeze_lm_head")
+     parser.add_argument("--train-plan-token-embedding", action="store_true", default=True)
+     parser.add_argument("--no-train-plan-token-embedding", action="store_false", dest="train_plan_token_embedding")
+-    parser.add_argument("--ddp-find-unused-parameters", action="store_true")
+     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
+     parser.add_argument("--save-steps", type=int, default=500)
+     parser.add_argument("--num-workers", type=int, default=2)
+@@ -310,17 +316,6 @@ def parse_args() -> argparse.Namespace:
+     return args
+ 
+ 
+-def ddp_info() -> tuple[int, int, int]:
+-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+-        rank = int(os.environ["RANK"])
+-        world = int(os.environ["WORLD_SIZE"])
+-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+-        dist.init_process_group("nccl")
+-        torch.cuda.set_device(local_rank)
+-        return rank, world, local_rank
+-    return 0, 1, 0
+-
+-
+ def is_main(rank: int) -> bool:
+     return rank == 0
+ 
+@@ -1936,14 +1931,14 @@ def validate_fastwam_export_contract(
+ def save_checkpoint(
+     output_dir: Path,
+     step: int,
+-    wrapper: PlannerWrapper | DDP,
++    wrapper: PlannerWrapper,
+     processor: Any,
+     args: argparse.Namespace,
+     rank: int,
+ ) -> None:
+     if not is_main(rank):
+         return
+-    module = wrapper.module if isinstance(wrapper, DDP) else wrapper
++    module = wrapper
+     fastwam_data_config = getattr(args, "fastwam_data_config", None)
+     fastwam_offsets = None
+     if fastwam_data_config is not None:
+@@ -2121,12 +2116,36 @@ def main() -> None:
+             pretrained_norm_stats=args.fastwam_pretrained_norm_stats,
+         )
+     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+-    random.seed(args.seed)
+-    torch.manual_seed(args.seed)
+-
+-    rank, world, local_rank = ddp_info()
+-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+-    args.output_dir.mkdir(parents=True, exist_ok=True)
++    accelerator = build_accelerator(grad_accum=args.grad_accum, dtype=args.dtype)
++    runtime_contract = validate_runtime_contract(
++        accelerator,
++        per_device_batch_size=args.batch_size,
++        grad_accum=args.grad_accum,
++        expected_global_batch=args.expected_global_batch,
++    )
++    rank = int(accelerator.process_index)
++    world = int(accelerator.num_processes)
++    device = accelerator.device
++    if accelerator.is_main_process:
++        args.output_dir.mkdir(parents=True, exist_ok=True)
++        print(
++            json.dumps(
++                {
++                    "distributed_type": runtime_contract.distributed_type,
++                    "world_size": runtime_contract.world_size,
++                    "batch_size_per_gpu": runtime_contract.per_device_batch_size,
++                    "gradient_accumulation_steps": runtime_contract.gradient_accumulation_steps,
++                    "global_batch_size": runtime_contract.global_batch_size,
++                    "zero_stage": runtime_contract.zero_stage,
++                    "dtype": args.dtype,
++                    "gradient_checkpointing": bool(args.gradient_checkpointing),
++                }
++            ),
++            flush=True,
++        )
++    accelerator.wait_for_everyone()
++    random.seed(args.seed + rank)
++    torch.manual_seed(args.seed + rank)
+ 
+     model, processor = load_qwen3vl_model_and_processor(
+         args.model_path,
+@@ -2298,7 +2317,7 @@ def main() -> None:
+             current_depth_report = wrapper.current_depth_head.load_lingbot_warmstart(
+                 head_state, head_name="depth_align_head"
+             )
+-        if is_main(rank):
++        if accelerator.is_main_process:
+             print(json.dumps({"head_warmstart": report}), flush=True)
+             if wrapper.depth_head is not None:
+                 print(json.dumps({"depth_head_warmstart": depth_report}), flush=True)
+@@ -2308,7 +2327,7 @@ def main() -> None:
+                 print(json.dumps({"current_depth_head_warmstart": current_depth_report}), flush=True)
+     wrapper.to(device)
+     wrapper.train()
+-    if is_main(rank):
++    if accelerator.is_main_process:
+         trainable, total = count_trainable_parameters(wrapper)
+         print(
+             json.dumps(
+@@ -2327,13 +2346,6 @@ def main() -> None:
+             ),
+             flush=True,
+         )
+-    if world > 1:
+-        wrapper = DDP(
+-            wrapper,
+-            device_ids=[local_rank],
+-            find_unused_parameters=args.ddp_find_unused_parameters,
+-            static_graph=not args.ddp_find_unused_parameters,
+-        )
+ 
+     if args.online_plan_labels:
+         if args.fastwam_data_config is not None:
+@@ -2363,7 +2375,7 @@ def main() -> None:
+                 max_samples=args.max_samples,
+                 seed=args.seed,
+             )
+-        if is_main(rank):
++        if accelerator.is_main_process:
+             print(
+                 json.dumps(
+                     {
+@@ -2386,12 +2398,10 @@ def main() -> None:
+             max_samples=args.max_samples,
+             sample_one_window_per_stem=args.sample_one_window_per_stem,
+         )
+-    sampler = DistributedSampler(dataset, num_replicas=world, rank=rank, shuffle=True) if world > 1 else None
+     loader = DataLoader(
+         dataset,
+         batch_size=args.batch_size,
+-        sampler=sampler,
+-        shuffle=sampler is None,
++        shuffle=True,
+         num_workers=args.num_workers,
+         collate_fn=Collator(
+             processor=processor,
+@@ -2400,10 +2410,11 @@ def main() -> None:
+         pin_memory=True,
+     )
+ 
+-    optim = build_optimizer(wrapper.module if isinstance(wrapper, DDP) else wrapper, args)
++    optim = build_optimizer(wrapper, args)
+     scheduler = build_scheduler(optim, args)
++    wrapper, optim, loader = accelerator.prepare(wrapper, optim, loader)
+     wandb_run = None
+-    if is_main(rank) and os.environ.get("PLANNER_WANDB", "1") == "1":
++    if accelerator.is_main_process and os.environ.get("PLANNER_WANDB", "1") == "1":
+         try:
+             import wandb
+ 
+@@ -2417,12 +2428,17 @@ def main() -> None:
+         except Exception as exc:  # missing wandb must not kill training; JSON stdout remains
+             print(f"wandb disabled: {exc}", flush=True)
+     step = 0
+-    accum = 0
++    micro_step = 0
+     running_loss = 0.0
+-    pbar = tqdm(total=args.max_steps, disable=not is_main(rank), desc="qwen3vl planner")
++    deepspeed_enabled = is_deepspeed(accelerator)
++    if not deepspeed_enabled:
++        optim.zero_grad(set_to_none=True)
++    pbar = tqdm(
++        total=args.max_steps,
++        disable=not accelerator.is_local_main_process,
++        desc="qwen3vl planner",
++    )
+     while step < args.max_steps:
+-        if sampler is not None:
+-            sampler.set_epoch(step)
+         # Advance the dataset epoch too, else sample_one_window_per_stem never resamples the
+         # window per stem (the new epoch is picked up when the DataLoader respawns workers).
+         dataset.set_epoch(step)
+@@ -2430,7 +2446,7 @@ def main() -> None:
+             batch.pop("stems", None)
+             keyframes = batch.pop("keyframe_images", None)
+             current = batch.pop("current_image", None)
+-            module = wrapper.module if isinstance(wrapper, DDP) else wrapper
++            module = accelerator.unwrap_model(wrapper)
+             model_dtype = next(module.model.parameters()).dtype
+             batch = move_qwen_inputs_to_device(batch, device, model_dtype=model_dtype)
+             if keyframes is not None:
+@@ -2459,47 +2475,87 @@ def main() -> None:
+                     else:
+                         # Online SigLIP2 targets (bit-consistent with the offline builder).
+                         b, k = keyframes.shape[0], keyframes.shape[1]
+-                        imgs = [keyframes[i, j].numpy() for i in range(b) for j in range(k)]
++                        imgs = [keyframes[i, j].detach().cpu().numpy() for i in range(b) for j in range(k)]
+                         target = sig_encode(sig_model, sig_processor, imgs, args.online_grid_size, device, torch.float32)
+                         batch["semantic_plan_labels"] = target.reshape(b, k * target.shape[1], target.shape[-1])
+-            out = wrapper(**batch)
+-            (out["loss"] / args.grad_accum).backward()
++            with accumulation_context(accelerator, wrapper):
++                out = wrapper(**batch)
++                accelerator.backward(out["loss"])
++                if not deepspeed_enabled:
++                    if accelerator.sync_gradients:
++                        accelerator.clip_grad_norm_(
++                            (
++                                parameter
++                                for parameter in wrapper.parameters()
++                                if parameter.requires_grad
++                            ),
++                            1.0,
++                        )
++                    optim.step()
++                    optim.zero_grad(set_to_none=True)
+             running_loss += float(out["loss"].detach())
+-            accum += 1
+-            if accum >= args.grad_accum:
+-                torch.nn.utils.clip_grad_norm_([p for p in wrapper.parameters() if p.requires_grad], 1.0)
+-                optim.step()
++            micro_step += 1
++            if is_optimizer_update(accelerator, micro_step, args.grad_accum):
+                 if scheduler is not None:
+                     scheduler.step()
+-                optim.zero_grad(set_to_none=True)
+                 step += 1
+-                accum = 0
+-                if is_main(rank):
++                if accelerator.is_main_process:
+                     pbar.update(1)
+                     if step % args.log_steps == 0:
+-                        avg = running_loss / max(args.log_steps * args.grad_accum, 1)
+-                        log_entry = {"step": step, "loss": avg, "lr": optim.param_groups[0]["lr"]}
++                        average_loss = running_loss / max(
++                            args.log_steps * args.grad_accum,
++                            1,
++                        )
++                        log_entry = {
++                            "step": step,
++                            "loss": average_loss,
++                            "lr": (
++                                scheduler.get_last_lr()[0]
++                                if scheduler is not None
++                                else args.lr
++                            ),
++                        }
+                         log_entry.update(
+                             {key: float(value) for key, value in out.items() if key != "loss"}
+                         )
+                         print(json.dumps(log_entry), flush=True)
+                         if wandb_run is not None:
+                             wandb_run.log(log_entry, step=step)
+-                        running_loss = 0.0
+-                    if step % args.save_steps == 0:
+-                        save_checkpoint(args.output_dir, step, wrapper, processor, args, rank)
++                if step % args.log_steps == 0:
++                    running_loss = 0.0
++                if step % args.save_steps == 0:
++                    accelerator.wait_for_everyone()
++                    if accelerator.is_main_process:
++                        save_checkpoint(
++                            args.output_dir,
++                            step,
++                            checkpoint_module(accelerator, wrapper),
++                            processor,
++                            args,
++                            rank=0,
++                        )
++                    accelerator.wait_for_everyone()
+                 if step >= args.max_steps:
+                     break
+         if len(loader) == 0:
+             break
+ 
+-    save_checkpoint(args.output_dir, step, wrapper, processor, args, rank)
+-    if is_main(rank):
++    accelerator.wait_for_everyone()
++    if accelerator.is_main_process:
++        save_checkpoint(
++            args.output_dir,
++            step,
++            checkpoint_module(accelerator, wrapper),
++            processor,
++            args,
++            rank=0,
++        )
++    accelerator.wait_for_everyone()
++    if accelerator.is_local_main_process:
+         pbar.close()
+-    if wandb_run is not None:
++    if accelerator.is_main_process and wandb_run is not None:
+         wandb_run.finish()
+-    if dist.is_available() and dist.is_initialized():
+-        dist.destroy_process_group()
++    accelerator.end_training()
+ 
+ 
+ if __name__ == "__main__":

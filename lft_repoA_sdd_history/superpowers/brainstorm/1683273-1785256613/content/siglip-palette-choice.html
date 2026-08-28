@@ -1,0 +1,115 @@
+<style>
+  .reference-row, .palette-row {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+  .reference-row { max-width: 560px; margin: 0 auto 20px; }
+  .shot { position: relative; overflow: hidden; border-radius: 9px; background: #111827; }
+  .shot img { display: block; width: 100%; aspect-ratio: 1; object-fit: cover; }
+  .shot span {
+    position: absolute; left: 7px; bottom: 7px; padding: 3px 7px;
+    border-radius: 999px; background: rgba(0,0,0,.68); color: #fff;
+    font-size: 11px; letter-spacing: .02em;
+  }
+  .cards { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .card { min-width: 0; }
+  .card-image { padding: 10px; background: #10141d; }
+  .card-body p { min-height: 42px; }
+  .palette-a { filter: none; }
+  .palette-b { filter: url(#palette-warm); }
+  .palette-c { filter: url(#palette-cool); }
+  .mapping {
+    display: inline-block; margin-top: 6px; padding: 3px 7px;
+    border-radius: 6px; background: rgba(127,127,127,.12);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+  }
+  @media (max-width: 850px) {
+    .cards { grid-template-columns: 1fr; }
+    .card-body p { min-height: auto; }
+  }
+</style>
+
+<svg width="0" height="0" aria-hidden="true">
+  <filter id="palette-warm" color-interpolation-filters="sRGB">
+    <feColorMatrix type="matrix"
+      values="0 1 0 0 0
+              0 0 1 0 0
+              1 0 0 0 0
+              0 0 0 1 0"/>
+  </filter>
+  <filter id="palette-cool" color-interpolation-filters="sRGB">
+    <feColorMatrix type="matrix"
+      values="0 0 1 0 0
+              1 0 0 0 0
+              0 1 0 0 0
+              0 0 0 1 0"/>
+  </filter>
+</svg>
+
+<h2>SigLIP 特征图配色：哪一组更容易和 RGB 对照？</h2>
+<p class="subtitle">
+  同一帧、同一特征数值，仅交换 PCA 三个通道对应的显示颜色；主视图和腕部相机一起预览。
+</p>
+
+<div class="section">
+  <div class="label">RGB 参考 · frame 112</div>
+  <div class="reference-row">
+    <div class="shot">
+      <img src="/files/main_rgb_112.png" alt="Main camera RGB">
+      <span>主视图 RGB</span>
+    </div>
+    <div class="shot">
+      <img src="/files/wrist_rgb_112.png" alt="Wrist camera RGB">
+      <span>腕部 RGB</span>
+    </div>
+  </div>
+</div>
+
+<div class="cards">
+  <div class="card" data-choice="a-current" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="palette-row">
+        <div class="shot"><img class="palette-a" src="/files/main_probe_112.png"><span>主视图</span></div>
+        <div class="shot"><img class="palette-a" src="/files/wrist_probe_112.png"><span>腕部</span></div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A · 保持当前</h3>
+      <p>绿色/青色占主导，和已有 checkpoint、历史图完全一致。</p>
+      <span class="mapping">RGB = [PC1, PC2, PC3]</span>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b-warm" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="palette-row">
+        <div class="shot"><img class="palette-b" src="/files/main_probe_112.png"><span>主视图</span></div>
+        <div class="shot"><img class="palette-b" src="/files/wrist_probe_112.png"><span>腕部</span></div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B · 暖色平衡（推荐）</h3>
+      <p>把当前最强的绿色通道转为红色，物体区域更醒目，减少“满屏绿”的感觉。</p>
+      <span class="mapping">RGB = [PC2, PC3, PC1]</span>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c-cool" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="palette-row">
+        <div class="shot"><img class="palette-c" src="/files/main_probe_112.png"><span>主视图</span></div>
+        <div class="shot"><img class="palette-c" src="/files/wrist_probe_112.png"><span>腕部</span></div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>C · 冷色平衡</h3>
+      <p>把当前最强的绿色通道转为蓝色，整体更克制，边界和暖色区域对比更明显。</p>
+      <span class="mapping">RGB = [PC3, PC1, PC2]</span>
+    </div>
+  </div>
+</div>
+
+<p class="subtitle" style="margin-top:18px">
+  点击选一个。三种方案都不重训、不损失信息，只改变保存 PNG 时的通道顺序。
+</p>

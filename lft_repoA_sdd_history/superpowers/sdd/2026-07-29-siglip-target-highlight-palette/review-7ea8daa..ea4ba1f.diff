@@ -1,0 +1,272 @@
+# Review package: 7ea8daa..ea4ba1f
+
+## Commits
+ea4ba1f feat(viz): add SigLIP target Grad-CAM
+
+## Files changed
+ .../dinov3_da3_2b/siglip2_target_highlight.py      | 124 ++++++++++++++++++++
+ tests/test_siglip2_target_highlight.py             | 125 +++++++++++++++++++++
+ 2 files changed, 249 insertions(+)
+
+## Diff
+diff --git a/qwen3_vl_semantic_planner/dinov3_da3_2b/siglip2_target_highlight.py b/qwen3_vl_semantic_planner/dinov3_da3_2b/siglip2_target_highlight.py
+new file mode 100644
+index 0000000..86b3e6d
+--- /dev/null
++++ b/qwen3_vl_semantic_planner/dinov3_da3_2b/siglip2_target_highlight.py
+@@ -0,0 +1,124 @@
++"""Text-conditioned SigLIP relevance maps from pairwise image-text scores."""
++from __future__ import annotations
++
++from pathlib import Path
++from typing import Any, Sequence
++
++import numpy as np
++import torch
++import torch.nn.functional as F
++from PIL import Image
++
++
++def normalize_relevance(
++    cam: torch.Tensor,
++    low_q: float = 0.05,
++    high_q: float = 0.95,
++) -> torch.Tensor:
++    """Scale each relevance map between its fixed lower and upper quantiles."""
++    flat = cam.flatten(1)
++    low = torch.quantile(flat, low_q, dim=1).view(-1, 1, 1)
++    high = torch.quantile(flat, high_q, dim=1).view(-1, 1, 1)
++    span = high - low
++    normalized = torch.where(
++        span > 0,
++        (cam - low) / span.clamp_min(torch.finfo(cam.dtype).eps),
++        torch.zeros_like(cam),
++    )
++    return normalized.clamp(0, 1)
++
++
++def token_gradcam(
++    tokens: torch.Tensor,
++    gradients: torch.Tensor,
++    *,
++    grid_size: int = 16,
++    output_size: int = 256,
++) -> torch.Tensor:
++    """Return normalized spatial Grad-CAM maps for flattened visual tokens."""
++    expected = grid_size * grid_size
++    if tokens.shape != gradients.shape or tokens.ndim != 3:
++        raise ValueError("tokens and gradients must share [B,N,D]")
++    if tokens.shape[1] != expected:
++        raise ValueError(f"expected {expected} tokens")
++    cam = (tokens.float() * gradients.float()).sum(dim=-1).relu()
++    cam = cam.reshape(tokens.shape[0], 1, grid_size, grid_size)
++    cam = F.interpolate(
++        cam,
++        size=(output_size, output_size),
++        mode="bilinear",
++        align_corners=False,
++    )[:, 0]
++    return normalize_relevance(cam)
++
++
++class SiglipPairGradCAM:
++    """Frozen SigLIP Grad-CAM diagnostic for paired image and text inputs."""
++
++    def __init__(
++        self,
++        model_dir: Path,
++        device: torch.device,
++        *,
++        model: torch.nn.Module | None = None,
++        processor: Any | None = None,
++    ) -> None:
++        self.device = torch.device(device)
++        if model is None:
++            from transformers import AutoModel
++
++            model = AutoModel.from_pretrained(str(model_dir), local_files_only=True)
++        if processor is None:
++            from transformers import AutoProcessor
++
++            processor = AutoProcessor.from_pretrained(str(model_dir), local_files_only=True)
++        if not hasattr(model, "vision_model") or not hasattr(model, "text_model"):
++            raise RuntimeError("Expected a SigLIP model with vision_model and text_model towers.")
++
++        vision_config = model.vision_model.config
++        expected_config = {"image_size": 256, "patch_size": 16, "hidden_size": 1024}
++        actual_config = {
++            name: int(getattr(vision_config, name, -1)) for name in expected_config
++        }
++        if actual_config != expected_config:
++            raise RuntimeError(
++                "Expected siglip2-large-patch16-256 vision config "
++                f"{expected_config}, got {actual_config}."
++            )
++
++        self.model = model.to(self.device).eval()
++        self.model.requires_grad_(False)
++        self.processor = processor
++
++    def __call__(
++        self,
++        images: Sequence[Image.Image],
++        phrases: Sequence[str],
++    ) -> np.ndarray:
++        if len(images) != len(phrases):
++            raise ValueError("images and phrases must have the same length")
++
++        inputs = self.processor(
++            text=list(phrases),
++            images=list(images),
++            padding="max_length",
++            return_tensors="pt",
++        )
++        pixel_values = inputs.pop("pixel_values").to(self.device)
++        pixel_values.requires_grad_(True)
++        outputs = self.model(
++            pixel_values=pixel_values,
++            **{name: value.to(self.device) for name, value in inputs.items()},
++            output_hidden_states=True,
++            return_dict=True,
++        )
++        tokens = outputs.vision_model_output.hidden_states[-2]
++        tokens.retain_grad()
++        score = outputs.logits_per_image.diagonal().sum()
++        score.backward()
++        if tokens.grad is None:
++            raise RuntimeError("SigLIP penultimate tokens did not receive gradients")
++        maps = token_gradcam(tokens.detach(), tokens.grad.detach())
++        self.model.zero_grad(set_to_none=True)
++        pixel_values.grad = None
++        return maps.cpu().numpy().astype(np.float32)
+diff --git a/tests/test_siglip2_target_highlight.py b/tests/test_siglip2_target_highlight.py
+new file mode 100644
+index 0000000..209f710
+--- /dev/null
++++ b/tests/test_siglip2_target_highlight.py
+@@ -0,0 +1,125 @@
++from pathlib import Path
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++from PIL import Image
++
++from qwen3_vl_semantic_planner.dinov3_da3_2b.siglip2_target_highlight import (
++    normalize_relevance,
++    SiglipPairGradCAM,
++    token_gradcam,
++)
++
++
++def test_normalize_relevance_uses_fixed_quantiles_and_handles_zero_range():
++    cam = torch.arange(100, dtype=torch.float32).reshape(1, 10, 10)
++    normalized = normalize_relevance(cam, low_q=0.05, high_q=0.95)
++    assert normalized.shape == (1, 10, 10)
++    assert normalized.min().item() == 0.0
++    assert normalized.max().item() == 1.0
++    torch.testing.assert_close(
++        normalize_relevance(torch.ones(1, 4, 4)),
++        torch.zeros(1, 4, 4),
++    )
++
++
++def test_token_gradcam_keeps_positive_activation_gradient_product():
++    tokens = torch.zeros(1, 4, 2)
++    gradients = torch.zeros_like(tokens)
++    tokens[0, 3] = torch.tensor([2.0, 1.0])
++    gradients[0, 3] = torch.tensor([1.0, 2.0])
++    cam = token_gradcam(
++        tokens,
++        gradients,
++        grid_size=2,
++        output_size=2,
++    )
++    assert cam.shape == (1, 2, 2)
++    assert cam[0, 1, 1] == 1.0
++    assert torch.count_nonzero(cam) == 1
++
++
++class _FakeProcessor:
++    def __init__(self) -> None:
++        self.calls = []
++
++    def __call__(self, *, text, images, padding, return_tensors):
++        self.calls.append((text, images, padding, return_tensors))
++        return {
++            "pixel_values": torch.ones(len(images), 3, 1, 1),
++            "input_ids": torch.arange(len(text)).view(-1, 1),
++            "attention_mask": torch.ones(len(text), 1, dtype=torch.long),
++        }
++
++
++class _FakePairwiseSiglip(torch.nn.Module):
++    def __init__(self) -> None:
++        super().__init__()
++        self.unused_parameter = torch.nn.Parameter(torch.ones(1))
++        self.vision_model = SimpleNamespace(
++            config=SimpleNamespace(image_size=256, patch_size=16, hidden_size=1024)
++        )
++        self.text_model = SimpleNamespace()
++        pattern = torch.zeros(1, 256, 1024)
++        for row in range(4):
++            for column in range(4):
++                pattern[0, row * 16 + column, 0] = 1.0
++                pattern[0, (15 - row) * 16 + 15 - column, 1] = 1.0
++        self.register_buffer("token_pattern", pattern)
++        self.forward_kwargs = None
++
++    def forward(
++        self,
++        *,
++        pixel_values,
++        input_ids,
++        attention_mask,
++        output_hidden_states,
++        return_dict,
++    ):
++        del attention_mask
++        self.forward_kwargs = {
++            "output_hidden_states": output_hidden_states,
++            "return_dict": return_dict,
++        }
++        tokens = pixel_values[:, :1, 0, 0].view(-1, 1, 1) * self.token_pattern
++        visual_features = tokens.sum(dim=1)[:, :2]
++        text_features = torch.eye(2, device=tokens.device)[input_ids[:, 0]]
++        logits_per_image = visual_features @ text_features.T
++        decoy_final_layer = tokens * 0
++        return SimpleNamespace(
++            logits_per_image=logits_per_image,
++            vision_model_output=SimpleNamespace(
++                hidden_states=(torch.zeros_like(tokens), tokens, decoy_final_layer)
++            ),
++        )
++
++
++def test_siglip_pair_gradcam_backpropagates_each_pairwise_diagonal_score():
++    processor = _FakeProcessor()
++    model = _FakePairwiseSiglip()
++    highlighter = SiglipPairGradCAM(
++        Path("unused-fake-checkpoint"),
++        torch.device("cpu"),
++        model=model,
++        processor=processor,
++    )
++    images = [Image.new("RGB", (2, 2)), Image.new("RGB", (2, 2))]
++
++    maps = highlighter(images, ["first", "second"])
++
++    assert maps.shape == (2, 256, 256)
++    assert maps.dtype == np.float32
++    assert maps[0, 0, 0] == 1.0
++    assert maps[0, -1, -1] == 0.0
++    assert maps[1, 0, 0] == 0.0
++    assert maps[1, -1, -1] == 1.0
++    assert model.forward_kwargs == {"output_hidden_states": True, "return_dict": True}
++    assert all(not parameter.requires_grad for parameter in model.parameters())
++    assert all(parameter.grad is None for parameter in model.parameters())
++    assert processor.calls[0][2:] == ("max_length", "pt")
++
++    with pytest.raises(ValueError, match="same length"):
++        highlighter(images, ["only one phrase"])

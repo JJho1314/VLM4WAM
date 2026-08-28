@@ -1,0 +1,224 @@
+diff --git a/.superpowers/sdd/snapshots/zero2-task-2-before/test_lingbot_zero2_runtime.py b/tests/test_lingbot_zero2_runtime.py
+index 4f4b238..a151cd9 100644
+--- a/.superpowers/sdd/snapshots/zero2-task-2-before/test_lingbot_zero2_runtime.py
++++ b/tests/test_lingbot_zero2_runtime.py
+@@ -1,11 +1,13 @@
+ from __future__ import annotations
+ 
+ import importlib.util
++import json
+ import sys
+ from contextlib import contextmanager
+ from pathlib import Path
+ 
+ import pytest
++import yaml
+ 
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+@@ -14,6 +16,19 @@ RUNTIME = (
+     / "scripts/qwen3_vl_semantic_planner/lingbot_dino_4b"
+     / "distributed_runtime.py"
+ )
++CONFIG_GENERATOR = (
++    ROOT
++    / "scripts/qwen3_vl_semantic_planner/lingbot_dino_4b"
++    / "make_zero2_config.py"
++)
++TRAINER = ROOT / "scripts/qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py"
++GENERIC_LAUNCHER = (
++    ROOT
++    / "scripts/qwen3_vl_semantic_planner/lingbot_dino_4b"
++    / "train_lingbot_dino_4b.sh"
++)
++POD_LAUNCHER = GENERIC_LAUNCHER.with_name("train_lingbot_fastwam_pod.sh")
++HPC_LAUNCHER = GENERIC_LAUNCHER.with_name("train_lingbot_fastwam_hpc3.sbatch")
+ 
+ 
+ def load_runtime():
+@@ -25,6 +40,14 @@ def load_runtime():
+     return module
+ 
+ 
++def load_config_generator():
++    spec = importlib.util.spec_from_file_location("lingbot_zero2_config", CONFIG_GENERATOR)
++    module = importlib.util.module_from_spec(spec)
++    assert spec.loader is not None
++    spec.loader.exec_module(module)
++    return module
++
++
+ class FakePlugin:
+     def __init__(self, *, grad_accum: int = 2, zero_stage: int = 2):
+         self.deepspeed_config = {
+@@ -144,3 +167,78 @@ def test_deepspeed_bypasses_no_sync_and_unwraps_checkpoint_module():
+         pass
+     assert accelerator.accumulate_calls == 0
+     assert module.checkpoint_module(accelerator, model) is model.inner
++
++
++def test_zero2_config_matches_batch_accumulation_and_process_count(tmp_path):
++    module = load_config_generator()
++    accelerate_path, deepspeed_path = module.make_zero2_configs(
++        grad_accum=2,
++        num_processes=8,
++        output_dir=tmp_path,
++    )
++
++    deepspeed = json.loads(deepspeed_path.read_text())
++    accelerate = yaml.safe_load(accelerate_path.read_text())
++    assert deepspeed["gradient_accumulation_steps"] == 2
++    assert deepspeed["zero_optimization"]["stage"] == 2
++    assert deepspeed["zero_optimization"]["overlap_comm"] is True
++    assert deepspeed["zero_optimization"]["contiguous_gradients"] is True
++    assert deepspeed["bf16"]["enabled"] is True
++    assert deepspeed["fp16"]["enabled"] is False
++    assert accelerate["num_processes"] == 8
++    assert accelerate["distributed_type"] == "DEEPSPEED"
++    assert Path(accelerate["deepspeed_config"]["deepspeed_config_file"]) == deepspeed_path
++    assert "mixed_precision" not in accelerate
++
++
++@pytest.mark.parametrize(("grad_accum", "num_processes"), [(0, 8), (2, 0)])
++def test_zero2_config_rejects_nonpositive_runtime_values(tmp_path, grad_accum, num_processes):
++    module = load_config_generator()
++    with pytest.raises(ValueError, match="positive"):
++        module.make_zero2_configs(
++            grad_accum=grad_accum,
++            num_processes=num_processes,
++            output_dir=tmp_path,
++        )
++
++
++def test_trainer_uses_accelerate_runtime_without_manual_ddp():
++    source = TRAINER.read_text(encoding="utf-8")
++    assert "accelerator.prepare(wrapper, optim, loader)" in source
++    assert "accelerator.backward(out[\"loss\"])" in source
++    assert "checkpoint_module(accelerator, wrapper)" in source
++    assert "DistributedDataParallel" not in source
++    assert "DistributedSampler" not in source
++    assert ".backward()" not in source
++
++
++def test_trainer_moves_prepared_siglip_keyframes_to_cpu_before_numpy():
++    source = TRAINER.read_text(encoding="utf-8")
++    assert "keyframes[i, j].detach().cpu().numpy()" in source
++    assert "keyframes[i, j].numpy()" not in source
++
++
++def test_only_canonical_launchers_are_referenced():
++    generic = GENERIC_LAUNCHER.read_text(encoding="utf-8")
++    pod = POD_LAUNCHER.read_text(encoding="utf-8")
++    hpc = HPC_LAUNCHER.read_text(encoding="utf-8")
++    assert "set -euo pipefail" in generic
++    assert "make_zero2_config.py" in generic
++    assert "--expected-global-batch" in generic
++    assert "NUM_TASK_TOKENS=${NUM_TASK_TOKENS:-64}" in generic
++    assert "BATCH_SIZE=${BATCH_SIZE:-8}" in generic
++    assert "GRAD_ACCUM=${GRAD_ACCUM:-2}" in generic
++    assert "train_lingbot_dino_4b.sh" in pod
++    assert "train_lingbot_dino_4b.sh" in hpc
++
++
++def test_readme_smoke_command_matches_single_gpu_runtime_contract():
++    readme = (
++        ROOT / "scripts/qwen3_vl_semantic_planner/README.md"
++    ).read_text(encoding="utf-8")
++    smoke_contract = (
++        "USE_DEEPSPEED=0 NUM_GPUS=1 BATCH_SIZE=1 GRAD_ACCUM=1 "
++        "EXPECTED_GLOBAL_BATCH=1 MAX_STEPS=2 SAVE_STEPS=2 FULL_FINETUNE=0"
++    )
++
++    assert smoke_contract in readme
+diff --git a/scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/make_zero2_config.py b/scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/make_zero2_config.py
+new file mode 100644
+index 0000000..2fa5f2e
+--- /dev/null
++++ b/scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/make_zero2_config.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++
++def make_zero2_configs(
++    *,
++    grad_accum: int,
++    num_processes: int,
++    output_dir: Path,
++) -> tuple[Path, Path]:
++    if grad_accum <= 0 or num_processes <= 0:
++        raise ValueError("gradient accumulation and process count must be positive")
++    output_dir = output_dir.resolve()
++    output_dir.mkdir(parents=True, exist_ok=True)
++    tag = f"np{num_processes}_ga{grad_accum}_zero2"
++    deepspeed_path = output_dir / f"deepspeed_{tag}.json"
++    accelerate_path = output_dir / f"accelerate_{tag}.yaml"
++    deepspeed_config = {
++        "fp16": {"enabled": False},
++        "bf16": {"enabled": True},
++        "train_micro_batch_size_per_gpu": "auto",
++        "train_batch_size": "auto",
++        "gradient_accumulation_steps": grad_accum,
++        "zero_optimization": {
++            "stage": 2,
++            "allgather_partitions": True,
++            "allgather_bucket_size": 500_000_000,
++            "reduce_scatter": True,
++            "reduce_bucket_size": 500_000_000,
++            "overlap_comm": True,
++            "contiguous_gradients": True,
++        },
++        "gradient_clipping": 1.0,
++        "steps_per_print": 10,
++    }
++    deepspeed_path.write_text(
++        json.dumps(deepspeed_config, indent=2) + "\n",
++        encoding="utf-8",
++    )
++    accelerate_path.write_text(
++        "\n".join(
++            [
++                "compute_environment: LOCAL_MACHINE",
++                "debug: false",
++                "deepspeed_config:",
++                f'  deepspeed_config_file: "{deepspeed_path}"',
++                "  deepspeed_multinode_launcher: standard",
++                "  zero3_init_flag: false",
++                "distributed_type: DEEPSPEED",
++                "downcast_bf16: 'no'",
++                "machine_rank: 0",
++                "main_training_function: main",
++                "num_machines: 1",
++                f"num_processes: {num_processes}",
++                "rdzv_backend: static",
++                "same_network: true",
++                "use_cpu: false",
++                "",
++            ]
++        ),
++        encoding="utf-8",
++    )
++    return accelerate_path, deepspeed_path
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--grad-accum", type=int, required=True)
++    parser.add_argument("--num-processes", type=int, required=True)
++    parser.add_argument("--output-dir", type=Path, required=True)
++    args = parser.parse_args()
++    accelerate_path, _ = make_zero2_configs(
++        grad_accum=args.grad_accum,
++        num_processes=args.num_processes,
++        output_dir=args.output_dir,
++    )
++    print(accelerate_path)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

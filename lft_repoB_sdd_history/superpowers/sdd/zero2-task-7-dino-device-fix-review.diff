@@ -1,0 +1,83 @@
+--- a/scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/dino_video_target.py
++++ b/scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/dino_video_target.py
+@@ -97,6 +97,11 @@
+             x = F.interpolate(x, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False)
+         return x
+ 
++    def _normalize_video(self, video: torch.Tensor) -> torch.Tensor:
++        mean = self.mean.to(device=video.device, dtype=video.dtype)
++        std = self.std.to(device=video.device, dtype=video.dtype)
++        return (video - mean) / std
++
+     @torch.no_grad()
+     def encode_future_keyframes(
+         self,
+@@ -117,7 +122,7 @@
+             clip = torch.stack([cur, cur, fut], dim=2)
+             clips.append(clip)
+         video = torch.cat(clips, dim=0)  # (B*K,3,3,S,S)
+-        video = (video - self.mean) / self.std
++        video = self._normalize_video(video)
+         feats = self.teacher.get_future_feature(video, current_index=1)  # (B*K, 256, 1024)
+         tok, dim = feats.shape[1], feats.shape[2]
+         feats = feats.view(k, b, tok, dim).permute(1, 0, 2, 3).reshape(b, k * tok, dim)
+@@ -136,7 +141,7 @@
+         current = self._prep(current_b3hw)
+         future = self._prep(future_b3hw)
+         video = torch.stack([current, current, future], dim=2)
+-        video = (video - self.mean) / self.std
++        video = self._normalize_video(video)
+         future_patch, current_patch = self.teacher.get_future_feature(
+             video,
+             return_current=True,
+--- a/tests/test_lingbot_k1_current_future.py
++++ b/tests/test_lingbot_k1_current_future.py
+@@ -61,6 +61,48 @@
+     assert torch.all(future_target == 2)
+ 
+ 
++def test_dino_normalization_uses_input_device_and_dtype():
++    module = load_module("k1_dino_target_device", DINO_TARGET)
++
++    class FakeTeacher:
++        def __init__(self):
++            self.video_metadata = None
++
++        def get_future_feature(self, video, **_kwargs):
++            self.video_metadata = (video.device, video.dtype, tuple(video.shape))
++            patches = torch.empty(
++                video.shape[0],
++                256,
++                1024,
++                device=video.device,
++                dtype=video.dtype,
++            )
++            return patches, patches
++
++    encoder = module.DinoVideoTargetEncoder.__new__(module.DinoVideoTargetEncoder)
++    nn.Module.__init__(encoder)
++    encoder.effective_fps = 1.0
++    encoder._prep = lambda tensor: tensor
++    encoder.teacher = FakeTeacher()
++    encoder.register_buffer("mean", torch.zeros(1, 3, 1, 1, 1))
++    encoder.register_buffer("std", torch.ones(1, 3, 1, 1, 1))
++    current = torch.empty(2, 3, 2, 2, device="meta", dtype=torch.bfloat16)
++    future = torch.empty(2, 3, 2, 2, device="meta", dtype=torch.bfloat16)
++
++    current_target, future_target = encoder.encode_current_and_future(current, future)
++
++    assert encoder.mean.device.type == "cpu"
++    assert encoder.std.device.type == "cpu"
++    assert encoder.teacher.video_metadata == (
++        current.device,
++        current.dtype,
++        (2, 3, 3, 2, 2),
++    )
++    assert current_target.shape == future_target.shape == (2, 256, 1024)
++    assert current_target.device == future_target.device == current.device
++    assert current_target.dtype == future_target.dtype == current.dtype
++
++
+ def test_depth_teacher_batches_current_and_future_once():
+     module = load_module("k1_depth_target", DEPTH_TARGET)
+     encoder = module.DepthTargetEncoder.__new__(module.DepthTargetEncoder)

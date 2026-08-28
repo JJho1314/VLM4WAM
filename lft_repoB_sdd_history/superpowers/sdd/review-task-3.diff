@@ -1,0 +1,1025 @@
+# Review package: 17901d6..04491a3
+
+## Commits
+04491a3 feat: add fastwam aligned planner training entrypoint
+
+## Files changed
+ .../lingbot_dino_4b/train_lingbot_dino_4b.sh       |  37 +-
+ .../train_lingbot_dino_depth_fastwam_k4.sh         |  17 +
+ .../train_qwen3vl4b_lingbot_dino_planner.py        | 145 +++++-
+ tests/test_lingbot_dino_depth_contract.py          |  53 +++
+ .../datasets/lerobot/robot_video_dataset.py        | 489 +++++++++++++++++++++
+ 5 files changed, 722 insertions(+), 19 deletions(-)
+
+## Diff
+diff --git a/scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_4b.sh b/scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_4b.sh
+index 028f139..ab389b6 100755
+--- a/scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_4b.sh
++++ b/scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_4b.sh
+@@ -1,16 +1,16 @@
+ #!/bin/bash
+ # Self-contained launcher for the 4B lingbot-DINO planner line (independent of the 2B slurm base).
+ # Runs directly via torchrun in the box env we validated (torch 2.8+cu128, transformers 5.5.4,
+ # flex_attention). All paths default to the downloaded/extracted weights on this box.
+ #
+-# Required:  DATASET_ROOT  (the DROID semantic-plan dataset — must exist wherever you run this)
++# Required: exactly one of DATASET_ROOT (legacy DROID data) or FASTWAM_DATA_CONFIG.
+ # Smoke:     NUM_GPUS=1 BATCH_SIZE=1 GRAD_ACCUM=1 MAX_STEPS=2 FULL_FINETUNE=0 bash train_lingbot_dino_4b.sh
+ set -uo pipefail
+ 
+ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ PLANNER_DIR="$(dirname "$HERE")"                       # scripts/qwen3_vl_semantic_planner
+ REPO_ROOT="$(cd "$PLANNER_DIR/../.." && pwd)"
+ cd "$REPO_ROOT" || exit 2
+ 
+ # covt/planner training env: transformers 4.57 (Qwen3-VL) + torch 2.6 flex_attention + mistral_common 1.9
+ # (the box default python has transformers 5.x with a broken mistral_common, so pin this env).
+@@ -29,27 +29,39 @@ USE_DEPTH=${USE_DEPTH:-0}
+ DEPTH_MOGE_PATH=${DEPTH_MOGE_PATH:-$WEIGHTS/moge-2-vitb-normal/model.pt}   # MoGe-2 (HF Ruicheng/moge-2-vitb-normal)
+ DEPTH_MORGBD_PATH=${DEPTH_MORGBD_PATH:-$LINGBOT_6B/depth/model.pt}         # LingBot-Depth / MoRGBD
+ DEPTH_LOSS_WEIGHT=${DEPTH_LOSS_WEIGHT:-0.004}   # lingbot future_depth_loss_weight
+ DEPTH_GRID_SIZE=${DEPTH_GRID_SIZE:-16}          # 16 -> 256 depth tokens/keyframe
+ DEPTH_DIM=${DEPTH_DIM:-1024}
+ 
+ # lingbot source (moge/mdm/dino teacher code) + MoGe-pinned utils3d; override on non-box hosts (HPC3).
+ LINGBOT_SRC_ROOT=${LINGBOT_SRC_ROOT:-/data/LFT-W02_data/junjie/VLA_WM/lingbot-vla-v2}
+ UTILS3D_MOGE_PATH=${UTILS3D_MOGE_PATH:-/data/LFT-W02_data/junjie/weights/py_deps/utils3d_moge}
+ 
+-DATASET_ROOT=${DATASET_ROOT:?set DATASET_ROOT to the DROID semantic-plan dataset dir}
++DATASET_ROOT=${DATASET_ROOT:-}
++FASTWAM_DATA_CONFIG=${FASTWAM_DATA_CONFIG:-}
++FASTWAM_DATASET_DIRS=${FASTWAM_DATASET_DIRS:-}
++if [[ -n "$DATASET_ROOT" && -n "$FASTWAM_DATA_CONFIG" ]]; then
++  echo "[launch] set only one of DATASET_ROOT or FASTWAM_DATA_CONFIG" >&2
++  exit 2
++fi
++if [[ -z "$DATASET_ROOT" && -z "$FASTWAM_DATA_CONFIG" ]]; then
++  echo "[launch] set DATASET_ROOT or FASTWAM_DATA_CONFIG" >&2
++  exit 2
++fi
+ OUTPUT_DIR=${OUTPUT_DIR:-$REPO_ROOT/outputs/qwen3vl_semantic_planner/qwen3vl4b_lingbot_dino_uniform_k5}
+ 
+ # plan geometry: DINO-video, 5 keyframes x 16^2=256 tokens x 1024 dim => target_len 1280
+ NUM_KEYFRAMES=${NUM_KEYFRAMES:-5}
+ GRID_SIZE=${GRID_SIZE:-16}
+ NUM_LATENT_PER_KEYFRAME=${NUM_LATENT_PER_KEYFRAME:-8}   # matches lingbot num_task_tokens=8
++SHARED_LATENT_PER_KEYFRAME=${SHARED_LATENT_PER_KEYFRAME:-32}
++PRIVATE_LATENT_PER_KEYFRAME=${PRIVATE_LATENT_PER_KEYFRAME:-32}
+ SEMANTIC_DIM=${SEMANTIC_DIM:-1024}
+ SEQUENCE_LENGTH=${SEQUENCE_LENGTH:-49}
+ KEYFRAME_SCHEME=${KEYFRAME_SCHEME:-uniform}
+ KEYFRAME_GAMMA=${KEYFRAME_GAMMA:-0.6}
+ DINO_INPUT_SIZE=${DINO_INPUT_SIZE:-256}
+ 
+ # plain MSE (lingbot's active video term); other terms off
+ MSE_LOSS_WEIGHT=${MSE_LOSS_WEIGHT:-1.0}
+ COSINE_LOSS_WEIGHT=${COSINE_LOSS_WEIGHT:-0.0}
+ NORM_LOSS_WEIGHT=${NORM_LOSS_WEIGHT:-0.0}
+@@ -63,25 +75,25 @@ HEAD_LR=${HEAD_LR:-1e-4}
+ MAX_STEPS=${MAX_STEPS:-16000}
+ SAVE_STEPS=${SAVE_STEPS:-1000}
+ LOG_STEPS=${LOG_STEPS:-10}
+ WARMUP_STEPS=${WARMUP_STEPS:-400}
+ WEIGHT_DECAY=${WEIGHT_DECAY:-0.01}
+ NUM_WORKERS=${NUM_WORKERS:-4}
+ DTYPE=${DTYPE:-bf16}
+ FULL_FINETUNE=${FULL_FINETUNE:-1}   # 1: tune LM+head; 0: head + plan-token embeddings only (fits small GPUs)
+ 
+ mkdir -p "$OUTPUT_DIR" logs
+-echo "[launch] gpus=$NUM_GPUS model=$MODEL_PATH dataset=$DATASET_ROOT out=$OUTPUT_DIR full_ft=$FULL_FINETUNE"
++DATA_SOURCE=${FASTWAM_DATA_CONFIG:-$DATASET_ROOT}
++echo "[launch] gpus=$NUM_GPUS model=$MODEL_PATH dataset=$DATA_SOURCE out=$OUTPUT_DIR full_ft=$FULL_FINETUNE"
+ 
+ TRAIN_ARGS=(
+   --model-path "$MODEL_PATH"
+-  --dataset-root "$DATASET_ROOT"
+   --output-dir "$OUTPUT_DIR"
+   --max-steps "$MAX_STEPS"
+   --batch-size "$BATCH_SIZE"
+   --grad-accum "$GRAD_ACCUM"
+   --num-keyframes "$NUM_KEYFRAMES"
+   --grid-size "$GRID_SIZE"
+   --num-latent-per-keyframe "$NUM_LATENT_PER_KEYFRAME"
+   --lr "$LR"
+   --head-lr "$HEAD_LR"
+   --plan-head-type lingbot_dino
+@@ -102,20 +114,37 @@ TRAIN_ARGS=(
+   --ddp-find-unused-parameters
+   --online-plan-labels
+   --sequence-length "$SEQUENCE_LENGTH"
+   --keyframe-scheme "$KEYFRAME_SCHEME"
+   --keyframe-gamma "$KEYFRAME_GAMMA"
+   --semantic-dim "$SEMANTIC_DIM"
+   --dino-teacher-ckpt "$DINO_TEACHER_CKPT"
+   --dino-teacher-config "$DINO_TEACHER_CONFIG"
+   --dino-input-size "$DINO_INPUT_SIZE"
+ )
++if [[ -n "$FASTWAM_DATA_CONFIG" ]]; then
++  TRAIN_ARGS+=(--fastwam-data-config "$FASTWAM_DATA_CONFIG")
++  if [[ -n "$FASTWAM_DATASET_DIRS" ]]; then
++    IFS=':' read -r -a fastwam_dataset_dirs <<< "$FASTWAM_DATASET_DIRS"
++    for dataset_dir in "${fastwam_dataset_dirs[@]}"; do
++      [[ -n "$dataset_dir" ]] && TRAIN_ARGS+=(--fastwam-dataset-dir "$dataset_dir")
++    done
++  fi
++else
++  TRAIN_ARGS+=(--dataset-root "$DATASET_ROOT")
++fi
++if [[ "$SHARED_LATENT_PER_KEYFRAME" =~ ^[1-9][0-9]*$ ]]; then
++  TRAIN_ARGS+=(--shared-latent-per-keyframe "$SHARED_LATENT_PER_KEYFRAME")
++fi
++if [[ "$PRIVATE_LATENT_PER_KEYFRAME" =~ ^[1-9][0-9]*$ ]]; then
++  TRAIN_ARGS+=(--private-latent-per-keyframe "$PRIVATE_LATENT_PER_KEYFRAME")
++fi
+ # warm-start only if the 6b model shards are actually present (skip gracefully, e.g. smoke on HPC3).
+ if [[ -n "$HEAD_WARMSTART_CKPT" && -f "$HEAD_WARMSTART_CKPT/model.safetensors.index.json" ]]; then
+   TRAIN_ARGS+=(--head-warmstart-ckpt "$HEAD_WARMSTART_CKPT")
+ else
+   echo "[launch] skip head warm-start (no model.safetensors.index.json under '$HEAD_WARMSTART_CKPT')"
+ fi
+ [[ "$FULL_FINETUNE" == "1" ]] && TRAIN_ARGS+=(--full-finetune)
+ [[ "$USE_DEPTH" == "1" ]] && TRAIN_ARGS+=(
+   --use-depth
+   --depth-moge-path "$DEPTH_MOGE_PATH"
+diff --git a/scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_depth_fastwam_k4.sh b/scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_depth_fastwam_k4.sh
+new file mode 100755
+index 0000000..1577385
+--- /dev/null
++++ b/scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/train_lingbot_dino_depth_fastwam_k4.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
++
++export USE_DEPTH=1
++export SEQUENCE_LENGTH=9
++export NUM_KEYFRAMES=4
++export GRID_SIZE=16
++export SEMANTIC_DIM=1024
++export KEYFRAME_SCHEME=even_future
++export SHARED_LATENT_PER_KEYFRAME=32
++export PRIVATE_LATENT_PER_KEYFRAME=32
++export FASTWAM_DATA_CONFIG=${FASTWAM_DATA_CONFIG:-third_party/FastWAM/configs/data/libero_2cam_cosmos.yaml}
++export OUTPUT_DIR=${OUTPUT_DIR:-outputs/qwen3vl4b_lingbot_dino_depth_fastwam_k4}
++
++exec "$SCRIPT_DIR/train_lingbot_dino_4b.sh" "$@"
+diff --git a/scripts/qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py b/scripts/qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py
+index 1f52f81..1850fcc 100755
+--- a/scripts/qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py
++++ b/scripts/qwen3_vl_semantic_planner/train_qwen3vl4b_lingbot_dino_planner.py
+@@ -16,21 +16,21 @@ separate downstream step (not covered here). See lingbot_dino_4b/LINGBOT_DINO_SP
+ from __future__ import annotations
+ 
+ import argparse
+ import json
+ import math
+ import os
+ import random
+ import sys
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Any
++from typing import Any, Sequence
+ 
+ # Per-rank torch.compile / Triton cache dirs. With N ranks sharing ONE cache dir, concurrent
+ # flex_attention kernel compiles race on the same artifact (FileNotFoundError on
+ # triton_tem_fused_*.cubin). torchrun exports LOCAL_RANK before this script runs, so scope the
+ # cache per rank BEFORE importing torch (inductor/triton read these env vars at compile time).
+ _local_rank = os.environ.get("LOCAL_RANK")
+ if _local_rank is not None:
+     for _cache_var in ("TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR"):
+         _base = os.environ.get(_cache_var)
+         if _base:
+@@ -85,21 +85,23 @@ PLAN_TOKEN = "<|sem_plan|>"
+ def _positive_int(value: str) -> int:
+     parsed = int(value)
+     if parsed <= 0:
+         raise argparse.ArgumentTypeError(f"expected a positive integer, got {value}")
+     return parsed
+ 
+ 
+ def parse_args() -> argparse.Namespace:
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--model-path", type=Path, required=True)
+-    parser.add_argument("--dataset-root", type=Path, required=True)
++    parser.add_argument("--dataset-root", type=Path, default=None)
++    parser.add_argument("--fastwam-data-config", type=Path, default=None)
++    parser.add_argument("--fastwam-dataset-dir", action="append", default=[])
+     parser.add_argument("--plan-label-dir", type=Path, default=None)
+     parser.add_argument("--output-dir", type=Path, required=True)
+     # Online labels (cosmos-style episode sampling): instead of fixed precomputed .pt windows,
+     # sample a random sequence-length window per stem per epoch from frame_ranges.json and
+     # encode the SigLIP2 targets on the fly — aligns the planner's window distribution with
+     # the world model's episode sampling and makes the keyframe scheme an env-free switch.
+     parser.add_argument("--online-plan-labels", action="store_true")
+     parser.add_argument("--frame-ranges-json", type=Path, default=None)
+     parser.add_argument("--siglip2-encoder-path", type=Path, default=None)
+     parser.add_argument("--sequence-length", type=int, default=49)
+@@ -176,21 +178,49 @@ def parse_args() -> argparse.Namespace:
+     parser.add_argument("--freeze-lm-head", action="store_true", default=True)
+     parser.add_argument("--no-freeze-lm-head", action="store_false", dest="freeze_lm_head")
+     parser.add_argument("--train-plan-token-embedding", action="store_true", default=True)
+     parser.add_argument("--no-train-plan-token-embedding", action="store_false", dest="train_plan_token_embedding")
+     parser.add_argument("--ddp-find-unused-parameters", action="store_true")
+     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
+     parser.add_argument("--save-steps", type=int, default=500)
+     parser.add_argument("--num-workers", type=int, default=2)
+     parser.add_argument("--seed", type=int, default=20260622)
+     parser.add_argument("--log-steps", type=int, default=10)
+-    return parser.parse_args()
++    args = parser.parse_args()
++    if (args.dataset_root is None) == (args.fastwam_data_config is None):
++        parser.error(
++            "exactly one of --dataset-root or --fastwam-data-config is required"
++        )
++    if args.fastwam_dataset_dir and args.fastwam_data_config is None:
++        parser.error("--fastwam-dataset-dir requires --fastwam-data-config")
++    if args.fastwam_data_config is not None:
++        if not args.online_plan_labels:
++            parser.error("--fastwam-data-config requires --online-plan-labels")
++        try:
++            offsets = keyframe_offsets(
++                args.sequence_length,
++                args.num_keyframes,
++                args.keyframe_scheme,
++                args.keyframe_gamma,
++            )
++        except ValueError as error:
++            parser.error(f"invalid FastWAM keyframe geometry: {error}")
++        if (
++            args.sequence_length != 9
++            or args.num_keyframes != 4
++            or offsets != [2, 4, 6, 8]
++        ):
++            parser.error(
++                "FastWAM planner training requires sequence_length=9, "
++                "num_keyframes=4, and keyframe offsets [2, 4, 6, 8]"
++            )
++    return args
+ 
+ 
+ def ddp_info() -> tuple[int, int, int]:
+     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+         rank = int(os.environ["RANK"])
+         world = int(os.environ["WORLD_SIZE"])
+         local_rank = int(os.environ.get("LOCAL_RANK", 0))
+         dist.init_process_group("nccl")
+         torch.cuda.set_device(local_rank)
+         return rank, world, local_rank
+@@ -409,20 +439,98 @@ class OnlineSemanticPlanDataset(Dataset):
+             "sample_id": f"{stem}__s{start:06d}",
+             "image": frames[0],
+             "prompt": read_meta(self.dataset_root, stem),
+             "keyframe_images": torch.from_numpy(keyframes),  # (K, H, W, 3) uint8
+             # current frame (frames[0]) as raw uint8 too — the DINO teacher needs it as the clip's
+             # current/warmup frame (the PIL `image` above is consumed by the VLM processor).
+             "current_image": torch.from_numpy(np.asarray(frames[0], dtype=np.uint8)),  # (H, W, 3) uint8
+         }
+ 
+ 
++class FastWAMOnlinePlannerDataset(Dataset):
++    offsets = [2, 4, 6, 8]
++
++    def __init__(self, dataset, max_samples: int = 0):
++        self.dataset = dataset
++        self.max_samples = int(max_samples)
++
++    @classmethod
++    def from_config(
++        cls,
++        config_path: Path,
++        *,
++        dataset_dirs: Sequence[str] | None = None,
++        max_samples: int = 0,
++    ):
++        from hydra.utils import instantiate
++        from omegaconf import OmegaConf
++
++        data_config = OmegaConf.load(config_path)
++        root_config = OmegaConf.create(
++            {
++                "data": OmegaConf.to_container(
++                    data_config,
++                    resolve=False,
++                )
++            }
++        )
++        if dataset_dirs:
++            root_config.data.train.dataset_dirs = [
++                str(path) for path in dataset_dirs
++            ]
++        dataset = instantiate(root_config.data.train)
++        return cls(dataset, max_samples=max_samples)
++
++    @classmethod
++    def from_dataset(cls, dataset, max_samples: int = 0):
++        return cls(dataset, max_samples=max_samples)
++
++    def __len__(self):
++        size = len(self.dataset)
++        return min(size, self.max_samples) if self.max_samples > 0 else size
++
++    def set_epoch(self, _epoch: int) -> None:
++        return None
++
++    def __getitem__(self, index: int) -> dict[str, Any]:
++        sample = self.dataset[index]
++        video = sample["video"]
++        if tuple(video.shape[:2]) != (3, 9):
++            raise ValueError(
++                "FastWAM planner input must be [3, 9, H, W], got "
++                f"{tuple(video.shape)}"
++            )
++        instruction = sample.get("instruction")
++        if not isinstance(instruction, str) or not instruction:
++            raise ValueError(
++                "FastWAM planner sample needs a non-empty raw instruction"
++            )
++        selected = video[:, [0, *self.offsets]]
++        selected = (
++            ((selected.to(torch.float32) + 1.0) * 127.5)
++            .round()
++            .clamp(0, 255)
++            .to(torch.uint8)
++            .permute(1, 2, 3, 0)
++            .contiguous()
++        )
++        current = selected[0]
++        return {
++            "stem": f"fastwam_{index:09d}",
++            "sample_id": f"fastwam_{index:09d}",
++            "image": Image.fromarray(current.numpy()),
++            "prompt": instruction,
++            "keyframe_images": selected[1:],
++            "current_image": current,
++        }
++
++
+ PLANNER_USER_TEMPLATE = (
+     "You are a robot video semantic planner. Given the first frame and instruction, "
+     "predict future spatial semantic plan tokens for the manipulation video.\n"
+     "Instruction: {instruction}"
+ )
+ 
+ 
+ def build_planner_inputs(
+     processor: Any,
+     images: list[Any],
+@@ -1496,21 +1604,21 @@ def main() -> None:
+             # masked grad hook; with no LM text loss the lm_head side gets no grad.
+             register_plan_rows_hook(embed_weight, plan_token_ids)
+     model = apply_lora(model, args)
+ 
+     sig_model = sig_processor = sig_encode = None
+     dino_encoder = None
+     depth_encoder = None
+     if args.plan_head_type == "lingbot_dino":
+         if not args.online_plan_labels:
+             raise ValueError("lingbot_dino requires --online-plan-labels (online DINO-video targets)")
+-        if args.frame_ranges_json is None:
++        if args.frame_ranges_json is None and args.fastwam_data_config is None:
+             args.frame_ranges_json = args.dataset_root / "frame_ranges.json"
+         dino_encoder = DinoVideoTargetEncoder(
+             ckpt_path=args.dino_teacher_ckpt,
+             config_path=args.dino_teacher_config,
+             input_size=args.dino_input_size,
+             device=device,
+         )
+         args.sample_feature_type = "dino_video"
+         if args.semantic_dim <= 0:
+             args.semantic_dim = 1024
+@@ -1522,21 +1630,21 @@ def main() -> None:
+                 morgbd_path=args.depth_morgbd_path,
+                 input_size=args.depth_input_size,
+                 num_tokens=args.depth_grid_size * args.depth_grid_size,
+                 device=device,
+             )
+     elif args.online_plan_labels:
+         from build_siglip2_semantic_plan_labels import encode_images, load_siglip2, semantic_feature_type
+ 
+         if args.siglip2_encoder_path is None:
+             raise ValueError("--online-plan-labels requires --siglip2-encoder-path")
+-        if args.frame_ranges_json is None:
++        if args.frame_ranges_json is None and args.fastwam_data_config is None:
+             args.frame_ranges_json = args.dataset_root / "frame_ranges.json"
+         sig_model, sig_processor = load_siglip2(args.siglip2_encoder_path, device, "bf16")
+         sig_model.requires_grad_(False)
+         sig_encode = encode_images
+         # Probe dim + tokens-per-keyframe with a dummy frame; validates the head grid early.
+         probe = sig_encode(sig_model, sig_processor, [Image.new("RGB", (64, 64))], args.online_grid_size, device, torch.float32)
+         if probe.shape[1] != args.grid_size * args.grid_size:
+             raise ValueError(
+                 f"online grid {args.online_grid_size} yields {probe.shape[1]} tokens/keyframe, "
+                 f"but --grid-size {args.grid_size} expects {args.grid_size * args.grid_size}"
+@@ -1616,30 +1724,37 @@ def main() -> None:
+         )
+     if world > 1:
+         wrapper = DDP(
+             wrapper,
+             device_ids=[local_rank],
+             find_unused_parameters=args.ddp_find_unused_parameters,
+             static_graph=not args.ddp_find_unused_parameters,
+         )
+ 
+     if args.online_plan_labels:
+-        dataset = OnlineSemanticPlanDataset(
+-            dataset_root=args.dataset_root,
+-            frame_ranges_json=args.frame_ranges_json,
+-            num_keyframes=args.num_keyframes,
+-            sequence_length=args.sequence_length,
+-            keyframe_scheme=args.keyframe_scheme,
+-            keyframe_gamma=args.keyframe_gamma,
+-            max_samples=args.max_samples,
+-            seed=args.seed,
+-        )
++        if args.fastwam_data_config is not None:
++            dataset = FastWAMOnlinePlannerDataset.from_config(
++                args.fastwam_data_config,
++                dataset_dirs=args.fastwam_dataset_dir,
++                max_samples=args.max_samples,
++            )
++        else:
++            dataset = OnlineSemanticPlanDataset(
++                dataset_root=args.dataset_root,
++                frame_ranges_json=args.frame_ranges_json,
++                num_keyframes=args.num_keyframes,
++                sequence_length=args.sequence_length,
++                keyframe_scheme=args.keyframe_scheme,
++                keyframe_gamma=args.keyframe_gamma,
++                max_samples=args.max_samples,
++                seed=args.seed,
++            )
+         if is_main(rank):
+             print(
+                 json.dumps(
+                     {
+                         "online_plan_labels": True,
+                         "stems": len(dataset),
+                         "keyframe_scheme": args.keyframe_scheme,
+                         "keyframe_offsets": dataset.offsets,
+                         "sequence_length": args.sequence_length,
+                         "feature_type": args.sample_feature_type,
+diff --git a/tests/test_lingbot_dino_depth_contract.py b/tests/test_lingbot_dino_depth_contract.py
+index c686241..aa7a379 100644
+--- a/tests/test_lingbot_dino_depth_contract.py
++++ b/tests/test_lingbot_dino_depth_contract.py
+@@ -548,10 +548,63 @@ def test_save_checkpoint_writes_depth_and_fastwam_contract(tmp_path):
+     assert metadata["query_layout"] == (
+         "keyframe_major__shared_dino_private_depth_private"
+     )
+     assert metadata["shared_latent_per_keyframe"] == 32
+     assert metadata["private_latent_per_keyframe"] == 32
+     assert metadata["branch_latent_per_keyframe"] == 64
+     assert metadata["total_unique_latent_per_keyframe"] == 96
+     assert metadata["plan_token_strings"] == [
+         f"<|sem_plan_{index}|>" for index in range(384)
+     ]
++
++
++def test_fastwam_planner_dataset_uses_composed_nine_frame_video():
++    module = load_trainer_module()
++
++    class FakeFastWAMDataset:
++        def __len__(self):
++            return 1
++
++        def __getitem__(self, _index):
++            video = torch.linspace(
++                -1.0,
++                1.0,
++                steps=3 * 9 * 8 * 16,
++            ).reshape(3, 9, 8, 16)
++            return {
++                'video': video,
++                'instruction': 'open the middle drawer',
++            }
++
++    dataset = module.FastWAMOnlinePlannerDataset.from_dataset(
++        FakeFastWAMDataset(),
++        max_samples=0,
++    )
++    item = dataset[0]
++
++    assert item['image'].size == (16, 8)
++    assert item['prompt'] == 'open the middle drawer'
++    assert item['keyframe_images'].shape == (4, 8, 16, 3)
++    assert item['current_image'].shape == (8, 16, 3)
++    assert dataset.offsets == [2, 4, 6, 8]
++
++
++def test_fastwam_launcher_pins_nine_frame_dual_branch_contract():
++    launcher = (
++        ROOT
++        / 'scripts/qwen3_vl_semantic_planner/lingbot_dino_4b'
++        / 'train_lingbot_dino_depth_fastwam_k4.sh'
++    ).read_text()
++    required_exports = (
++        'export USE_DEPTH=1',
++        'export SEQUENCE_LENGTH=9',
++        'export NUM_KEYFRAMES=4',
++        'export GRID_SIZE=16',
++        'export SEMANTIC_DIM=1024',
++        'export KEYFRAME_SCHEME=even_future',
++        'export SHARED_LATENT_PER_KEYFRAME=32',
++        'export PRIVATE_LATENT_PER_KEYFRAME=32',
++        'export FASTWAM_DATA_CONFIG=',
++    )
++    for export in required_exports:
++        assert export in launcher
++    assert 'train_lingbot_dino_4b.sh' in launcher
+diff --git a/third_party/FastWAM/src/fastwam/datasets/lerobot/robot_video_dataset.py b/third_party/FastWAM/src/fastwam/datasets/lerobot/robot_video_dataset.py
+new file mode 100644
+index 0000000..d404c01
+--- /dev/null
++++ b/third_party/FastWAM/src/fastwam/datasets/lerobot/robot_video_dataset.py
+@@ -0,0 +1,489 @@
++import glob
++import hashlib
++import importlib.util
++import json
++import os
++from pathlib import Path
++from typing import Optional
++import time
++import numpy as np
++import traceback
++import torch
++import torchvision.transforms.functional as transforms_F
++from contextlib import contextmanager
++
++from omegaconf import DictConfig, OmegaConf
++
++from hydra.utils import instantiate
++from .base_lerobot_dataset import BaseLerobotDataset
++from .lerobot.datasets.video_utils import set_frame_cache_dir
++from .utils.normalizer import save_dataset_stats_to_json, load_dataset_stats_from_json
++from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Normalize
++from fastwam.utils.logging_config import get_logger
++from fastwam.utils import misc, pytorch_utils
++from accelerate import PartialState
++logger = get_logger(__name__)
++
++
++DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
++
++_SEMANTIC_PLAN_UTILS = None
++
++
++def _load_semantic_plan_utils():
++    global _SEMANTIC_PLAN_UTILS
++    if _SEMANTIC_PLAN_UTILS is not None:
++        return _SEMANTIC_PLAN_UTILS
++
++    try:
++        from cosmos_predict2._src.predict2.networks.semantic_plan_conditioning import (
++            load_semantic_plan_payload,
++            semantic_plan_times_from_frame_indices,
++        )
++
++        _SEMANTIC_PLAN_UTILS = (load_semantic_plan_payload, semantic_plan_times_from_frame_indices)
++        return _SEMANTIC_PLAN_UTILS
++    except ModuleNotFoundError as import_error:
++        candidates = []
++        env_repo = os.environ.get("COSMOS_REPO")
++        if env_repo:
++            candidates.append(
++                Path(env_repo) / "cosmos_predict2/_src/predict2/networks/semantic_plan_conditioning.py"
++            )
++        this_file = Path(__file__).resolve()
++        if len(this_file.parents) > 5:
++            candidates.append(
++                this_file.parents[5]
++                / "cosmos-predict2.5/cosmos_predict2/_src/predict2/networks/semantic_plan_conditioning.py"
++            )
++
++        for module_path in candidates:
++            if not module_path.is_file():
++                continue
++            spec = importlib.util.spec_from_file_location(
++                "fastwam_semantic_plan_conditioning", module_path
++            )
++            module = importlib.util.module_from_spec(spec)
++            assert spec.loader is not None
++            spec.loader.exec_module(module)
++            _SEMANTIC_PLAN_UTILS = (
++                module.load_semantic_plan_payload,
++                module.semantic_plan_times_from_frame_indices,
++            )
++            return _SEMANTIC_PLAN_UTILS
++        raise import_error
++
++class RobotVideoDataset(torch.utils.data.Dataset):
++    def __init__(
++        self,
++        dataset_dirs,
++        shape_meta,
++        num_frames=33,
++        video_size=[384, 640],
++        camera_key=None,
++        processor=None,
++        text_embedding_cache_dir=None,
++        context_len=128,
++        pretrained_norm_stats=None,
++        val_set_proportion=0.05,
++        is_training_set=False,
++        global_sample_stride=1,
++        action_video_freq_ratio: int = 1,
++        skip_padding_as_possible: bool = False,
++        max_padding_retry: int = 3,
++        concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
++        override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
++        frame_cache_dir: Optional[str] = None, # pre-decoded frame cache dir; None = decode mp4 at runtime (back-compatible)
++        condition_frame_augmentation: Optional[dict] = None,
++        video_augmentation: Optional[dict] = None,
++        semantic_plan_dir: Optional[str] = None,
++        semantic_plan_manifest: Optional[str] = None,
++        semantic_plan_dim: int = 1152,
++        semantic_plan_max_tokens: int = 0,
++        semantic_plan_default_to_zero: bool = False,
++    ):
++        # Set the pre-decoded frame cache dir for this process/worker. This must run
++        # before any video decode. The FASTWAM_FRAME_CACHE_DIR env var also works
++        # standalone; an explicit arg here overrides it. Passing None leaves whatever
++        # the env var set (so env-only usage stays back-compatible).
++        if frame_cache_dir is not None:
++            set_frame_cache_dir(frame_cache_dir)
++        self.frame_cache_dir = frame_cache_dir
++
++        self.lerobot_dataset = BaseLerobotDataset(
++            dataset_dirs=dataset_dirs,
++            shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
++            obs_size=num_frames,
++            action_size=num_frames - 1,
++            val_set_proportion=val_set_proportion,
++            is_training_set=is_training_set,
++            global_sample_stride=global_sample_stride,
++        )
++    
++        self.num_frames = num_frames
++        self.action_video_freq_ratio = action_video_freq_ratio
++        
++        assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
++            f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
++        assert ((num_frames - 1) // self.action_video_freq_ratio) % 4 == 0, \
++            f"video frames must be divisible by 4 for tokenization, got {(num_frames - 1) // self.action_video_freq_ratio}"
++        self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio))
++
++        self.camera_key = camera_key
++        self.lerobot_dataset._set_return_images(True)
++
++        self.video_size = video_size
++        self.text_embedding_cache_dir = text_embedding_cache_dir
++        self.context_len = context_len
++        self.skip_padding_as_possible = skip_padding_as_possible
++        self.max_padding_retry = max_padding_retry
++        self.concat_multi_camera = concat_multi_camera
++        self.override_instruction = override_instruction
++        self.semantic_plan_dir = None if semantic_plan_dir is None else os.fspath(semantic_plan_dir)
++        self.semantic_plan_dim = int(semantic_plan_dim)
++        self.semantic_plan_max_tokens = int(semantic_plan_max_tokens)
++        self.semantic_plan_default_to_zero = bool(semantic_plan_default_to_zero)
++        self.semantic_plan_records = self._load_semantic_plan_manifest(semantic_plan_manifest)
++        augmentation_cfg = video_augmentation if video_augmentation is not None else condition_frame_augmentation
++        if augmentation_cfg is not None and is_training_set:
++            if isinstance(augmentation_cfg, torch.nn.Module):
++                self.video_augmentation = augmentation_cfg
++            else:
++                self.video_augmentation = instantiate(augmentation_cfg)
++        else:
++            self.video_augmentation = None
++
++        self.resize_transform = ResizeSmallestSideAspectPreserving(
++            args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
++        )
++        self.crop_transform = CenterCrop(
++            args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
++        )
++        self.normalize_transform = Normalize(
++            args={"mean": 0.5, "std": 0.5},
++        )
++        if processor is not None:
++            if isinstance(processor, DictConfig):
++                processor = instantiate(processor)
++            if not pretrained_norm_stats:
++                if not is_training_set:
++                    raise ValueError("pretrained_norm_stats must be provided for validation/test sets since we don't want to calculate stats on them.")
++                if PartialState().is_main_process:
++                    logger.info("Calculating dataset stats for normalization...")
++                    dataset_stats = self.lerobot_dataset.get_dataset_stats(processor)
++                    work_dir = misc.get_work_dir()
++                    save_dataset_stats_to_json(dataset_stats, os.path.join(work_dir, "dataset_stats.json"))
++                else:
++                    dataset_stats = None
++                if torch.distributed.is_available() and torch.distributed.is_initialized():
++                    obj_list = [dataset_stats]
++                    torch.distributed.broadcast_object_list(obj_list, src=0)
++                    dataset_stats = obj_list[0]
++            else:
++                dataset_stats = load_dataset_stats_from_json(pretrained_norm_stats)
++                logger.info(f"Using dataset stats: {pretrained_norm_stats}")
++                if PartialState().is_main_process:
++                    work_dir = misc.get_work_dir()
++                    save_dataset_stats_to_json(dataset_stats, os.path.join(work_dir, "dataset_stats.json"))
++
++            processor.set_normalizer_from_stats(dataset_stats)
++            self.lerobot_dataset.set_processor(processor)
++
++    def _resolve_manifest_paths(self, semantic_plan_manifest):
++        if semantic_plan_manifest is None:
++            return []
++        if self.semantic_plan_dir is None:
++            raise ValueError("semantic_plan_manifest requires semantic_plan_dir.")
++
++        if isinstance(semantic_plan_manifest, (str, os.PathLike)):
++            manifest_items = [
++                item.strip()
++                for item in os.fspath(semantic_plan_manifest).split(",")
++                if item.strip()
++            ]
++        else:
++            manifest_items = list(semantic_plan_manifest)
++
++        paths = []
++        for item in manifest_items:
++            text = os.fspath(item)
++            base = text if os.path.isabs(text) else os.path.join(self.semantic_plan_dir, text)
++            matches = sorted(glob.glob(base))
++            if not matches:
++                raise FileNotFoundError(f"semantic plan manifest not found: {base}")
++            paths.extend(matches)
++        return paths
++
++    def _load_semantic_plan_manifest(self, semantic_plan_manifest):
++        paths = self._resolve_manifest_paths(semantic_plan_manifest)
++        records = []
++        for path in paths:
++            with open(path, "r", encoding="utf-8") as handle:
++                for line_no, line in enumerate(handle, start=1):
++                    line = line.strip()
++                    if not line:
++                        continue
++                    record = json.loads(line)
++                    if "sample_id" not in record:
++                        raise ValueError(f"{path}:{line_no} missing sample_id")
++                    records.append(record)
++        if records:
++            logger.info("Loaded %d semantic-plan manifest records from %d file(s).", len(records), len(paths))
++        return records
++
++    def _semantic_record_for_index(self, idx):
++        if not self.semantic_plan_records:
++            return None
++        return self.semantic_plan_records[int(idx)]
++
++    @staticmethod
++    def _semantic_sample_idx(record, fallback_idx):
++        if record is None:
++            return int(fallback_idx)
++        for key in ("idx", "sample_idx", "dataset_index", "lerobot_index", "base_idx"):
++            if key in record:
++                return int(record[key])
++        return int(fallback_idx)
++
++    def _semantic_plan_path(self, sample_id):
++        if self.semantic_plan_dir is None:
++            return None
++        sample_id = str(sample_id)
++        root = Path(self.semantic_plan_dir)
++        raw = Path(sample_id)
++        candidates = [raw if raw.is_absolute() else root / raw]
++        if raw.suffix not in (".pt", ".pth", ".npy", ".npz"):
++            candidates.extend(root / f"{sample_id}{ext}" for ext in (".pt", ".pth", ".npy", ".npz"))
++        for path in candidates:
++            if path.is_file():
++                return path
++        return None
++
++    def _zero_semantic_plan(self):
++        if self.semantic_plan_dim <= 0:
++            raise ValueError("semantic_plan_default_to_zero requires semantic_plan_dim > 0.")
++        length = max(int(self.semantic_plan_max_tokens), 1)
++        return torch.zeros(length, int(self.semantic_plan_dim), dtype=torch.float32)
++
++    def _semantic_times_from_record(self, record, fallback_times):
++        if record is None:
++            return fallback_times
++        explicit = record.get("semantic_plan_times", record.get("keyframe_times", None))
++        if explicit is not None:
++            return torch.as_tensor(explicit, dtype=torch.float32)
++        _, semantic_plan_times_from_frame_indices = _load_semantic_plan_utils()
++        record_times = semantic_plan_times_from_frame_indices(
++            record.get("future_frame_indices"),
++            record.get("video_frame_indices"),
++        )
++        return fallback_times if record_times is None else record_times
++
++    def _attach_semantic_plan(self, data, semantic_record, sample_idx):
++        if self.semantic_plan_dir is None:
++            return
++        load_semantic_plan_payload, _ = _load_semantic_plan_utils()
++        sample_id = (
++            semantic_record.get("sample_id")
++            if semantic_record is not None
++            else str(int(sample_idx))
++        )
++        plan_path = self._semantic_plan_path(sample_id)
++        if plan_path is None:
++            if not self.semantic_plan_default_to_zero:
++                raise FileNotFoundError(f"Missing semantic plan for sample_id={sample_id}")
++            semantic_plan = self._zero_semantic_plan()
++            payload_times = None
++        else:
++            semantic_plan, payload_times = load_semantic_plan_payload(
++                plan_path,
++                semantic_plan_dim=self.semantic_plan_dim,
++                max_tokens=self.semantic_plan_max_tokens,
++            )
++
++        data["semantic_plan"] = semantic_plan
++        semantic_times = self._semantic_times_from_record(semantic_record, payload_times)
++        if semantic_times is not None:
++            data["semantic_plan_times"] = semantic_times
++        if semantic_record is not None:
++            data["semantic_plan_meta"] = dict(semantic_record)
++        
++    def __len__(self):
++        return len(self.semantic_plan_records) if self.semantic_plan_records else len(self.lerobot_dataset)
++
++    def _get(self, idx):
++        query_idx = int(idx)
++        semantic_record = self._semantic_record_for_index(query_idx)
++        sample_idx = self._semantic_sample_idx(semantic_record, query_idx)
++        sample = None
++        for attempt in range(self.max_padding_retry + 1):
++            sample = self.lerobot_dataset[sample_idx]
++
++            if not self.skip_padding_as_possible:
++                break
++
++            action_is_pad = sample["action_is_pad"]
++            image_is_pad = sample["image_is_pad"]
++            proprio_is_pad = sample["proprio_is_pad"]
++            has_pad = False
++            if bool(action_is_pad.any().item()):
++                has_pad = True
++            if bool(image_is_pad.any().item()):
++                has_pad = True
++            if bool(proprio_is_pad.any().item()):
++                has_pad = True
++
++            if not has_pad or attempt >= self.max_padding_retry:
++                break
++
++            if self.semantic_plan_records:
++                query_idx = int(np.random.randint(len(self.semantic_plan_records)))
++                semantic_record = self._semantic_record_for_index(query_idx)
++                sample_idx = self._semantic_sample_idx(semantic_record, query_idx)
++            else:
++                sample_idx = int(np.random.randint(len(self.lerobot_dataset)))
++        
++        image_is_pad = sample["image_is_pad"]
++
++        video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
++        num_cameras = 1
++        if video.ndim == 5:
++            video = video[:, self.video_sample_indices, :, :, :] # [num_cameras, T_video, C, H, W]
++            num_cameras, T_video, C, H, W = video.shape
++        else:
++            assert video.ndim == 4, f"Expected video to have shape [T, C, H, W], but got {video.shape}"
++            video = video[self.video_sample_indices, :, :, :] # [T_video, C, H, W]
++            T_video, C, H, W = video.shape
++        image_is_pad = image_is_pad[self.video_sample_indices]
++
++        video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
++        if self.video_augmentation is not None:
++            video = self.video_augmentation(video)
++
++        if self.concat_multi_camera == "robotwin":
++            if num_cameras != 3:
++                raise ValueError(
++                    f"`concat_multi_camera='robotwin'` requires exactly 3 cameras, got {num_cameras}"
++                )
++            cam_top = transforms_F.resize(
++                video[0],
++                size=[256, 320],
++                interpolation=transforms_F.InterpolationMode.BILINEAR,
++                antialias=True,
++            )  # [T_video, C, 256, 320]
++            cam_left = transforms_F.resize(
++                video[1],
++                size=[128, 160],
++                interpolation=transforms_F.InterpolationMode.BILINEAR,
++                antialias=True,
++            )  # [T_video, C, 128, 160]
++            cam_right = transforms_F.resize(
++                video[2],
++                size=[128, 160],
++                interpolation=transforms_F.InterpolationMode.BILINEAR,
++                antialias=True,
++            )  # [T_video, C, 128, 160]
++            bottom = torch.cat([cam_left, cam_right], dim=-1)  # [T_video, C, 128, 320]
++            video = torch.cat([cam_top, bottom], dim=-2)  # [T_video, C, 384, 320]
++        elif num_cameras > 1:
++            if self.concat_multi_camera == "horizontal":
++                video = torch.cat([video[i] for i in range(num_cameras)], dim=-1)  # [T_video, C, H, num_cameras*W]
++            elif self.concat_multi_camera == "vertical":
++                video = torch.cat([video[i] for i in range(num_cameras)], dim=-2)  # [T_video, C, num_cameras*H, W]
++            else:
++                raise ValueError(
++                    f"Invalid concat_multi_camera: {self.concat_multi_camera}. "
++                    "Expected one of: horizontal, vertical, robotwin."
++                )
++        else:
++            video = video.squeeze(0)  # [T_video, C, H, W]
++
++        # final resize and normalization
++        video = self.resize_transform(video)
++        video = self.crop_transform(video)
++        video = self.normalize_transform(video)  # [T_video, C, H, W]
++
++        video = video.permute(1, 0, 2, 3) # [C, T_video, H, W], range [-1, 1]
++
++        # Proxy (from lerobot): 
++        #   action: [num_frames-1, action_dim] # start from t0, except the last frame
++        #   proprio: [num_frames, proprio_dim] # start from t0 to the last frame, aligned with video frames
++        action = sample["action"] # [T-1, action_dim]
++        proprio = sample["proprio"][:-1, :] # [T-1, state_dim]， to align with action
++        if video.shape[1] <= 1:
++            raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
++        if action.shape[0] % (video.shape[1] - 1) != 0:
++            raise ValueError(
++                f"`action` horizon must be divisible by `video` transitions, got {action.shape[0]} and {video.shape[1] - 1}"
++            )
++
++        task = sample["instruction"]
++        
++        # FIXME
++        if self.override_instruction is not None:
++            task = self.override_instruction
++        instruction = DEFAULT_PROMPT.format(task=task)
++
++        context, context_mask = self._get_cached_text_context(instruction)
++        # NOTE: to keep consistent with wan2.2's behavior
++        context[~context_mask] = 0.0
++        context_mask = torch.ones_like(context_mask)
++        
++        data = {
++            "video": video,
++            "action": action,
++            "proprio": proprio,
++            "prompt": instruction,
++            "instruction": str(task),
++            "context": context,
++            "context_mask": context_mask,
++            "image_is_pad": image_is_pad,
++            "action_is_pad": sample["action_is_pad"],
++            "proprio_is_pad": sample["proprio_is_pad"],
++        }
++        self._attach_semantic_plan(data, semantic_record, sample_idx)
++        return data
++
++    def _get_cached_text_context(self, prompt: str):
++        if self.text_embedding_cache_dir is None:
++            raise ValueError("text_embedding_cache_dir is not set.")
++        cache_dir = self.text_embedding_cache_dir
++        os.makedirs(cache_dir, exist_ok=True)
++        hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
++        cache_path = os.path.join(cache_dir, f"{hashed}.t5_len{self.context_len}.wan22ti2v5b.pt")
++        if not os.path.exists(cache_path):
++            raise FileNotFoundError(
++                f"Missing text embedding cache: {cache_path}. "
++                "Run scripts/precompute_text_embeds.py first."
++            )
++        payload = torch.load(cache_path, map_location="cpu")
++        context = payload["context"]
++        context_mask = payload["mask"].bool()
++        if context.ndim != 2:
++            raise ValueError(
++                f"Cached `context` must be 2D [L, D], got shape {tuple(context.shape)} in {cache_path}"
++            )
++        if context_mask.ndim != 1:
++            raise ValueError(
++                f"Cached `mask` must be 1D [L], got shape {tuple(context_mask.shape)} in {cache_path}"
++            )
++        if context.shape[0] != self.context_len:
++            raise ValueError(
++                f"Cached context_len mismatch: expected {self.context_len}, got {context.shape[0]} in {cache_path}"
++            )
++        if context_mask.shape[0] != self.context_len:
++            raise ValueError(
++                f"Cached mask_len mismatch: expected {self.context_len}, got {context_mask.shape[0]} in {cache_path}"
++            )
++
++        return context, context_mask
++
++    def __getitem__(self, idx):
++        try:
++            data = self._get(idx)
++        except Exception as e:
++            print(f"Error processing sample idx {idx}: {e}. Returning a random sample instead.")
++            # trace back
++            print(traceback.format_exc())
++            random_idx = np.random.randint(len(self))
++            data = self._get(random_idx)
++        return data

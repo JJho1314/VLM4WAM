@@ -1,0 +1,296 @@
+### Task 1: Add a testable Accelerate/ZeRO-2 runtime contract
+
+**Files:**
+- Create: `tests/test_lingbot_zero2_runtime.py`
+- Create: `scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/distributed_runtime.py`
+
+**Interfaces:**
+- Produces: `RuntimeContract`, `build_accelerator`, `validate_runtime_contract`, `is_deepspeed`, `accumulation_context`, `is_optimizer_update`, and `checkpoint_module`.
+- Consumes later: trainer arguments `batch_size`, `grad_accum`, `expected_global_batch`, and `dtype`.
+
+- [ ] **Step 1: Write failing runtime-contract and boundary tests**
+
+Create `tests/test_lingbot_zero2_runtime.py` with these tests and helpers:
+
+```python
+from __future__ import annotations
+
+import importlib.util
+import sys
+from contextlib import contextmanager
+from pathlib import Path
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+RUNTIME = (
+    ROOT
+    / "scripts/qwen3_vl_semantic_planner/lingbot_dino_4b"
+    / "distributed_runtime.py"
+)
+
+
+def load_runtime():
+    spec = importlib.util.spec_from_file_location("lingbot_distributed_runtime", RUNTIME)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class FakePlugin:
+    def __init__(self, *, grad_accum: int = 2, zero_stage: int = 2):
+        self.deepspeed_config = {
+            "gradient_accumulation_steps": grad_accum,
+            "zero_optimization": {"stage": zero_stage},
+        }
+
+
+class FakeState:
+    def __init__(self, plugin=None):
+        self.deepspeed_plugin = plugin
+
+
+class FakeAccelerator:
+    def __init__(
+        self,
+        *,
+        distributed_type="DEEPSPEED",
+        num_processes=8,
+        grad_accum=2,
+        plugin=None,
+    ):
+        self.distributed_type = distributed_type
+        self.num_processes = num_processes
+        self.gradient_accumulation_steps = grad_accum
+        self.state = FakeState(plugin)
+        self.sync_gradients = False
+        self.accumulate_calls = 0
+
+    @contextmanager
+    def accumulate(self, _model):
+        self.accumulate_calls += 1
+        yield
+
+    def unwrap_model(self, model):
+        return model.inner
+
+
+def test_runtime_contract_accepts_eight_by_eight_by_two():
+    module = load_runtime()
+    accelerator = FakeAccelerator(plugin=FakePlugin())
+
+    contract = module.validate_runtime_contract(
+        accelerator,
+        per_device_batch_size=8,
+        grad_accum=2,
+        expected_global_batch=128,
+    )
+
+    assert contract.world_size == 8
+    assert contract.global_batch_size == 128
+    assert contract.distributed_type == "DEEPSPEED"
+    assert contract.zero_stage == 2
+
+
+@pytest.mark.parametrize(
+    ("accelerator", "message"),
+    [
+        (FakeAccelerator(grad_accum=4, plugin=FakePlugin(grad_accum=2)), "Accelerator"),
+        (FakeAccelerator(plugin=FakePlugin(grad_accum=4)), "DeepSpeed"),
+        (FakeAccelerator(plugin=FakePlugin(zero_stage=3)), "ZeRO stage"),
+    ],
+)
+def test_runtime_contract_rejects_mismatched_accumulation_or_stage(accelerator, message):
+    module = load_runtime()
+    with pytest.raises(RuntimeError, match=message):
+        module.validate_runtime_contract(
+            accelerator,
+            per_device_batch_size=8,
+            grad_accum=2,
+            expected_global_batch=128,
+        )
+
+
+def test_runtime_contract_rejects_wrong_global_batch():
+    module = load_runtime()
+    accelerator = FakeAccelerator(plugin=FakePlugin())
+    with pytest.raises(RuntimeError, match="global batch"):
+        module.validate_runtime_contract(
+            accelerator,
+            per_device_batch_size=4,
+            grad_accum=2,
+            expected_global_batch=128,
+        )
+
+
+def test_deepspeed_boundary_is_driven_by_microstep_count():
+    module = load_runtime()
+    accelerator = FakeAccelerator(plugin=FakePlugin())
+    assert [module.is_optimizer_update(accelerator, step, 2) for step in range(1, 5)] == [
+        False,
+        True,
+        False,
+        True,
+    ]
+
+
+def test_non_deepspeed_uses_accelerate_accumulation_and_sync_flag():
+    module = load_runtime()
+    accelerator = FakeAccelerator(
+        distributed_type="MULTI_GPU",
+        plugin=None,
+    )
+    model = object()
+    with module.accumulation_context(accelerator, model):
+        pass
+    assert accelerator.accumulate_calls == 1
+    accelerator.sync_gradients = True
+    assert module.is_optimizer_update(accelerator, micro_step=1, grad_accum=2) is True
+
+
+def test_deepspeed_bypasses_no_sync_and_unwraps_checkpoint_module():
+    module = load_runtime()
+    accelerator = FakeAccelerator(plugin=FakePlugin())
+    model = type("Wrapped", (), {"inner": object()})()
+    with module.accumulation_context(accelerator, model):
+        pass
+    assert accelerator.accumulate_calls == 0
+    assert module.checkpoint_module(accelerator, model) is model.inner
+```
+
+- [ ] **Step 2: Run the new tests and verify RED**
+
+Run:
+
+```bash
+pytest -q tests/test_lingbot_zero2_runtime.py
+```
+
+Expected: FAIL because `distributed_runtime.py` does not exist.
+
+- [ ] **Step 3: Implement the minimal distributed runtime**
+
+Create `distributed_runtime.py` with:
+
+```python
+from __future__ import annotations
+
+from contextlib import nullcontext
+from dataclasses import dataclass
+from typing import Any, ContextManager
+
+
+@dataclass(frozen=True)
+class RuntimeContract:
+    distributed_type: str
+    world_size: int
+    per_device_batch_size: int
+    gradient_accumulation_steps: int
+    global_batch_size: int
+    zero_stage: int | None
+
+
+def _distributed_type_name(accelerator: Any) -> str:
+    value = getattr(accelerator, "distributed_type", "NO")
+    name = getattr(value, "name", str(value))
+    return name.rsplit(".", 1)[-1].upper()
+
+
+def is_deepspeed(accelerator: Any) -> bool:
+    return _distributed_type_name(accelerator) == "DEEPSPEED"
+
+
+def _deepspeed_config(accelerator: Any) -> dict[str, Any]:
+    plugin = getattr(getattr(accelerator, "state", None), "deepspeed_plugin", None)
+    config = getattr(plugin, "deepspeed_config", None)
+    if plugin is None or not isinstance(config, dict):
+        raise RuntimeError("DeepSpeed runtime has no resolved DeepSpeed configuration")
+    return config
+
+
+def validate_runtime_contract(
+    accelerator: Any,
+    *,
+    per_device_batch_size: int,
+    grad_accum: int,
+    expected_global_batch: int,
+) -> RuntimeContract:
+    if per_device_batch_size <= 0 or grad_accum <= 0:
+        raise RuntimeError("batch size and gradient accumulation must be positive")
+    world_size = int(accelerator.num_processes)
+    accelerator_accum = int(accelerator.gradient_accumulation_steps)
+    if accelerator_accum != grad_accum:
+        raise RuntimeError(
+            "Accelerator gradient accumulation mismatch: "
+            f"trainer={grad_accum}, accelerator={accelerator_accum}"
+        )
+    global_batch = world_size * per_device_batch_size * grad_accum
+    if expected_global_batch > 0 and global_batch != expected_global_batch:
+        raise RuntimeError(
+            f"global batch mismatch: computed={global_batch}, "
+            f"expected={expected_global_batch}"
+        )
+    zero_stage = None
+    if is_deepspeed(accelerator):
+        config = _deepspeed_config(accelerator)
+        deepspeed_accum = int(config.get("gradient_accumulation_steps", -1))
+        if deepspeed_accum != grad_accum:
+            raise RuntimeError(
+                "DeepSpeed gradient accumulation mismatch: "
+                f"trainer={grad_accum}, deepspeed={deepspeed_accum}"
+            )
+        zero_stage = int(config.get("zero_optimization", {}).get("stage", -1))
+        if zero_stage != 2:
+            raise RuntimeError(f"ZeRO stage mismatch: expected 2, got {zero_stage}")
+    return RuntimeContract(
+        distributed_type=_distributed_type_name(accelerator),
+        world_size=world_size,
+        per_device_batch_size=per_device_batch_size,
+        gradient_accumulation_steps=grad_accum,
+        global_batch_size=global_batch,
+        zero_stage=zero_stage,
+    )
+
+
+def build_accelerator(*, grad_accum: int, dtype: str):
+    from accelerate import Accelerator
+
+    mixed_precision = {"bf16": "bf16", "fp16": "fp16", "fp32": "no"}[dtype]
+    return Accelerator(
+        gradient_accumulation_steps=grad_accum,
+        mixed_precision=mixed_precision,
+    )
+
+
+def accumulation_context(accelerator: Any, model: Any) -> ContextManager[None]:
+    if is_deepspeed(accelerator):
+        return nullcontext()
+    return accelerator.accumulate(model)
+
+
+def is_optimizer_update(accelerator: Any, micro_step: int, grad_accum: int) -> bool:
+    if is_deepspeed(accelerator):
+        return micro_step % grad_accum == 0
+    return bool(accelerator.sync_gradients)
+
+
+def checkpoint_module(accelerator: Any, model: Any) -> Any:
+    return accelerator.unwrap_model(model)
+```
+
+- [ ] **Step 4: Verify GREEN and inspect the focused diff**
+
+Run:
+
+```bash
+pytest -q tests/test_lingbot_zero2_runtime.py
+git diff --check -- tests/test_lingbot_zero2_runtime.py scripts/qwen3_vl_semantic_planner/lingbot_dino_4b/distributed_runtime.py
+```
+
+Expected: all runtime tests pass and `git diff --check` prints nothing.
+
+---
+

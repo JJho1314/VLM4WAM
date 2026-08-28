@@ -1,0 +1,1144 @@
+# Review package: aab7a94..134a2af
+
+## Commits
+134a2af feat: expose sampled video timing to fastwam
+
+## Files changed
+ tests/test_fastwam_sample_timing.py                | 512 +++++++++++++++++++++
+ .../datasets/lerobot/base_lerobot_dataset.py       | 440 ++++++++++++++++++
+ .../datasets/lerobot/robot_video_dataset.py        |  65 +++
+ 3 files changed, 1017 insertions(+)
+
+## Diff
+diff --git a/tests/test_fastwam_sample_timing.py b/tests/test_fastwam_sample_timing.py
+new file mode 100644
+index 0000000..db2c7f9
+--- /dev/null
++++ b/tests/test_fastwam_sample_timing.py
+@@ -0,0 +1,512 @@
++from __future__ import annotations
++
++import importlib.util
++import logging
++import math
++import sys
++import types
++from pathlib import Path
++
++import numpy as np
++import pytest
++import torch
++
++
++ROOT = Path(__file__).resolve().parents[1]
++FASTWAM_SRC = ROOT / "third_party/FastWAM/src"
++LEROBOT_DIR = FASTWAM_SRC / "fastwam/datasets/lerobot"
++BASE_DATASET_PATH = LEROBOT_DIR / "base_lerobot_dataset.py"
++ROBOT_DATASET_PATH = LEROBOT_DIR / "robot_video_dataset.py"
++
++
++def _install_package(monkeypatch, name: str, path: Path) -> None:
++    package = types.ModuleType(name)
++    package.__path__ = [str(path)]
++    monkeypatch.setitem(sys.modules, name, package)
++
++
++def _install_fastwam_packages(monkeypatch) -> None:
++    _install_package(monkeypatch, "fastwam", FASTWAM_SRC / "fastwam")
++    _install_package(
++        monkeypatch,
++        "fastwam.datasets",
++        FASTWAM_SRC / "fastwam/datasets",
++    )
++    _install_package(monkeypatch, "fastwam.datasets.lerobot", LEROBOT_DIR)
++    _install_package(
++        monkeypatch,
++        "fastwam.datasets.lerobot.lerobot",
++        LEROBOT_DIR / "lerobot",
++    )
++    _install_package(
++        monkeypatch,
++        "fastwam.datasets.lerobot.processors",
++        LEROBOT_DIR / "processors",
++    )
++    _install_package(
++        monkeypatch,
++        "fastwam.datasets.lerobot.utils",
++        LEROBOT_DIR / "utils",
++    )
++    _install_package(monkeypatch, "fastwam.utils", FASTWAM_SRC / "fastwam/utils")
++
++    logging_module = types.ModuleType("fastwam.utils.logging_config")
++    logging_module.get_logger = logging.getLogger
++    monkeypatch.setitem(
++        sys.modules,
++        "fastwam.utils.logging_config",
++        logging_module,
++    )
++
++
++def _load_source_module(monkeypatch, name: str, path: Path):
++    monkeypatch.delitem(sys.modules, name, raising=False)
++    spec = importlib.util.spec_from_file_location(name, path)
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    monkeypatch.setitem(sys.modules, name, module)
++    spec.loader.exec_module(module)
++    return module
++
++
++def _load_base_dataset_module(monkeypatch, *, raw_fps: float = 20.0):
++    _install_fastwam_packages(monkeypatch)
++
++    lerobot_module = types.ModuleType(
++        "fastwam.datasets.lerobot.lerobot.lerobot_dataset"
++    )
++
++    class FakeMetadata:
++        def __init__(self, repo_id, root):
++            del root
++            self.repo_id = repo_id
++            self.fps = raw_fps
++            self.total_episodes = 1
++
++    class FakeMultiLeRobotDataset:
++        def __init__(self, **_kwargs):
++            episode_index = {
++                "from": torch.tensor([0]),
++                "to": torch.tensor([1]),
++            }
++            self._datasets = [
++                types.SimpleNamespace(episode_data_index=episode_index)
++            ]
++            self.num_frames = 1
++            self.num_episodes = 1
++
++    lerobot_module.LeRobotDatasetMetadata = FakeMetadata
++    lerobot_module.MultiLeRobotDataset = FakeMultiLeRobotDataset
++    monkeypatch.setitem(
++        sys.modules,
++        "fastwam.datasets.lerobot.lerobot.lerobot_dataset",
++        lerobot_module,
++    )
++
++    processor_module = types.ModuleType(
++        "fastwam.datasets.lerobot.processors.base_processor"
++    )
++    processor_module.BaseProcessor = object
++    monkeypatch.setitem(
++        sys.modules,
++        "fastwam.datasets.lerobot.processors.base_processor",
++        processor_module,
++    )
++    return _load_source_module(
++        monkeypatch,
++        "fastwam.datasets.lerobot.base_lerobot_dataset",
++        BASE_DATASET_PATH,
++    )
++
++
++def _load_robot_dataset_module(
++    monkeypatch,
++    *,
++    raw_fps: float | None = 20.0,
++):
++    _install_fastwam_packages(monkeypatch)
++
++    omegaconf = types.ModuleType("omegaconf")
++
++    class DictConfig(dict):
++        pass
++
++    omegaconf.DictConfig = DictConfig
++    omegaconf.OmegaConf = types.SimpleNamespace(
++        to_container=lambda value, resolve=True: value
++    )
++    monkeypatch.setitem(sys.modules, "omegaconf", omegaconf)
++
++    hydra = types.ModuleType("hydra")
++    hydra_utils = types.ModuleType("hydra.utils")
++    hydra_utils.instantiate = lambda config: config
++    hydra.utils = hydra_utils
++    monkeypatch.setitem(sys.modules, "hydra", hydra)
++    monkeypatch.setitem(sys.modules, "hydra.utils", hydra_utils)
++
++    accelerate = types.ModuleType("accelerate")
++    accelerate.PartialState = lambda: types.SimpleNamespace(is_main_process=True)
++    monkeypatch.setitem(sys.modules, "accelerate", accelerate)
++
++    torchvision = types.ModuleType("torchvision")
++    torchvision_transforms = types.ModuleType("torchvision.transforms")
++    torchvision_functional = types.ModuleType("torchvision.transforms.functional")
++    torchvision_functional.InterpolationMode = types.SimpleNamespace(
++        BILINEAR="bilinear"
++    )
++    torchvision_functional.resize = (
++        lambda tensor, size, interpolation=None, antialias=None: tensor
++    )
++    torchvision_transforms.functional = torchvision_functional
++    torchvision.transforms = torchvision_transforms
++    monkeypatch.setitem(sys.modules, "torchvision", torchvision)
++    monkeypatch.setitem(sys.modules, "torchvision.transforms", torchvision_transforms)
++    monkeypatch.setitem(
++        sys.modules,
++        "torchvision.transforms.functional",
++        torchvision_functional,
++    )
++
++    base_module = types.ModuleType(
++        "fastwam.datasets.lerobot.base_lerobot_dataset"
++    )
++
++    class FakeBaseLerobotDataset:
++        task_text = "pick up the cup"
++
++        def __init__(self, *, global_sample_stride, **_kwargs):
++            if raw_fps is not None:
++                self.fps = float(raw_fps)
++            self.global_sample_stride = global_sample_stride
++            self.processor = None
++            self.samples = [
++                {
++                    "pixel_values": torch.zeros(33, 3, 2, 2),
++                    "image_is_pad": torch.zeros(33, dtype=torch.bool),
++                    "action": torch.zeros(32, 7),
++                    "proprio": torch.zeros(33, 8),
++                    "instruction": self.task_text,
++                    "action_is_pad": torch.zeros(32, dtype=torch.bool),
++                    "proprio_is_pad": torch.zeros(33, dtype=torch.bool),
++                }
++            ]
++
++        def __len__(self):
++            return len(self.samples)
++
++        def __getitem__(self, index):
++            return dict(self.samples[int(index)])
++
++        def _set_return_images(self, _flag):
++            return None
++
++        def set_processor(self, processor):
++            self.processor = processor
++            return self
++
++        def get_dataset_stats(self, _processor):
++            return {}
++
++    base_module.BaseLerobotDataset = FakeBaseLerobotDataset
++    monkeypatch.setitem(
++        sys.modules,
++        "fastwam.datasets.lerobot.base_lerobot_dataset",
++        base_module,
++    )
++
++    video_utils = types.ModuleType(
++        "fastwam.datasets.lerobot.lerobot.datasets.video_utils"
++    )
++    video_utils.set_frame_cache_dir = lambda _path: None
++    monkeypatch.setitem(
++        sys.modules,
++        "fastwam.datasets.lerobot.lerobot.datasets.video_utils",
++        video_utils,
++    )
++
++    normalizer = types.ModuleType("fastwam.datasets.lerobot.utils.normalizer")
++    normalizer.save_dataset_stats_to_json = lambda *_args, **_kwargs: None
++    normalizer.load_dataset_stats_from_json = lambda *_args, **_kwargs: {}
++    monkeypatch.setitem(
++        sys.modules,
++        "fastwam.datasets.lerobot.utils.normalizer",
++        normalizer,
++    )
++
++    dataset_utils = types.ModuleType("fastwam.datasets.dataset_utils")
++
++    class IdentityTransform:
++        def __init__(self, *args, **kwargs):
++            pass
++
++        def __call__(self, value):
++            return value
++
++    dataset_utils.ResizeSmallestSideAspectPreserving = IdentityTransform
++    dataset_utils.CenterCrop = IdentityTransform
++    dataset_utils.Normalize = IdentityTransform
++    monkeypatch.setitem(sys.modules, "fastwam.datasets.dataset_utils", dataset_utils)
++
++    return _load_source_module(
++        monkeypatch,
++        "fastwam.datasets.lerobot.robot_video_dataset",
++        ROBOT_DATASET_PATH,
++    )
++
++
++def _shape_meta():
++    return {"images": [], "state": [], "action": []}
++
++
++def test_base_dataset_preserves_raw_fps_and_normalizes_global_stride(monkeypatch):
++    module = _load_base_dataset_module(monkeypatch, raw_fps=20)
++
++    dataset = module.BaseLerobotDataset(
++        dataset_dirs=["libero"],
++        shape_meta=_shape_meta(),
++        obs_size=1,
++        action_size=0,
++        val_set_proportion=0,
++        global_sample_stride=np.int64(2),
++    )
++
++    assert dataset.fps == pytest.approx(20.0)
++    assert type(dataset.fps) is float
++    assert dataset.global_sample_stride == 2
++    assert type(dataset.global_sample_stride) is int
++
++
++@pytest.mark.parametrize("raw_fps", [0.0, -1.0, math.inf, -math.inf, math.nan])
++def test_base_dataset_rejects_nonpositive_or_nonfinite_fps(
++    monkeypatch,
++    raw_fps,
++):
++    module = _load_base_dataset_module(monkeypatch, raw_fps=raw_fps)
++
++    with pytest.raises(ValueError, match="fps.*positive.*finite"):
++        module.BaseLerobotDataset(
++            dataset_dirs=["libero"],
++            shape_meta=_shape_meta(),
++            obs_size=1,
++            action_size=0,
++            val_set_proportion=0,
++        )
++
++
++@pytest.mark.parametrize("global_stride", [True, 1.0, 1.5, "1", None])
++def test_base_dataset_rejects_non_integral_global_stride(
++    monkeypatch,
++    global_stride,
++):
++    module = _load_base_dataset_module(monkeypatch)
++
++    with pytest.raises(TypeError, match="global_sample_stride.*integer"):
++        module.BaseLerobotDataset(
++            dataset_dirs=["libero"],
++            shape_meta=_shape_meta(),
++            obs_size=1,
++            action_size=0,
++            val_set_proportion=0,
++            global_sample_stride=global_stride,
++        )
++
++
++@pytest.mark.parametrize("global_stride", [0, -1])
++def test_base_dataset_rejects_nonpositive_global_stride(
++    monkeypatch,
++    global_stride,
++):
++    module = _load_base_dataset_module(monkeypatch)
++
++    with pytest.raises(ValueError, match="global_sample_stride.*positive"):
++        module.BaseLerobotDataset(
++            dataset_dirs=["libero"],
++            shape_meta=_shape_meta(),
++            obs_size=1,
++            action_size=0,
++            val_set_proportion=0,
++            global_sample_stride=global_stride,
++        )
++
++
++def test_effective_video_fps_uses_both_sampling_strides(monkeypatch):
++    module = _load_robot_dataset_module(monkeypatch)
++
++    assert module.compute_effective_video_fps(
++        raw_fps=20.0,
++        global_sample_stride=2,
++        action_video_freq_ratio=4,
++    ) == pytest.approx(2.5)
++    assert module.compute_effective_video_fps(
++        raw_fps=20.0,
++        global_sample_stride=1,
++        action_video_freq_ratio=4,
++    ) == pytest.approx(5.0)
++
++
++@pytest.mark.parametrize(
++    ("raw_fps", "global_stride", "ratio"),
++    [
++        (0.0, 1, 4),
++        (-20.0, 1, 4),
++        (math.inf, 1, 4),
++        (-math.inf, 1, 4),
++        (math.nan, 1, 4),
++        (20.0, 0, 4),
++        (20.0, -1, 4),
++        (20.0, 1, 0),
++        (20.0, 1, -4),
++    ],
++)
++def test_effective_video_fps_rejects_invalid_numeric_inputs(
++    monkeypatch,
++    raw_fps,
++    global_stride,
++    ratio,
++):
++    module = _load_robot_dataset_module(monkeypatch)
++
++    with pytest.raises(ValueError, match="positive|finite"):
++        module.compute_effective_video_fps(
++            raw_fps=raw_fps,
++            global_sample_stride=global_stride,
++            action_video_freq_ratio=ratio,
++        )
++
++
++@pytest.mark.parametrize(
++    ("name", "value"),
++    [
++        ("raw_fps", True),
++        ("raw_fps", "20"),
++        ("global_sample_stride", True),
++        ("global_sample_stride", 1.0),
++        ("global_sample_stride", 1.5),
++        ("action_video_freq_ratio", True),
++        ("action_video_freq_ratio", 4.0),
++        ("action_video_freq_ratio", 1.5),
++    ],
++)
++def test_effective_video_fps_rejects_invalid_types(monkeypatch, name, value):
++    module = _load_robot_dataset_module(monkeypatch)
++    kwargs = {
++        "raw_fps": 20.0,
++        "global_sample_stride": 1,
++        "action_video_freq_ratio": 4,
++    }
++    kwargs[name] = value
++
++    with pytest.raises(TypeError, match=name):
++        module.compute_effective_video_fps(**kwargs)
++
++
++@pytest.mark.parametrize(
++    ("name", "value", "error_type"),
++    [
++        ("global_sample_stride", True, TypeError),
++        ("global_sample_stride", 1.0, TypeError),
++        ("global_sample_stride", 0, ValueError),
++        ("action_video_freq_ratio", True, TypeError),
++        ("action_video_freq_ratio", 4.0, TypeError),
++        ("action_video_freq_ratio", 0, ValueError),
++    ],
++)
++def test_robot_video_dataset_validates_sampling_inputs_at_init(
++    monkeypatch,
++    tmp_path,
++    name,
++    value,
++    error_type,
++):
++    module = _load_robot_dataset_module(monkeypatch)
++    kwargs = {
++        "dataset_dirs": [str(tmp_path / "lerobot")],
++        "shape_meta": _shape_meta(),
++        "num_frames": 33,
++        "global_sample_stride": 1,
++        "action_video_freq_ratio": 4,
++        "video_size": [2, 2],
++        "text_embedding_cache_dir": str(tmp_path / "text"),
++    }
++    kwargs[name] = value
++
++    with pytest.raises(error_type, match=name):
++        module.RobotVideoDataset(**kwargs)
++
++
++@pytest.mark.parametrize("raw_fps", [0.0, -1.0, math.inf, math.nan])
++def test_robot_video_dataset_rejects_present_but_invalid_base_fps(
++    monkeypatch,
++    tmp_path,
++    raw_fps,
++):
++    module = _load_robot_dataset_module(monkeypatch, raw_fps=raw_fps)
++
++    with pytest.raises(ValueError, match="raw_fps.*positive.*finite"):
++        module.RobotVideoDataset(
++            dataset_dirs=[str(tmp_path / "lerobot")],
++            shape_meta=_shape_meta(),
++            num_frames=33,
++            global_sample_stride=1,
++            action_video_freq_ratio=4,
++            video_size=[2, 2],
++            text_embedding_cache_dir=str(tmp_path / "text"),
++        )
++
++
++def test_robot_video_dataset_warns_when_injected_base_has_no_fps(
++    monkeypatch,
++    tmp_path,
++    caplog,
++):
++    module = _load_robot_dataset_module(monkeypatch, raw_fps=None)
++
++    with caplog.at_level(logging.WARNING):
++        dataset = module.RobotVideoDataset(
++            dataset_dirs=[str(tmp_path / "lerobot")],
++            shape_meta=_shape_meta(),
++            num_frames=33,
++            global_sample_stride=1,
++            action_video_freq_ratio=4,
++            video_size=[2, 2],
++            text_embedding_cache_dir=str(tmp_path / "text"),
++        )
++
++    assert dataset.video_fps is None
++    assert "sampled video timing is unavailable" in caplog.text
++
++
++def test_robot_video_sample_emits_fps_and_raw_instruction(monkeypatch, tmp_path):
++    module = _load_robot_dataset_module(monkeypatch)
++    dataset = module.RobotVideoDataset(
++        dataset_dirs=[str(tmp_path / "lerobot")],
++        shape_meta=_shape_meta(),
++        num_frames=33,
++        global_sample_stride=1,
++        action_video_freq_ratio=4,
++        video_size=[2, 2],
++        text_embedding_cache_dir=str(tmp_path / "text"),
++    )
++    monkeypatch.setattr(
++        dataset,
++        "_get_cached_text_context",
++        lambda _prompt: (
++            torch.zeros(2, 8),
++            torch.ones(2, dtype=torch.bool),
++        ),
++    )
++
++    sample = dataset[0]
++
++    assert dataset.lerobot_dataset.fps == pytest.approx(20.0)
++    assert dataset.global_sample_stride == 1
++    assert dataset.action_video_freq_ratio == 4
++    assert dataset.video_fps == pytest.approx(5.0)
++    assert sample["video_fps"].ndim == 0
++    assert sample["video_fps"].dtype == torch.float32
++    assert sample["video_fps"].item() == pytest.approx(5.0)
++    assert sample["instruction"] == dataset.lerobot_dataset.task_text
++    assert sample["prompt"] == (
++        "A video recorded from a robot's point of view executing the following "
++        "instruction: pick up the cup"
++    )
+diff --git a/third_party/FastWAM/src/fastwam/datasets/lerobot/base_lerobot_dataset.py b/third_party/FastWAM/src/fastwam/datasets/lerobot/base_lerobot_dataset.py
+new file mode 100644
+index 0000000..11b5cc2
+--- /dev/null
++++ b/third_party/FastWAM/src/fastwam/datasets/lerobot/base_lerobot_dataset.py
+@@ -0,0 +1,440 @@
++import math
++from numbers import Integral, Real
++
++import torch
++import numpy as np
++from pathlib import Path
++from typing import List, Literal, Dict, Optional, Any, DefaultDict
++from tqdm import tqdm
++from .lerobot.lerobot_dataset import LeRobotDatasetMetadata, MultiLeRobotDataset
++
++from concurrent.futures import ThreadPoolExecutor, as_completed
++import traceback
++from fastwam.utils.logging_config import get_logger
++from .processors.base_processor import BaseProcessor
++
++logger = get_logger(__name__)
++
++MAX_GETITEM_ATTEMPT = 5
++
++
++def _normalize_positive_integral(value, *, name: str) -> int:
++    if isinstance(value, bool) or not isinstance(value, Integral):
++        raise TypeError(f"{name} must be a non-bool integer, got {value!r}")
++    value = int(value)
++    if value <= 0:
++        raise ValueError(f"{name} must be positive, got {value}")
++    return value
++
++
++def _normalize_positive_fps(value) -> float:
++    if isinstance(value, bool) or not isinstance(value, Real):
++        raise TypeError(f"fps must be a real number, got {value!r}")
++    value = float(value)
++    if value <= 0 or not math.isfinite(value):
++        raise ValueError(f"fps must be positive and finite, got {value}")
++    return value
++
++
++class BaseLerobotDataset(torch.utils.data.Dataset):
++    def __init__(
++        self,
++        dataset_dirs: List[str],
++
++        # shapes
++        shape_meta: Dict[str, Any],
++        action_size: int = 1,
++        past_action_size: int = 0, # Excludes the current frame
++        obs_size: int = 1, # should be
++        past_obs_size: int = 0,
++
++        # train vs val
++        val_set_proportion: float = 0.05,
++        is_training_set: bool = False,
++        seed: int = 42,
++
++        # sampling
++        global_sample_stride: int = 1,
++    ):
++        assert len(dataset_dirs) > 0, "At least one dataset directory is required"
++        assert past_action_size == 0
++        assert past_obs_size == 0
++        assert action_size == obs_size - 1, "In this dataset, action_size should be obs_size - 1"
++
++        global_sample_stride = _normalize_positive_integral(
++            global_sample_stride,
++            name="global_sample_stride",
++        )
++
++        self.dataset_dirs = dataset_dirs
++        self.shape_meta = shape_meta
++        self.action_size = action_size
++        self.past_action_size = past_action_size
++        self.obs_size = obs_size
++        self.processor = None  # Will be set externally
++        metas = []
++        for ds_dir in dataset_dirs:
++            ds_root = Path(ds_dir)
++            repo_id = ds_dir
++            meta = LeRobotDatasetMetadata(repo_id=repo_id, root=ds_root)
++            metas.append(meta)
++
++        fps_list = [m.fps for m in metas]
++        assert len(set(fps_list)) == 1, f"All dataset_dirs must have the same fps, got {fps_list}"
++        fps = _normalize_positive_fps(fps_list[0])
++
++        self.fps = fps
++        self.global_sample_stride = global_sample_stride
++
++        self.val_set_proportion = val_set_proportion
++        self.is_training_set = is_training_set
++
++        self.image_meta = shape_meta["images"]
++        self.state_meta = shape_meta["state"]
++        self.action_meta = shape_meta["action"]
++
++        delta_timestamps = {}
++        for meta in self.image_meta:
++            key = meta["key"]
++            meta["lerobot_key"] = f"observation.images.{key}" if key != "default" else "observation.images"
++            delta_timestamps[meta["lerobot_key"]] = [
++                (t * global_sample_stride) / fps for t in range(-past_obs_size, -past_obs_size + obs_size)
++            ]
++
++        for meta in self.state_meta:
++            key = meta["key"]
++            meta["lerobot_key"] = f"observation.state.{key}" if key != "default" else "observation.state"
++            delta_timestamps[meta["lerobot_key"]] = [
++                (t * global_sample_stride) / fps for t in range(-past_obs_size, -past_obs_size + obs_size)
++            ]
++
++        for meta in self.action_meta:
++            key = meta["key"]
++            meta["lerobot_key"] = f"action.{key}" if key != "default" else "action"
++            delta_timestamps[meta["lerobot_key"]] = [(t * global_sample_stride) / fps for t in range(-past_action_size, -past_action_size + action_size)]
++
++        episodes = {}
++        if val_set_proportion < 1e-6:
++            for meta in metas:
++                episodes.update({meta.repo_id: list(range(meta.total_episodes))})
++        else:
++            for meta in metas:
++                split_idx = int(meta.total_episodes * (1 - val_set_proportion))
++                # random shuffle episode indices before splitting
++                episode_indices = list(range(meta.total_episodes))
++                rng = np.random.default_rng(seed)
++                rng.shuffle(episode_indices)
++                if self.is_training_set:
++                    episodes.update({meta.repo_id: [episode_indices[i] for i in range(split_idx)]})
++                else:
++                    episodes.update({meta.repo_id: [episode_indices[i] for i in range(split_idx, meta.total_episodes)]})
++
++        self.multi_dataset = MultiLeRobotDataset(
++            dataset_dirs=self.dataset_dirs,
++            episodes=episodes,
++            delta_timestamps=delta_timestamps,
++        )
++
++        # HACK: lerobot 3.0 will fix this
++        episode_data_index = []
++        end_index = 0
++        for dataset in self.multi_dataset._datasets:
++            multi_episode_data_index = {
++                "from": dataset.episode_data_index["from"] + end_index,
++                "to": dataset.episode_data_index["to"] + end_index,
++            }
++            episode_data_index.append(multi_episode_data_index)
++            end_index = multi_episode_data_index["to"][-1]
++
++        self.episode_data_index = {
++            "from": torch.cat([dataset["from"] for dataset in episode_data_index]),
++            "to": torch.cat([dataset["to"] for dataset in episode_data_index]),
++        }
++
++    def _get_action(self, meta, lerobot_sample) -> torch.Tensor:
++        key, lerobot_key, raw_shape = meta["key"], meta["lerobot_key"], meta["raw_shape"]
++        action: torch.Tensor = lerobot_sample[lerobot_key] # [T, action_dim]
++        if action.ndim == 1: # for shape of 1, like gripper
++            action = action.unsqueeze(-1)
++        assert action.shape[-1] == raw_shape, f"Action '{key}' shape {action.shape[-1]} mismatch with meta {raw_shape}."
++        return action
++
++    def _get_state(self, meta, lerobot_sample) -> torch.Tensor:
++        key, lerobot_key, raw_shape = meta["key"], meta["lerobot_key"], meta["raw_shape"]
++        state: torch.Tensor = lerobot_sample[lerobot_key]
++        if state.ndim == 1: # for shape of 1, like gripper
++            state = state.unsqueeze(-1)
++        # state = state[..., :-1, :]  # use state_{t} as observation_t
++        assert state.shape[-1] == raw_shape, f"State '{key}' shape {state.shape[-1]} mismatch with meta {raw_shape}."
++        return state
++
++    def _get_image(self, meta, lerobot_sample) -> torch.Tensor:
++        key, lerobot_key, raw_shape = meta["key"], meta["lerobot_key"], meta["raw_shape"]
++        image: torch.Tensor = lerobot_sample[lerobot_key]
++        if image.ndim == 3: # time dim will lost when obs_size is 1
++            image = image.unsqueeze(0)
++        image = (image * 255).to(torch.uint8) # (1, 3, H, W)
++        # For config simplication
++        # assert image.shape[1:] == raw_shape, f"Image '{key}' shape {image.shape[1:]} mismatch with {raw_shape}."
++        return image
++
++    def _split_lerobot_sample(self, lerobot_sample) -> Dict[str, Any]:
++        return lerobot_sample
++
++    def _get_episode_data(self, episode_idx):
++        lerobot_sample = self.multi_dataset.get_episode_data(episode_idx)
++        lerobot_sample = self._split_lerobot_sample(lerobot_sample)
++        state, action = {}, {}
++        for meta in self.state_meta:
++            s = self._get_state(meta, lerobot_sample)
++            state[meta["key"]] = s.unsqueeze(1).float()
++        for meta in self.action_meta:
++            a = self._get_action(meta, lerobot_sample)
++            a = sliding_window_with_replication(a, self.action_size)
++            action[meta["key"]] = a.float()
++        return {"action": action, "state": state}
++
++    def _set_return_images(self, flag: bool):
++        self.return_images = flag
++        self.multi_dataset.set_during_training(flag)
++
++    def __len__(self):
++        return self.multi_dataset.num_frames
++
++    def _get_additional_data(self, sample, lerobot_sample):
++        return sample
++
++    def __getitem__(self, idx):
++        if idx >= len(self):
++            raise IndexError(f"Index {idx} out of bounds {len(self)}.")
++
++        # Retry with random indices until we successfully load a frame.
++        sample_idx = idx
++        attempt = 0
++        last_exception: Optional[Exception] = None
++        while attempt < MAX_GETITEM_ATTEMPT:
++            try:
++                lerobot_sample = self.multi_dataset[sample_idx]
++                lerobot_sample = self._split_lerobot_sample(lerobot_sample)
++                break
++            except Exception as err:
++                attempt += 1
++                last_exception = err
++                logger.warning(
++                    f"Error loading sample {sample_idx} (attempt {attempt}). "
++                    "Retrying with a random index. "
++                    f"Error: {err}"
++                )
++                sample_idx = np.random.randint(len(self))
++                print(traceback.format_exc())
++        else:
++            raise RuntimeError(
++                f"Failed to load a valid sample after {MAX_GETITEM_ATTEMPT} attempts "
++                f"for index {idx}."
++            ) from last_exception
++
++        # Get data from lerobot, organized in nested dict
++        sample = {
++            "idx": sample_idx,
++            "task": lerobot_sample["task"],
++            "action": {},
++            "state": {},
++            "images": {},
++        }
++        for meta in self.state_meta:
++            sample["state"][meta["key"]] = self._get_state(meta, lerobot_sample)
++
++        for meta in self.action_meta:
++            sample["action"][meta["key"]] = self._get_action(meta, lerobot_sample)
++
++        for meta in self.image_meta:
++            sample["images"][meta["key"]] = self._get_image(meta, lerobot_sample)
++
++        sample["action_is_pad"] = lerobot_sample[f"{self.action_meta[0]['lerobot_key']}_is_pad"]
++        sample["state_is_pad"] = lerobot_sample[f"{self.state_meta[0]['lerobot_key']}_is_pad"]
++        sample["image_is_pad"] = lerobot_sample[f"{self.image_meta[0]['lerobot_key']}_is_pad"]
++
++        sample = self._get_additional_data(sample, lerobot_sample)
++
++        for key in lerobot_sample:
++            if key not in sample and "observation" not in key and "action" not in key:
++                sample[key] = lerobot_sample[key]
++
++        # Preprocess the sample using the processor
++        # for quick data loading
++        if self.processor is not None:
++            sample = self.processor.preprocess(sample)
++
++        return sample
++
++    def set_processor(self, processor: BaseProcessor):
++        """Set processor instance from external initialization."""
++        self.processor = processor
++        if self.is_training_set:
++            self.processor.train()
++        else:
++            self.processor.eval()
++        return self
++
++    def get_dataset_stats(self, preprocessor: BaseProcessor):
++        state_min = DefaultDict(list)
++        state_max = DefaultDict(list)
++        state_mean = DefaultDict(list)
++        state_var = DefaultDict(list)
++        state_q01 = DefaultDict(list)
++        state_q99 = DefaultDict(list)
++
++        action_min = DefaultDict(list)
++        action_max = DefaultDict(list)
++        action_mean = DefaultDict(list)
++        action_var = DefaultDict(list)
++        action_q01 = DefaultDict(list)
++        action_q99 = DefaultDict(list)
++
++        episodes_num = self.multi_dataset.num_episodes
++
++        def process_episode(episode_idx):
++            batch = self._get_episode_data(episode_idx)
++            batch = preprocessor.action_state_transform(batch)
++            return batch
++
++        multi_thread = True
++        if not multi_thread:
++            for episode_idx in tqdm(range(episodes_num), desc="Iterating dataset to get normalization"):
++                batch = process_episode(episode_idx)
++                for meta in self.state_meta:
++                    key = meta["key"]
++                    cur_state: torch.Tensor = batch["state"][key] # (B, T, dim)
++                    state_min[key].append(cur_state.amin(0))
++                    state_max[key].append(cur_state.amax(0))
++                    state_mean[key].append(cur_state.mean(0))
++                    state_var[key].append(cur_state.var(0))
++                    state_q01[key].append(torch.quantile(cur_state, 0.01, dim=0, keepdim=False))
++                    state_q99[key].append(torch.quantile(cur_state, 0.99, dim=0, keepdim=False))
++                for meta in self.action_meta:
++                    key = meta["key"]
++                    cur_action: torch.Tensor = batch["action"][key] # (B, T, dim)
++                    action_min[key].append(cur_action.amin(0))
++                    action_max[key].append(cur_action.amax(0))
++                    action_mean[key].append(cur_action.mean(0))
++                    action_var[key].append(cur_action.var(0))
++                    action_q01[key].append(torch.quantile(cur_action, 0.01, dim=0, keepdim=False))
++                    action_q99[key].append(torch.quantile(cur_action, 0.99, dim=0, keepdim=False))
++
++        else:
++            with ThreadPoolExecutor() as executor:
++                futures = [executor.submit(process_episode, num) for num in range(episodes_num)]
++
++                for future in tqdm(as_completed(futures), total=episodes_num, desc="Iterating dataset to get normalization"):
++                    try:
++                        batch = future.result()
++                        for meta in self.state_meta:
++                            key = meta["key"]
++                            cur_state: torch.Tensor = batch["state"][key] # (B, T, dim)
++                            state_min[key].append(cur_state.amin(0))
++                            state_max[key].append(cur_state.amax(0))
++                            state_mean[key].append(cur_state.mean(0))
++                            state_var[key].append(cur_state.var(0))
++                            state_q01[key].append(torch.quantile(cur_state, 0.01, dim=0, keepdim=False))
++                            state_q99[key].append(torch.quantile(cur_state, 0.99, dim=0, keepdim=False))
++
++                        for meta in self.action_meta:
++                            key = meta["key"]
++                            cur_action: torch.Tensor = batch["action"][key] # (B, T, dim)
++                            action_min[key].append(cur_action.amin(0))
++                            action_max[key].append(cur_action.amax(0))
++                            action_mean[key].append(cur_action.mean(0))
++                            action_var[key].append(cur_action.var(0))
++                            action_q01[key].append(torch.quantile(cur_action, 0.01, dim=0, keepdim=False))
++                            action_q99[key].append(torch.quantile(cur_action, 0.99, dim=0, keepdim=False))
++
++                    except Exception as e:
++                        logger.error(f"Error processing episode: {e}")
++                        print(traceback.format_exc())
++                        raise e
++
++        # assume that each minibatch has equal number of samples
++        def get_mean_std(means, vars):
++            means = torch.stack(means)
++            vars = torch.stack(vars)
++            stepwise_mean = means.mean(0)
++            stepwise_std = (vars + (means - stepwise_mean) ** 2).mean(0).sqrt()
++            global_mean = means.mean((0, 1))
++            global_std = (vars + (means - global_mean) ** 2).mean((0, 1)).sqrt()
++            return stepwise_mean, stepwise_std, global_mean, global_std
++
++        stats = {"state": DefaultDict(dict), "action": DefaultDict(dict), "num_episodes": episodes_num, "num_transition": self.multi_dataset.num_frames}
++        for meta in self.state_meta:
++            key = meta["key"]
++            stats["state"][key]["stepwise_min"] = torch.stack(state_min[key]).amin(0)
++            stats["state"][key]["stepwise_max"] = torch.stack(state_max[key]).amax(0)
++            stats["state"][key]["global_min"] = stats["state"][key]["stepwise_min"].amin(0)
++            stats["state"][key]["global_max"] = stats["state"][key]["stepwise_max"].amax(0)
++            stats["state"][key]["stepwise_q01"] = torch.stack(state_q01[key]).amin(0)
++            stats["state"][key]["stepwise_q99"] = torch.stack(state_q99[key]).amax(0)
++            stats["state"][key]["global_q01"] = stats["state"][key]["stepwise_q01"].amin(0)
++            stats["state"][key]["global_q99"] = stats["state"][key]["stepwise_q99"].amax(0)
++            (
++                stats["state"][key]["stepwise_mean"],
++                stats["state"][key]["stepwise_std"],
++                stats["state"][key]["global_mean"],
++                stats["state"][key]["global_std"],
++            ) = get_mean_std(state_mean[key], state_var[key])
++
++        for meta in self.action_meta:
++            key = meta["key"]
++            stats["action"][key]["stepwise_min"] = torch.stack(action_min[key]).amin(0)
++            stats["action"][key]["stepwise_max"] = torch.stack(action_max[key]).amax(0)
++            stats["action"][key]["global_min"] = stats["action"][key]["stepwise_min"].amin(0)
++            stats["action"][key]["global_max"] = stats["action"][key]["stepwise_max"].amax(0)
++            stats["action"][key]["stepwise_q01"] = torch.stack(action_q01[key]).amin(0)
++            stats["action"][key]["stepwise_q99"] = torch.stack(action_q99[key]).amax(0)
++            stats["action"][key]["global_q01"] = stats["action"][key]["stepwise_q01"].amin(0)
++            stats["action"][key]["global_q99"] = stats["action"][key]["stepwise_q99"].amax(0)
++            (
++                stats["action"][key]["stepwise_mean"],
++                stats["action"][key]["stepwise_std"],
++                stats["action"][key]["global_mean"],
++                stats["action"][key]["global_std"],
++            ) = get_mean_std(action_mean[key], action_var[key])
++
++        return stats
++
++
++def sliding_window_with_replication(x: torch.Tensor, window_size: int) -> torch.Tensor:
++    """
++    Construct a sliding-window tensor from the input tensor x (shape: [N, D]).
++    The output shape is [N, window_size, D].
++
++    For each starting index i:
++        out[i, j, :] =
++            x[i + j, :]      if i + j < N
++            x[-1, :]         otherwise (replicate the last row when out of bounds)
++
++    Args:
++        x (torch.Tensor): Input tensor of shape [N, D]
++        window_size (int): Size of the sliding window
++
++    Returns:
++        torch.Tensor: Tensor of shape [N, window_size, D]
++    """
++    assert x.dim() == 2
++    assert window_size > 0
++
++    N, D = x.shape
++
++    # shape [N, window_size]
++    # indices[i, j] = i + j
++    i_indices = torch.arange(N).unsqueeze(1)            # [N, 1]
++    j_indices = torch.arange(window_size).unsqueeze(0)  # [1, window_size]
++    indices = i_indices + j_indices                     # [N, window_size]
++
++    # N-1
++    # torch.clamp  [0, N-1]
++    clamped_indices = torch.clamp(indices, min=0, max=N - 1)
++
++    # clamped_indices [N, window_size]，x [N, D]
++    # out[i, j, :] = x[clamped_indices[i, j], :]
++    out = x[clamped_indices]  # [N, window_size, D]
++
++    return out
+diff --git a/third_party/FastWAM/src/fastwam/datasets/lerobot/robot_video_dataset.py b/third_party/FastWAM/src/fastwam/datasets/lerobot/robot_video_dataset.py
+index 8f56161..77d445c 100644
+--- a/third_party/FastWAM/src/fastwam/datasets/lerobot/robot_video_dataset.py
++++ b/third_party/FastWAM/src/fastwam/datasets/lerobot/robot_video_dataset.py
+@@ -1,15 +1,17 @@
+ import glob
+ import hashlib
+ import importlib.util
+ import json
++import math
+ import os
++from numbers import Integral, Real
+ from pathlib import Path
+ from typing import Optional
+ import numpy as np
+ import traceback
+ import torch
+ import torchvision.transforms.functional as transforms_F
+ 
+ from omegaconf import DictConfig, OmegaConf
+ 
+ from hydra.utils import instantiate
+@@ -20,20 +22,56 @@ from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Norm
+ from fastwam.utils.logging_config import get_logger
+ from accelerate import PartialState
+ logger = get_logger(__name__)
+ 
+ 
+ DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
+ 
+ _SEMANTIC_PLAN_UTILS = None
+ 
+ 
++def _normalize_positive_integral(value, *, name: str) -> int:
++    if isinstance(value, bool) or not isinstance(value, Integral):
++        raise TypeError(f"{name} must be a non-bool integer, got {value!r}")
++    value = int(value)
++    if value <= 0:
++        raise ValueError(f"{name} must be positive, got {value}")
++    return value
++
++
++def _normalize_positive_fps(value, *, name: str) -> float:
++    if isinstance(value, bool) or not isinstance(value, Real):
++        raise TypeError(f"{name} must be a real number, got {value!r}")
++    value = float(value)
++    if value <= 0 or not math.isfinite(value):
++        raise ValueError(f"{name} must be positive and finite, got {value}")
++    return value
++
++
++def compute_effective_video_fps(
++    *,
++    raw_fps: float,
++    global_sample_stride: int,
++    action_video_freq_ratio: int,
++) -> float:
++    raw_fps = _normalize_positive_fps(raw_fps, name="raw_fps")
++    global_sample_stride = _normalize_positive_integral(
++        global_sample_stride,
++        name="global_sample_stride",
++    )
++    action_video_freq_ratio = _normalize_positive_integral(
++        action_video_freq_ratio,
++        name="action_video_freq_ratio",
++    )
++    return raw_fps / (global_sample_stride * action_video_freq_ratio)
++
++
+ def _get_work_dir():
+     """Use FastWAM's registered work dir without requiring its S3 dependency."""
+     try:
+         from fastwam.utils import misc
+     except ModuleNotFoundError as error:
+         if error.name != "boto3":
+             raise
+         work_dir = os.environ.get("FASTWAM_WORK_DIR") or "./runs"
+         Path(work_dir).mkdir(parents=True, exist_ok=True)
+         return work_dir
+@@ -105,40 +143,65 @@ class RobotVideoDataset(torch.utils.data.Dataset):
+         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+         frame_cache_dir: Optional[str] = None, # pre-decoded frame cache dir; None = decode mp4 at runtime (back-compatible)
+         condition_frame_augmentation: Optional[dict] = None,
+         video_augmentation: Optional[dict] = None,
+         semantic_plan_dir: Optional[str] = None,
+         semantic_plan_manifest: Optional[str] = None,
+         semantic_plan_dim: int = 1152,
+         semantic_plan_max_tokens: int = 0,
+         semantic_plan_default_to_zero: bool = False,
+     ):
++        global_sample_stride = _normalize_positive_integral(
++            global_sample_stride,
++            name="global_sample_stride",
++        )
++        action_video_freq_ratio = _normalize_positive_integral(
++            action_video_freq_ratio,
++            name="action_video_freq_ratio",
++        )
++
+         # Set the pre-decoded frame cache dir for this process/worker. This must run
+         # before any video decode. The FASTWAM_FRAME_CACHE_DIR env var also works
+         # standalone; an explicit arg here overrides it. Passing None leaves whatever
+         # the env var set (so env-only usage stays back-compatible).
+         if frame_cache_dir is not None:
+             set_frame_cache_dir(frame_cache_dir)
+         self.frame_cache_dir = frame_cache_dir
+ 
+         self.lerobot_dataset = BaseLerobotDataset(
+             dataset_dirs=dataset_dirs,
+             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
+             obs_size=num_frames,
+             action_size=num_frames - 1,
+             val_set_proportion=val_set_proportion,
+             is_training_set=is_training_set,
+             global_sample_stride=global_sample_stride,
+         )
+     
+         self.num_frames = num_frames
++        self.global_sample_stride = global_sample_stride
+         self.action_video_freq_ratio = action_video_freq_ratio
++        raw_fps = getattr(self.lerobot_dataset, "fps", None)
++        if raw_fps is None:
++            logger.warning(
++                "BaseLerobotDataset does not expose `fps`; sampled video "
++                "timing is unavailable and `video_fps` will be omitted."
++            )
++        self.video_fps = (
++            None
++            if raw_fps is None
++            else compute_effective_video_fps(
++                raw_fps=raw_fps,
++                global_sample_stride=self.global_sample_stride,
++                action_video_freq_ratio=self.action_video_freq_ratio,
++            )
++        )
+         
+         assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
+             f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
+         assert ((num_frames - 1) // self.action_video_freq_ratio) % 4 == 0, \
+             f"video frames must be divisible by 4 for tokenization, got {(num_frames - 1) // self.action_video_freq_ratio}"
+         self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio))
+ 
+         self.camera_key = camera_key
+         self.lerobot_dataset._set_return_images(True)
+ 
+@@ -443,20 +506,22 @@ class RobotVideoDataset(torch.utils.data.Dataset):
+             "action": action,
+             "proprio": proprio,
+             "prompt": instruction,
+             "instruction": str(task),
+             "context": context,
+             "context_mask": context_mask,
+             "image_is_pad": image_is_pad,
+             "action_is_pad": sample["action_is_pad"],
+             "proprio_is_pad": sample["proprio_is_pad"],
+         }
++        if self.video_fps is not None:
++            data["video_fps"] = torch.tensor(self.video_fps, dtype=torch.float32)
+         self._attach_semantic_plan(data, semantic_record, sample_idx)
+         return data
+ 
+     def _get_cached_text_context(self, prompt: str):
+         if self.text_embedding_cache_dir is None:
+             raise ValueError("text_embedding_cache_dir is not set.")
+         cache_dir = self.text_embedding_cache_dir
+         os.makedirs(cache_dir, exist_ok=True)
+         hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+         cache_path = os.path.join(cache_dir, f"{hashed}.t5_len{self.context_len}.wan22ti2v5b.pt")
