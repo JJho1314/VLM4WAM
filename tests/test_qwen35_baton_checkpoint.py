@@ -1658,3 +1658,15 @@ def test_loader_rejects_format_v1_checkpoint_before_mutation(
         )
 
     _assert_state_equal(planner.state_dict(), before)
+
+
+def test_published_checkpoint_directory_honors_process_umask(tmp_path: Path) -> None:
+    """mkdtemp staging is 0700; the published checkpoint must not inherit that."""
+
+    previous = os.umask(0o022)
+    try:
+        checkpoint = tmp_path / "checkpoint"
+        _save_valid_checkpoint(checkpoint)
+        assert stat.S_IMODE(checkpoint.stat().st_mode) == 0o755
+    finally:
+        os.umask(previous)

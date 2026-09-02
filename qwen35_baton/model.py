@@ -21,7 +21,15 @@ _PLAN_PAD_ADAPTER_INDEX = ADDED_TOKENS.index(PLAN_PAD)
 
 
 class PlanTokenEmbeddingAdapter(nn.Module):
-    """Overlay seven trainable plan rows on a frozen resized Qwen embedding."""
+    """Overlay seven separately-owned plan rows on the resized Qwen embedding.
+
+    Constructing the adapter freezes the base embedding so that standalone use
+    (provider inference, unit tests) never touches Qwen rows. Stage-1 training
+    deliberately overrides this: ``qwen35_baton.ownership`` re-enables gradients
+    for the *full* planner, base rows included. The attribute keeps the name
+    ``frozen_base_embedding`` because it is part of the on-disk
+    ``planner.safetensors`` key contract, not because it stays frozen in training.
+    """
 
     def __init__(
         self,
@@ -52,7 +60,8 @@ class PlanTokenEmbeddingAdapter(nn.Module):
 
         frozen_base_embedding.requires_grad_(False)
         # Keep the base as a non-owning reference. BatonQwen35Planner registers it
-        # separately, while this module owns only the seven optimizer-visible rows.
+        # separately, and Stage-1 ownership later re-enables its gradients; this
+        # module owns only the seven plan rows.
         object.__setattr__(self, "_frozen_base_embedding", frozen_base_embedding)
         self.register_buffer(
             "added_token_ids",
@@ -72,7 +81,7 @@ class PlanTokenEmbeddingAdapter(nn.Module):
 
     @property
     def weight(self) -> torch.Tensor:
-        """Expose the frozen full matrix for Qwen weight-tying introspection."""
+        """Expose the full base matrix for Qwen weight-tying introspection."""
 
         weight = getattr(self.frozen_base_embedding, "weight")
         assert isinstance(weight, torch.Tensor)

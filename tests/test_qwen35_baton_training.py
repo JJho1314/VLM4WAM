@@ -20,6 +20,7 @@ import torch.nn as nn
 from qwen35_baton.cli.preflight import (
     preflight_stage1,
     require_qwen35_fast_path,
+    require_supported_python,
 )
 from qwen35_baton.cli.train_semantic_planner import (
     GroundingValidationData,
@@ -2599,3 +2600,12 @@ def test_launcher_rejects_nonpositive_gradient_accumulation(
 
     assert result.returncode == 2
     assert "GRAD_ACCUM must be positive" in result.stderr
+
+
+def test_preflight_rejects_python_older_than_3_10() -> None:
+    require_supported_python((3, 10, 0))
+    require_supported_python((3, 12, 4))
+    with pytest.raises(RuntimeError, match="requires Python 3.10"):
+        require_supported_python((3, 9, 6))
+    with pytest.raises(RuntimeError, match="requires Python 3.10"):
+        require_supported_python((3, 8, 18))

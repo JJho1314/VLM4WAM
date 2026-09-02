@@ -8,6 +8,7 @@ from dataclasses import replace
 import importlib
 import json
 from pathlib import Path
+import sys
 from typing import Any
 
 from qwen35_baton.hashing import sha256_artifact, sha256_file
@@ -218,6 +219,26 @@ def _reject_output_ancestor(output: Path, protected: Sequence[Path]) -> None:
             )
 
 
+MINIMUM_PYTHON = (3, 10)
+
+
+def require_supported_python(version: tuple[int, ...] | None = None) -> None:
+    """Fail closed before training on an interpreter the codebase cannot run on.
+
+    The package relies on 3.10+ syntax and library behaviour (``zip(strict=)``,
+    runtime ``X | Y`` unions, parenthesized context managers), which otherwise
+    surfaces as a confusing TypeError deep inside the first training step.
+    """
+
+    actual = tuple(sys.version_info[:3]) if version is None else tuple(version)
+    if actual[:2] < MINIMUM_PYTHON:
+        raise RuntimeError(
+            "qwen35_baton requires Python "
+            f"{MINIMUM_PYTHON[0]}.{MINIMUM_PYTHON[1]}+, found "
+            f"{'.'.join(str(part) for part in actual)}"
+        )
+
+
 def preflight_stage1(
     config: str | Path | Mapping[str, Any] | Any,
     *,
@@ -225,6 +246,7 @@ def preflight_stage1(
 ) -> dict[str, Any]:
     """Validate all local provenance and geometry without loading tensor weights."""
 
+    require_supported_python()
     from qwen35_baton.cli.train_semantic_planner import Stage1TrainingConfig
 
     if isinstance(config, (str, Path)):

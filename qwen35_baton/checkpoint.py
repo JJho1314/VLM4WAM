@@ -361,6 +361,14 @@ def _validate_checkpoint_hash_envelope(
     return raw_metadata, metadata, manifest
 
 
+def _umask_directory_mode() -> int:
+    """Return the directory mode a plain ``mkdir`` would produce under the umask."""
+
+    current = os.umask(0)
+    os.umask(current)
+    return 0o777 & ~current
+
+
 def _atomic_replace_from(source: Path, destination: Path) -> None:
     """Copy a staged file then atomically replace one live checkpoint entry."""
 
@@ -1184,6 +1192,9 @@ def save_baton_checkpoint(
         )
     )
     try:
+        # mkdtemp always creates 0700; publish with the process umask instead so
+        # the checkpoint is readable by the group on shared cluster storage.
+        os.chmod(staging, _umask_directory_mode())
         save_model(
             planner,
             str(staging / "planner.safetensors"),
