@@ -159,6 +159,7 @@ class Inferencer:
                 getattr(self, "val_dataset", None),
                 device=device,
                 dtype=dtype,
+                for_training=False,
             )
 
         ### Load Tokenizer

@@ -323,6 +323,7 @@ class InferenceLibero:
                 dataset=None,
                 device=device,
                 dtype=dtype,
+                for_training=False,
             )
 
         ### Load Tokenizer

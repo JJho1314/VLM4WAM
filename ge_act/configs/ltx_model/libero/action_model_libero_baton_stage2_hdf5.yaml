@@ -96,6 +96,10 @@ semantic_plan:
   feature_dim: 1024
   keyframe_indices: [0, 3, 5, 8]
   dropout: 0.15
+  # Training-only regularization of the ground-truth tokens so the action
+  # expert cannot read the future off them verbatim (Stage-3 gets predictions).
+  teacher_token_noise_std: 0.1
+  teacher_token_dropout: 0.1
   validation_mode: teacher
   validation_modes: [teacher, semantic_disabled]
 

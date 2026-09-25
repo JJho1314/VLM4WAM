@@ -108,6 +108,17 @@ def materialize_baton_config(
         semantic["qwen_tokenizer_path"] = require(
             "BATON_QWEN_TOKENIZER_PATH"
         )
+        if isinstance(semantic.get("teacher_mix"), dict):
+            # The Stage-3 mixed-in teacher is validated like the Stage-2 one.
+            semantic["siglip2_config_hash"] = require(
+                "BATON_SIGLIP2_CONFIG_HASH"
+            )
+            semantic["siglip2_artifact_hash"] = require(
+                "BATON_SIGLIP2_ARTIFACT_HASH"
+            )
+            semantic["teacher_preprocessing_hash"] = require(
+                "BATON_TEACHER_PREPROCESSING_HASH"
+            )
         semantic["qwen_processor_path"] = require(
             "BATON_QWEN_PROCESSOR_PATH"
         )

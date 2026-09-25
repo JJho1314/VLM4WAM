@@ -102,6 +102,19 @@ semantic_plan:
   feature_dim: 1024
   keyframe_indices: [0, 3, 5, 8]
   dropout: 0.15
+  # Training-only curriculum: per sample, ground-truth teacher tokens replace
+  # the planner's prediction with a probability that decays linearly from
+  # initial_probability to final_probability over decay_steps optimizer steps.
+  # Validation and inference always use pure predictions. The launcher fills
+  # the three hashes below from BATON_SIGLIP2_CONFIG_HASH,
+  # BATON_SIGLIP2_ARTIFACT_HASH and BATON_TEACHER_PREPROCESSING_HASH.
+  teacher_mix:
+    initial_probability: 0.5
+    final_probability: 0.0
+    decay_steps: 15000
+  siglip2_config_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  siglip2_artifact_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  teacher_preprocessing_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   validation_mode: prediction
   validation_modes: [prediction, semantic_disabled]
 

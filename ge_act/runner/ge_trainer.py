@@ -6,7 +6,7 @@ import stat
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, Sequence
@@ -102,6 +102,10 @@ class BatonConditioningComponents:
     source: str
     teacher: FrozenSiglip2Teacher | None
     planner: FrozenDualCameraBatonPlanner | None
+    # Stage-3 only: a frozen teacher used to mix ground-truth tokens into the
+    # predicted ones during training (see BatonTeacherMix). Never used at
+    # validation or inference.
+    mix_teacher: FrozenSiglip2Teacher | None = None
 
     def __post_init__(self) -> None:
         if self.source not in BATON_SOURCES:
@@ -111,6 +115,8 @@ class BatonConditioningComponents:
             raise ValueError("Baton teacher ownership does not match source")
         if (self.planner is not None) == expected_teacher:
             raise ValueError("Baton planner ownership does not match source")
+        if self.mix_teacher is not None and self.source != BATON_PREDICTION_SOURCE:
+            raise ValueError("teacher mixing is only valid for the prediction source")
 
 
 @dataclass(frozen=True)
@@ -279,11 +285,21 @@ def prepare_baton_conditioning(
     dataset: Any,
     device: torch.device | str,
     dtype: torch.dtype,
+    *,
+    for_training: bool = True,
 ) -> BatonConditioningComponents:
-    """Construct exactly one frozen Baton source after fail-closed validation."""
+    """Construct exactly one frozen Baton source after fail-closed validation.
+
+    ``for_training=False`` (validation-only trainers, inference, closed-loop
+    eval) skips the Stage-3 mixed-in teacher, which only exists to shape the
+    training distribution.
+    """
 
     config_mapping = _config_mapping(config)
     semantic, source = _validated_baton_semantic_config(config_mapping)
+    # Fail closed on malformed curriculum fields before loading any weights.
+    parse_baton_teacher_augmentation(semantic)
+    teacher_mix = parse_baton_teacher_mix(semantic)
     if getattr(dataset, "hindsight_cache", None) is not None:
         raise ValueError("Baton conditioning rejects hindsight cache datasets")
     target_device = torch.device(device)
@@ -318,10 +334,21 @@ def prepare_baton_conditioning(
         torch_dtype=dtype,
     )
     freeze_conditioning_modules(planner)
+    mix_teacher = None
+    if teacher_mix is not None and for_training:
+        validate_baton_siglip2_provenance(semantic)
+        mix_teacher = FrozenSiglip2Teacher(
+            semantic["siglip2_model_path"],
+            device=target_device,
+            dtype=dtype,
+            frame_microbatch_size=32,
+        )
+        freeze_conditioning_modules(mix_teacher)
     return BatonConditioningComponents(
         source=source,
         teacher=None,
         planner=planner,
+        mix_teacher=mix_teacher,
     )
 
 
@@ -375,17 +402,14 @@ def build_baton_semantic_condition(
 
     target_device = torch.device(device)
     if source == BATON_TEACHER_SOURCE:
-        if video.shape[3] < n_previous + num_future_frames:
-            raise ValueError("teacher video does not contain the full future clip")
-        future = video[:, :, :, n_previous : n_previous + num_future_frames]
-        keyframes = select_future_keyframes(
-            rearrange(future, "b c v t h w -> b v t c h w"),
-            indices=BATON_FUTURE_INDICES,
-        ).contiguous()
         if components.teacher is None:
             raise RuntimeError("Baton teacher component is missing")
-        with torch.no_grad():
-            tokens = components.teacher.encode_future(keyframes)
+        tokens = encode_baton_teacher_future(
+            components.teacher,
+            video,
+            n_previous=n_previous,
+            num_future_frames=num_future_frames,
+        )
         positions = build_patch_center_positions(
             batch_size,
             2,
@@ -448,6 +472,263 @@ def build_baton_semantic_condition(
         times=times,
         positions=positions,
     )
+
+
+def encode_baton_teacher_future(
+    teacher: Any,
+    video: torch.Tensor,
+    *,
+    n_previous: int,
+    num_future_frames: int,
+) -> torch.Tensor:
+    """Frozen SigLIP2 tokens [B,2,4,256,1024] of the four future keyframes."""
+
+    if video.shape[3] < n_previous + num_future_frames:
+        raise ValueError("teacher video does not contain the full future clip")
+    future = video[:, :, :, n_previous : n_previous + num_future_frames]
+    keyframes = select_future_keyframes(
+        rearrange(future, "b c v t h w -> b v t c h w"),
+        indices=BATON_FUTURE_INDICES,
+    ).contiguous()
+    with torch.no_grad():
+        return teacher.encode_future(keyframes)
+
+
+@dataclass(frozen=True)
+class BatonTeacherAugmentation:
+    """Stage-2 regularization of ground-truth teacher tokens (training only).
+
+    Ground-truth future features let the action expert read the future off the
+    condition verbatim; at Stage-3 that exact signal is gone. Relative Gaussian
+    noise and whole-token dropout keep the policy from over-trusting it.
+    """
+
+    noise_std: float = 0.0
+    token_dropout: float = 0.0
+
+    @property
+    def active(self) -> bool:
+        return self.noise_std > 0.0 or self.token_dropout > 0.0
+
+
+@dataclass(frozen=True)
+class BatonTeacherMix:
+    """Stage-3 curriculum: per sample, use teacher tokens instead of predicted
+    ones with a probability that decays linearly from ``initial_probability`` to
+    ``final_probability`` over ``decay_steps`` optimizer steps."""
+
+    initial_probability: float
+    final_probability: float
+    decay_steps: int
+
+
+def _unit_interval_float(name: str, value: Any, *, upper_inclusive: bool) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+    ):
+        raise ValueError(f"{name} must be a finite number")
+    value = float(value)
+    if value < 0.0 or value > 1.0 or (value == 1.0 and not upper_inclusive):
+        raise ValueError(
+            f"{name} must be in [0, 1{']' if upper_inclusive else ')'}"
+        )
+    return value
+
+
+def parse_baton_teacher_augmentation(
+    semantic: Mapping[str, Any],
+) -> BatonTeacherAugmentation:
+    noise_std = semantic.get("teacher_token_noise_std", 0.0)
+    if (
+        isinstance(noise_std, bool)
+        or not isinstance(noise_std, (int, float))
+        or not math.isfinite(float(noise_std))
+        or float(noise_std) < 0.0
+    ):
+        raise ValueError(
+            "semantic_plan.teacher_token_noise_std must be a finite non-negative number"
+        )
+    token_dropout = _unit_interval_float(
+        "semantic_plan.teacher_token_dropout",
+        semantic.get("teacher_token_dropout", 0.0),
+        upper_inclusive=False,
+    )
+    augmentation = BatonTeacherAugmentation(
+        noise_std=float(noise_std),
+        token_dropout=token_dropout,
+    )
+    if augmentation.active and semantic.get("source") != BATON_TEACHER_SOURCE:
+        raise ValueError(
+            "teacher token augmentation applies only to qwen35_baton_teacher"
+        )
+    return augmentation
+
+
+def parse_baton_teacher_mix(semantic: Mapping[str, Any]) -> BatonTeacherMix | None:
+    raw = semantic.get("teacher_mix")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError("semantic_plan.teacher_mix must be a mapping")
+    if semantic.get("source") != BATON_PREDICTION_SOURCE:
+        raise ValueError(
+            "semantic_plan.teacher_mix applies only to qwen35_baton_prediction"
+        )
+    unknown = set(raw) - {"initial_probability", "final_probability", "decay_steps"}
+    if unknown:
+        raise ValueError(
+            f"semantic_plan.teacher_mix has unknown fields: {sorted(unknown)}"
+        )
+    initial = _unit_interval_float(
+        "teacher_mix.initial_probability",
+        raw.get("initial_probability"),
+        upper_inclusive=True,
+    )
+    final = _unit_interval_float(
+        "teacher_mix.final_probability",
+        raw.get("final_probability", 0.0),
+        upper_inclusive=True,
+    )
+    decay_steps = raw.get("decay_steps")
+    if isinstance(decay_steps, bool) or type(decay_steps) is not int or decay_steps <= 0:
+        raise ValueError("teacher_mix.decay_steps must be a positive integer")
+    for field in (
+        "siglip2_config_hash",
+        "siglip2_artifact_hash",
+        "teacher_preprocessing_hash",
+    ):
+        if not isinstance(semantic.get(field), str) or not semantic[field].strip():
+            raise ValueError(
+                f"teacher_mix requires semantic_plan.{field} for the mixed-in teacher"
+            )
+    return BatonTeacherMix(
+        initial_probability=initial,
+        final_probability=final,
+        decay_steps=decay_steps,
+    )
+
+
+def teacher_mix_probability(mix: BatonTeacherMix, global_step: int) -> float:
+    if isinstance(global_step, bool) or type(global_step) is not int or global_step < 0:
+        raise ValueError("global_step must be a non-negative integer")
+    fraction = min(1.0, global_step / mix.decay_steps)
+    return mix.initial_probability + (
+        mix.final_probability - mix.initial_probability
+    ) * fraction
+
+
+def augment_teacher_tokens(
+    tokens: torch.Tensor,
+    *,
+    noise_std: float = 0.0,
+    token_dropout: float = 0.0,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Noise (relative to the global feature scale) and whole-token dropout."""
+
+    if (
+        not isinstance(tokens, torch.Tensor)
+        or tokens.ndim != 5
+        or not tokens.dtype.is_floating_point
+    ):
+        raise ValueError("teacher tokens must be floating [B,V,F,P,D]")
+    if noise_std < 0.0 or not 0.0 <= token_dropout < 1.0:
+        raise ValueError("noise_std must be >= 0 and token_dropout in [0, 1)")
+    out = tokens
+    if noise_std > 0.0:
+        scale = tokens.detach().float().std().clamp_min(1e-6)
+        noise = torch.randn(
+            tokens.shape,
+            device=tokens.device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        out = (out.float() + noise_std * scale * noise).to(dtype=tokens.dtype)
+    if token_dropout > 0.0:
+        keep = (
+            torch.rand(tokens.shape[:-1], device=tokens.device, generator=generator)
+            >= token_dropout
+        )
+        out = out * keep.unsqueeze(-1).to(dtype=out.dtype)
+    return out
+
+
+def mix_teacher_and_predicted_tokens(
+    predicted: torch.Tensor,
+    teacher: torch.Tensor,
+    probability: float,
+    *,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-sample selection of teacher tokens; returns (tokens, used_teacher[B])."""
+
+    if not isinstance(predicted, torch.Tensor) or not isinstance(teacher, torch.Tensor):
+        raise TypeError("predicted and teacher tokens must be tensors")
+    if predicted.shape != teacher.shape or predicted.ndim != 5:
+        raise ValueError("predicted and teacher tokens must share [B,V,F,P,D] shape")
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("probability must be in [0, 1]")
+    use_teacher = (
+        torch.rand(predicted.shape[0], device=predicted.device, generator=generator)
+        < probability
+    )
+    select = use_teacher.view(-1, *([1] * (predicted.ndim - 1)))
+    tokens = torch.where(
+        select,
+        teacher.to(device=predicted.device, dtype=predicted.dtype),
+        predicted,
+    )
+    return tokens, use_teacher
+
+
+def apply_baton_training_curriculum(
+    components: BatonConditioningComponents,
+    semantic_config: Mapping[str, Any],
+    condition: BatonSemanticCondition,
+    video: torch.Tensor,
+    *,
+    n_previous: int,
+    num_future_frames: int,
+    global_step: int,
+) -> tuple[BatonSemanticCondition, dict[str, float]]:
+    """Training-only token shaping: Stage-2 augmentation or Stage-3 teacher mixing."""
+
+    semantic = semantic_config.get("semantic_plan", semantic_config)
+    logs: dict[str, float] = {}
+    if components.source == BATON_TEACHER_SOURCE:
+        augmentation = parse_baton_teacher_augmentation(semantic)
+        if not augmentation.active:
+            return condition, logs
+        tokens = augment_teacher_tokens(
+            condition.tokens,
+            noise_std=augmentation.noise_std,
+            token_dropout=augmentation.token_dropout,
+        )
+        logs["baton/teacher_token_noise_std"] = augmentation.noise_std
+        logs["baton/teacher_token_dropout"] = augmentation.token_dropout
+        return dataclass_replace(condition, tokens=tokens), logs
+    if components.mix_teacher is None:
+        return condition, logs
+    mix = parse_baton_teacher_mix(semantic)
+    if mix is None:
+        raise RuntimeError("mix teacher present without a teacher_mix config")
+    probability = teacher_mix_probability(mix, global_step)
+    teacher_tokens = encode_baton_teacher_future(
+        components.mix_teacher,
+        video,
+        n_previous=n_previous,
+        num_future_frames=num_future_frames,
+    )
+    tokens, used_teacher = mix_teacher_and_predicted_tokens(
+        condition.tokens,
+        teacher_tokens,
+        probability,
+    )
+    logs["baton/teacher_mix_probability"] = probability
+    logs["baton/teacher_mix_fraction"] = float(used_teacher.float().mean().item())
+    return dataclass_replace(condition, tokens=tokens.detach()), logs
 
 
 def apply_baton_validation_mode(
@@ -3184,6 +3465,18 @@ class Trainer:
                             device=accelerator.device,
                             dtype=weight_dtype,
                         )
+                        baton_condition, baton_curriculum_logs = (
+                            apply_baton_training_curriculum(
+                                self.baton_components,
+                                self.args.semantic_plan,
+                                baton_condition,
+                                baton_video,
+                                n_previous=mem_size,
+                                num_future_frames=raw_frames,
+                                global_step=global_step,
+                            )
+                        )
+                        self._baton_curriculum_logs = baton_curriculum_logs
                         semantic_plan = baton_condition.tokens
                         semantic_plan_times = baton_condition.times
                         semantic_plan_positions = baton_condition.positions
@@ -3477,6 +3770,7 @@ class Trainer:
                         f"{train_mode_label}/action"
                     ] = loss_action.detach().item()
                 progress_bar.set_postfix(logs)
+                logs.update(getattr(self, "_baton_curriculum_logs", None) or {})
                 accelerator.log(logs, step=global_step)
 
                 if global_step >= self.state.train_steps:

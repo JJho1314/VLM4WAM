@@ -52,9 +52,17 @@ from runner import ge_inferencer as ge_inferencer_module  # noqa: E402
 from runner import ge_trainer as ge_trainer_module  # noqa: E402
 from runner.ge_trainer import (  # noqa: E402
     BatonConditioningComponents,
+    BatonSemanticCondition,
+    BatonTeacherMix,
     Trainer,
     TrainingCursor,
+    apply_baton_training_curriculum,
+    augment_teacher_tokens,
     build_baton_semantic_condition,
+    mix_teacher_and_predicted_tokens,
+    parse_baton_teacher_augmentation,
+    parse_baton_teacher_mix,
+    teacher_mix_probability,
     build_optimizer_parameter_groups,
     forward_baton_ge_act,
     load_baton_training_checkpoint,
@@ -981,6 +989,17 @@ def test_baton_recipe_matches_approved_training_contract(
     assert config["diffusion_model"]["config"]["action_out_channels"] == 15
     for split in ("train", "val"):
         assert config["data"][split]["pack_action_state"] is True
+    curriculum = config["semantic_plan"]
+    if source == "qwen35_baton_teacher":
+        augmentation = parse_baton_teacher_augmentation(curriculum)
+        assert augmentation.active
+        assert "teacher_mix" not in curriculum
+    else:
+        mix = parse_baton_teacher_mix(curriculum)
+        assert mix is not None
+        assert mix.initial_probability > mix.final_probability
+        assert mix.decay_steps < steps
+        assert parse_baton_teacher_augmentation(curriculum).active is False
     assert config["train_steps"] == steps
     assert config["steps_to_save"] == 5_000
     assert config["lr"] == 2e-5
@@ -1245,6 +1264,9 @@ def _materialization_environment(source: str) -> dict[str, str]:
         "BATON_QWEN_TOKENIZER_PATH": "/resolved/qwen",
         "BATON_QWEN_PROCESSOR_PATH": "/resolved/qwen",
         "BATON_SIGLIP2_MODEL_PATH": "/resolved/siglip2",
+        "BATON_SIGLIP2_CONFIG_HASH": "1" * 64,
+        "BATON_SIGLIP2_ARTIFACT_HASH": "2" * 64,
+        "BATON_TEACHER_PREPROCESSING_HASH": "2" * 64,
     }
 
 
@@ -2483,3 +2505,220 @@ def test_paired_validation_reuses_batch_condition_noise_timesteps_and_actions(
         disabled["semantic_condition_mask"],
         torch.zeros(2),
     )
+
+
+def _teacher_semantic(**extra) -> dict[str, Any]:
+    semantic = _semantic_config("qwen35_baton_teacher")["semantic_plan"]
+    semantic.update(extra)
+    return semantic
+
+
+def _prediction_semantic(**extra) -> dict[str, Any]:
+    semantic = _semantic_config("qwen35_baton_prediction")["semantic_plan"]
+    semantic.update(extra)
+    return semantic
+
+
+def test_teacher_augmentation_parses_defaults_and_rejects_bad_values() -> None:
+    assert parse_baton_teacher_augmentation(_teacher_semantic()).active is False
+    parsed = parse_baton_teacher_augmentation(
+        _teacher_semantic(teacher_token_noise_std=0.1, teacher_token_dropout=0.2)
+    )
+    assert (parsed.noise_std, parsed.token_dropout) == (0.1, 0.2)
+    for bad in (
+        {"teacher_token_noise_std": -0.1},
+        {"teacher_token_noise_std": True},
+        {"teacher_token_dropout": 1.0},
+        {"teacher_token_dropout": "0.1"},
+    ):
+        with pytest.raises(ValueError):
+            parse_baton_teacher_augmentation(_teacher_semantic(**bad))
+    with pytest.raises(ValueError, match="only to qwen35_baton_teacher"):
+        parse_baton_teacher_augmentation(
+            _prediction_semantic(teacher_token_noise_std=0.1)
+        )
+
+
+def test_teacher_mix_parses_schedule_and_requires_teacher_hashes() -> None:
+    assert parse_baton_teacher_mix(_prediction_semantic()) is None
+    hashes = {
+        "siglip2_config_hash": "1" * 64,
+        "siglip2_artifact_hash": "2" * 64,
+        "teacher_preprocessing_hash": "2" * 64,
+    }
+    mix = parse_baton_teacher_mix(
+        _prediction_semantic(
+            teacher_mix={"initial_probability": 0.5, "decay_steps": 100},
+            **hashes,
+        )
+    )
+    assert mix == BatonTeacherMix(0.5, 0.0, 100)
+    assert teacher_mix_probability(mix, 0) == 0.5
+    assert teacher_mix_probability(mix, 50) == pytest.approx(0.25)
+    assert teacher_mix_probability(mix, 100) == 0.0
+    assert teacher_mix_probability(mix, 10_000) == 0.0
+    with pytest.raises(ValueError, match="requires semantic_plan.siglip2_config_hash"):
+        parse_baton_teacher_mix(
+            _prediction_semantic(teacher_mix={"initial_probability": 0.5, "decay_steps": 10})
+        )
+    for bad in (
+        {"initial_probability": 1.5, "decay_steps": 10},
+        {"initial_probability": 0.5, "decay_steps": 0},
+        {"initial_probability": 0.5, "decay_steps": 10, "extra": 1},
+        "half",
+    ):
+        with pytest.raises(ValueError):
+            parse_baton_teacher_mix(_prediction_semantic(teacher_mix=bad, **hashes))
+    with pytest.raises(ValueError, match="only to qwen35_baton_prediction"):
+        parse_baton_teacher_mix(
+            _teacher_semantic(teacher_mix={"initial_probability": 0.5, "decay_steps": 10})
+        )
+
+
+def test_augment_teacher_tokens_perturbs_only_when_configured() -> None:
+    tokens = torch.randn(2, 2, 4, 8, 16)
+    torch.testing.assert_close(augment_teacher_tokens(tokens), tokens)
+    generator = torch.Generator().manual_seed(0)
+    noised = augment_teacher_tokens(tokens, noise_std=0.1, generator=generator)
+    assert noised.shape == tokens.shape and noised.dtype == tokens.dtype
+    assert not torch.equal(noised, tokens)
+    assert (noised - tokens).abs().mean() < 0.3 * tokens.abs().mean()
+    generator = torch.Generator().manual_seed(0)
+    dropped = augment_teacher_tokens(tokens, token_dropout=0.5, generator=generator)
+    zero_tokens = (dropped.abs().sum(dim=-1) == 0).float().mean().item()
+    assert 0.3 < zero_tokens < 0.7
+    kept = dropped.abs().sum(dim=-1) != 0
+    torch.testing.assert_close(dropped[kept], tokens[kept])
+    with pytest.raises(ValueError):
+        augment_teacher_tokens(tokens, token_dropout=1.0)
+    with pytest.raises(ValueError):
+        augment_teacher_tokens(tokens[0], noise_std=0.1)
+
+
+def test_mix_teacher_and_predicted_tokens_selects_per_sample() -> None:
+    predicted = torch.zeros(6, 2, 4, 8, 16)
+    teacher = torch.ones(6, 2, 4, 8, 16)
+    tokens, used = mix_teacher_and_predicted_tokens(predicted, teacher, 0.0)
+    assert not used.any() and torch.equal(tokens, predicted)
+    tokens, used = mix_teacher_and_predicted_tokens(predicted, teacher, 1.0)
+    assert used.all() and torch.equal(tokens, teacher)
+    generator = torch.Generator().manual_seed(1)
+    tokens, used = mix_teacher_and_predicted_tokens(
+        predicted, teacher, 0.5, generator=generator
+    )
+    per_sample = tokens.flatten(1).mean(dim=1)
+    torch.testing.assert_close(per_sample, used.float())
+    with pytest.raises(ValueError):
+        mix_teacher_and_predicted_tokens(predicted, teacher[:3], 0.5)
+
+
+def test_components_reject_mix_teacher_for_teacher_source() -> None:
+    teacher = SimpleNamespace(model=torch.nn.Linear(1, 1))
+    with pytest.raises(ValueError, match="only valid for the prediction source"):
+        BatonConditioningComponents(
+            source="qwen35_baton_teacher",
+            teacher=teacher,
+            planner=None,
+            mix_teacher=teacher,
+        )
+
+
+class _ConstantTeacher:
+    def __init__(self, value: float) -> None:
+        self.value = value
+        self.calls = 0
+
+    def encode_future(self, keyframes: torch.Tensor) -> torch.Tensor:
+        self.calls += 1
+        batch_size, camera_count = keyframes.shape[:2]
+        return torch.full((batch_size, camera_count, 4, 256, 1024), self.value)
+
+
+def _condition(batch_size: int, value: float) -> BatonSemanticCondition:
+    tokens = torch.full((batch_size, 2, 4, 256, 1024), value)
+    return BatonSemanticCondition(
+        tokens=tokens,
+        times=torch.zeros(batch_size * 2, 4),
+        positions=build_patch_center_positions(batch_size, 2, 4),
+    )
+
+
+def test_training_curriculum_mixes_teacher_tokens_by_schedule() -> None:
+    teacher = _ConstantTeacher(1.0)
+    components = BatonConditioningComponents(
+        source="qwen35_baton_prediction",
+        teacher=None,
+        planner=SimpleNamespace(model=torch.nn.Linear(1, 1)),
+        mix_teacher=teacher,
+    )
+    semantic = _prediction_semantic(
+        teacher_mix={"initial_probability": 1.0, "final_probability": 0.0, "decay_steps": 10},
+        siglip2_config_hash="1" * 64,
+        siglip2_artifact_hash="2" * 64,
+        teacher_preprocessing_hash="2" * 64,
+    )
+    video = torch.zeros(3, 3, 2, 13, 8, 8)
+    mixed, logs = apply_baton_training_curriculum(
+        components, {"semantic_plan": semantic}, _condition(3, 0.0), video,
+        n_previous=4, num_future_frames=9, global_step=0,
+    )
+    assert logs["baton/teacher_mix_probability"] == 1.0
+    assert logs["baton/teacher_mix_fraction"] == 1.0
+    assert torch.equal(mixed.tokens, torch.ones_like(mixed.tokens))
+    finished, logs = apply_baton_training_curriculum(
+        components, {"semantic_plan": semantic}, _condition(3, 0.0), video,
+        n_previous=4, num_future_frames=9, global_step=10,
+    )
+    assert logs["baton/teacher_mix_probability"] == 0.0
+    assert torch.equal(finished.tokens, torch.zeros_like(finished.tokens))
+    assert teacher.calls == 2
+
+
+def test_training_curriculum_is_identity_without_config() -> None:
+    components = BatonConditioningComponents(
+        source="qwen35_baton_prediction",
+        teacher=None,
+        planner=SimpleNamespace(model=torch.nn.Linear(1, 1)),
+    )
+    condition = _condition(2, 0.5)
+    same, logs = apply_baton_training_curriculum(
+        components, {"semantic_plan": _prediction_semantic()}, condition,
+        torch.zeros(2, 3, 2, 13, 8, 8), n_previous=4, num_future_frames=9, global_step=3,
+    )
+    assert same is condition and logs == {}
+    teacher_components = BatonConditioningComponents(
+        source="qwen35_baton_teacher",
+        teacher=_ConstantTeacher(1.0),
+        planner=None,
+    )
+    same, logs = apply_baton_training_curriculum(
+        teacher_components, {"semantic_plan": _teacher_semantic()}, condition,
+        torch.zeros(2, 3, 2, 13, 8, 8), n_previous=4, num_future_frames=9, global_step=3,
+    )
+    assert same is condition and logs == {}
+    noised, logs = apply_baton_training_curriculum(
+        teacher_components,
+        {"semantic_plan": _teacher_semantic(teacher_token_noise_std=0.05)},
+        condition, torch.zeros(2, 3, 2, 13, 8, 8),
+        n_previous=4, num_future_frames=9, global_step=3,
+    )
+    assert logs["baton/teacher_token_noise_std"] == 0.05
+    assert not torch.equal(noised.tokens, condition.tokens)
+
+
+def test_materializer_injects_teacher_hashes_for_stage3_teacher_mix() -> None:
+    template = _load_config(STAGE3_CONFIG)
+    assert isinstance(template["semantic_plan"].get("teacher_mix"), dict)
+    environment = _materialization_environment("qwen35_baton_prediction")
+    resolved = materialize_baton_config(template, environment)
+    assert resolved["semantic_plan"]["siglip2_config_hash"] == "1" * 64
+    assert resolved["semantic_plan"]["teacher_preprocessing_hash"] == "2" * 64
+    for missing in (
+        "BATON_SIGLIP2_CONFIG_HASH",
+        "BATON_SIGLIP2_ARTIFACT_HASH",
+        "BATON_TEACHER_PREPROCESSING_HASH",
+    ):
+        partial = dict(environment)
+        del partial[missing]
+        with pytest.raises(ValueError, match=missing):
+            materialize_baton_config(template, partial)
