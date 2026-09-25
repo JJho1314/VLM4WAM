@@ -101,6 +101,7 @@ class LiberoFastWAMHDF5Dataset(Dataset):
         baton_sampling_algorithm: str | None = None,
         baton_sampling_version: int | None = None,
         baton_sampling_seed: int | None = None,
+        pack_action_state: bool = False,
     ) -> None:
         self._validate_fixed_arguments(
             source_fps=source_fps,
@@ -118,6 +119,8 @@ class LiberoFastWAMHDF5Dataset(Dataset):
             raise ValueError("previous_pick_mode must be 'random' or 'uniform'")
         if type(train_dataset) is not bool:
             raise ValueError("train_dataset must be a bool")
+        if type(pack_action_state) is not bool:
+            raise ValueError("pack_action_state must be a bool")
         if type(max_open_shards) is not int or max_open_shards <= 0:
             raise ValueError("max_open_shards must be a positive integer")
         self._validate_fixed_indexes(fix_sidx, fix_mem_idx)
@@ -173,6 +176,7 @@ class LiberoFastWAMHDF5Dataset(Dataset):
         self.fix_mem_idx = None if fix_mem_idx is None else list(fix_mem_idx)
         self.max_open_shards = max_open_shards
         self.ignore_seek = ignore_seek
+        self.pack_action_state = pack_action_state
         self._baton_sampling_contract = (
             None
             if baton_sampling_algorithm is None
@@ -492,6 +496,16 @@ class LiberoFastWAMHDF5Dataset(Dataset):
             record.domain
         ]
         state = (state - self.state_mean[record.domain]) / self.state_std[record.domain]
+        if self.pack_action_state:
+            # Same layout as lerobot_like_dataset: action token [act(C_a); state_t(C_s)],
+            # history token [zeros(C_a); state(C_s)]. This is what the released GE-Act
+            # LIBERO checkpoints (action_in_channels=15) were trained with.
+            state_sequence_norm = (
+                state_sequence - self.state_mean[record.domain]
+            ) / self.state_std[record.domain]
+            original_action_dim = action.shape[1]
+            action = torch.cat((action, state_sequence_norm), dim=1)
+            state = torch.cat((torch.zeros([1, original_action_dim]), state), dim=1)
         return {
             "video": video,
             "actions": action,

@@ -69,6 +69,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_trails_per_task", type=int, default=50)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--threshold", type=int, default=20)
+    parser.add_argument("--semantic_mode", type=str, default="config", choices=["config", "disabled"])
     args = parser.parse_args()
 
     infer = InferenceLiberoOfficial(
@@ -76,6 +77,7 @@ if __name__ == "__main__":
         output_dir=os.path.join(args.output_dir, args.task_suite_name),
         task_suite_name=args.task_suite_name, model_path=args.ckpt_path,
         exec_step=args.exec_step, device=f"cuda:{args.device}", threshold=args.threshold,
+        semantic_mode=args.semantic_mode,
     )
     infer.prepare_models()
     infer.infer(num_trails_per_task=args.num_trails_per_task,

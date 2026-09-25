@@ -26,8 +26,10 @@ pipeline_class_path: models/pipeline/custom_pipeline.py
 pipeline_class: CustomPipeline
 
 return_action: true
-return_video: true
-train_mode: all
+# Action recipe (matches the released GE-Act LIBERO checkpoints): no video loss,
+# future latents are pure noise, proprioception packed into the action token.
+return_video: false
+train_mode: action_full
 action_loss_scale: 1.0
 
 train_steps: 30000
@@ -43,12 +45,13 @@ seed: 42
 
 enable_slicing: true
 enable_tiling: true
-add_state: false
-caption_dropout_p: 0.06
+add_state: true
+rand_init_action: true
+caption_dropout_p: 0.0
 
-# 1 sample/GPU * 8 GPUs * 16 accumulation = global batch 128.
-batch_size: 1
-gradient_accumulation_steps: 16
+# 8 samples/GPU * 8 GPUs * 2 accumulation = global batch 128.
+batch_size: 8
+gradient_accumulation_steps: 2
 dataloader_num_workers: 4
 dataloader_prefetch_factor: 2
 pin_memory: true
@@ -121,8 +124,9 @@ diffusion_model:
     patch_size_t: 1
     qk_norm: rms_norm_across_heads
     action_expert: true
-    action_in_channels: 7
-    action_out_channels: 7
+    # 7 eef actions + 8 proprioceptive state dims packed per token.
+    action_in_channels: 15
+    action_out_channels: 15
     action_num_attention_heads: 16
     action_attention_head_dim: 32
     semantic_plan_context: true
@@ -149,6 +153,7 @@ data:
     baton_sampling_seed: 42
     action_type: absolute
     action_space: eef
+    pack_action_state: true
     train_dataset: true
   val:
     manifest_path: /data/user/jhe724/junjie/datasets/LIBERO-fastwam-hdf5/manifest.json
@@ -165,11 +170,12 @@ data:
     baton_sampling_seed: 42
     action_type: absolute
     action_space: eef
+    pack_action_state: true
     train_dataset: false
 
 use_color_jitter: true
 num_inference_step: 10
-noisy_video: false
+noisy_video: true
 load_weights: true
 resume_from_checkpoint: null
 

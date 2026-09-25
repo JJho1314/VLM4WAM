@@ -969,9 +969,18 @@ def test_baton_recipe_matches_approved_training_contract(
 
     assert config["train_data_class"] == "LiberoFastWAMHDF5Dataset"
     assert config["val_data_class"] == "LiberoFastWAMHDF5Dataset"
-    assert config["return_video"] is True
+    assert config["return_video"] is False
     assert config["return_action"] is True
-    assert config["train_mode"] == "all"
+    assert config["train_mode"] == "action_full"
+    # Action recipe shared with the released GE-Act LIBERO checkpoints.
+    assert config["add_state"] is True
+    assert config["rand_init_action"] is True
+    assert config["noisy_video"] is True
+    assert config["caption_dropout_p"] == 0.0
+    assert config["diffusion_model"]["config"]["action_in_channels"] == 15
+    assert config["diffusion_model"]["config"]["action_out_channels"] == 15
+    for split in ("train", "val"):
+        assert config["data"][split]["pack_action_state"] is True
     assert config["train_steps"] == steps
     assert config["steps_to_save"] == 5_000
     assert config["lr"] == 2e-5

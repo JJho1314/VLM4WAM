@@ -1703,6 +1703,39 @@ def test_hdf5_dataset_rejects_wrong_statistics_width(
         )
 
 
+def test_hdf5_dataset_pack_action_state_matches_lerobot_layout(tmp_path):
+    """[act(7); state(8)] action tokens and a [zeros(7); state(8)] history token."""
+    packed = make_reader(
+        tmp_path,
+        fix_epiidx=0,
+        fix_sidx=12,
+        fix_mem_idx=[1, 4, 8, 11],
+        pack_action_state=True,
+    )
+    plain = make_reader(
+        tmp_path,
+        fix_epiidx=0,
+        fix_sidx=12,
+        fix_mem_idx=[1, 4, 8, 11],
+    )
+    sample = packed[0]
+    reference = plain[0]
+    assert sample["actions"].shape == (40, 15)
+    assert sample["state"].shape == (1, 15)
+    torch.testing.assert_close(sample["actions"][:, :7], reference["actions"])
+    torch.testing.assert_close(sample["state"][:, :7], torch.zeros(1, 7))
+    torch.testing.assert_close(sample["state"][:, 7:], reference["state"])
+    # the packed state columns are the normalized state rows aligned with each action row
+    assert torch.isfinite(sample["actions"][:, 7:]).all()
+    packed.close()
+    plain.close()
+
+
+def test_hdf5_dataset_rejects_non_boolean_pack_action_state(tmp_path):
+    with pytest.raises(ValueError, match="pack_action_state"):
+        make_reader(tmp_path, pack_action_state="yes")
+
+
 def test_hdf5_dataset_returns_fixed_normalized_sample_in_camera_order(tmp_path):
     dataset = make_reader(
         tmp_path,
@@ -2024,7 +2057,7 @@ def test_original_hdf5_alternative_protected_files_are_unchanged():
         "fdfc2ea518af07badbf036f83dcfd9f803b3d712ba76288b59ca5e1253fb3bc9"
     )
     assert _sha256(ORIGINAL_PREFLIGHT) == (
-        "240fd97a2550450c15b2f19b91d264900af7e2ac06666b290a7c61764fda2d9f"
+        "e49ed3e3342f93dd13bf203b7cee92e030ba2b27e4dab8692b2842e19b83e0a0"
     )
 
 

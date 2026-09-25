@@ -1,10 +1,19 @@
+# Control run for the Baton Stage-2 action recipe: identical data pipeline
+# (LiberoFastWAMHDF5Dataset, stateless Baton sampling, packed action+state),
+# identical optimizer/schedule, but NO semantic branch. Any difference between
+# this run and action_model_libero_baton_stage2_hdf5.yaml is attributable to
+# the semantic conditioning alone.
+#
+# Launch (no BATON_* materialization is needed for this config):
+#   cd ge_act && bash scripts/train.sh main.py \
+#     configs/ltx_model/libero/action_model_libero_control_stage2_hdf5.yaml
 model_name: ltx_train
 is_i2v: true
 report_to: None
-tracker_name: ltx_baton_stage2_hdf5_trainer
+tracker_name: ltx_control_stage2_hdf5_trainer
 
 logging_dir: logs
-output_dir: /data/user/jhe724/junjie/outputs/libero_ltx_baton_stage2_hdf5
+output_dir: /data/user/jhe724/junjie/outputs/libero_ltx_control_stage2_hdf5
 pretrained_model_name_or_path: /data/user/jhe724/junjie/weights/LTX-Video
 
 train_data_class_path: data/libero_fastwam_hdf5_dataset.py
@@ -84,20 +93,7 @@ flow_mode_scale: 1.29
 pixel_wise_timestep: true
 
 semantic_plan:
-  enabled: true
-  source: qwen35_baton_teacher
-  # Deployment launchers replace every artifact/hash below from BATON_* env.
-  siglip2_model_path: /data/user/jhe724/junjie/weights/siglip2-large-patch16-256
-  siglip2_config_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  siglip2_artifact_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  teacher_preprocessing_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  frame_microbatch_size: 16
-  tokens_per_frame: 256
-  feature_dim: 1024
-  keyframe_indices: [0, 3, 5, 8]
-  dropout: 0.15
-  validation_mode: teacher
-  validation_modes: [teacher, semantic_disabled]
+  enabled: false
 
 diffusion_model:
   # Deployment launcher requires BATON_GE_BASE_CHECKPOINT.
@@ -124,13 +120,6 @@ diffusion_model:
     action_out_channels: 15
     action_num_attention_heads: 16
     action_attention_head_dim: 32
-    semantic_plan_context: true
-    semantic_plan_in_dim: 1024
-    semantic_plan_coordinate_dim: 256
-    semantic_plan_num_keyframes: 4
-    semantic_plan_num_views: 2
-    semantic_plan_adaln_rank: 256
-    semantic_plan_cross_attention_blocks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
 
 data:
   train:

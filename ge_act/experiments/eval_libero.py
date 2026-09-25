@@ -1,4 +1,9 @@
 import os, random, math
+import gc
+import hashlib
+import platform
+import subprocess
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -33,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 
 from utils.libero_sim_utils import get_libero_env, get_libero_image, get_libero_dummy_action, get_libero_state, save_rollout_video
-from libero.libero import benchmark
+from libero.libero import benchmark, get_libero_path
 # ----------------------------------------------------
 from utils.model_utils import load_condition_models, load_latent_models, load_vae_models, load_diffusion_model, count_model_parameters, unwrap_model
 from utils.model_utils import forward_pass
@@ -54,7 +59,7 @@ from runner.ge_inferencer import validate_baton_inference_source
 
 class InferenceLibero:
 
-    def __init__(self, config_file, output_dir=None, weight_dtype=torch.bfloat16, device="cuda:0", task_suite_name='libero_goal', model_path=None, exec_step=8, threshold=20, num_inference_steps=10) -> None:
+    def __init__(self, config_file, output_dir=None, weight_dtype=torch.bfloat16, device="cuda:0", task_suite_name='libero_goal', model_path=None, exec_step=8, threshold=20, num_inference_steps=10, semantic_mode="config") -> None:
 
         cd = load(open(config_file, "r"), Loader=Loader)
         args = argparse.Namespace(**cd)
@@ -82,6 +87,13 @@ class InferenceLibero:
         # Scheduler
         self.scheduler = None
         self.baton_components = None
+        if semantic_mode not in ("config", "disabled"):
+            raise ValueError("semantic_mode must be 'config' or 'disabled'")
+        ### "disabled" keeps the Baton provider in the loop but zeroes the semantic
+        ### condition gate, i.e. the closed-loop counterpart of the training-time
+        ### `semantic_disabled` validation mode. Always report both numbers.
+        self.semantic_mode = semantic_mode
+        self._latency = {"policy_ms": [], "baton_ms": [], "episode_s": []}
 
         self.args.output_dir = Path(self.args.output_dir)
         self.args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -143,7 +155,8 @@ class InferenceLibero:
             model_path = cd["diffusion_model"]['model_path']
         model_steps = model_path.split('/')[-2]
         self.with_state = cd["add_state"]
-        log_file_path = os.path.join(self.save_folder, f"inference_{task_suite_name}_{model_steps}_wstate{self.with_state}_execstep{self.excution_step}_thresh{self.threshold}.txt")
+        _sem_tag = "" if self.semantic_mode == "config" else f"_sem{self.semantic_mode}"
+        log_file_path = os.path.join(self.save_folder, f"inference_{task_suite_name}_{model_steps}_wstate{self.with_state}_execstep{self.excution_step}_thresh{self.threshold}{_sem_tag}.txt")
         self.log_file = open(log_file_path, "w")
 
         args_dict["model_path"] = model_path
@@ -151,11 +164,151 @@ class InferenceLibero:
         args_dict["with_state"] = self.with_state
         args_dict["excution_step"] = self.excution_step
         args_dict["threshold"] = self.threshold
+        args_dict["semantic_mode"] = self.semantic_mode
+        ### Pin everything that can silently change a LIBERO number: simulator assets,
+        ### checkpoint bytes, code revision and the runtime. Best-effort, never fatal.
+        args_dict["provenance"] = self._collect_provenance(model_path, task_suite_name)
 
         with open(os.path.join(self.save_folder, 'config.json'), "w") as file:
             json.dump(args_dict, file, indent=4, sort_keys=False)
+        with open(os.path.join(self.save_folder, 'provenance.json'), "w") as file:
+            json.dump(args_dict["provenance"], file, indent=4, sort_keys=True)
         self.log_file.write(f"config: {args_dict}\n")
         self.log_file.flush()
+
+    ### --- provenance -----------------------------------------------------------
+    @staticmethod
+    def _sha256_tree(root, limit_bytes=None):
+        """SHA-256 over sorted relative paths and file contents under *root*."""
+        root = Path(root)
+        digest = hashlib.sha256()
+        files = sorted(p for p in root.rglob("*") if p.is_file())
+        total = 0
+        for path in files:
+            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1 << 20), b""):
+                    digest.update(chunk)
+                    total += len(chunk)
+                    if limit_bytes is not None and total > limit_bytes:
+                        return {"sha256": None, "files": len(files), "note": "skipped: too large"}
+        return {"sha256": digest.hexdigest(), "files": len(files)}
+
+    @staticmethod
+    def _sha256_file(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 22), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _git_revision(path):
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            rev = out.stdout.strip()
+            if not rev:
+                return None
+            dirty = subprocess.run(
+                ["git", "-C", str(path), "status", "--porcelain"],
+                capture_output=True, text=True, timeout=30, check=False,
+            ).stdout.strip()
+            return {"commit": rev, "dirty": bool(dirty)}
+        except Exception:
+            return None
+
+    def _collect_provenance(self, model_path, task_suite_name):
+        info = {
+            "python": platform.python_version(),
+            "torch": torch.__version__,
+            "cuda": getattr(torch.version, "cuda", None),
+            "transformers": transformers.__version__,
+            "diffusers": diffusers.__version__,
+            "numpy": np.__version__,
+        }
+        for module in ("robosuite", "mujoco", "libero"):
+            try:
+                info[module] = getattr(importlib.import_module(module), "__version__", "unknown")
+            except Exception as error:
+                info[module] = f"unavailable: {error}"
+        try:
+            benchmark_root = Path(get_libero_path("benchmark_root"))
+            info["libero_benchmark_root"] = str(benchmark_root)
+            info["libero_git"] = self._git_revision(benchmark_root)
+            for key in ("init_states", "bddl_files"):
+                suite_dir = Path(get_libero_path(key)) / task_suite_name
+                info[f"libero_{key}_{task_suite_name}"] = (
+                    self._sha256_tree(suite_dir) if suite_dir.is_dir() else None
+                )
+        except Exception as error:
+            info["libero_assets_error"] = str(error)
+        try:
+            ckpt = Path(model_path)
+            info["checkpoint"] = {
+                "path": str(ckpt),
+                "bytes": ckpt.stat().st_size if ckpt.exists() else None,
+                "sha256": (
+                    self._sha256_file(ckpt) if ckpt.is_file()
+                    else self._sha256_tree(ckpt).get("sha256") if ckpt.is_dir() else None
+                ),
+            }
+        except Exception as error:
+            info["checkpoint"] = {"path": str(model_path), "error": str(error)}
+        info["code_git"] = self._git_revision(Path(__file__).resolve().parent)
+        return info
+
+    ### --- prompt cache ---------------------------------------------------------
+    ### The task description is fixed for a whole episode, but play() runs on every
+    ### control step, so without a cache T5-XXL is re-encoded dozens to hundreds of
+    ### times per episode. Encode each prompt once; once every prompt a run will
+    ### need is cached, free_text_encoder() drops T5 (~9.4 GB bf16).
+    @torch.no_grad()
+    def _cached_prompt(self, prompt, negative_prompt):
+        if not hasattr(self, "_prompt_cache"):
+            self._prompt_cache = {}
+        key = (prompt, negative_prompt)
+        if key not in self._prompt_cache:
+            if getattr(self, "_text_encoder_freed", False):
+                raise RuntimeError(
+                    f"prompt not pre-encoded and the text encoder was freed: {prompt!r}. "
+                    "Call prefill_prompts() with every task description first."
+                )
+            out = self.pipeline.encode_prompt(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                do_classifier_free_guidance=False,
+                num_videos_per_prompt=1,
+                device=self.device,
+            )
+            ### Park the cache on the host: each entry is ~1 MB, shipping it to the
+            ### GPU per call is free next to the rollout.
+            self._prompt_cache[key] = tuple(
+                t.detach().to("cpu") if torch.is_tensor(t) else t for t in out
+            )
+        return tuple(
+            t.to(self.device) if torch.is_tensor(t) else t
+            for t in self._prompt_cache[key]
+        )
+
+    def prefill_prompts(self, prompts, negative_prompt="", free_encoder=True):
+        """Encode every prompt this process will need, then optionally release T5."""
+        for pr in dict.fromkeys(prompts):
+            self._cached_prompt(pr, negative_prompt)
+        if free_encoder:
+            self.free_text_encoder()
+
+    def free_text_encoder(self):
+        """Drop T5 from GPU. Only safe once every prompt is in the cache."""
+        if getattr(self, "_text_encoder_freed", False):
+            return
+        self.pipeline.text_encoder = None
+        self.text_encoder = None
+        self._text_encoder_freed = True
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def prepare_models(self,):
 
@@ -314,6 +467,7 @@ class InferenceLibero:
         semantic_plan_relevance = None
         semantic_condition_mask = None
         if self.baton_components is not None:
+            _baton_t0 = time.perf_counter()
             latent_num_frames = compute_ltx_latent_frames(
                 self.chunk,
                 temporal_compression_ratio=self.TEMPORAL_DOWN_RATIO,
@@ -335,18 +489,27 @@ class InferenceLibero:
             semantic_plan_positions = condition.positions
             semantic_plan_mask = condition.mask
             semantic_plan_relevance = condition.relevance
-            semantic_condition_mask = torch.ones(
-                v,
+            _gate = 0.0 if self.semantic_mode == "disabled" else 1.0
+            semantic_condition_mask = torch.full(
+                (v,),
+                _gate,
                 device=self.device,
                 dtype=self.dtype,
             )
+            self._latency["baton_ms"].append((time.perf_counter() - _baton_t0) * 1000.0)
         obs_tensor = rearrange(obs_tensor, "b c v t h w -> (b v) c t h w")
 
         negative_prompt = ""
+        pe, pam, npe, npam = self._cached_prompt(prompt, negative_prompt)
+        _policy_t0 = time.perf_counter()
         pred_all = self.pipeline.infer(
             image=obs_tensor,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
+            prompt=None,
+            negative_prompt=None,
+            prompt_embeds=pe,
+            prompt_attention_mask=pam,
+            negative_prompt_embeds=npe,
+            negative_prompt_attention_mask=npam,
             num_inference_steps=self.num_inference_steps,
             decode_timestep=0.03,
             decode_noise_scale=0.025,
@@ -371,6 +534,7 @@ class InferenceLibero:
             semantic_plan_relevance=semantic_plan_relevance,
             semantic_condition_mask=semantic_condition_mask,
         )[0]
+        self._latency["policy_ms"].append((time.perf_counter() - _policy_t0) * 1000.0)
 
         actions_pred = pred_all["action"].detach().cpu()[0]
 
@@ -411,6 +575,12 @@ class InferenceLibero:
         _smoke_max = os.environ.get("SMOKE_MAX_TASKS", "")
         if _smoke_max:
             _n_tasks = min(_n_tasks, int(_smoke_max))
+        ### Encode every task description once and free T5 before the rollouts.
+        ### KEEP_TEXT_ENCODER=1 keeps T5 resident (debugging only).
+        self.prefill_prompts(
+            [self.task_suite.get_task(i).language for i in range(_n_tasks)],
+            free_encoder=os.environ.get("KEEP_TEXT_ENCODER", "") != "1",
+        )
         for task_id in range( _n_tasks):
             task = self.task_suite.get_task(task_id)
             initial_states = self.task_suite.get_task_init_states(task_id)
@@ -435,6 +605,7 @@ class InferenceLibero:
 
 
                 obs = env.set_init_state(initial_states[episode_idx])
+                _episode_t0 = time.perf_counter()
                 t = 0
                 replay_images = []
                 if self.task_suite_name == "libero_spatial":
@@ -525,6 +696,7 @@ class InferenceLibero:
 
                 task_episodes += 1
                 total_episodes += 1
+                self._latency["episode_s"].append(time.perf_counter() - _episode_t0)
 
                 # Log current results
                 print(f"Success: {done}")
@@ -541,6 +713,34 @@ class InferenceLibero:
             self.log_file.write(f"Current task success rate: {float(task_successes) / float(task_episodes)}\n")
             self.log_file.write(f"Current total success rate: {float(total_successes) / float(total_episodes)}\n")
             self.log_file.flush()
+        self._write_latency_summary()
+
+    def _write_latency_summary(self):
+        """Per-call policy/Baton latency and per-episode wall time, for deployability."""
+        summary = {}
+        for name, values in self._latency.items():
+            if not values:
+                continue
+            arr = np.asarray(values, dtype=np.float64)
+            summary[name] = {
+                "count": int(arr.size),
+                "mean": float(arr.mean()),
+                "p50": float(np.percentile(arr, 50)),
+                "p95": float(np.percentile(arr, 95)),
+                "max": float(arr.max()),
+            }
+        summary["exec_step"] = self.excution_step
+        summary["num_inference_steps"] = self.num_inference_steps
+        summary["semantic_mode"] = self.semantic_mode
+        with open(os.path.join(self.save_folder, "latency.json"), "w") as file:
+            json.dump(summary, file, indent=4, sort_keys=True)
+        line = "latency: " + ", ".join(
+            f"{k} mean={v['mean']:.1f} p95={v['p95']:.1f}"
+            for k, v in summary.items() if isinstance(v, dict)
+        )
+        print(line)
+        self.log_file.write(line + "\n")
+        self.log_file.flush()
 
 
 
@@ -555,6 +755,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_trails_per_task", type=int, default=50, help="number of inference steps")
     parser.add_argument("--device", type=int, default=0, help="cuda id")
     parser.add_argument("--threshold", type=int, default=20, help="threshold")
+    parser.add_argument("--semantic_mode", type=str, default="config", choices=["config", "disabled"],
+                        help="'disabled' zeroes the Baton semantic gate (closed-loop semantic_disabled ablation)")
 
     args = parser.parse_args()
 
@@ -564,7 +766,7 @@ if __name__ == "__main__":
 
     libero_infer = InferenceLibero(
         config_file=config_file, output_dir=output_dir, task_suite_name=args.task_suite_name, model_path=args.ckpt_path, exec_step=args.exec_step, device=f"cuda:{args.device}",
-        threshold=args.threshold
+        threshold=args.threshold, semantic_mode=args.semantic_mode,
     )
     libero_infer.prepare_models()
     libero_infer.infer(

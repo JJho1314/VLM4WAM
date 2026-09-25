@@ -463,7 +463,7 @@ def _validate_baton_training_config(
     world_size: int,
     errors: list[str],
 ) -> None:
-    """Validate only the two action+video Baton HDF5 curricula."""
+    """Validate the two action-recipe Baton HDF5 curricula (Stage-2 teacher, Stage-3 prediction)."""
 
     source = semantic.get("source")
     expected_steps = (
@@ -476,15 +476,17 @@ def _validate_baton_training_config(
         "model_name": "ltx_train",
         "is_i2v": True,
         "return_action": True,
-        "return_video": True,
-        "train_mode": "all",
+        "return_video": False,
+        "train_mode": "action_full",
         "train_steps": expected_steps,
         "steps_to_save": 5_000,
         "mixed_precision": "bf16",
         "allow_tf32": True,
         "gradient_checkpointing": True,
-        "add_state": False,
-        "noisy_video": False,
+        "add_state": True,
+        "rand_init_action": True,
+        "noisy_video": True,
+        "caption_dropout_p": 0.0,
         "load_weights": True,
         "use_deepspeed": True,
         "lr": 2e-5,
@@ -514,8 +516,8 @@ def _validate_baton_training_config(
         )
     for field, expected in {
         "action_expert": True,
-        "action_in_channels": 7,
-        "action_out_channels": 7,
+        "action_in_channels": 15,
+        "action_out_channels": 15,
         "semantic_plan_context": True,
         "semantic_plan_in_dim": 1024,
         "semantic_plan_num_keyframes": 4,
@@ -593,6 +595,7 @@ def _validate_baton_training_config(
         ),
         "baton_sampling_version": 1,
         "baton_sampling_seed": config.get("seed"),
+        "pack_action_state": True,
     }
     for split, split_data in (("train", train_data), ("val", val_data)):
         for field, expected in sampling_contract.items():

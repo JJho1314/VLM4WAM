@@ -42,6 +42,34 @@ raises `ImportError` instead of silently training a dead configuration. The
 dispatch code was deliberately left in place rather than refactored out, since
 no test environment was available on this box to verify a trainer rewrite.
 
+## Manipulation evaluation (LIBERO closed loop)
+
+Three evaluators, chosen by how the checkpoint was trained. Using the wrong one
+silently yields garbage actions (the gripper and normalization conventions are
+mutually incompatible), which looks like a 0% policy rather than an error.
+
+| Checkpoint | Evaluator | Config |
+|---|---|---|
+| Released GE-Act LIBERO weights (`ge_act_libero_*.safetensors`) | `ge_act/experiments/eval_libero_official.py` | `action_model_libero_official_eval.yaml` |
+| FastWAM-mix / HDF5 action checkpoints (mean/std normalization) | `ge_act/experiments/eval_libero.py` | `action_model_libero_fastwam_eval.yaml` |
+| Baton Stage-3 checkpoints | `ge_act/experiments/eval_libero.py` | `action_model_libero_baton_eval.yaml` |
+
+Every run writes `provenance.json` (LIBERO `init_files`/`bddl_files` hashes for the
+suite, LIBERO and code git revisions, checkpoint SHA-256, runtime versions) and
+`latency.json` (per-call policy and Baton planner latency, per-episode wall time)
+next to the `inference_*.txt` log. Task prompts are T5-encoded once per run and the
+text encoder is then released. `--semantic_mode disabled` zeroes the Baton semantic
+gate and is the mandatory closed-loop ablation for any Baton number.
+
+Sanity anchor: the released `ge_act_libero_goal` checkpoint scores about 0.96 to 0.97
+on `libero_goal` with the official evaluator; a collapse there means the harness or
+environment is wrong, not the policy.
+
+The Baton Stage-2/3 recipes (`action_model_libero_baton_stage{2,3}_hdf5.yaml`) use
+the same action recipe as the released checkpoints (`action_full`, packed
+action+state, `noisy_video`), so that `action_model_libero_control_stage2_hdf5.yaml`,
+which is identical minus the semantic branch, isolates the effect of conditioning.
+
 ## World model (Cosmos)
 
 Main files:

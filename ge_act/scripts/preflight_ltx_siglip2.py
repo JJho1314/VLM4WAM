@@ -260,12 +260,12 @@ def collect_preflight_errors(
     if model_config.get("semantic_plan_num_views") != 2:
         errors.append("LTX semantic plan must preserve two camera views")
     if semantic_source in BATON_SOURCES:
-        if config.get("return_video") is not True:
-            errors.append("Baton curricula must train video")
+        if config.get("return_video") is not False:
+            errors.append("Baton action curricula must not train video (return_video: false)")
         if config.get("return_action") is not True:
             errors.append("Baton curricula must train action")
-        if config.get("train_mode") != "all":
-            errors.append("Baton curricula train_mode must be all")
+        if config.get("train_mode") != "action_full":
+            errors.append("Baton curricula train_mode must be action_full")
         if model_config.get("action_expert") is not True:
             errors.append("Baton curricula require the action expert")
         expected_rates = {
