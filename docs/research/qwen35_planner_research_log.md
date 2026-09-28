@@ -43,7 +43,7 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 | ID | Tests | Setup | Cost | Status |
 |---|---|---|---|---|
-| E1 | H1, H4, H8 | Stage 2: GE base + online SigLIP2 teacher at [0,3,5,8], 20k steps, val modes teacher / semantic_disabled; log semantic vs text branch norms. | 8 GPU x ~2-3 days | resubmitted as 658617 (first attempt failed: Slurm spool path broke GE_ACT_ROOT) |
+| E1 | H1, H4, H8 | Stage 2: GE base + online SigLIP2 teacher at [0,3,5,8], 20k steps, val modes teacher / semantic_disabled; log semantic vs text branch norms. | 8 GPU x ~2-3 days | running as 658685 via `sbatch_stage2.sh` (8 GPU, ~12.5 s/step, first val at 5k ~17 h); earlier attempts failed on the Slurm spool path and on peft 0.17 / diffusers 0.35.1 vs transformers 5, fixed by the overlay below |
 | E2 | H2 | Baton step_020000 on LIBERO windows: per-keyframe planner MSE vs copy-current-frame MSE vs dataset-mean MSE, plus instruction swap. | 1 GPU x 15 min | **done** (job 658491) |
 | E3 | H3 | Stage-2 ckpt (E1) val with teacher / predicted (E2 planner) / disabled. | 1 GPU x ~2 h | after E1 10k |
 | E4 | H5b, H6 | Warm start from step_020000, 5k steps, gbs 128 (2/GPU x 8 accum x 8 GPU), lr 1e-5 backbone / 1e-4 heads, gradient checkpointing: current {none, context} x lambda_spa {0, 0.1}. A = none/0 is the same-budget control. | 4 runs x 8 GPU x ~8 h | resubmitted as 658621-658624 after OOM at 4/GPU; 2-GPU smoke peaks at 49.4 GiB |
@@ -82,6 +82,11 @@ Findings:
   tests current-frame context without the skip instead (H5b).
 
 ## 5. Decisions
+
+- 2026-09-28: GE-Act LTX on transformers 5.14.1 needs an import overlay,
+  `/data/user/jhe724/envs/overlay_peft_tf5` (peft 0.21.0, diffusers 0.35.2,
+  tensorboard 2.17.1, grpcio, markdown; all `--no-deps`), prepended through
+  PYTHONPATH. The shared `qwen35` env is left untouched.
 
 - 2026-09-28: planner frozen after Stage 1; LTX consumes SigLIP2 only; DA3 is
   a planner-side auxiliary target (WSA 4-layer). Paper to be aligned later.
