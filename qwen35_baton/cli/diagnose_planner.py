@@ -18,6 +18,7 @@ import torch
 
 from qwen35_baton.data import BatonLiberoDataset
 from qwen35_baton.provider import FrozenBatonPlanner
+from qwen35_baton.research_provider import ResearchBatonPlanner
 from qwen35_baton.teacher import FrozenSiglip2Teacher
 
 
@@ -26,7 +27,10 @@ _CAMERAS = ("main", "wrist")
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--checkpoint", help="strict v3 Baton step directory")
+    parser.add_argument(
+        "--research-checkpoint", help="research_train step directory (E4 variants)"
+    )
     parser.add_argument("--qwen-path", required=True)
     parser.add_argument("--siglip2-path", required=True)
     parser.add_argument("--manifest", required=True)
@@ -48,15 +52,35 @@ def main() -> int:
     args = _parser().parse_args()
     from ge_act.data.libero_fastwam_hdf5_dataset import LiberoFastWAMHDF5Dataset
 
+    if (args.checkpoint is None) == (args.research_checkpoint is None):
+        raise ValueError("pass exactly one of --checkpoint and --research-checkpoint")
     device = torch.device("cuda")
-    planner = FrozenBatonPlanner.from_checkpoint(
-        args.checkpoint,
-        qwen_model_path=args.qwen_path,
-        qwen_tokenizer_path=args.qwen_path,
-        qwen_processor_path=args.qwen_path,
-        siglip2_model_path=args.siglip2_path,
-        device=device,
-    )
+    if args.research_checkpoint is not None:
+        planner = ResearchBatonPlanner.from_research_checkpoint(
+            args.research_checkpoint, qwen_path=args.qwen_path, device=device
+        )
+
+        def predict(images, instructions, current_features):
+            return planner.predict_tokens(
+                images,
+                instructions,
+                current_features=(
+                    current_features if planner.uses_current_context else None
+                ),
+            )
+    else:
+        planner = FrozenBatonPlanner.from_checkpoint(
+            args.checkpoint,
+            qwen_model_path=args.qwen_path,
+            qwen_tokenizer_path=args.qwen_path,
+            qwen_processor_path=args.qwen_path,
+            siglip2_model_path=args.siglip2_path,
+            device=device,
+        )
+
+        def predict(images, instructions, current_features):
+            del current_features
+            return planner.predict(images, instructions).tokens
     teacher = FrozenSiglip2Teacher(args.siglip2_path, device=device)
     base = LiberoFastWAMHDF5Dataset(
         args.manifest, args.stat_file, train_dataset=False
@@ -89,7 +113,7 @@ def main() -> int:
         instructions = [sample["instruction"] for sample in samples]
         current_features = teacher.encode_current(current)
         future_features = teacher.encode_future(future)
-        prediction = planner.predict(current, instructions).tokens
+        prediction = predict(current, instructions, current_features)
 
         copy = current_features.unsqueeze(2).expand_as(future_features)
         sums["planner"] += _per_frame_mse(prediction, future_features).double().cpu()
@@ -110,7 +134,9 @@ def main() -> int:
                 alternatives.append(rng.choice(options))
                 keep.append(row)
         if keep:
-            swapped_prediction = planner.predict(current[keep], alternatives).tokens
+            swapped_prediction = predict(
+                current[keep], alternatives, current_features[keep]
+            )
             sums["swap_shift"] += _per_frame_mse(
                 swapped_prediction, prediction[keep]
             ).double().cpu()
@@ -127,7 +153,7 @@ def main() -> int:
     mean = feature_sum / seen
     variance = (feature_sq_sum / seen - mean.square()).mean(dim=(2, 3))
     result: dict[str, object] = {
-        "checkpoint": args.checkpoint,
+        "checkpoint": args.checkpoint or args.research_checkpoint,
         "num_samples": seen,
         "num_swapped": swapped,
         "note": "LIBERO training used all episodes; these windows are in-distribution.",

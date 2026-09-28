@@ -32,7 +32,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--stat-file", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--residual", action="store_true")
+    parser.add_argument(
+        "--current-mode",
+        choices=("none", "context", "residual"),
+        default="none",
+        help="how the current-frame SigLIP2 grid enters the planner",
+    )
     parser.add_argument("--spatial-weight", type=float, default=0.0)
     parser.add_argument("--da3-ckpt")
     parser.add_argument("--da3-code-root")
@@ -53,31 +58,16 @@ def _parser() -> argparse.ArgumentParser:
 
 def _build_planner(args: argparse.Namespace) -> tuple[object, nn.Module]:
     from safetensors.torch import load_model
-    from transformers import AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
 
-    from qwen35_baton.model import BatonQwen35Planner
-    from qwen35_baton.sequence import ADDED_TOKENS
+    from qwen35_baton.research_provider import (
+        build_research_planner,
+        init_checkpoint_token_ids,
+    )
 
-    metadata = json.loads(
-        (Path(args.init_checkpoint) / "metadata.json").read_text(encoding="utf-8")
-    )
-    added_token_ids = tuple(int(value) for value in metadata["added_token_ids"])
-    tokenizer = AutoTokenizer.from_pretrained(args.qwen_path, local_files_only=True)
-    processor = AutoProcessor.from_pretrained(args.qwen_path, local_files_only=True)
-    processor.tokenizer = tokenizer
-    actual = tuple(int(tokenizer.convert_tokens_to_ids(token)) for token in ADDED_TOKENS)
-    if actual != added_token_ids:
-        raise ValueError("tokenizer added-token IDs differ from the init checkpoint")
-    qwen = AutoModelForImageTextToText.from_pretrained(
-        args.qwen_path,
-        local_files_only=True,
-        torch_dtype=torch.float32,
-        low_cpu_mem_usage=True,
-    )
-    planner = BatonQwen35Planner(
-        qwen,
-        added_token_ids=added_token_ids,
-        residual=args.residual,
+    processor, planner = build_research_planner(
+        qwen_path=args.qwen_path,
+        added_token_ids=init_checkpoint_token_ids(args.init_checkpoint),
+        current_mode=args.current_mode,
         spatial=args.spatial_weight > 0,
     )
     missing, unexpected = load_model(
@@ -95,7 +85,7 @@ def _build_planner(args: argparse.Namespace) -> tuple[object, nn.Module]:
     ]
     if unexplained:
         raise ValueError(f"init checkpoint is missing trained tensors: {unexplained[:5]}")
-    if args.residual:
+    if args.current_mode == "residual":
         # The loaded absolute head would add a full feature map on top of the
         # current grid; restart the delta at zero (= copy-current baseline).
         planner.zero_init_residual_head()
@@ -207,7 +197,8 @@ def main() -> int:
                     current = siglip.encode_current(batch.current_images)
                     future = siglip.encode_future(batch.future_images)
                 output = planner(
-                    batch, current_features=current if args.residual else None
+                    batch,
+                    current_features=None if args.current_mode == "none" else current,
                 )
                 semantic_mse = (
                     output.positive.float() - future.float()

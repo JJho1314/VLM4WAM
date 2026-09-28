@@ -8,11 +8,14 @@ from qwen35_baton.model import SPATIAL_DIM, SPATIAL_LAYERS, BatonQwen35Planner
 from test_qwen35_baton_model import ADDED_TOKEN_IDS, TinyQwen, make_batch
 
 
-def make_variant(*, residual: bool, spatial: bool) -> BatonQwen35Planner:
+def make_variant(
+    *, residual: bool, spatial: bool, current_context: bool = False
+) -> BatonQwen35Planner:
     torch.manual_seed(0)
     return BatonQwen35Planner(
         TinyQwen(width=16),
         added_token_ids=ADDED_TOKEN_IDS,
+        current_context=current_context,
         residual=residual,
         spatial=spatial,
     )
@@ -68,6 +71,18 @@ def test_non_residual_planner_rejects_current_features() -> None:
 
     with pytest.raises(ValueError, match="current_features"):
         planner(make_batch(), current_features=torch.zeros(2, 2, 256, 1024))
+
+
+def test_context_planner_reads_current_features_without_skip() -> None:
+    planner = make_variant(residual=False, spatial=False, current_context=True)
+    batch = make_batch()
+    current = torch.randn(2, 2, 256, 1024)
+
+    base = planner(batch, current_features=current).positive
+    moved = planner(batch, current_features=current + 1.0).positive
+
+    assert not torch.allclose(base, current.unsqueeze(2).expand_as(base))
+    assert not torch.allclose(base, moved)
 
 
 def test_spatial_head_predicts_wsa_layers_per_camera_and_keyframe() -> None:

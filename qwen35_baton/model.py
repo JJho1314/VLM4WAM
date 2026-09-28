@@ -140,15 +140,18 @@ class BatonQwen35Planner(nn.Module):
         *,
         added_token_ids: tuple[int, ...],
         query_tower: nn.Module | None = None,
+        current_context: bool = False,
         residual: bool = False,
         spatial: bool = False,
     ) -> None:
-        """``residual`` predicts ``current SigLIP2 + delta`` and also feeds the
-        current grid to the tower; ``spatial`` adds an auxiliary DA3 head."""
+        """``current_context`` feeds the current SigLIP2 grid to the towers;
+        ``residual`` (implies it) predicts ``current + delta``; ``spatial``
+        adds an auxiliary DA3 head."""
 
         super().__init__()
-        if type(residual) is not bool or type(spatial) is not bool:
-            raise TypeError("residual and spatial must be booleans")
+        if any(type(flag) is not bool for flag in (current_context, residual, spatial)):
+            raise TypeError("current_context, residual and spatial must be booleans")
+        self.current_context = current_context or residual
         self.residual = residual
         self.spatial = spatial
         if not isinstance(backbone, nn.Module):
@@ -190,8 +193,9 @@ class BatonQwen35Planner(nn.Module):
             nn.GELU(),
             nn.Linear(qwen_dim, _FEATURE_DIM),
         )
-        if residual:
+        if self.current_context:
             self.current_projection = nn.Linear(_FEATURE_DIM, qwen_dim)
+        if residual:
             self.zero_init_residual_head()
         if spatial:
             self.spa_query_tower = BatonVisualAlignmentTower(qwen_dim)
@@ -284,12 +288,13 @@ class BatonQwen35Planner(nn.Module):
         """Run one causal Qwen pass and predict one continuous grid per row.
 
         ``current_features`` are the rows' current-frame SigLIP2 grids
-        ``[rows,256,1024]``; required exactly when the planner is residual.
+        ``[rows,256,1024]``; required exactly when the planner uses them.
         """
 
-        if self.residual != (current_features is not None):
+        if self.current_context != (current_features is not None):
             raise ValueError(
-                "current_features must be given if and only if the planner is residual"
+                "current_features must be given if and only if the planner "
+                "uses current context"
             )
         forwarded, positions = self._validate_rows(
             qwen_inputs,
@@ -325,7 +330,7 @@ class BatonQwen35Planner(nn.Module):
         )
         rows = last_hidden.shape[0]
         tower_kwargs: dict[str, torch.Tensor] = {}
-        if self.residual:
+        if self.current_context:
             if (
                 not isinstance(current_features, torch.Tensor)
                 or tuple(current_features.shape)

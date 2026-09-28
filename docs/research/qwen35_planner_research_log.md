@@ -30,27 +30,56 @@ LIBERO-Plus, and why has it not reliably done so far?
 | ID | Hypothesis | Prediction if true | Kill criterion |
 |---|---|---|---|
 | H1 | Oracle future semantics help LTX. | Stage 2 val: `teacher` beats `semantic_disabled` on video loss and action MSE. | No gap after 10k steps -> guidance design, not the planner, is the bottleneck (go to H4). |
-| H2 | The planner ignores the current observation and outputs a near-mean plan. | Planner MSE >= copy-current-frame MSE on keyframe 0, and the gap is flat across keyframes. | Planner beats copy baseline clearly on all keyframes. |
+| H2 | The planner ignores the current observation and outputs a near-mean plan. | Planner MSE >= copy-current-frame MSE on keyframe 0, and the gap is flat across keyframes. | Planner beats copy baseline clearly on all keyframes. **Refuted by E2.** |
 | H3 | Exposure bias: LTX trained on teacher features degrades with predicted features. | Stage-2 ckpt val with predicted features falls between teacher and disabled; Stage 3 closes the gap. | Predicted ~= teacher already. |
 | H4 | Guidance is under-weighted relative to text. | Semantic out-proj/gate norms stay << text; raising inference CFG on guidance improves action MSE. | Norms comparable, CFG sweep flat. |
-| H5 | A residual planner `F = SigLIP2(current) + delta` (zero-init delta) beats the absolute planner. | Lower MSE than baton step_20000 on every keyframe, and never worse than copy baseline. | No MSE gain after 5k steps. |
+| H5 | A residual planner `F = SigLIP2(current) + delta` (zero-init delta) beats the absolute planner. | Lower MSE than baton step_20000 on every keyframe, and never worse than copy baseline. | No MSE gain after 5k steps. **Deprioritized: E2 shows the copy baseline is far worse than the planner.** |
+| H5b | Feeding the current SigLIP2 grid as extra tower context (no skip) improves the absolute planner. | Lower MSE than the same-budget control at every keyframe. | No gain after 5k steps. |
 | H6 | DA3 (WSA 4-layer) auxiliary loss improves the SigLIP2 prediction. | Lower SigLIP2 MSE at equal steps vs lambda_spa=0. | No gain or worse. |
 | H7 | LIBERO is saturated; gains show on LIBERO-Plus. | Larger delta on LIBERO-Plus (Layout/Language) than on LIBERO. | - |
+| H8 | Wrist-view guidance is mostly noise (R^2 ~0.23 vs main ~0.53) and can hurt LTX. | Masking wrist guidance at validation does not raise, or lowers, video/action loss. | Wrist masking clearly hurts. |
 
 ## 3. Experiments
 
 | ID | Tests | Setup | Cost | Status |
 |---|---|---|---|---|
-| E1 | H1, H4 | Stage 2: GE base + online SigLIP2 teacher at [0,3,5,8], 20k steps, val modes teacher / semantic_disabled; log semantic vs text branch norms. | 8 GPU x ~2-3 days | submitted, job 658473 (2026-09-28) |
-| E2 | H2 | Baton step_020000 on LIBERO windows: per-keyframe planner MSE vs copy-current-frame MSE vs dataset-mean MSE. | 1 GPU x ~1 h | next |
+| E1 | H1, H4, H8 | Stage 2: GE base + online SigLIP2 teacher at [0,3,5,8], 20k steps, val modes teacher / semantic_disabled; log semantic vs text branch norms. | 8 GPU x ~2-3 days | submitted, job 658473 (2026-09-28) |
+| E2 | H2 | Baton step_020000 on LIBERO windows: per-keyframe planner MSE vs copy-current-frame MSE vs dataset-mean MSE, plus instruction swap. | 1 GPU x 15 min | **done** (job 658491) |
 | E3 | H3 | Stage-2 ckpt (E1) val with teacher / predicted (E2 planner) / disabled. | 1 GPU x ~2 h | after E1 10k |
-| E4 | H5, H6 | Residual + DA3 planner warm-started from step_020000; 2x2: residual {on,off} x lambda_spa {0, 0.1}, 5k steps each. | 4 runs x 8 GPU x ~6 h | code in progress |
+| E4 | H5b, H6 | Warm start from step_020000, 5k steps, gbs 128, lr 1e-5 backbone / 1e-4 heads: current {none, context} x lambda_spa {0, 0.1}. A = none/0 is the same-budget control. | 4 runs x 8 GPU x ~6 h | submitted, jobs 658581-658584 (earliest start 09-29 01:51) |
 | E5 | H3 | Stage 3: E1 ckpt + frozen best planner (E4), 30k steps. | 8 GPU x ~3 days | after E1, E4 |
 | E6 | H7 + final | LIBERO 4x500 and LIBERO-Plus, sharded over HPC3 GPUs: GE-Act base, E1 disabled, E5. | ~0.5 day | after E5 |
 
 ## 4. Results
 
 (append newest first)
+
+### 2026-09-28 E2: planner vs trivial baselines (400 LIBERO windows, in-distribution)
+
+Teacher-space MSE per token (SigLIP2 penultimate, 1024-d). R^2 = 1 - planner / dataset-mean.
+
+| cam | k | planner | copy current | dataset mean | R^2 | swap-instr shift | swapped vs truth |
+|---|---|---|---|---|---|---|---|
+| main | 0 | 1.268 | 1.622 | 2.758 | 0.54 | 0.483 | 1.714 |
+| main | 1 | 1.295 | 2.320 | 2.760 | 0.53 | 0.476 | 1.768 |
+| main | 2 | 1.299 | 2.543 | 2.794 | 0.53 | 0.522 | 1.806 |
+| main | 3 | 1.302 | 2.770 | 2.775 | 0.53 | 0.606 | 1.910 |
+| wrist | 0 | 2.253 | 3.723 | 2.940 | 0.23 | 0.467 | 2.691 |
+| wrist | 1 | 2.224 | 4.802 | 2.914 | 0.24 | 0.493 | 2.709 |
+| wrist | 2 | 2.176 | 4.876 | 2.837 | 0.23 | 0.563 | 2.724 |
+| wrist | 3 | 2.216 | 5.085 | 2.897 | 0.24 | 0.589 | 2.816 |
+
+Findings:
+- H2 refuted: the planner beats copy-current on every keyframe, so it uses the
+  observation. The flat per-keyframe MSE comes from SigLIP2 features changing
+  a lot even one keyframe ahead (copy MSE 1.62 at k0, grows to 2.77 by k3).
+- Wrist copy is worse than the dataset mean; wrist prediction explains only
+  ~23% of variance vs ~53% for main -> new H8.
+- The prediction is instruction-conditioned: a same-suite instruction swap
+  moves it by 0.48-0.61 and raises error vs the true future by 35% (main) /
+  20% (wrist). Usable for rebuttal item #2.
+- The residual design (H5) starts from the much worse copy baseline, so E4
+  tests current-frame context without the skip instead (H5b).
 
 ## 5. Decisions
 
