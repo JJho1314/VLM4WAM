@@ -43,10 +43,10 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 | ID | Tests | Setup | Cost | Status |
 |---|---|---|---|---|
-| E1 | H1, H4, H8 | Stage 2: GE base + online SigLIP2 teacher at [0,3,5,8], 20k steps, val modes teacher / semantic_disabled; log semantic vs text branch norms. | 8 GPU x ~2-3 days | submitted, job 658473 (2026-09-28) |
+| E1 | H1, H4, H8 | Stage 2: GE base + online SigLIP2 teacher at [0,3,5,8], 20k steps, val modes teacher / semantic_disabled; log semantic vs text branch norms. | 8 GPU x ~2-3 days | resubmitted as 658617 (first attempt failed: Slurm spool path broke GE_ACT_ROOT) |
 | E2 | H2 | Baton step_020000 on LIBERO windows: per-keyframe planner MSE vs copy-current-frame MSE vs dataset-mean MSE, plus instruction swap. | 1 GPU x 15 min | **done** (job 658491) |
 | E3 | H3 | Stage-2 ckpt (E1) val with teacher / predicted (E2 planner) / disabled. | 1 GPU x ~2 h | after E1 10k |
-| E4 | H5b, H6 | Warm start from step_020000, 5k steps, gbs 128, lr 1e-5 backbone / 1e-4 heads: current {none, context} x lambda_spa {0, 0.1}. A = none/0 is the same-budget control. | 4 runs x 8 GPU x ~6 h | submitted, jobs 658581-658584 (earliest start 09-29 01:51) |
+| E4 | H5b, H6 | Warm start from step_020000, 5k steps, gbs 128 (2/GPU x 8 accum x 8 GPU), lr 1e-5 backbone / 1e-4 heads, gradient checkpointing: current {none, context} x lambda_spa {0, 0.1}. A = none/0 is the same-budget control. | 4 runs x 8 GPU x ~8 h | resubmitted as 658621-658624 after OOM at 4/GPU; 2-GPU smoke peaks at 49.4 GiB |
 | E5 | H3 | Stage 3: E1 ckpt + frozen best planner (E4), 30k steps. | 8 GPU x ~3 days | after E1, E4 |
 | E6 | H7 + final | LIBERO 4x500 and LIBERO-Plus, sharded over HPC3 GPUs: GE-Act base, E1 disabled, E5. | ~0.5 day | after E5 |
 

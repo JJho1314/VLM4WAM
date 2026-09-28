@@ -52,7 +52,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--gradient-checkpointing", action="store_true")
+    # On by default: under plain DDP the fp32 weights, grads and AdamW states
+    # alone take ~37 GB/GPU, and full activations push 2 samples/GPU past 80 GB.
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     return parser
 
 
@@ -138,7 +144,13 @@ def main() -> int:
         mixed_precision="bf16",
         gradient_accumulation_steps=args.grad_accum,
         device_placement=False,
-        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
+        kwargs_handlers=[
+            DistributedDataParallelKwargs(
+                find_unused_parameters=True,
+                # Alias grads to the DDP buckets instead of keeping a second copy.
+                gradient_as_bucket_view=True,
+            )
+        ],
     )
     set_seed(args.seed, device_specific=True)
     output_dir = Path(args.output_dir)
@@ -246,6 +258,9 @@ def main() -> int:
                         "lr_backbone": scheduler.get_last_lr()[0],
                         "semantic_mse": float(reduced["semantic_mse"].mean()),
                         "copy_mse": float(reduced["copy_mse"].mean()),
+                        "peak_mem_gib": round(
+                            torch.cuda.max_memory_allocated(accelerator.device) / 2**30, 2
+                        ),
                     }
                     for camera_index, camera in enumerate(("main", "wrist")):
                         for frame in range(4):
