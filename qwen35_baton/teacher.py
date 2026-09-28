@@ -185,3 +185,73 @@ class FrozenSiglip2Teacher:
         return self._encode_frames(images.reshape(-1, *images.shape[-3:])).reshape(
             batch_size, 2, 4, 256, 1024
         )
+
+
+class FrozenDA3Teacher:
+    """Detached DA3-LARGE WSA targets (4 backbone layers x 2048-d) per keyframe.
+
+    Wraps the Qwen3-VL line's ``DepthAnything3TargetEncoder`` so both planner
+    lines align to the identical spatial target.
+    """
+
+    def __init__(
+        self,
+        ckpt_dir: str | Path,
+        code_root: str | Path,
+        *,
+        device: torch.device | str = "cuda",
+        teacher_layers: tuple[int, ...] = (11, 15, 19, 23),
+        layer_weights: tuple[float, ...] = (1.0, 1.2, 1.4, 1.6),
+        process_res: int = 224,
+        frame_microbatch_size: int = 32,
+    ) -> None:
+        import sys
+
+        target_dir = (
+            Path(__file__).resolve().parents[1]
+            / "qwen3_vl_semantic_planner"
+            / "dinov3_da3_2b"
+        )
+        if str(target_dir) not in sys.path:
+            sys.path.insert(0, str(target_dir))
+        from depth_anything3_target import DepthAnything3TargetEncoder
+
+        self.encoder = DepthAnything3TargetEncoder(
+            ckpt_dir,
+            process_res=process_res,
+            align_strategy="wsa_multilayer",
+            teacher_layers=teacher_layers,
+            layer_weights=layer_weights,
+            device=device,
+            code_root=code_root,
+        )
+        self.layer_weights = torch.tensor(self.encoder.layer_weights)
+        self.frame_microbatch_size = frame_microbatch_size
+
+    def to(self, device: torch.device | str) -> "FrozenDA3Teacher":
+        self.encoder.to(device)
+        self.encoder.device = torch.device(device)
+        return self
+
+    @torch.no_grad()
+    def encode_future(self, images: torch.Tensor) -> torch.Tensor:
+        """``[B,2,4,3,H,W]`` uint8 RGB -> detached ``[B,2,4,256,4,2048]`` bf16."""
+
+        if (
+            not isinstance(images, torch.Tensor)
+            or images.ndim != 6
+            or images.shape[1:4] != (2, 4, 3)
+            or images.dtype != torch.uint8
+        ):
+            raise ValueError(f"future images must be uint8 [B,2,4,3,H,W], got {tuple(images.shape)}")
+        batch_size = images.shape[0]
+        # Scale explicitly: the encoder's [0,255] auto-detection misreads dark frames.
+        frames = images.reshape(-1, *images.shape[-3:]).float().div(255.0)
+        chunks = []
+        for start in range(0, frames.shape[0], self.frame_microbatch_size):
+            prepped = self.encoder._prep(frames[start : start + self.frame_microbatch_size])
+            chunks.append(self.encoder._patch_tokens(prepped))  # [N,L,256,2048]
+        features = torch.cat(chunks, dim=0).transpose(1, 2)  # [N,256,L,2048]
+        return features.reshape(batch_size, 2, 4, *features.shape[1:]).detach().to(
+            torch.bfloat16
+        )

@@ -45,3 +45,46 @@ def compute_baton_planner_loss(
 
     mse = (prediction.float() - future_teacher.float()).square().mean()
     return BatonPlannerLoss(mse=mse, total=mse)
+
+
+@dataclass(frozen=True)
+class SpatialWSALoss:
+    """Weighted per-layer DA3 alignment and its two components."""
+
+    total: torch.Tensor
+    cosine: torch.Tensor
+    layernorm_mse: torch.Tensor
+
+
+def compute_spatial_wsa_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    layer_weights: torch.Tensor,
+) -> SpatialWSALoss:
+    """WSA multi-layer DA3 alignment, identical to the Qwen3-VL planner line.
+
+    ``prediction``/``target`` are ``[..., L, D]``. Per layer the loss is
+    ``(1 - cos) + MSE(LayerNorm(pred), LayerNorm(target))``, weighted by
+    ``layer_weights`` and averaged over layers.
+    """
+
+    if prediction.shape != target.shape or prediction.ndim < 3:
+        raise ValueError("spatial prediction and target must share shape [...,L,D]")
+    layers, dim = prediction.shape[-2:]
+    if tuple(layer_weights.shape) != (layers,):
+        raise ValueError(f"layer_weights must have shape ({layers},)")
+    prediction = prediction.float().reshape(-1, layers, dim)
+    target = target.detach().float().reshape(-1, layers, dim)
+    cosine = 1.0 - torch.nn.functional.cosine_similarity(
+        prediction, target, dim=-1
+    ).mean(dim=0)
+    layernorm_mse = (
+        torch.nn.functional.layer_norm(prediction, (dim,))
+        - torch.nn.functional.layer_norm(target, (dim,))
+    ).square().mean(dim=(0, 2))
+    weights = layer_weights.to(device=prediction.device, dtype=prediction.dtype)
+    return SpatialWSALoss(
+        total=((cosine + layernorm_mse) * weights).mean(),
+        cosine=cosine.mean(),
+        layernorm_mse=layernorm_mse.mean(),
+    )

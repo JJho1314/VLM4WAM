@@ -90,6 +90,7 @@ class BatonVisualAlignmentTower(nn.Module):
         self,
         qwen_states: torch.Tensor,
         *,
+        extra_context: torch.Tensor | None = None,
         return_attention_maps: bool = False,
     ) -> QueryTowerOutput:
         expected_tail = (
@@ -109,6 +110,17 @@ class BatonVisualAlignmentTower(nn.Module):
 
         rows = qwen_states.shape[0]
         context = qwen_states.reshape(rows, -1, self.qwen_dim)
+        if extra_context is not None:
+            if (
+                not isinstance(extra_context, torch.Tensor)
+                or extra_context.ndim != 3
+                or extra_context.shape[0] != rows
+                or extra_context.shape[-1] != self.qwen_dim
+            ):
+                raise ValueError(
+                    f"extra_context must be [rows,tokens,{self.qwen_dim}]"
+                )
+            context = torch.cat((context, extra_context.to(context.dtype)), dim=1)
         queries = self.learned_queries.reshape(-1, self.qwen_dim)
         queries = queries.unsqueeze(0).expand(rows, -1, -1)
         aligned, attention = self.cross_attention(
