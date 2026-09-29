@@ -10,6 +10,7 @@ production contract is not used until a variant is promoted.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import os
@@ -21,7 +22,6 @@ import torch.nn as nn
 
 
 _NEW_MODULE_PREFIXES = ("current_projection.", "spa_query_tower.", "spa_mlp.")
-_HEAD_PREFIXES = ("query_tower.", "sem_mlp.", *_NEW_MODULE_PREFIXES)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -44,14 +44,29 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, default=5000)
     parser.add_argument("--per-device-batch", type=int, default=4)
     parser.add_argument("--grad-accum", type=int, default=4)
-    parser.add_argument("--lr-backbone", type=float, default=1e-5)
-    parser.add_argument("--lr-heads", type=float, default=1e-4)
+    # The warm-start source stopped at 22.6k/30k of a 1e-5 cosine (~1.5e-6), so
+    # already-trained weights continue near that rate; only new modules start hot.
+    parser.add_argument("--lr-pretrained", type=float, default=2e-6)
+    parser.add_argument("--lr-new", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-steps", type=int, default=250)
     parser.add_argument("--save-every", type=int, default=2500)
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--worker-malloc-trim",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="return freed heap to the OS in DataLoader workers after every batch",
+    )
+    parser.add_argument("--max-open-shards", type=int, default=8)
+    parser.add_argument(
+        "--gpu-teacher-preprocess",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="rescale/normalize SigLIP2 inputs on GPU instead of the PIL processor",
+    )
     # On by default: under plain DDP the fp32 weights, grads and AdamW states
     # alone take ~37 GB/GPU, and full activations push 2 samples/GPU past 80 GB.
     parser.add_argument(
@@ -100,17 +115,59 @@ def _build_planner(args: argparse.Namespace) -> tuple[object, nn.Module]:
 
 
 def _optimizer(planner: nn.Module, args: argparse.Namespace) -> torch.optim.AdamW:
-    heads, backbone = [], []
+    new, pretrained = [], []
     for name, parameter in planner.named_parameters():
-        (heads if name.startswith(_HEAD_PREFIXES) else backbone).append(parameter)
+        (new if name.startswith(_NEW_MODULE_PREFIXES) else pretrained).append(parameter)
+    groups = [{"params": pretrained, "lr": args.lr_pretrained}]
+    if new:
+        groups.append({"params": new, "lr": args.lr_new})
     return torch.optim.AdamW(
-        [
-            {"params": backbone, "lr": args.lr_backbone},
-            {"params": heads, "lr": args.lr_heads},
-        ],
+        groups,
         betas=(0.9, 0.999),
         weight_decay=args.weight_decay,
     )
+
+
+def _warm_start_adam_state(
+    optimizer: torch.optim.AdamW,
+    planner: nn.Module,
+    init_checkpoint: str | Path,
+) -> tuple[int, int]:
+    """Copy the source run's AdamW moments onto same-named, same-shaped params.
+
+    A fresh AdamW takes ~lr-sized sign steps on every weight, which measurably
+    degraded the warm-started planner; restoring moments makes the run a true
+    continuation. New modules keep an empty state. Returns (restored, total).
+    """
+
+    saved = torch.load(
+        Path(init_checkpoint) / "optimizer.pt",
+        map_location="cpu",
+        weights_only=False,
+        mmap=True,
+    )
+    by_name: dict[str, dict[str, torch.Tensor]] = {}
+    for group in saved["param_groups"]:
+        for name, index in zip(group["parameter_names"], group["params"]):
+            if index in saved["state"]:
+                by_name[name] = saved["state"][index]
+    name_of = {id(parameter): name for name, parameter in planner.named_parameters()}
+    restored = total = 0
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            total += 1
+            state = by_name.get(name_of.get(id(parameter), ""))
+            if state is None or tuple(state["exp_avg"].shape) != tuple(parameter.shape):
+                continue
+            optimizer.state[parameter] = {
+                "step": torch.as_tensor(state["step"], dtype=torch.float32).clone(),
+                "exp_avg": state["exp_avg"].to(parameter.device, parameter.dtype),
+                "exp_avg_sq": state["exp_avg_sq"].to(parameter.device, parameter.dtype),
+            }
+            restored += 1
+    del saved, by_name
+    gc.collect()
+    return restored, total
 
 
 def _lr_lambda(step: int, *, warmup: int, total: int) -> float:
@@ -118,6 +175,35 @@ def _lr_lambda(step: int, *, warmup: int, total: int) -> float:
         return (step + 1) / warmup
     progress = min(max((step - warmup) / max(total - warmup, 1), 0.0), 1.0)
     return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+class _TrimmingCollate:
+    """Collate, then malloc_trim: worker RSS grew ~9 MiB per sample otherwise."""
+
+    def __init__(self, collate_fn) -> None:
+        self.collate_fn = collate_fn
+
+    def __call__(self, samples):
+        import ctypes
+
+        batch = self.collate_fn(samples)
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+        return batch
+
+
+def _host_rss_gib() -> tuple[float, float]:
+    """Resident memory (GiB) of this rank and of its DataLoader workers."""
+
+    import psutil
+
+    process = psutil.Process()
+    children = 0
+    for child in process.children(recursive=True):
+        try:
+            children += child.memory_info().rss
+        except psutil.Error:
+            pass
+    return process.memory_info().rss / 2**30, children / 2**30
 
 
 def _per_frame_mse(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -169,7 +255,12 @@ def main() -> int:
         lambda step: _lr_lambda(step, warmup=args.warmup_steps, total=args.max_steps),
     )
     dataset = BatonLiberoDataset(
-        LiberoFastWAMHDF5Dataset(args.manifest, args.stat_file, train_dataset=True),
+        LiberoFastWAMHDF5Dataset(
+            args.manifest,
+            args.stat_file,
+            train_dataset=True,
+            max_open_shards=args.max_open_shards,
+        ),
         seed=args.seed,
     )
     loader = torch.utils.data.DataLoader(
@@ -178,19 +269,34 @@ def main() -> int:
         shuffle=True,
         drop_last=True,
         num_workers=args.num_workers,
-        collate_fn=BatonPlannerCollator(processor),
+        collate_fn=(
+            _TrimmingCollate(BatonPlannerCollator(processor))
+            if args.worker_malloc_trim
+            else BatonPlannerCollator(processor)
+        ),
         persistent_workers=args.num_workers > 0,
         multiprocessing_context="spawn" if args.num_workers > 0 else None,
     )
     planner.to(accelerator.device)
+    restored, total = _warm_start_adam_state(optimizer, planner, args.init_checkpoint)
+    if accelerator.is_main_process:
+        print(json.dumps({"adam_state_restored": restored, "params": total}), flush=True)
     planner, optimizer, loader = accelerator.prepare(planner, optimizer, loader)
     siglip = FrozenSiglip2Teacher(args.siglip2_path, device=accelerator.device)
+    siglip.gpu_preprocess = args.gpu_teacher_preprocess
     da3 = None
     if args.spatial_weight > 0:
         da3 = FrozenDA3Teacher(
             args.da3_ckpt, args.da3_code_root, device=accelerator.device
         )
 
+    # Diagnostic: RESEARCH_MEMPROFILE=1 diffs Python allocations on rank 0.
+    profile_memory = os.environ.get("RESEARCH_MEMPROFILE") == "1"
+    snapshots = []
+    if profile_memory and accelerator.is_main_process:
+        import tracemalloc
+
+        tracemalloc.start(8)
     metrics_path = output_dir / "metrics.jsonl"
     window: dict[str, torch.Tensor] = {}
     window_count = 0
@@ -246,6 +352,16 @@ def main() -> int:
             if not accelerator.sync_gradients:
                 continue
             step += 1
+            if profile_memory and accelerator.is_main_process and step in (20, 120):
+                snapshots.append(tracemalloc.take_snapshot())
+                if len(snapshots) == 2:
+                    top = snapshots[1].compare_to(snapshots[0], "lineno")[:15]
+                    print("TRACEMALLOC_TOP", flush=True)
+                    for stat in top:
+                        print(f"  {stat}", flush=True)
+            # Batches leave reference cycles that only full collections free;
+            # without this rank RSS grew ~0.15 GiB/step until the host OOMed.
+            gc.collect()
             if step % args.log_every == 0 or step == args.max_steps:
                 reduced = {
                     name: accelerator.reduce(value / window_count, reduction="mean")
@@ -255,12 +371,14 @@ def main() -> int:
                     entry = {
                         "step": step,
                         "elapsed_s": round(time.time() - started, 1),
-                        "lr_backbone": scheduler.get_last_lr()[0],
+                        "lr_pretrained": scheduler.get_last_lr()[0],
                         "semantic_mse": float(reduced["semantic_mse"].mean()),
                         "copy_mse": float(reduced["copy_mse"].mean()),
                         "peak_mem_gib": round(
                             torch.cuda.max_memory_allocated(accelerator.device) / 2**30, 2
                         ),
+                        "rank0_host_rss_gib": round(sum(_host_rss_gib()), 2),
+                        "rank0_main_rss_gib": round(_host_rss_gib()[0], 2),
                     }
                     for camera_index, camera in enumerate(("main", "wrist")):
                         for frame in range(4):

@@ -46,7 +46,7 @@ LIBERO-Plus, and why has it not reliably done so far?
 | E1 | H1, H4, H8 | Stage 2: GE base + online SigLIP2 teacher at [0,3,5,8], 20k steps, val modes teacher / semantic_disabled; log semantic vs text branch norms. | 8 GPU x ~2-3 days | running as 658685 via `sbatch_stage2.sh` (8 GPU, ~12.5 s/step, first val at 5k ~17 h); earlier attempts failed on the Slurm spool path and on peft 0.17 / diffusers 0.35.1 vs transformers 5, fixed by the overlay below |
 | E2 | H2 | Baton step_020000 on LIBERO windows: per-keyframe planner MSE vs copy-current-frame MSE vs dataset-mean MSE, plus instruction swap. | 1 GPU x 15 min | **done** (job 658491) |
 | E3 | H3 | Stage-2 ckpt (E1) val with teacher / predicted (E2 planner) / disabled. | 1 GPU x ~2 h | after E1 10k |
-| E4 | H5b, H6 | Warm start from step_020000, 5k steps, gbs 128 (2/GPU x 8 accum x 8 GPU), lr 1e-5 backbone / 1e-4 heads, gradient checkpointing: current {none, context} x lambda_spa {0, 0.1}. A = none/0 is the same-budget control. | 4 runs x 8 GPU x ~8 h | resubmitted as 658621-658624 after OOM at 4/GPU; 2-GPU smoke peaks at 49.4 GiB |
+| E4 | H5b, H6 | Warm start from step_020000 incl. its AdamW moments, 5k steps, gbs 128 (2/GPU x 8 accum x 8 GPU), lr 2e-6 pretrained / 1e-4 new modules, gradient checkpointing, worker malloc_trim, GPU SigLIP2 preprocessing: current {none, context} x lambda_spa {0, 0.1}. A = none/0 is the same-budget control. | 4 runs x 8 GPU x ~6.5 h | submitted 659872-659875 (starts 09-29 20:42 to 09-30 10:55) |
 | E5 | H3 | Stage 3: E1 ckpt + frozen best planner (E4), 30k steps. | 8 GPU x ~3 days | after E1, E4 |
 | E6 | H7 + final | LIBERO 4x500 and LIBERO-Plus, sharded over HPC3 GPUs: GE-Act base, E1 disabled, E5. | ~0.5 day | after E5 |
 
@@ -82,6 +82,19 @@ Findings:
   tests current-frame context without the skip instead (H5b).
 
 ## 5. Decisions
+
+- 2026-09-29: research-trainer infrastructure fixes, each verified by a
+  2-GPU probe before relaunching:
+  - Host OOM at ~440 steps: DataLoader worker heap grew ~9 MiB/sample
+    (main process flat at ~7.8 GiB). `gc.collect`, `MALLOC_ARENA_MAX=2`,
+    GPU preprocessing and `max_open_shards=1` did not help;
+    `malloc_trim(0)` after each worker collate keeps total RSS flat at 23.4 GiB.
+  - Loss rose after warm start (1.76 -> 2.05) with lr 1e-5/1e-4 and a fresh
+    AdamW. Now lr 2e-6 for trained weights (source ended at 2.66e-6), 1e-4 only
+    for new modules, and the source AdamW moments restored by name (627/627):
+    loss stays at 1.74-1.78.
+  - Stage 2 on 8 GPUs needed accelerate 1.14.0 (ZeRO-2 `no_sync`), added to the
+    overlay; always smoke-test on >= 2 GPUs.
 
 - 2026-09-28: GE-Act LTX on transformers 5.14.1 needs an import overlay,
   `/data/user/jhe724/envs/overlay_peft_tf5` (peft 0.21.0, diffusers 0.35.2,

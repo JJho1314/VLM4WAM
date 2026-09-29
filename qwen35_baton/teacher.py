@@ -88,6 +88,10 @@ class FrozenSiglip2Teacher:
         self.model = vision_model.to(device=self.device, dtype=dtype)
         self.model.requires_grad_(False)
         self.model.eval()
+        # Opt-in GPU preprocessing for frames already at the processor size;
+        # verified once against the HF processor before it is trusted.
+        self.gpu_preprocess = False
+        self._gpu_preprocess_verified = False
 
     def to(self, device: torch.device | str) -> "FrozenSiglip2Teacher":
         """Move the vision tower and keep preprocessing outputs on the same device."""
@@ -112,8 +116,35 @@ class FrozenSiglip2Teacher:
             raise ValueError("normalized RGB frames must be in [-1,1]")
         return frames.add(1).mul(127.5).round().clamp(0, 255).to(torch.uint8)
 
+    def _gpu_pixel_values(self, rgb: torch.Tensor) -> torch.Tensor | None:
+        """Rescale/normalize on device when no resize is needed, else None."""
+
+        size = getattr(self.processor, "size", None) or {}
+        height, width = size.get("height"), size.get("width")
+        if tuple(rgb.shape[-2:]) != (height, width):
+            return None
+        mean = torch.tensor(self.processor.image_mean, device=self.device).view(1, 3, 1, 1)
+        std = torch.tensor(self.processor.image_std, device=self.device).view(1, 3, 1, 1)
+        scaled = rgb.to(self.device, torch.float32) * float(self.processor.rescale_factor)
+        return ((scaled - mean) / std).to(self.dtype)
+
     def _pixel_values(self, frames: torch.Tensor) -> torch.Tensor:
         rgb = self._as_uint8_rgb(frames)
+        if self.gpu_preprocess:
+            fast = self._gpu_pixel_values(rgb)
+            if fast is not None and self._gpu_preprocess_verified:
+                return fast
+            if fast is not None:
+                reference = self.processor(images=list(rgb[:2].cpu()), return_tensors="pt")
+                difference = (
+                    fast[:2].float() - reference["pixel_values"].to(self.device).float()
+                ).abs().max()
+                if float(difference) > 1e-2:
+                    raise RuntimeError(
+                        f"GPU SigLIP2 preprocessing differs from the processor by {float(difference):.4f}"
+                    )
+                self._gpu_preprocess_verified = True
+                return fast
         processed = self.processor(images=list(rgb.cpu()), return_tensors="pt")
         if not isinstance(processed, Mapping) or "pixel_values" not in processed:
             raise ValueError("SigLIP2 processor must return pixel_values")
