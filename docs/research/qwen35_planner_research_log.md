@@ -56,6 +56,26 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-09-30 E4 planner variants and HPC3 access
+
+Planner diagnostic (400 windows, means over keyframes):
+
+| variant | main MSE | wrist MSE | swap shift main | swap shift wrist |
+|---|---|---|---|---|
+| base step_020000 | 1.291 | 2.217 | 0.522 | 0.528 |
+| B current context | 1.278 | 2.196 | 0.469 | 0.455 |
+| C DA3 aux | 1.276 | 2.196 | 0.476 | 0.456 |
+| D context + DA3 | 1.282 | 2.195 | 0.465 | 0.452 |
+
+- B, C and D are within ~0.5% of each other and ~1% better than base; D does
+  not add up. The gain and the lower instruction sensitivity most likely come
+  from the extra 5k steps (control A pending). H5b and H6 show no specific
+  benefit.
+- E8 (additive injection with text) finished training
+  (`s2_additive_text/2026_09_30_18_49_14/step_001500`); its E3 could not be
+  submitted: at 23:30 all HPC3 partitions became restricted to the `admin`
+  group ("User's group not permitted to use this partition").
+
 ### 2026-09-30 E7: additive injection makes LTX use oracle guidance (no text)
 
 Same setting as E6 (no text, zero_out gate, semantic lr 5e-4, 1500 steps from
