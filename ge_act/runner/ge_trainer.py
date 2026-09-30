@@ -2411,6 +2411,9 @@ class Trainer:
         args = argparse.Namespace(**cd)
         args.lr = float(args.lr)
         args.semantic_lr = float(getattr(args, "semantic_lr", args.lr))
+        # Research opt-in: probe whether the semantic branch is learning-rate bound.
+        if os.environ.get("BATON_RESEARCH_SEMANTIC_LR"):
+            args.semantic_lr = float(os.environ["BATON_RESEARCH_SEMANTIC_LR"])
         args.action_lr = float(getattr(args, "action_lr", args.lr))
         args.qwen_top_lr = float(getattr(args, "qwen_top_lr", 1e-6))
         args.qwen_vision_lr = float(getattr(args, "qwen_vision_lr", 5e-7))

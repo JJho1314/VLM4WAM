@@ -22,7 +22,12 @@ import torch
 from einops import rearrange
 from torch.utils.data import default_collate
 
-MODES = ("teacher", "semantic_disabled", "teacher_wrist_masked", "teacher_main_masked")
+MODES = tuple(
+    os.environ.get(
+        "E3_MODES",
+        "teacher,semantic_disabled,teacher_wrist_masked,teacher_main_masked",
+    ).split(",")
+)
 HORIZONS = ((0, 1), (1, 9), (9, 25), (25, 36))
 
 
@@ -42,9 +47,17 @@ def _semantic_kwargs(runner, condition, mode: str, n_view: int) -> dict:
     from runner.ge_trainer import apply_baton_validation_mode
 
     base_mode = "semantic_disabled" if mode == "semantic_disabled" else "teacher"
+    tokens = condition.tokens
+    if mode == "random_tokens":
+        # Wiring probe: large random guidance must change the output if the
+        # semantic path is live at inference.
+        generator = torch.Generator(device=tokens.device).manual_seed(0)
+        tokens = torch.randn(
+            tokens.shape, generator=generator, device=tokens.device, dtype=torch.float32
+        ).to(tokens.dtype) * (3 * tokens.float().std())
     selection = apply_baton_validation_mode(
         runner.baton_components,
-        tokens=condition.tokens,
+        tokens=tokens,
         mode=base_mode,
         batch_size=1,
         n_view=n_view,
@@ -67,6 +80,21 @@ def _semantic_kwargs(runner, condition, mode: str, n_view: int) -> dict:
     }
 
 
+def _semantic_trace(runner):
+    """The trace list of the module that actually defines the loaded blocks.
+
+    The trainer imports model classes by file path, so this can differ from
+    ``models.ltx_models.transformer_ltx_multiview`` imported by name.
+    """
+
+    import sys
+
+    for module in runner.diffusion_model.modules():
+        if hasattr(module, "semantic_gate_mode"):
+            return getattr(sys.modules[type(module).__module__], "_SEMANTIC_TRACE", None)
+    return None
+
+
 @torch.no_grad()
 def _run_mode(runner, pipe, batch, condition, mode: str, seed: int) -> dict:
     args = runner.args
@@ -82,6 +110,9 @@ def _run_mode(runner, pipe, batch, condition, mode: str, seed: int) -> dict:
             history = history[:, n_prev - 1 : n_prev, :]
         history = history.contiguous()
     generator = torch.Generator(device=accelerator.device).manual_seed(seed)
+    trace = _semantic_trace(runner)
+    if trace is not None:
+        trace.clear()
     preds = pipe.infer(
         image=image,
         prompt=batch["caption"][:1],
@@ -110,6 +141,10 @@ def _run_mode(runner, pipe, batch, condition, mode: str, seed: int) -> dict:
         **_semantic_kwargs(runner, condition, mode, n_view),
     )[0]
     result: dict = {}
+    trace = _semantic_trace(runner)
+    if trace:
+        result["semantic_ratio"] = float(np.mean(trace))
+        trace.clear()
     gt_actions = batch["actions"][:, -args.data["train"]["action_chunk"] :].float()
     action_dim = gt_actions.shape[-1]
     squared = (preds["action"][:1, :, :action_dim].float().cpu() - gt_actions[:1]).square()
@@ -196,11 +231,17 @@ def _merge(args: argparse.Namespace) -> None:
     records = []
     for path in sorted(glob.glob(os.path.join(args.output_dir, "shard*.jsonl"))):
         records += [json.loads(line) for line in open(path) if line.strip()]
-    metrics = [key for key in records[0]["teacher"]]
+    metrics = sorted({key for record in records for mode in MODES for key in record[mode]})
     summary = {"num_samples": len(records), "reference": "semantic_disabled", "modes": {}}
     for mode in MODES:
         summary["modes"][mode] = {}
         for metric in metrics:
+            if any(metric not in r[mode] or metric not in r["semantic_disabled"] for r in records):
+                if all(metric in r[mode] for r in records):
+                    summary["modes"][mode][metric] = {
+                        "mean": float(np.mean([r[mode][metric] for r in records]))
+                    }
+                continue
             values = np.array([r[mode][metric] for r in records])
             base = np.array([r["semantic_disabled"][metric] for r in records])
             diff = values - base

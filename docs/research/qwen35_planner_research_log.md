@@ -55,6 +55,27 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-09-30 E5: the zero_out gate fix does not make LTX use guidance (yet)
+
+- E5 (zero_out gate, from Stage-2 step-5000 weights, 1500 steps, fast config):
+  E3 paired diffs vs disabled are still ~0 (action -0.0001 +/- 0.0004, video
+  0.0000). Action MSE overall dropped 0.214 -> 0.079 from the extra training,
+  so training works; the semantic branch just does not matter.
+- Wiring probe (20 windows): large random tokens change the output as little
+  as true-future tokens (action -0.00046 vs -0.00026, video ~0).
+- Residual trace: per-block ||semantic residual|| / ||hidden|| = 2.9e-4 with
+  teacher tokens, exactly 0 when disabled. The path is live but ~0.03% of the
+  residual stream per block; output projections grew from 0 to Frobenius
+  0.4-1.7 (text cross-attn ~130).
+- Reading: with 4 memory frames + text, LTX predicts LIBERO futures well and
+  gains little from extra conditioning, and at lr 5e-5 the zero-initialized
+  branch stays tiny. E5b tests the learning-rate part (semantic lr 5e-4).
+- Planner side: diag C (DA3 aux) ~= diag B (current context), both ~1% better
+  than step_020000 and both less instruction-sensitive (swap shift 0.48-0.61 ->
+  ~0.42-0.56). Since C has no current context, that reduction comes from the
+  extra 5000 steps, not from context. Control A is on hold because planner
+  gains are moot while LTX ignores guidance.
+
 ### 2026-09-30 E3: Stage-2 step 5000 ignores even oracle guidance (210 windows, paired)
 
 Paired differences vs `semantic_disabled` (same inputs and noise; negative = better):

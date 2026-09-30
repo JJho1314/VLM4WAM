@@ -16,6 +16,8 @@
 import math
 from typing import Any, Dict, Optional, Tuple
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,6 +42,11 @@ from models.ltx_models.semantic_conditioning import SemanticContextAdapter
 from models.action_patches.patches import preprocessing_action_states, add_action_expert
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+# Research trace: when BATON_RESEARCH_TRACE_SEMANTIC=1, each semantic block
+# appends ||semantic residual|| / ||hidden states|| here.
+_SEMANTIC_TRACE = [] if os.environ.get("BATON_RESEARCH_TRACE_SEMANTIC") == "1" else None
 
 
 class _AttachZeroForwardSurrogate(torch.autograd.Function):
@@ -654,6 +661,13 @@ class LTXVideoTransformerBlock(nn.Module):
                 semantic_residual = _AttachZeroForwardSurrogate.apply(
                     semantic_residual,
                     semantic_bias_surrogate,
+                )
+            if _SEMANTIC_TRACE is not None:
+                _SEMANTIC_TRACE.append(
+                    float(
+                        semantic_residual.detach().float().norm()
+                        / hidden_states.detach().float().norm().clamp_min(1e-12)
+                    )
                 )
             hidden_states = hidden_states + semantic_residual
 
