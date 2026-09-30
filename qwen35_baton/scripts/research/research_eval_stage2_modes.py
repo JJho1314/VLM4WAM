@@ -159,6 +159,19 @@ def _run_mode(runner, pipe, batch, condition, mode: str, seed: int) -> dict:
         result["video"] = float(per_view.mean())
         result["video_main"] = float(per_view[0])
         result["video_wrist"] = float(per_view[1])
+        # Motion-region error: only pixels whose true future differs from the
+        # last memory frame (arm and manipulated objects); full-frame MSE is
+        # dominated by static background.
+        last = batch["video"][:1, :, :, n_prev - 1 : n_prev].float().cpu()
+        motion = (target[:, :, :, :frames] - last).abs().mean(dim=1, keepdim=True) > 0.1
+        squared_error = (predicted[:, :, :, :frames] - target[:, :, :, :frames]).square()
+        masked = (squared_error * motion).sum(dim=(0, 1, 3, 4, 5))
+        pixels = motion.sum(dim=(0, 1, 3, 4, 5)).clamp_min(1) * squared_error.shape[1]
+        motion_per_view = masked / pixels
+        result["video_motion"] = float(motion_per_view.mean())
+        result["video_motion_main"] = float(motion_per_view[0])
+        result["video_motion_wrist"] = float(motion_per_view[1])
+        result["motion_fraction"] = float(motion.float().mean())
     return result
 
 
