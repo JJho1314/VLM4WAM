@@ -29,7 +29,7 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 | ID | Hypothesis | Prediction if true | Kill criterion |
 |---|---|---|---|
-| H1 | Oracle future semantics help LTX. **Rejected for per-block cross-attention injection (E3/E5/E5b/E6).** | Stage 2 val: `teacher` beats `semantic_disabled` on video loss and action MSE. | No gap after 10k steps -> guidance design, not the planner, is the bottleneck (go to H4). |
+| H1 | Oracle future semantics help LTX. **Rejected for per-block cross-attention (E3/E5/E5b/E6); supported with additive injection (E7, no text: -6.6% action MSE).** | Stage 2 val: `teacher` beats `semantic_disabled` on video loss and action MSE. | No gap after 10k steps -> guidance design, not the planner, is the bottleneck (go to H4). |
 | H2 | The planner ignores the current observation and outputs a near-mean plan. | Planner MSE >= copy-current-frame MSE on keyframe 0, and the gap is flat across keyframes. | Planner beats copy baseline clearly on all keyframes. **Refuted by E2.** |
 | H3 | Exposure bias: LTX trained on teacher features degrades with predicted features. | Stage-2 ckpt val with predicted features falls between teacher and disabled; Stage 3 closes the gap. | Predicted ~= teacher already. |
 | H4 | Guidance is under-weighted relative to text. **Confirmed (E3): zero-init gate starves the semantic branch.** | Semantic out-proj/gate norms stay << text; raising inference CFG on guidance improves action MSE. | Norms comparable, CFG sweep flat. |
@@ -55,6 +55,30 @@ LIBERO-Plus, and why has it not reliably done so far?
 ## 4. Results
 
 (append newest first)
+
+### 2026-09-30 E7: additive injection makes LTX use oracle guidance (no text)
+
+Same setting as E6 (no text, zero_out gate, semantic lr 5e-4, 1500 steps from
+step-5000 weights) plus the additive, spatially aligned injection. E3 with an
+empty prompt, 210 windows, paired vs `semantic_disabled`:
+
+| mode | action MSE | diff vs disabled | win |
+|---|---|---|---|
+| disabled | 0.3716 | - | - |
+| teacher | 0.3471 | **-0.0245 +/- 0.0043 (-6.6%, ~5.7 SE)** | 83% |
+| wrist masked (main only) | 0.3597 | -0.0119 +/- 0.0044 | 73% |
+| main masked (wrist only) | 0.3680 | -0.0036 +/- 0.0013 | 56% |
+
+All four horizons improve (-0.023 to -0.040). E6 (cross-attention only) gave
++0.0014 under the same conditions.
+
+- The bottleneck was the injection mechanism, not the semantics: H1 holds with
+  additive injection.
+- H8 partly supported: the main view carries about half the gain, wrist alone
+  ~15%; both together are best.
+- Decoded full-frame video MSE barely moves (static background dominates); a
+  motion-region video metric is needed.
+- Next: E8 = E7 with the instruction (normal setting), the case the paper needs.
 
 ### 2026-09-30 E6: without text the model needs task information but still ignores guidance
 
