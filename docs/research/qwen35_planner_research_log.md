@@ -56,6 +56,35 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-01 E8: additive injection with text (run on Qianhai CCI, 2x H800)
+
+Same as E7 but the prompt is kept (step_001500, zero_out gate + additive
+injection). E3, 210 paired windows (same linspace indices as E7), diff =
+mode - semantic_disabled:
+
+| metric | E7 no text | E8 with text |
+|---|---|---|
+| disabled action_all | 0.3716 | 0.0858 |
+| teacher action_all | -0.0245 +- 0.0043 (-6.6%, win 0.83) | -0.0019 +- 0.0006 (-2.2%, win 0.62) |
+| main only (wrist masked) | -0.0119 | -0.0019 +- 0.0005 (win 0.70) |
+| wrist only (main masked) | -0.0036 | +0.0015 +- 0.0005 (win 0.30, worse) |
+| video / video_motion | ~0 | -0.0003 / -0.0004 +- 0.0003 |
+
+Reading:
+- H1 holds with text but the effect is small: oracle future semantics buys
+  2% action MSE when the instruction is present, 6.6% (13x larger absolute)
+  when it is absent. Text already carries most of what the keyframes add.
+- H8: the whole gain comes from the main view; wrist guidance alone hurts.
+- Video (including the motion-region metric) does not use the guidance.
+- The planner is weaker than the oracle (E2 R2 0.53 main), so planner-driven
+  gains under normal text would be smaller still. The case for the planner
+  is robustness when the instruction is missing or perturbed (H7), not
+  in-distribution LIBERO accuracy.
+
+Next: E9 continues E8 (warm start from its diffusion_model) to test whether
+the with-text gain grows with training; H7 evaluation under language
+perturbations follows.
+
 ### 2026-09-30 E4 planner variants and HPC3 access
 
 Planner diagnostic (400 windows, means over keyframes):
