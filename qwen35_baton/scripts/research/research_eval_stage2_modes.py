@@ -115,7 +115,7 @@ def _run_mode(runner, pipe, batch, condition, mode: str, seed: int) -> dict:
         trace.clear()
     preds = pipe.infer(
         image=image,
-        prompt=batch["caption"][:1],
+        prompt=[""] if os.environ.get("E3_EMPTY_PROMPT") == "1" else batch["caption"][:1],
         negative_prompt="",
         num_inference_steps=args.num_inference_step,
         decode_timestep=0.03,

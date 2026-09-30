@@ -55,6 +55,20 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-09-30 E5b: 10x semantic LR does not help; next, remove the text (E6)
+
+- E5b (zero_out gate, semantic lr 5e-4, 1500 steps from step-5000 weights):
+  per-block semantic residual ratio 4e-4 (E5: 2.9e-4); E3 paired diffs still
+  ~0 (action +0.0002 +/- 0.0001, video 0.0000).
+- The branch is not LR-bound: the model keeps it small because the guidance
+  adds little over 4 memory frames + instruction on LIBERO (redundancy).
+- E6 (running, job 662076): same as E5b but caption dropout 1.0, so the
+  semantic plan is the only task cue (many LIBERO scenes host several tasks).
+  E3 runs with an empty prompt. If the oracle gap opens, the injection works
+  and text redundancy explains the null result -> move the evaluation to
+  settings where text/priors fail (LIBERO-Plus language/layout, H7). If it
+  stays ~0, the injection architecture itself is inadequate.
+
 ### 2026-09-30 E5: the zero_out gate fix does not make LTX use guidance (yet)
 
 - E5 (zero_out gate, from Stage-2 step-5000 weights, 1500 steps, fast config):

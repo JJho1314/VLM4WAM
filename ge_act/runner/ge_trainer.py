@@ -2412,6 +2412,10 @@ class Trainer:
         args.lr = float(args.lr)
         args.semantic_lr = float(getattr(args, "semantic_lr", args.lr))
         # Research opt-in: probe whether the semantic branch is learning-rate bound.
+        # Research opt-in: drop the instruction so semantic guidance is the
+        # only task cue (tests whether redundancy with text hides its value).
+        if os.environ.get("BATON_RESEARCH_CAPTION_DROPOUT"):
+            args.caption_dropout_p = float(os.environ["BATON_RESEARCH_CAPTION_DROPOUT"])
         if os.environ.get("BATON_RESEARCH_SEMANTIC_LR"):
             args.semantic_lr = float(os.environ["BATON_RESEARCH_SEMANTIC_LR"])
         args.action_lr = float(getattr(args, "action_lr", args.lr))
