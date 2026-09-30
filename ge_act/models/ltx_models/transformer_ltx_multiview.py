@@ -551,6 +551,10 @@ class LTXVideoTransformerBlock(nn.Module):
                 nn.Linear(semantic_adaln_rank, 3 * dim, bias=False),
             )
             nn.init.zeros_(self.semantic_modulation[-1].weight)
+        # "zero_gate" multiplies the output by a zero-initialized gate, which
+        # starves both factors of gradient; "zero_out" (research) zeroes the
+        # output projection instead and uses a (1 + gate) scale.
+        self.semantic_gate_mode = "zero_gate"
 
         self.scale_shift_table = nn.Parameter(torch.randn(6, dim) / dim**0.5)
 
@@ -634,6 +638,8 @@ class LTXVideoTransformerBlock(nn.Module):
                 semantic_output = semantic_output * semantic_mask
                 if semantic_bias_surrogate is not None:
                     semantic_bias_surrogate = semantic_bias_surrogate * semantic_mask
+            if self.semantic_gate_mode == "zero_out":
+                semantic_gate = 1 + semantic_gate
             semantic_residual = semantic_output * semantic_gate
             if semantic_bias_surrogate is not None:
                 residual_gate_is_initialized = bool(

@@ -10,6 +10,8 @@ set -euo pipefail
 ROOT=/data/user/jhe724/workspace/VLM4WAM_baton
 set -a; . "$ROOT/stage2_env.sh"; set +a
 if [[ -n "${OUTPUT_OVERRIDE:-}" ]]; then export BATON_OUTPUT_DIR="$OUTPUT_OVERRIDE"; fi
+# Start from other weights than the GE base (e.g. a Stage-2 step dir).
+if [[ -n "${INIT_OVERRIDE:-}" ]]; then export BATON_GE_BASE_CHECKPOINT="$INIT_OVERRIDE"; fi
 export CONDA_ENV=/data/user/jhe724/.conda/envs/qwen35
 export PYTHON_BIN="$CONDA_ENV/bin/python" PATH="$CONDA_ENV/bin:$PATH"
 export PYTHONPATH=/data/user/jhe724/envs/overlay_peft_tf5

@@ -301,6 +301,11 @@ def prepare_baton_conditioning(
             ),
         )
         freeze_conditioning_modules(teacher)
+        # Research opt-in: rescale/normalize already-sized frames on GPU
+        # (checked once against the processor) instead of per-frame PIL work.
+        teacher.gpu_preprocess = (
+            os.environ.get("BATON_TEACHER_GPU_PREPROCESS") == "1"
+        )
         return BatonConditioningComponents(
             source=source,
             teacher=teacher,
@@ -570,6 +575,40 @@ def build_deepspeed_batch_config(
     config["gradient_accumulation_steps"] = gradient_accumulation_steps
     return config
 
+
+
+def apply_research_semantic_gate_mode(diffusion_model: torch.nn.Module) -> None:
+    """Research opt-in for the semantic residual (see LTX block gate modes).
+
+    BATON_RESEARCH_SEMANTIC_GATE_MODE=zero_out switches every semantic block to
+    the (1 + gate) scale; BATON_RESEARCH_SEMANTIC_REZERO_OUT=1 additionally
+    zeroes the semantic output projections, which is only valid when starting
+    a run (it would erase trained weights at evaluation).
+    """
+
+    mode = os.environ.get("BATON_RESEARCH_SEMANTIC_GATE_MODE")
+    if not mode:
+        return
+    if mode not in ("zero_gate", "zero_out"):
+        raise ValueError(f"unknown semantic gate mode: {mode}")
+    rezero = os.environ.get("BATON_RESEARCH_SEMANTIC_REZERO_OUT") == "1"
+    blocks = [
+        module
+        for module in diffusion_model.modules()
+        if hasattr(module, "semantic_gate_mode") and hasattr(module, "semantic_attn")
+    ]
+    if not blocks:
+        raise ValueError("semantic gate mode requested but no semantic blocks exist")
+    for block in blocks:
+        block.semantic_gate_mode = mode
+        if rezero:
+            with torch.no_grad():
+                block.semantic_attn.to_out[0].weight.zero_()
+                if block.semantic_attn.to_out[0].bias is not None:
+                    block.semantic_attn.to_out[0].bias.zero_()
+    logger.info(
+        f"semantic gate mode {mode} on {len(blocks)} blocks (rezero_out={rezero})"
+    )
 
 def compute_ltx_latent_frames(
     raw_future_frames: int,
@@ -2082,15 +2121,28 @@ def load_baton_training_checkpoint(
     )
     if loaded.training_provenance != expected_provenance:
         raise ValueError("Baton checkpoint training provenance mismatch")
-    if (
-        loaded.cursor.microbatches_per_epoch
-        != expected_microbatches_per_epoch
-        or loaded.cursor.sampler_seed != expected_sampler_seed
-    ):
+    cursor = loaded.cursor
+    if cursor.sampler_seed != expected_sampler_seed:
         raise ValueError("Baton checkpoint data cursor mismatch")
+    if cursor.microbatches_per_epoch != expected_microbatches_per_epoch:
+        # Research opt-in for resuming at a different per-device batch with the
+        # same global batch: keep step/epoch and map the in-epoch position.
+        if os.environ.get("BATON_RESEARCH_RESCALE_CURSOR") != "1":
+            raise ValueError("Baton checkpoint data cursor mismatch")
+        cursor = TrainingCursor(
+            global_step=cursor.global_step,
+            epoch=cursor.epoch,
+            consumed_microbatches=(
+                cursor.consumed_microbatches
+                * expected_microbatches_per_epoch
+                // cursor.microbatches_per_epoch
+            ),
+            microbatches_per_epoch=expected_microbatches_per_epoch,
+            sampler_seed=cursor.sampler_seed,
+        )
     accelerator.load_state(str(loaded.checkpoint))
     accelerator.wait_for_everyone()
-    return loaded.cursor
+    return cursor
 
 
 def _validate_loaded_baton_stage2_checkpoint(
@@ -2791,6 +2843,7 @@ class Trainer:
             self.scheduler = diffusion_scheduler_class()
 
         ### Import Inference Pipeline Class
+        apply_research_semantic_gate_mode(self.diffusion_model)
         self.pipeline_class = import_custom_class(
             self.args.pipeline_class, getattr(self.args, "pipeline_class_path", "diffusers")
         )
