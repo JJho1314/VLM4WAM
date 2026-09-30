@@ -49,6 +49,56 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 _SEMANTIC_TRACE = [] if os.environ.get("BATON_RESEARCH_TRACE_SEMANTIC") == "1" else None
 
 
+
+def _semantic_additive_residual(
+    module: nn.Module,
+    plan: torch.Tensor,
+    positions: torch.Tensor,
+    condition_mask: Optional[torch.Tensor],
+    *,
+    num_frames: int,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    """Pool each keyframe grid to the latent grid and add it at its latent frame.
+
+    ``plan`` is ``[B,V,K,P,D]`` with a square ``P``; ``positions`` holds the
+    adapter's raw ``(t, y, x)`` per token, ``t`` in latent-frame units. Returns
+    ``[B*V, F*H*W, C]`` to be added to the projected input tokens.
+    """
+
+    rows = plan.shape[0] * plan.shape[1]
+    keyframes, patches, dim = plan.shape[2:]
+    grid = int(round(patches ** 0.5))
+    pooled = torch.nn.functional.adaptive_avg_pool2d(
+        plan.reshape(rows * keyframes, grid, grid, dim).permute(0, 3, 1, 2).float(),
+        (height, width),
+    )
+    pooled = pooled.permute(0, 2, 3, 1).reshape(rows, keyframes, height * width, dim)
+    projected = module(pooled.to(module[-1].weight.dtype))
+    channels = projected.shape[-1]
+    frames = (
+        positions.reshape(rows, keyframes, patches, -1)[:, :, 0, 0]
+        .round()
+        .long()
+        .clamp(0, num_frames - 1)
+    )
+    out = projected.new_zeros(rows, num_frames, height * width, channels)
+    out.scatter_add_(
+        1, frames[:, :, None, None].expand(-1, -1, height * width, channels), projected
+    )
+    counts = projected.new_zeros(rows, num_frames, 1, 1)
+    counts.scatter_add_(
+        1,
+        frames[:, :, None, None],
+        torch.ones(rows, keyframes, 1, 1, device=projected.device, dtype=projected.dtype),
+    )
+    out = out / counts.clamp_min(1)
+    if condition_mask is not None:
+        out = out * condition_mask.to(out.dtype).view(rows, 1, 1, 1)
+    return out.reshape(rows, num_frames * height * width, channels)
+
+
 class _AttachZeroForwardSurrogate(torch.autograd.Function):
     """Keep the primary forward value while routing backward through a surrogate."""
 
@@ -977,6 +1027,17 @@ class LTXVideoTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin
 
             batch_size = hidden_states.size(0)
             hidden_states = self.proj_in(hidden_states)
+            additive = getattr(self, "semantic_additive", None)
+            if additive is not None and semantic_plan is not None:
+                hidden_states = hidden_states + _semantic_additive_residual(
+                    additive,
+                    semantic_plan,
+                    semantic_positions,
+                    semantic_condition_mask,
+                    num_frames=num_frames,
+                    height=height,
+                    width=width,
+                ).to(hidden_states.dtype)
 
             temb, embedded_timestep = self.time_embed(
                 timestep.flatten(),

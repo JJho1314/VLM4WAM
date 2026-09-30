@@ -577,6 +577,49 @@ def build_deepspeed_batch_config(
 
 
 
+
+def apply_research_semantic_additive(
+    diffusion_model: torch.nn.Module, model_path: str | None
+) -> None:
+    """Research opt-in (E7): add a zero-initialized additive semantic projection.
+
+    BATON_RESEARCH_SEMANTIC_ADDITIVE=1 attaches ``semantic_additive`` (LayerNorm
+    + Linear to the model width) and restores its weights from ``model_path``
+    when the checkpoint contains them (checkpoints load non-strictly).
+    """
+
+    if os.environ.get("BATON_RESEARCH_SEMANTIC_ADDITIVE") != "1":
+        return
+    proj_in = getattr(diffusion_model, "proj_in", None)
+    if proj_in is None:
+        raise ValueError("semantic additive injection needs an LTX transformer")
+    semantic_dim = int(getattr(diffusion_model.config, "semantic_plan_in_dim", 1024))
+    module = torch.nn.Sequential(
+        torch.nn.LayerNorm(semantic_dim, elementwise_affine=False),
+        torch.nn.Linear(semantic_dim, proj_in.out_features),
+    )
+    torch.nn.init.zeros_(module[-1].weight)
+    torch.nn.init.zeros_(module[-1].bias)
+    module.to(device=proj_in.weight.device, dtype=proj_in.weight.dtype)
+    diffusion_model.semantic_additive = module
+    restored = 0
+    if model_path:
+        from safetensors.torch import load_file
+        from utils.model_utils import resolve_checkpoint_files
+
+        for checkpoint_file in resolve_checkpoint_files(model_path):
+            state = load_file(str(checkpoint_file))
+            extra = {
+                key[len("semantic_additive."):]: value
+                for key, value in state.items()
+                if key.startswith("semantic_additive.")
+            }
+            if extra:
+                module.load_state_dict(extra, strict=True)
+                restored += len(extra)
+    logger.info(f"semantic additive injection attached (restored {restored} tensors)")
+
+
 def apply_research_semantic_gate_mode(diffusion_model: torch.nn.Module) -> None:
     """Research opt-in for the semantic residual (see LTX block gate modes).
 
@@ -2851,6 +2894,9 @@ class Trainer:
 
         ### Import Inference Pipeline Class
         apply_research_semantic_gate_mode(self.diffusion_model)
+        apply_research_semantic_additive(
+            self.diffusion_model, self.args.diffusion_model.get("model_path")
+        )
         self.pipeline_class = import_custom_class(
             self.args.pipeline_class, getattr(self.args, "pipeline_class_path", "diffusers")
         )
