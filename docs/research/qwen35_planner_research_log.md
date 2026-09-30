@@ -29,7 +29,7 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 | ID | Hypothesis | Prediction if true | Kill criterion |
 |---|---|---|---|
-| H1 | Oracle future semantics help LTX. | Stage 2 val: `teacher` beats `semantic_disabled` on video loss and action MSE. | No gap after 10k steps -> guidance design, not the planner, is the bottleneck (go to H4). |
+| H1 | Oracle future semantics help LTX. **Rejected for per-block cross-attention injection (E3/E5/E5b/E6).** | Stage 2 val: `teacher` beats `semantic_disabled` on video loss and action MSE. | No gap after 10k steps -> guidance design, not the planner, is the bottleneck (go to H4). |
 | H2 | The planner ignores the current observation and outputs a near-mean plan. | Planner MSE >= copy-current-frame MSE on keyframe 0, and the gap is flat across keyframes. | Planner beats copy baseline clearly on all keyframes. **Refuted by E2.** |
 | H3 | Exposure bias: LTX trained on teacher features degrades with predicted features. | Stage-2 ckpt val with predicted features falls between teacher and disabled; Stage 3 closes the gap. | Predicted ~= teacher already. |
 | H4 | Guidance is under-weighted relative to text. **Confirmed (E3): zero-init gate starves the semantic branch.** | Semantic out-proj/gate norms stay << text; raising inference CFG on guidance improves action MSE. | Norms comparable, CFG sweep flat. |
@@ -55,6 +55,25 @@ LIBERO-Plus, and why has it not reliably done so far?
 ## 4. Results
 
 (append newest first)
+
+### 2026-09-30 E6: without text the model needs task information but still ignores guidance
+
+| condition | action MSE | teacher - disabled (action) | video diff | semantic ratio |
+|---|---|---|---|---|
+| with text (E5b) | 0.079 | +0.0002 +/- 0.0001 | 0.0000 | 4e-4 |
+| no text (E6, 1500 steps, caption dropout 1.0, E3 with empty prompt) | 0.455 | +0.0014 +/- 0.0008 | 0.0000 | 7e-4 |
+
+- Removing the instruction raises action MSE ~6x, so the model is starved of
+  task information, yet oracle future semantics (which encode the task) do not
+  help at all. Redundancy with text is NOT the explanation.
+- H1 is rejected for the current injection design: per-block cross-attention to
+  LayerNorm-ed adapter tokens cannot carry the signal within 1500 steps even
+  under strong incentive.
+- Next (E7): additive, spatially aligned injection. Pool each keyframe's 16x16
+  grid to the 8x8 latent grid, project with a zero-initialized linear layer, and
+  add it to the input tokens of the matching future latent frame. If the oracle
+  gap opens, the cross-attention injection is the problem; if not, revisit
+  whether future semantics can help LTX at all.
 
 ### 2026-09-30 E5b: 10x semantic LR does not help; next, remove the text (E6)
 
