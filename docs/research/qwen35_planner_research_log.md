@@ -56,6 +56,34 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-01 Long runs on Qianhai ACP; first checkpoint (B, step 5000)
+
+HPC3 is down for maintenance; training moved to Qianhai ACP. Two 20k-step
+Stage 2 runs from the GE base with additive injection from the start
+(zero_out gate, global batch 128, steps_to_save 5000):
+A = both views (olabots-cci, 4x H800, pt-o6qzf3bu), B = main view only
+(`BATON_RESEARCH_SEMANTIC_VIEWS=main`, olabots, 8x H800, pt-v3of5lse).
+B's first attempt died at step 1057: quarkfs intermittently fails HDF5 file
+locks (errno 9) -> dataloader worker crash -> NCCL all-reduce timeout. Fixed
+with `HDF5_USE_FILE_LOCKING=FALSE` in the ACP launcher (77559c7).
+
+E3 on B step_005000 (210 windows, same indices as every earlier E3):
+
+| model @ 5k steps | teacher | disabled | paired diff |
+|---|---|---|---|
+| original Stage 2 mainline (no additive) | 0.2128 | 0.2138 | -0.0010 |
+| B: additive, main view only | 0.2447 | 0.3569 | -0.1122 +- 0.0080 (win 0.92) |
+
+semantic_ratio 0.036 (E8: 0.0006). Video and motion-region video ~unchanged.
+
+Reading: trained with additive injection from the start, the model leans on
+the guidance heavily (removing it costs 31%), but with oracle guidance it is
+not better than the mainline was at the same step (0.245 vs 0.213; separate
+models, so not a paired comparison). So far the guidance replaces information
+the model would otherwise learn, rather than adding to it. A matched control
+past 5k steps is missing (the mainline stopped at 5.7k), so a no-additive
+control C with the identical schedule is launched to 20k steps.
+
 ### 2026-10-01 E8: additive injection with text (run on Qianhai CCI, 2x H800)
 
 Same as E7 but the prompt is kept (step_001500, zero_out gate + additive
