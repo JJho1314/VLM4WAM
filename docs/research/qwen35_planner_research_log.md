@@ -56,6 +56,22 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-01 B (additive, main view only) at step 10000
+
+| B @ step | teacher | disabled | paired diff | win | semantic_ratio |
+|---|---|---|---|---|---|
+| 5000 | 0.2447 | 0.3569 | -0.1122 +- 0.0080 | 0.92 | 0.036 |
+| 10000 | **0.0282** | 0.0468 | -0.0186 +- 0.0018 (-40%) | 0.93 | 0.034 |
+
+Video and motion-region video stay flat (-0.0004 / -0.0018). Between 5k and
+10k both conditions improve sharply (the learning rate is still near peak
+and the schedule runs to 20k), so step 10000 is the first point where B is
+clearly better than every earlier model (E5-E8, ~0.079 after 6.5k steps).
+Guidance still removes 40% of the remaining error. Whether B with oracle
+guidance beats a model trained without guidance needs the matched control C
+at 10k (about 15 h away); A (both views) is restarting after the HDF5-lock
+crash and is at ~2k steps.
+
 ### 2026-10-01 Long runs on Qianhai ACP; first checkpoint (B, step 5000)
 
 HPC3 is down for maintenance; training moved to Qianhai ACP. Two 20k-step
