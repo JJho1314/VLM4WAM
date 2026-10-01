@@ -1016,6 +1016,15 @@ class LTXVideoTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin
                         semantic_condition_mask = semantic_condition_mask.repeat_interleave(n_view, dim=0)
                     if semantic_condition_mask.shape[0] != hidden_states.shape[0]:
                         raise ValueError("semantic_condition_mask batch must be B or B*V")
+                if os.environ.get("BATON_RESEARCH_SEMANTIC_VIEWS") == "main":
+                    # Research opt-in (H8): condition only the main view; rows are (b v).
+                    keep = torch.arange(hidden_states.shape[0], device=hidden_states.device) % n_view == 0
+                    if semantic_condition_mask is None:
+                        semantic_condition_mask = keep
+                    elif semantic_condition_mask.dtype == torch.bool:
+                        semantic_condition_mask = semantic_condition_mask & keep
+                    else:
+                        semantic_condition_mask = semantic_condition_mask * keep.to(semantic_condition_mask.dtype)
 
             # convert encoder_attention_mask to a bias the same way we do for attention_mask
             if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
