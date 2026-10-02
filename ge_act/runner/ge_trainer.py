@@ -3278,10 +3278,11 @@ class Trainer:
                     wait = loader_stats["data_wait"] / loader_stats["n"]
                     wall = loader_stats["wall"] / loader_stats["n"]
                     count = loader_stats["n"]
-                    logger.info(
-                        f"loader timing over {count} microbatches: "
+                    print(
+                        f"[loader timing] over {count} microbatches: "
                         f"data_wait {wait:.3f}s / microstep {wall:.3f}s "
-                        f"({100 * wait / max(wall, 1e-9):.1f}% waiting)"
+                        f"({100 * wait / max(wall, 1e-9):.1f}% waiting)",
+                        flush=True,
                     )
                     loader_stats.update(data_wait=0.0, wall=0.0, n=0)
                 absolute_microbatch = skipped_microbatches + step + 1
