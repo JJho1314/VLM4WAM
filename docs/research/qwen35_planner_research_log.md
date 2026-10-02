@@ -56,6 +56,22 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-02 A (additive, both views) at step 5000
+
+| @ 5k steps | teacher | disabled | main only (wrist masked) | wrist only (main masked) |
+|---|---|---|---|---|
+| original mainline (no additive) | 0.2128 | 0.2138 | - | - |
+| B: additive, main view only | 0.2447 | 0.3569 | 0.2447 | 0.3569 |
+| **A: additive, both views** | **0.1065** | 0.1949 | 0.1879 | 0.1712 |
+
+A paired: -0.0884 +- 0.0098 (-45%, win 0.95); semantic_ratio 0.0095;
+video_motion -0.0044. Each view alone recovers only a small part of the
+gain, so when guidance is trained in from the start the two views are
+complementary; this reverses E8, where wrist guidance was useless after a
+1.5k-step fine-tune. A with oracle guidance halves the error of the original
+mainline at the same step (0.106 vs 0.213, unpaired); the matched control C
+at 5k is due shortly.
+
 ### 2026-10-01 B (additive, main view only) at step 10000
 
 | B @ step | teacher | disabled | paired diff | win | semantic_ratio |
