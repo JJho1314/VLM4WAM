@@ -56,6 +56,22 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-02 S3a: 3k-step planner fine-tune of B@20k (p=1)
+
+| S3a (B@20k + 3k steps, planner tokens p=1) | action_all | vs disabled |
+|---|---|---|
+| oracle | 0.0070 | -0.0049 +- 0.0006 |
+| disabled | 0.0119 | - |
+| planner | 0.0275 | +0.0155 +- 0.0040 (win 0.16) |
+
+Planner mixing was active for all 3,000 steps (log confirms p=1.0). Planner
+guidance went from 0.1134 (B@20k) to 0.0275 but is still worse than no
+guidance, and oracle guidance still helps: a short fine-tune does not undo
+20k steps of oracle dependence. Next: train the A configuration from the GE
+base with planner tokens throughout (p=1, 20k steps, 8 GPUs) and compare
+planner-mode error against control C at matched steps; S3b (A@10k, p=0.5)
+remains queued.
+
 ### 2026-10-02 Matched comparison at 10k: control C vs A vs B
 
 | @10k (action_all) | oracle | disabled |
