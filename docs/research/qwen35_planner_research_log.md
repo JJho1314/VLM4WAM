@@ -56,6 +56,24 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-02 Matched comparison at 5k: control C vs A vs B
+
+| @ 5k steps (action_all) | teacher (oracle guidance) | disabled |
+|---|---|---|
+| C: control (no additive, original mainline config) | 0.1872 | 0.1889 |
+| **A: additive, both views** | **0.1065 (-43% vs C)** | 0.1949 (= C) |
+| B: additive, main view only | 0.2447 (+31% vs C) | 0.3569 |
+
+- H1 confirmed at matched steps for A: oracle future-semantic guidance cuts
+  action MSE by 43% against an identically trained model without it, and A
+  without guidance is no worse than the control (no cost when the guidance
+  is absent).
+- B (main view only) is worse than the control at 5k even with guidance, so
+  dropping wrist guidance hurts early training. B's later gains (10k, 15k)
+  still need C at the same steps.
+- C reproduces the original mainline (0.2128 / 0.2138), so the control is
+  valid; its semantic path is unused (-0.0017).
+
 ### 2026-10-02 A (additive, both views) at step 5000
 
 | @ 5k steps | teacher | disabled | main only (wrist masked) | wrist only (main masked) |
