@@ -56,6 +56,23 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-02 Matched comparison at 10k: control C vs A vs B
+
+| @10k (action_all) | oracle | disabled |
+|---|---|---|
+| C: control (no additive) | 0.0225 | 0.0234 |
+| **A: additive, both views** | **0.0177 (-22% vs C)** | 0.0418 (+79% vs C) |
+| B: additive, main view | 0.0282 (+25% vs C) | 0.0468 |
+
+- A with oracle guidance still beats the matched control, but the margin
+  shrinks from -43% (5k) to -22% (10k) as the control catches up.
+- A without guidance falls far behind the control (+79%; it was on par at
+  5k): the model grows dependent on the guidance, consistent with the
+  planner-prediction collapse.
+- B (main view only) is worse than the control at matched steps, so the
+  main-view-only variant is dropped; its large late gains were mostly
+  training length.
+
 ### 2026-10-02 A (both views) at 10k
 
 | @10k (action_all) | oracle | disabled | paired diff |
