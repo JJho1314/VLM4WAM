@@ -1,7 +1,8 @@
 """E3: paired multi-sample evaluation of a Baton Stage-2 LTX checkpoint.
 
 For each validation window the same inputs and noise are run under several
-semantic modes (teacher guidance on, off, wrist-only masked, main-only masked),
+semantic modes (teacher guidance on, off, wrist-only masked, main-only masked;
+``planner*`` modes use frozen Qwen3.5 baton planner predictions instead),
 recording action MSE per horizon and future-video MSE. Paired differences
 against ``semantic_disabled`` test H1 (does oracle guidance help) and H8 (is
 wrist guidance useful). Shardable across 1-GPU jobs; merge with --merge.
@@ -66,9 +67,9 @@ def _semantic_kwargs(runner, condition, mode: str, n_view: int) -> dict:
     )
     mask = selection.condition_mask.clone()
     # Rows are (b v) with views ordered main, wrist.
-    if mode == "teacher_wrist_masked":
+    if mode.endswith("_wrist_masked"):
         mask[1::n_view] = 0
-    elif mode == "teacher_main_masked":
+    elif mode.endswith("_main_masked"):
         mask[0::n_view] = 0
     return {
         "semantic_plan": selection.tokens,
@@ -176,7 +177,14 @@ def _run_mode(runner, pipe, batch, condition, mode: str, seed: int) -> dict:
 
 
 def _evaluate(args: argparse.Namespace) -> None:
-    from runner.ge_trainer import Trainer, build_baton_semantic_condition, compute_ltx_latent_frames
+    import dataclasses
+
+    from runner.ge_trainer import (
+        Trainer,
+        _normalized_video_to_uint8,
+        build_baton_semantic_condition,
+        compute_ltx_latent_frames,
+    )
 
     # Trainer.__init__ broadcasts over the default process group, so a
     # standalone evaluator must provide a single-rank one.
@@ -208,6 +216,23 @@ def _evaluate(args: argparse.Namespace) -> None:
     latent_frames = compute_ltx_latent_frames(
         raw_future, temporal_compression_ratio=runner.TEMPORAL_DOWN_RATIO, n_previous=n_prev
     )
+    # Optional frozen Qwen3.5 baton planner: "planner*" modes replace the
+    # SigLIP2 teacher tokens with its predictions from the current frames.
+    planner = None
+    if os.environ.get("E3_PLANNER_CHECKPOINT"):
+        from qwen35_baton.provider import FrozenBatonPlanner
+
+        qwen = os.environ["E3_PLANNER_QWEN_PATH"]
+        planner = FrozenBatonPlanner.from_checkpoint(
+            os.environ["E3_PLANNER_CHECKPOINT"],
+            qwen_model_path=qwen,
+            qwen_tokenizer_path=qwen,
+            qwen_processor_path=qwen,
+            siglip2_model_path=runner.args.semantic_plan["siglip2_model_path"],
+            device=accelerator.device,
+        )
+    if any(mode.startswith("planner") for mode in MODES) and planner is None:
+        raise ValueError("planner modes need E3_PLANNER_CHECKPOINT and E3_PLANNER_QWEN_PATH")
     dataset = runner.val_dataset
     indices = np.linspace(0, len(dataset) - 1, args.num_samples).round().astype(int).tolist()
     mine = indices[args.shard_index :: args.num_shards]
@@ -232,9 +257,22 @@ def _evaluate(args: argparse.Namespace) -> None:
                 device=accelerator.device,
                 dtype=runner.state.weight_dtype,
             )
+            planner_condition = None
+            if planner is not None:
+                current = batch["video"][:1, :, :, n_prev - 1].permute(0, 2, 1, 3, 4)
+                current = _normalized_video_to_uint8(current).contiguous()
+                with torch.no_grad():
+                    predicted = planner.predict(current, tuple(batch["caption"][:1])).tokens
+                planner_condition = dataclasses.replace(
+                    condition,
+                    tokens=predicted.to(device=condition.tokens.device, dtype=condition.tokens.dtype),
+                )
             record = {"index": int(index), "caption": batch["caption"][0]}
             for mode in MODES:
-                record[mode] = _run_mode(runner, pipe, batch, condition, mode, seed=1000 + int(index))
+                mode_condition = planner_condition if mode.startswith("planner") else condition
+                record[mode] = _run_mode(
+                    runner, pipe, batch, mode_condition, mode, seed=1000 + int(index)
+                )
             stream.write(json.dumps(record) + "\n")
             stream.flush()
             print(json.dumps({"done": count + 1, "of": len(mine), "elapsed_s": round(time.time() - started)}), flush=True)
