@@ -578,6 +578,47 @@ def build_deepspeed_batch_config(
 
 
 
+def apply_research_planner_mixing(trainer, tokens, video, captions, n_previous):
+    """Research opt-in (Stage-3 style): swap teacher tokens for planner predictions.
+
+    With BATON_RESEARCH_PLANNER_PROB=p > 0, each sample's teacher grids are
+    replaced with probability p by the frozen Qwen3.5 baton planner's
+    prediction from the last memory frame and the instruction, so the model
+    learns to use the guidance it will actually receive at deployment.
+    Needs BATON_RESEARCH_PLANNER_CHECKPOINT and BATON_RESEARCH_PLANNER_QWEN_PATH.
+    """
+
+    prob = float(os.environ.get("BATON_RESEARCH_PLANNER_PROB", "0"))
+    if prob <= 0:
+        return tokens
+    planner = getattr(trainer, "_research_planner", None)
+    if planner is None:
+        from qwen35_baton.provider import FrozenBatonPlanner
+
+        qwen = os.environ["BATON_RESEARCH_PLANNER_QWEN_PATH"]
+        planner = FrozenBatonPlanner.from_checkpoint(
+            os.environ["BATON_RESEARCH_PLANNER_CHECKPOINT"],
+            qwen_model_path=qwen,
+            qwen_tokenizer_path=qwen,
+            qwen_processor_path=qwen,
+            siglip2_model_path=trainer.args.semantic_plan["siglip2_model_path"],
+            device=trainer.state.accelerator.device,
+        )
+        trainer._research_planner = planner
+        logger.info(f"research planner mixing enabled (p={prob})")
+    pick = torch.rand(tokens.shape[0]) < prob
+    if not bool(pick.any()):
+        return tokens
+    current = video[pick.to(video.device), :, :, n_previous - 1].permute(0, 2, 1, 3, 4)
+    current = _normalized_video_to_uint8(current).contiguous()
+    chosen = tuple(caption for caption, keep in zip(captions, pick.tolist()) if keep)
+    with torch.no_grad():
+        predicted = planner.predict(current, chosen).tokens
+    tokens = tokens.clone()
+    tokens[pick.to(tokens.device)] = predicted.to(device=tokens.device, dtype=tokens.dtype)
+    return tokens
+
+
 def apply_research_semantic_additive(
     diffusion_model: torch.nn.Module, model_path: str | None
 ) -> None:
@@ -3326,7 +3367,13 @@ class Trainer:
                             device=accelerator.device,
                             dtype=weight_dtype,
                         )
-                        semantic_plan = baton_condition.tokens
+                        semantic_plan = apply_research_planner_mixing(
+                            self,
+                            baton_condition.tokens,
+                            baton_video,
+                            batch["caption"],
+                            mem_size,
+                        )
                         semantic_plan_times = baton_condition.times
                         semantic_plan_positions = baton_condition.positions
                         semantic_plan_mask = baton_condition.mask
