@@ -1180,6 +1180,26 @@ class JointGroundedTrainingModel(torch.nn.Module):
         )
 
 
+def _timed_batches(iterable, stats: dict):
+    """Yield batches while recording how long each one took to arrive.
+
+    ``stats`` accumulates ``data_wait`` (seconds blocked in the loader) and
+    ``wall`` (seconds per micro-step, including the training body).
+    """
+
+    import time
+
+    last = time.perf_counter()
+    for batch in iterable:
+        arrived = time.perf_counter()
+        stats["data_wait"] += arrived - stats.pop("_resume", last)
+        stats["wall"] += arrived - last
+        stats["n"] += 1
+        last = arrived
+        yield batch
+        stats["_resume"] = time.perf_counter()
+
+
 class EpochSeededRandomSampler(torch.utils.data.Sampler[int]):
     """Reconstruct each epoch permutation from an immutable seed and epoch."""
 
@@ -2637,6 +2657,11 @@ class Trainer:
         )
         self.train_dataloader_generator = torch.Generator()
         self.train_dataloader_generator.manual_seed(self.sampler_seed)
+        # Research opt-in: override loader parallelism without touching the config.
+        if os.environ.get("BATON_RESEARCH_NUM_WORKERS"):
+            self.args.dataloader_num_workers = int(os.environ["BATON_RESEARCH_NUM_WORKERS"])
+        if os.environ.get("BATON_RESEARCH_PREFETCH"):
+            self.args.dataloader_prefetch_factor = int(os.environ["BATON_RESEARCH_PREFETCH"])
         self.train_dataloader = torch.utils.data.DataLoader(
             dataset=self.train_dataset,
             sampler=self.train_sampler,
@@ -3206,7 +3231,17 @@ class Trainer:
                 self.train_dataloader,
                 num_batches=skipped_microbatches,
             )
-            for step, batch in enumerate(epoch_dataloader):
+            loader_stats = {"data_wait": 0.0, "wall": 0.0, "n": 0}
+            for step, batch in enumerate(_timed_batches(epoch_dataloader, loader_stats)):
+                if loader_stats["n"] >= 50 and accelerator.is_main_process:
+                    wait = loader_stats["data_wait"] / loader_stats["n"]
+                    wall = loader_stats["wall"] / loader_stats["n"]
+                    logger.info(
+                        f"loader timing over {loader_stats[n]} microbatches: "
+                        f"data_wait {wait:.3f}s / microstep {wall:.3f}s "
+                        f"({100 * wait / max(wall, 1e-9):.1f}% waiting)"
+                    )
+                    loader_stats.update(data_wait=0.0, wall=0.0, n=0)
                 absolute_microbatch = skipped_microbatches + step + 1
                 logger.debug(f"Starting step {step + 1}")
                 logs = {}
