@@ -3236,8 +3236,9 @@ class Trainer:
                 if loader_stats["n"] >= 50 and accelerator.is_main_process:
                     wait = loader_stats["data_wait"] / loader_stats["n"]
                     wall = loader_stats["wall"] / loader_stats["n"]
+                    count = loader_stats["n"]
                     logger.info(
-                        f"loader timing over {loader_stats[n]} microbatches: "
+                        f"loader timing over {count} microbatches: "
                         f"data_wait {wait:.3f}s / microstep {wall:.3f}s "
                         f"({100 * wait / max(wall, 1e-9):.1f}% waiting)"
                     )
