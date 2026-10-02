@@ -56,6 +56,16 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-02 A (both views) at 10k
+
+| @10k (action_all) | oracle | disabled | paired diff |
+|---|---|---|---|
+| A: additive, both views | **0.0177** | 0.0418 | -0.0241 +- 0.0041 (-58%, win 0.95) |
+| B: additive, main view | 0.0282 | 0.0468 | -0.0186 +- 0.0018 (-40%) |
+
+Main only (wrist masked) 0.0434, wrist only 0.0324: both views remain
+complementary. Control C at 10k is due within the hour.
+
 ### 2026-10-02 Planner predictions instead of oracle guidance (negative)
 
 E3 with `planner*` modes: the frozen Qwen3.5 baton planner (step_020000)
