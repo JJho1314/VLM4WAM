@@ -61,7 +61,12 @@ LIBERO-Plus, and why has it not reliably done so far?
 | B @ step | teacher | disabled | paired diff | win | semantic_ratio |
 |---|---|---|---|---|---|
 | 5000 | 0.2447 | 0.3569 | -0.1122 +- 0.0080 | 0.92 | 0.036 |
-| 10000 | **0.0282** | 0.0468 | -0.0186 +- 0.0018 (-40%) | 0.93 | 0.034 |
+| 10000 | 0.0282 | 0.0468 | -0.0186 +- 0.0018 (-40%) | 0.93 | 0.034 |
+| 15000 | **0.0098** | 0.0197 | -0.0099 +- 0.0009 (-50%) | 0.98 | 0.033 |
+
+Update at 15k: the relative gain keeps growing (-31% -> -40% -> -50%) while
+both conditions keep improving, i.e. the model does not learn to ignore the
+guidance as it trains longer.
 
 Video and motion-region video stay flat (-0.0004 / -0.0018). Between 5k and
 10k both conditions improve sharply (the learning rate is still near peak
