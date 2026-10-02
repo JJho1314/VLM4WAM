@@ -56,6 +56,19 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-03 Matched trend A vs control C (5k, 10k, 15k)
+
+| step | C oracle / disabled | A oracle | A vs C (oracle) | A disabled |
+|---|---|---|---|---|
+| 5k | 0.1872 / 0.1889 | 0.1065 | -43% | 0.1949 |
+| 10k | 0.0225 / 0.0234 | 0.0177 | -22% | 0.0418 |
+| 15k | 0.0074 / 0.0088 | 0.0053 | -28% | 0.0198 |
+
+With oracle future semantics the both-view additive model stays ~25% below
+the matched control from 10k to 15k (the margin is not closing), but it
+depends on the guidance: without it the error is ~2x the control. This is
+the robustness gap the planner-trained run (s2planner20k) has to close.
+
 ### 2026-10-03 A (both views) at 15k
 
 oracle 0.0053, disabled 0.0198: -0.0145 +- 0.0026 (-73%, win 1.00); main
