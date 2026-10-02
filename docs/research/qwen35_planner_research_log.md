@@ -56,6 +56,11 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-03 A (both views) at 15k
+
+oracle 0.0053, disabled 0.0198: -0.0145 +- 0.0026 (-73%, win 1.00); main
+only 0.0240, wrist only 0.0123. Control C at 15k is due shortly.
+
 ### 2026-10-02 S3a: 3k-step planner fine-tune of B@20k (p=1)
 
 | S3a (B@20k + 3k steps, planner tokens p=1) | action_all | vs disabled |
