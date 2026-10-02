@@ -56,6 +56,27 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-02 Planner predictions instead of oracle guidance (negative)
+
+E3 with `planner*` modes: the frozen Qwen3.5 baton planner (step_020000)
+predicts the four keyframe grids from the last memory frame and the
+instruction, replacing the SigLIP2 teacher tokens (same windows and seeds).
+
+| model | oracle | disabled | planner | planner vs disabled |
+|---|---|---|---|---|
+| A @5k (both views) | 0.1065 | 0.1949 | 0.2074 | +0.0125 +- 0.0080 (win 0.48) |
+| B @20k (main view) | 0.0064 | 0.0162 | 0.1134 | +0.0972 +- 0.0138 (win 0.02, ~7x worse) |
+
+Masking either view with planner guidance is worse still (A: +0.036 / +0.043).
+
+Reading: models trained on oracle teacher tokens rely on them, and the
+planner's predictions (E2: R2 0.53 main / 0.23 wrist) are off-distribution
+for them; the more a model relies on the guidance (B at 20k), the larger the
+damage. Oracle gains do not transfer to deployment as is. The train/test
+mismatch has to be handled in training: Stage 3 (fine-tune on planner
+predictions), or teacher-token corruption / mixing during Stage 2, and/or a
+better planner.
+
 ### 2026-10-02 Matched comparison at 5k: control C vs A vs B
 
 | @ 5k steps (action_all) | teacher (oracle guidance) | disabled |
