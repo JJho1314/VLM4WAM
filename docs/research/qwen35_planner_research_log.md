@@ -56,6 +56,24 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-03 S3b (fixed): A@10k + 3k steps with planner tokens p=0.5
+
+| s3planA_p050_v2 (13k total steps) | action_all | vs disabled |
+|---|---|---|
+| oracle | 0.0073 | -0.0070 +- 0.0007 (win 0.92) |
+| disabled | 0.0143 | - |
+| **planner** | **0.0122** | **-0.0021 +- 0.0005 (-15%, win 0.74)** |
+| planner, wrist masked | 0.0300 | +0.0157 |
+| planner, main masked | 0.0206 | +0.0064 |
+
+First run where planner guidance helps: after 3k steps of training on
+planner tokens (half the samples), planner predictions cut action error by
+15% instead of hurting (oracle-trained A@5k: +6%). Against the control the
+comparison is approximate (C@10k 0.0225, C@15k 0.0074; linear C@13k ~0.013),
+so the matched answer comes from the from-scratch runs s2planner20k_v2 /
+s2mix050_20k_v2. Both views are still needed. The joint planner-head run
+s3joint_A10k (p=1, head lr 1e-5, anchor 0.1, 25.2M head params) is running.
+
 ### 2026-10-03 Final matched comparison A vs control C (20k)
 
 | step | C oracle / disabled | A oracle | A vs C (oracle) | A disabled |
