@@ -56,6 +56,21 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-03 CORRECTION: planner mixing was never applied (bug, fixed in 3cc8c36)
+
+`BATON_RESEARCH_PLANNER_PROB` (d1370f2) replaced `semantic_plan`, but the
+Baton training path pops `semantic_plan` from the forward kwargs and
+`forward_baton_ge_act` reads `baton_condition.tokens`, i.e. the teacher.
+Every run with PROB > 0 before 3cc8c36 trained on teacher tokens only:
+S3a, and the first s2planner20k / s2mix050_20k / s3planA_p050 submissions.
+The S3a entry below is therefore just 3k more teacher steps on B, not a
+planner fine-tune; its "short fine-tune is insufficient" conclusion is
+withdrawn. The three runs were stopped. The fix replaces the condition
+tokens (`dataclasses.replace(baton_condition, tokens=...)`) and 53fe8d5 logs
+once per run how many samples were replaced and the mean |planner - teacher|
+so the wiring is visible in every log. The runs are resubmitted under new
+RUN_IDs (suffix _v2).
+
 ### 2026-10-03 Matched trend A vs control C (5k, 10k, 15k)
 
 | step | C oracle / disabled | A oracle | A vs C (oracle) | A disabled |
