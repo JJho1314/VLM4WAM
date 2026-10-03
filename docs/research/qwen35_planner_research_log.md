@@ -56,6 +56,22 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-03 Final matched comparison A vs control C (20k)
+
+| step | C oracle / disabled | A oracle | A vs C (oracle) | A disabled |
+|---|---|---|---|---|
+| 5k | 0.1872 / 0.1889 | 0.1065 | -43% | 0.1949 |
+| 10k | 0.0225 / 0.0234 | 0.0177 | -22% | 0.0418 |
+| 15k | 0.0074 / 0.0088 | 0.0053 | -28% | 0.0198 |
+| **20k** | **0.0050 / 0.0064** | **0.0031** | **-38%** | 0.0165 |
+
+A@20k paired: oracle -0.0134 +- 0.0025 vs disabled (-81%, win 1.00); main
+only 0.0203, wrist only 0.0098. With oracle future semantics the both-view
+additive model ends 38% below the matched control and the margin widens
+after 10k. Without guidance it is 2.6x worse than the control, so the
+deployable claim rests on the planner-trained runs (s2planner20k_v2,
+s2mix050_20k_v2) beating C in planner mode.
+
 ### 2026-10-03 CORRECTION: planner mixing was never applied (bug, fixed in 3cc8c36)
 
 `BATON_RESEARCH_PLANNER_PROB` (d1370f2) replaced `semantic_plan`, but the
