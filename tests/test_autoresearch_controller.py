@@ -222,3 +222,15 @@ def test_registered_full_data_paths_keep_storage_root():
                     path=Path(cfg['data'][split][key])
                     assert path.parts[:3]==('/','data','users')
                     assert path.parent.name=='data_'+version
+
+def test_paired_workers_overlap_and_stop_on_failure(tmp_path):
+    from autoresearch.run_eval import run_mode_workers
+    import sys,time
+    # A worker can finish only after the other is running: serial launch fails.
+    script="import pathlib,time,sys; a,b=map(pathlib.Path,sys.argv[1:]); a.write_text('ready'); end=time.monotonic()+2;\nwhile not b.exists() and time.monotonic()<end: time.sleep(.01)\nassert b.exists()"
+    a,b=tmp_path/'a',tmp_path/'b'
+    run_mode_workers([[sys.executable,'-c',script,str(a),str(b)],[sys.executable,'-c',script,str(b),str(a)]],tmp_path/'logs')
+    assert a.exists() and b.exists()
+    start=time.monotonic()
+    with pytest.raises(subprocess.CalledProcessError):run_mode_workers([['false'],['sleep','30']],tmp_path/'failed')
+    assert time.monotonic()-start<3

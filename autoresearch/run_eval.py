@@ -32,39 +32,65 @@ def wait_service(proc,host,port,timeout=600):
     raise TimeoutError('policy service readiness timeout')
 
 
-def evaluate_pair(directory,config_path,checkpoint_path,protocol_path,planner_mode):
+def run_mode_workers(commands,directory):
+    """Launch independent language modes, fail together, retain both logs."""
+    from contextlib import ExitStack
     directory=Path(directory);directory.mkdir(parents=True,exist_ok=False)
+    processes=[]
+    with ExitStack() as stack:
+        try:
+            for i,cmd in enumerate(commands):
+                log=stack.enter_context((directory/f'worker_{i}.log').open('w'))
+                processes.append(subprocess.Popen(cmd,cwd=ROOT,stdout=log,stderr=subprocess.STDOUT))
+            while True:
+                codes=[proc.poll() for proc in processes]
+                for proc,code in zip(processes,codes):
+                    if code not in (None,0):raise subprocess.CalledProcessError(code,proc.args)
+                if all(code==0 for code in codes):return
+                time.sleep(.1)
+        finally:
+            for proc in processes:
+                if proc.poll() is None:stop_process_tree(proc)
+
+def evaluate_pair(directory,config_path,checkpoint_path,protocol_path,planner_mode,instruction_mode=None):
+    directory=Path(directory);directory.mkdir(parents=True,exist_ok=instruction_mode is not None)
     protocol=verify_protocol(json.loads(Path(protocol_path).read_text()))
     config_path=Path(config_path).resolve()
     import yaml
     config=yaml.safe_load(config_path.read_text());data=config['data']['train']
     manifest=Path(data['manifest_path'])
     if hashlib.sha256(manifest.read_bytes()).hexdigest()!=protocol['manifest_sha256']:raise ValueError('development data protocol mismatch')
-    # Refuse an occupied port, avoiding requests to someone else's server.
-    with socket.socket() as sock:
-        sock.bind(('127.0.0.1',8999))
     pixi=[PIX,'run','--manifest-path',str(ROOT/'autoresearch/runtime/pixi.toml')]
-    for mode in protocol['instruction_modes']:
+    if instruction_mode is None:
+        for port in (8999,9000):
+            with socket.socket() as sock:sock.bind(('127.0.0.1',port))
+        commands=[pixi+['research','-m','autoresearch.run_eval','--directory',str(directory),'--config',str(config_path),'--checkpoint',str(checkpoint_path),'--protocol',str(protocol_path),'--planner-mode',planner_mode,'--instruction-mode',mode] for mode in protocol['instruction_modes']]
+        run_mode_workers(commands,directory/'parallel_logs')
+        atomic_json(directory/'complete.json',dict(status='complete',protocol_hash=protocol['hash']))
+        return
+    if instruction_mode not in protocol['instruction_modes']:raise ValueError('unregistered instruction mode')
+    for mode in [instruction_mode]:
+        port=8999 if mode=='correct' else 9000
         kwargs=dict(config_path=str(config_path),checkpoint_path=str(Path(checkpoint_path).resolve()),stats_path=data['stat_file'],manifest_path=str(manifest),planner_mode=planner_mode,instruction_mode=mode)
-        argv=pixi+['serve','--factory','ge_act.experiments.robofollow_policy:make_policy','--kwargs',json.dumps(kwargs),'--host','127.0.0.1','--port','8999']
+        argv=pixi+['serve','--factory','ge_act.experiments.robofollow_policy:make_policy','--kwargs',json.dumps(kwargs),'--host','127.0.0.1','--port',str(port)]
         with (directory/f'{mode}_serve.log').open('w') as log:
             server=subprocess.Popen(argv,cwd=ROOT,env=dict(os.environ,CUDA_VISIBLE_DEVICES='0'),stdout=log,stderr=subprocess.STDOUT)
             try:
-                wait_service(server,'127.0.0.1',8999)
+                wait_service(server,'127.0.0.1',port)
                 for task in protocol['selected_tasks']:
                     out=directory/mode/task['scene']
                     # Every attempt is new; official evaluator itself cannot resume.
                     if out.exists():raise FileExistsError(out)
                     args=protocol['arguments']
-                    cmd=pixi+['sim','-m','robofollow.evaluate','--scene',task['scene'],'--levels','L0','--tasks',task['task'],'--rounds',str(args['rounds']),'--base-seed',str(args['base_seed']),'--max-steps',str(args['max_steps']),'--actions-per-step',str(args['actions_per_step']),'--runtime',args['runtime'],'--sim-steps',str(args['sim_steps']),'--gpu','1','--remote','--host','127.0.0.1','--port','8999','--output',str(out)]
+                    cmd=pixi+['sim','-m','robofollow.evaluate','--scene',task['scene'],'--levels','L0','--tasks',task['task'],'--rounds',str(args['rounds']),'--base-seed',str(args['base_seed']),'--max-steps',str(args['max_steps']),'--actions-per-step',str(args['actions_per_step']),'--runtime',args['runtime'],'--sim-steps',str(args['sim_steps']),'--gpu','1','--remote','--host','127.0.0.1','--port',str(port),'--output',str(out)]
                     atomic_json(directory/f'{mode}_{task["scene"]}_argv.json',cmd)
                     with (directory/f'{mode}_{task["scene"]}.log').open('w') as eval_log:subprocess.run(cmd,cwd=ROOT,stdout=eval_log,stderr=subprocess.STDOUT,check=True)
                     sidecar=dict(hash=protocol['hash'],expected_trials=args['rounds'],selected_tasks=[task],arguments=args,official_code_sha256=protocol['official_code_sha256'])
                     atomic_json(out/'protocol.json',sidecar)
                     read_complete_metrics(out,protocol['hash'])
             finally:
-                stop_process_tree(server)
-    atomic_json(directory/'complete.json',dict(status='complete',protocol_hash=protocol['hash']))
+                if server.poll() is None:stop_process_tree(server)
+    atomic_json(directory/f'{instruction_mode}_complete.json',dict(status='complete',protocol_hash=protocol['hash']))
 
 
 def collect_pair(directory,protocol):
@@ -95,8 +121,9 @@ def collect_pair(directory,protocol):
 
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--directory',required=True);p.add_argument('--config',required=True);p.add_argument('--checkpoint',required=True);p.add_argument('--protocol',required=True);p.add_argument('--planner-mode',choices=['disabled','predicted'],default='disabled');a=p.parse_args()
-    evaluate_pair(a.directory,a.config,a.checkpoint,a.protocol,a.planner_mode)
+    p=argparse.ArgumentParser();p.add_argument('--directory',required=True);p.add_argument('--config',required=True);p.add_argument('--checkpoint',required=True);p.add_argument('--protocol',required=True);p.add_argument('--planner-mode',choices=['disabled','predicted'],default='disabled');p.add_argument('--instruction-mode',choices=['correct','shuffle']);a=p.parse_args()
+    evaluate_pair(a.directory,a.config,a.checkpoint,a.protocol,a.planner_mode,a.instruction_mode)
+    if a.instruction_mode:return
     result,_=collect_pair(a.directory,json.loads(Path(a.protocol).read_text()));atomic_json(Path(a.directory)/'metrics.json',result)
 
 if __name__=='__main__':main()

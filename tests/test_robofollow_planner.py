@@ -41,3 +41,16 @@ def test_mixing_extremes_and_joint_gradients():
     selected,_=mix_training_plans(pred.detach(),teacher,0.,0.)
     assert torch.equal(selected,teacher)
     with pytest.raises(ValueError):mix_training_plans(pred,None,.5,0.)
+
+def test_text_runner_without_semantic_arguments(tmp_path,monkeypatch):
+    from pathlib import Path
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'ge_act'))
+    from runner.robofollow_trainer import RoboFollowTrainer,Trainer
+    runner=object.__new__(RoboFollowTrainer)
+    runner.args=SimpleNamespace(load_weights=False)
+    runner.raw_config={}
+    runner.vae=SimpleNamespace(config=SimpleNamespace(latent_channels=128))
+    monkeypatch.setattr(Trainer,'prepare_models',lambda self:None)
+    runner.prepare_models()
+    assert runner.args.semantic_plan=={}
+    assert runner.args.load_diffusion_model_weights is True

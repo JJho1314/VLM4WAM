@@ -8,7 +8,7 @@ class RoboFollowTrainer(Trainer):
     def prepare_models(self):
         original=getattr(self.args,'load_diffusion_model_weights',True)
         self.args.load_diffusion_model_weights=False
-        semantic=self.args.semantic_plan
+        semantic=getattr(self.args,'semantic_plan',{})
         self.args.semantic_plan=dict(semantic,enabled=False)
         try:super().prepare_models()
         finally:
