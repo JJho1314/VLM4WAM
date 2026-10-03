@@ -96,3 +96,11 @@ RoboFollow policy 需要 `reset()`、`set_instruction(text)`、`predict(observat
 - 本轮初版新增研究测试47通过；修正轨迹别名划分后再执行验收，相关provider/training/pipeline57通过。项目级tests曾1046通过、37失败、1跳过、10错误，其中3项静态检查在原baseline复现失败，其余尚有环境/共享状态及未分诊问题；不宣称整个项目测试通过。验证原始日志保存在研究输出validation目录。
 
 旧结果只作接入诊断，不能称为held-out结果；旧best/thresholds/baseline归档，累计8GPUh账本不重置。新v3基线和候选使用同一清洁数据与新协议重新比较，运行上限由2h收紧为75min以保留重跑预算。
+
+## 清洁基线与后续诊断
+
+complete-v3 R0 `20261003_115552_R0`已完成300步及四场景16个正确/打乱指令配对trials，Intent/Execution/CR全部0，Δ及近似区间均0。仅四个L0任务，零分无法区分语言条件无效与动作训练尚未建立能力。最后batch loss约1.77，不等于收敛。下一步依据R1实际证据决定是否进入训练集小批过拟合、14D投影warmup与学习率单因素对照；详见ACTION_DIAGNOSTIC.md。
+
+本轮四项Important研究边界修复与实际CPU prepare故障回归完成，122相关测试通过。部署绑定frozen encoder全部文件与prepare来源hash，全部2031975保留帧已解码；继承环境隔离与独立watchdog真实终止回归通过。审计同时发现4条内容排除记录图像不同：当前比较维持3746-example subset，未来新数据版本保留视觉不同示范并重新校准R0，不沿用当前分数。
+
+R1 `20261003_131008_R1`完整16trials结果也为0，Δ与四任务近似区间均0，准入inconclusive；控制器evidence_stop停止扩展R2/R3。本轮没有证明planner改善语言遵循，优先动作基础拟合诊断。累计记账6.816886GPUh，原费用不重置，best仍为基线。
