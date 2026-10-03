@@ -1,0 +1,61 @@
+{
+  "raw_episodes": 3750,
+  "usable": 3746,
+  "duplicates": 4,
+  "quarantine": 0,
+  "prior_usable": 3536,
+  "additional_usable": 210,
+  "manifest_sha256": "1f4fe7f6d3f8026f7d15a8f7b28274380e7b5659ad08d2a98f4a693af6dad096",
+  "coverage": {
+    "scene1": {
+      "expected_tasks": 16,
+      "usable_tasks": 16,
+      "missing_tasks": [],
+      "extra_tasks": [],
+      "split_episodes": {
+        "train": 750,
+        "dev": 50
+      }
+    },
+    "scene2": {
+      "expected_tasks": 16,
+      "usable_tasks": 16,
+      "missing_tasks": [],
+      "extra_tasks": [],
+      "split_episodes": {
+        "dev": 300,
+        "train": 500
+      }
+    },
+    "scene3": {
+      "expected_tasks": 16,
+      "usable_tasks": 16,
+      "missing_tasks": [],
+      "extra_tasks": [],
+      "split_episodes": {
+        "train": 550,
+        "dev": 250
+      }
+    },
+    "scene4": {
+      "expected_tasks": 27,
+      "usable_tasks": 27,
+      "missing_tasks": [],
+      "extra_tasks": [],
+      "split_episodes": {
+        "train": 1046,
+        "dev": 300
+      }
+    }
+  },
+  "download_receipt": {
+    "repo": "AutoLab-SJTU/robofollow-data",
+    "revision": "bbb1e266ed585f1557773de5a3f1e3b4cd944f97",
+    "files": 15158,
+    "bytes": 40404981626,
+    "all_lfs_sha256_and_git_blobs_verified": true,
+    "completed_utc": "2026-10-03T09:44:14.476742+00:00"
+  },
+  "use_note": "v2 frozen separately; active R0 and first paired R1 retain v1 for controlled comparison",
+  "frozen_v1_common_file_hashes_unchanged": true
+}

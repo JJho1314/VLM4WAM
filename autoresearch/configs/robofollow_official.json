@@ -1,0 +1,2240 @@
+{
+  "version": 1,
+  "purpose": "full official acceptance; never used for candidate selection",
+  "selected_tasks": [
+    {
+      "scene": "scene1",
+      "task": "L0_pickup_yellow_block_1_left"
+    },
+    {
+      "scene": "scene1",
+      "task": "L0_pickup_yellow_block_1_right"
+    },
+    {
+      "scene": "scene1",
+      "task": "L0_pickup_yellow_block_2"
+    },
+    {
+      "scene": "scene1",
+      "task": "L0_pickup_yellow_block_3"
+    },
+    {
+      "scene": "scene1",
+      "task": "L0_place_yellow_block_1_behind_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L0_place_yellow_block_1_behind_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L0_place_yellow_block_1_beside_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L0_place_yellow_block_1_left_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L0_place_yellow_block_2_behind_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L0_place_yellow_block_2_behind_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L0_place_yellow_block_2_in_front_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L0_place_yellow_block_2_left_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L0_place_yellow_block_3_behind_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L0_place_yellow_block_3_behind_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L0_place_yellow_block_3_beside_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L0_place_yellow_block_3_in_front_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L1_s11_pick_left_of_green"
+    },
+    {
+      "scene": "scene1",
+      "task": "L1_s11_pick_right_of_red"
+    },
+    {
+      "scene": "scene1",
+      "task": "L1_s12_pick_right_of_red"
+    },
+    {
+      "scene": "scene1",
+      "task": "L1_s12_place_right_of_red_behind_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L1_s12_place_right_of_red_right_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L1_s13_pick_left_of_green"
+    },
+    {
+      "scene": "scene1",
+      "task": "L1_s13_place_left_of_green_behind_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L1_s13_place_left_of_green_left_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L2_pick_block_in_front_of_red_sphere_left"
+    },
+    {
+      "scene": "scene1",
+      "task": "L2_pick_block_left_of_red_cylinder_left"
+    },
+    {
+      "scene": "scene1",
+      "task": "L2_pick_block_left_of_red_cylinder_right"
+    },
+    {
+      "scene": "scene1",
+      "task": "L2_pick_block_right_of_green_sphere_right"
+    },
+    {
+      "scene": "scene1",
+      "task": "L2_place_block_in_front_of_red_sphere_behind_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L2_place_block_in_front_of_red_sphere_behind_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L2_place_block_in_front_of_red_sphere_in_front_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L2_place_block_in_front_of_red_sphere_left_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L2_place_block_left_of_red_cylinder_behind_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L2_place_block_left_of_red_cylinder_behind_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L2_place_block_left_of_red_cylinder_left_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L2_place_block_left_of_red_cylinder_right_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L2_place_block_right_of_green_sphere_behind_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L2_place_block_right_of_green_sphere_behind_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L2_place_block_right_of_green_sphere_in_front_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L2_place_block_right_of_green_sphere_right_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i01_pickup_left__src_behind_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i01_pickup_left__src_right_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i02_pickup_right__src_behind_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i02_pickup_right__src_right_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i03_pickup_left__src_left_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i04_pickup_right__src_in_front_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i05_place_behind_green_sphere_right__src_behind_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i05_place_behind_green_sphere_right__src_right_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i06_place_beside_green_sphere_right__src_behind_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i06_place_beside_green_sphere_right__src_right_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i07_place_behind_red_cylinder_left__src_behind_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i07_place_behind_red_cylinder_left__src_right_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i08_place_left_of_red_cylinder_left__src_behind_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i08_place_left_of_red_cylinder_left__src_right_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i09_place_behind_red_sphere_left__src_left_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i10_place_in_front_red_sphere_left__src_left_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i11_place_behind_red_cylinder_left__src_left_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i12_place_left_of_red_cylinder_left__src_left_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i13_place_behind_green_sphere_right__src_in_front_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i14_place_beside_green_sphere_right__src_in_front_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i15_place_behind_red_sphere_right__src_in_front_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s11_i16_place_in_front_red_sphere_right__src_in_front_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i01_pickup_left__src_behind_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i01_pickup_left__src_left_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i01_pickup_left__src_right_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i02_pickup_right__src_behind_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i02_pickup_right__src_left_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i02_pickup_right__src_right_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i03_pickup_left__src_in_front_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i03_pickup_left__src_left_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i04_place_behind_red_cylinder_right__src_behind_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i04_place_behind_red_cylinder_right__src_left_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i04_place_behind_red_cylinder_right__src_right_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i05_place_beside_red_cylinder_right__src_behind_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i05_place_beside_red_cylinder_right__src_left_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i05_place_beside_red_cylinder_right__src_right_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i06_place_behind_green_sphere_left__src_behind_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i06_place_behind_green_sphere_left__src_left_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i06_place_behind_green_sphere_left__src_right_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i07_place_left_of_green_sphere_left__src_behind_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i07_place_left_of_green_sphere_left__src_left_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i07_place_left_of_green_sphere_left__src_right_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i08_place_behind_red_sphere_left__src_in_front_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i08_place_behind_red_sphere_left__src_left_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i09_place_in_front_red_sphere_left__src_in_front_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i09_place_in_front_red_sphere_left__src_left_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i10_place_behind_green_sphere_left__src_in_front_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i10_place_behind_green_sphere_left__src_left_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i11_place_left_of_green_sphere_left__src_in_front_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s12_i11_place_left_of_green_sphere_left__src_left_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i01_pickup_left__src_behind_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i02_pickup_right__src_behind_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i03_pickup_left__src_in_front_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i03_pickup_left__src_left_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i04_pickup_right__src_in_front_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i04_pickup_right__src_right_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i05_place_behind_green_sphere_right__src_behind_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i06_place_beside_green_sphere_right__src_behind_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i07_place_behind_red_sphere_left__src_behind_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i08_place_left_of_red_sphere_left__src_behind_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i09_place_behind_red_cylinder_left__src_in_front_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i09_place_behind_red_cylinder_left__src_left_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i10_place_in_front_red_cylinder_left__src_in_front_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i10_place_in_front_red_cylinder_left__src_left_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i11_place_behind_red_sphere_left__src_in_front_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i11_place_behind_red_sphere_left__src_left_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i12_place_left_of_red_sphere_left__src_in_front_of_red_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i12_place_left_of_red_sphere_left__src_left_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i13_place_behind_green_sphere_right__src_in_front_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i13_place_behind_green_sphere_right__src_right_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i14_place_beside_green_sphere_right__src_in_front_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i14_place_beside_green_sphere_right__src_right_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i15_place_behind_red_cylinder_right__src_in_front_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i15_place_behind_red_cylinder_right__src_right_of_red_cylinder"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i16_place_in_front_red_cylinder_right__src_in_front_of_green_sphere"
+    },
+    {
+      "scene": "scene1",
+      "task": "L3_s13_i16_place_in_front_red_cylinder_right__src_right_of_red_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L0_pickup_blue_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L0_pickup_left_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L0_pickup_red_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L0_pickup_right_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L0_place_blue_cylinder_in_green_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L0_place_blue_cylinder_in_yellow_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L0_place_right_cube_in_green_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L0_place_right_cube_in_yellow_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L0_push_left_cube_to_blue_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L0_push_left_cube_to_red_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L0_push_red_cylinder_to_left_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L0_push_red_cylinder_to_right_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L0_stack_blue_cylinder_on_left_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L0_stack_blue_cylinder_on_right_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L0_stack_left_cube_on_blue_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L0_stack_left_cube_on_red_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_1_01_pickup_red_cylinder_larger_red_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_1_02_pickup_red_cylinder_red_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_1_03_pickup_left_cube_leftmost_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_1_04_push_left_cube_to_red_cylinder_leftmost_cube_to_larger_red_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_1_05_push_red_cylinder_to_left_cube_red_cylinder_to_leftmost_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_2_01_pickup_blue_cylinder_smaller_blue_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_2_02_pickup_blue_cylinder_blue_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_3_01_pickup_right_cube_rightmost_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_3_02_pickup_blue_cylinder_smaller_blue_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_3_03_pickup_blue_cylinder_blue_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_3_04_place_right_cube_in_green_bowl_rightmost_cube_to_green_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_3_05_place_right_cube_in_yellow_bowl_rightmost_cube_to_yellow_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_3_06_place_blue_cylinder_in_green_bowl_smaller_blue_object_to_green_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_3_07_place_blue_cylinder_in_yellow_bowl_smaller_blue_object_to_yellow_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_4_01_pickup_red_cylinder_larger_red_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_4_02_pickup_red_cylinder_red_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_5_01_place_right_cube_in_green_bowl_rightmost_cube_to_green_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_5_02_place_right_cube_in_yellow_bowl_rightmost_cube_to_yellow_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_5_03_place_blue_cylinder_in_green_bowl_smaller_blue_object_to_green_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_5_04_place_blue_cylinder_in_yellow_bowl_smaller_blue_object_to_yellow_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_6_01_place_right_cube_in_green_bowl_rightmost_cube_to_green_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_6_02_place_right_cube_in_yellow_bowl_rightmost_cube_to_yellow_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_6_03_place_blue_cylinder_in_green_bowl_smaller_blue_object_to_green_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L1_scene2_6_04_place_blue_cylinder_in_yellow_bowl_smaller_blue_object_to_yellow_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_pickup_blue_cylinder__src_right_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_pickup_blue_cylinder__src_smaller_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_pickup_left_cube__src_blue_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_pickup_left_cube__src_larger_blue_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_pickup_left_cube__src_larger_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_pickup_red_cylinder__src_larger_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_pickup_red_cylinder__src_left_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_pickup_right_cube__src_red_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_pickup_right_cube__src_smaller_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_pickup_right_cube__src_smaller_red_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_place_blue_cylinder_in_green_bowl__src_right_cylinder__tgt_left_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_place_blue_cylinder_in_green_bowl__src_smaller_cylinder__tgt_left_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_place_blue_cylinder_in_yellow_bowl__src_right_cylinder__tgt_right_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_place_blue_cylinder_in_yellow_bowl__src_smaller_cylinder__tgt_right_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_place_right_cube_in_green_bowl__src_red_cube__tgt_left_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_place_right_cube_in_green_bowl__src_smaller_cube__tgt_left_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_place_right_cube_in_green_bowl__src_smaller_red_object__tgt_left_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_place_right_cube_in_yellow_bowl__src_red_cube__tgt_right_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_place_right_cube_in_yellow_bowl__src_smaller_cube__tgt_right_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_place_right_cube_in_yellow_bowl__src_smaller_red_object__tgt_right_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_left_cube_to_blue_cylinder__src_blue_cube__tgt_right_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_left_cube_to_blue_cylinder__src_blue_cube__tgt_smaller_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_left_cube_to_blue_cylinder__src_larger_blue_object__tgt_right_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_left_cube_to_blue_cylinder__src_larger_blue_object__tgt_smaller_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_left_cube_to_blue_cylinder__src_larger_cube__tgt_right_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_left_cube_to_blue_cylinder__src_larger_cube__tgt_smaller_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_left_cube_to_red_cylinder__src_blue_cube__tgt_larger_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_left_cube_to_red_cylinder__src_blue_cube__tgt_left_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_left_cube_to_red_cylinder__src_larger_blue_object__tgt_larger_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_left_cube_to_red_cylinder__src_larger_blue_object__tgt_left_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_left_cube_to_red_cylinder__src_larger_cube__tgt_larger_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_left_cube_to_red_cylinder__src_larger_cube__tgt_left_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_red_cylinder_to_left_cube__src_larger_cylinder__tgt_blue_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_red_cylinder_to_left_cube__src_larger_cylinder__tgt_larger_blue_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_red_cylinder_to_left_cube__src_larger_cylinder__tgt_larger_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_red_cylinder_to_left_cube__src_left_cylinder__tgt_blue_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_red_cylinder_to_left_cube__src_left_cylinder__tgt_larger_blue_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_red_cylinder_to_left_cube__src_left_cylinder__tgt_larger_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_red_cylinder_to_right_cube__src_larger_cylinder__tgt_red_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_red_cylinder_to_right_cube__src_larger_cylinder__tgt_smaller_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_red_cylinder_to_right_cube__src_larger_cylinder__tgt_smaller_red_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_red_cylinder_to_right_cube__src_left_cylinder__tgt_red_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_red_cylinder_to_right_cube__src_left_cylinder__tgt_smaller_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_push_red_cylinder_to_right_cube__src_left_cylinder__tgt_smaller_red_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_blue_cylinder_on_left_cube__src_right_cylinder__tgt_blue_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_blue_cylinder_on_left_cube__src_right_cylinder__tgt_larger_blue_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_blue_cylinder_on_left_cube__src_right_cylinder__tgt_larger_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_blue_cylinder_on_left_cube__src_smaller_cylinder__tgt_blue_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_blue_cylinder_on_left_cube__src_smaller_cylinder__tgt_larger_blue_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_blue_cylinder_on_left_cube__src_smaller_cylinder__tgt_larger_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_blue_cylinder_on_right_cube__src_right_cylinder__tgt_red_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_blue_cylinder_on_right_cube__src_right_cylinder__tgt_smaller_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_blue_cylinder_on_right_cube__src_right_cylinder__tgt_smaller_red_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_blue_cylinder_on_right_cube__src_smaller_cylinder__tgt_red_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_blue_cylinder_on_right_cube__src_smaller_cylinder__tgt_smaller_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_blue_cylinder_on_right_cube__src_smaller_cylinder__tgt_smaller_red_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_left_cube_on_blue_cylinder__src_blue_cube__tgt_right_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_left_cube_on_blue_cylinder__src_blue_cube__tgt_smaller_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_left_cube_on_blue_cylinder__src_larger_blue_object__tgt_right_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_left_cube_on_blue_cylinder__src_larger_blue_object__tgt_smaller_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_left_cube_on_blue_cylinder__src_larger_cube__tgt_right_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_left_cube_on_blue_cylinder__src_larger_cube__tgt_smaller_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_left_cube_on_red_cylinder__src_blue_cube__tgt_larger_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_left_cube_on_red_cylinder__src_blue_cube__tgt_left_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_left_cube_on_red_cylinder__src_larger_blue_object__tgt_larger_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_left_cube_on_red_cylinder__src_larger_blue_object__tgt_left_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_left_cube_on_red_cylinder__src_larger_cube__tgt_larger_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L2_stack_left_cube_on_red_cylinder__src_larger_cube__tgt_left_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_1_01_pickup_red_cylinder_larger_red_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_1_02_pickup_red_cylinder_red_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_1_03_pickup_left_cube_leftmost_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_1_04_push_left_cube_to_red_cylinder_leftmost_cube_to_larger_red_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_1_05_push_red_cylinder_to_left_cube_red_cylinder_to_leftmost_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_2_01_pickup_blue_cylinder_smaller_blue_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_2_02_pickup_blue_cylinder_blue_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_3_01_pickup_right_cube_rightmost_cube"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_3_02_pickup_blue_cylinder_smaller_blue_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_3_03_pickup_blue_cylinder_blue_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_3_04_place_right_cube_in_green_bowl_rightmost_cube_to_green_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_3_05_place_right_cube_in_yellow_bowl_rightmost_cube_to_yellow_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_3_06_place_blue_cylinder_in_green_bowl_smaller_blue_object_to_green_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_3_07_place_blue_cylinder_in_yellow_bowl_smaller_blue_object_to_yellow_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_4_01_pickup_red_cylinder_larger_red_object"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_4_02_pickup_red_cylinder_red_cylinder"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_5_01_place_right_cube_in_green_bowl_rightmost_cube_to_green_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_5_02_place_right_cube_in_yellow_bowl_rightmost_cube_to_yellow_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_5_03_place_blue_cylinder_in_green_bowl_smaller_blue_object_to_green_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_5_04_place_blue_cylinder_in_yellow_bowl_smaller_blue_object_to_yellow_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_6_01_place_right_cube_in_green_bowl_rightmost_cube_to_green_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_6_02_place_right_cube_in_yellow_bowl_rightmost_cube_to_yellow_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_6_03_place_blue_cylinder_in_green_bowl_smaller_blue_object_to_green_bowl"
+    },
+    {
+      "scene": "scene2",
+      "task": "L3_scene2_6_04_place_blue_cylinder_in_yellow_bowl_smaller_blue_object_to_yellow_bowl"
+    },
+    {
+      "scene": "scene3",
+      "task": "L0_l_pick4_around2_to1_long_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L0_l_pick4_around2_to1_short_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L0_l_pick4_around3_to1_long_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L0_l_pick4_around3_to1_short_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L0_l_pick5_around2_to1_long_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L0_l_pick5_around2_to1_short_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L0_l_pick5_around3_to1_long_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L0_l_pick5_around3_to1_short_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L0_r_pick2_via4_to6_long_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L0_r_pick2_via4_to6_short_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L0_r_pick2_via5_to6_long_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L0_r_pick2_via5_to6_short_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L0_r_pick3_via4_to6_long_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L0_r_pick3_via4_to6_short_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L0_r_pick3_via5_to6_long_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L0_r_pick3_via5_to6_short_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_1__l_pick4_around2_to1_long_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_1__l_pick4_around2_to1_short_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_1__l_pick4_around3_to1_long_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_1__l_pick4_around3_to1_short_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_1__l_pick5_around2_to1_long_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_1__l_pick5_around2_to1_short_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_1__l_pick5_around3_to1_long_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_1__l_pick5_around3_to1_short_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_1__r_pick2_via4_to6_long_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_1__r_pick2_via4_to6_short_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_1__r_pick2_via5_to6_long_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_1__r_pick2_via5_to6_short_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_1__r_pick3_via4_to6_long_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_1__r_pick3_via4_to6_short_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_1__r_pick3_via5_to6_long_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_1__r_pick3_via5_to6_short_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_2__l_pick4_around2_to1_long_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_2__l_pick4_around2_to1_short_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_2__l_pick4_around3_to1_long_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_2__l_pick4_around3_to1_short_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_2__l_pick5_around2_to1_long_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_2__l_pick5_around2_to1_short_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_2__l_pick5_around3_to1_long_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_2__l_pick5_around3_to1_short_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_2__r_pick2_via4_to6_long_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_2__r_pick2_via4_to6_short_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_2__r_pick2_via5_to6_long_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_2__r_pick2_via5_to6_short_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_2__r_pick3_via4_to6_long_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_2__r_pick3_via4_to6_short_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_2__r_pick3_via5_to6_long_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_2__r_pick3_via5_to6_short_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_3__l_pick5_around3_to1_long_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_3__l_pick5_around3_to1_short_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_3__r_pick3_via5_to6_long_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_3__r_pick3_via5_to6_short_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_4__l_pick4_around2_to1_long_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_4__l_pick4_around2_to1_short_right"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_4__r_pick2_via4_to6_long_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L1_scene3_4__r_pick2_via4_to6_short_front"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick4_around2_to1_long_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick4_around2_to1_long_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick4_around2_to1_long_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick4_around2_to1_long_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick4_around2_to1_short_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick4_around2_to1_short_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick4_around2_to1_short_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick4_around2_to1_short_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick4_around3_to1_long_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick4_around3_to1_long_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick4_around3_to1_long_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick4_around3_to1_long_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick4_around3_to1_short_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick4_around3_to1_short_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick4_around3_to1_short_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick4_around3_to1_short_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick5_around2_to1_long_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick5_around2_to1_long_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick5_around2_to1_long_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick5_around2_to1_long_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick5_around2_to1_short_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick5_around2_to1_short_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick5_around2_to1_short_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick5_around2_to1_short_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick5_around3_to1_long_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick5_around3_to1_long_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick5_around3_to1_long_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick5_around3_to1_long_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick5_around3_to1_short_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick5_around3_to1_short_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick5_around3_to1_short_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_l_pick5_around3_to1_short_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick2_via4_to6_long_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick2_via4_to6_long_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick2_via4_to6_long_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick2_via4_to6_long_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick2_via4_to6_short_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick2_via4_to6_short_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick2_via4_to6_short_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick2_via4_to6_short_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick2_via5_to6_long_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick2_via5_to6_long_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick2_via5_to6_long_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick2_via5_to6_long_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick2_via5_to6_short_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick2_via5_to6_short_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick2_via5_to6_short_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick2_via5_to6_short_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick3_via4_to6_long_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick3_via4_to6_long_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick3_via4_to6_long_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick3_via4_to6_long_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick3_via4_to6_short_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick3_via4_to6_short_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick3_via4_to6_short_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick3_via4_to6_short_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick3_via5_to6_long_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick3_via5_to6_long_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick3_via5_to6_long_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick3_via5_to6_long_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick3_via5_to6_short_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick3_via5_to6_short_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick3_via5_to6_short_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L2_r_pick3_via5_to6_short_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick4_around2_to1_long_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick4_around2_to1_long_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick4_around2_to1_long_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick4_around2_to1_long_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick4_around2_to1_short_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick4_around2_to1_short_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick4_around2_to1_short_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick4_around2_to1_short_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick4_around3_to1_long_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick4_around3_to1_long_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick4_around3_to1_long_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick4_around3_to1_long_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick4_around3_to1_short_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick4_around3_to1_short_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick4_around3_to1_short_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick4_around3_to1_short_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick5_around2_to1_long_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick5_around2_to1_long_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick5_around2_to1_long_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick5_around2_to1_long_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick5_around2_to1_short_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick5_around2_to1_short_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick5_around2_to1_short_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick5_around2_to1_short_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick5_around3_to1_long_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick5_around3_to1_long_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick5_around3_to1_long_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick5_around3_to1_long_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick5_around3_to1_short_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick5_around3_to1_short_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick5_around3_to1_short_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__l_pick5_around3_to1_short_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick2_via4_to6_long_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick2_via4_to6_long_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick2_via4_to6_long_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick2_via4_to6_long_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick2_via4_to6_short_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick2_via4_to6_short_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick2_via4_to6_short_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick2_via4_to6_short_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick2_via5_to6_long_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick2_via5_to6_long_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick2_via5_to6_long_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick2_via5_to6_long_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick2_via5_to6_short_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick2_via5_to6_short_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick2_via5_to6_short_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick2_via5_to6_short_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick3_via4_to6_long_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick3_via4_to6_long_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick3_via4_to6_long_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick3_via4_to6_long_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick3_via4_to6_short_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick3_via4_to6_short_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick3_via4_to6_short_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick3_via4_to6_short_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick3_via5_to6_long_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick3_via5_to6_long_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick3_via5_to6_long_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick3_via5_to6_long_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick3_via5_to6_short_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick3_via5_to6_short_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick3_via5_to6_short_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_1__r_pick3_via5_to6_short_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_3__l_pick5_around3_to1_long_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_3__l_pick5_around3_to1_long_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_3__l_pick5_around3_to1_long_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_3__l_pick5_around3_to1_long_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_3__l_pick5_around3_to1_short_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_3__l_pick5_around3_to1_short_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_3__l_pick5_around3_to1_short_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_3__l_pick5_around3_to1_short_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_3__r_pick3_via5_to6_long_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_3__r_pick3_via5_to6_long_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_3__r_pick3_via5_to6_long_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_3__r_pick3_via5_to6_long_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_3__r_pick3_via5_to6_short_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_3__r_pick3_via5_to6_short_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_3__r_pick3_via5_to6_short_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_3__r_pick3_via5_to6_short_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_4__l_pick4_around2_to1_long_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_4__l_pick4_around2_to1_long_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_4__l_pick4_around2_to1_long_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_4__l_pick4_around2_to1_long_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_4__l_pick4_around2_to1_short_right__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_4__l_pick4_around2_to1_short_right__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_4__l_pick4_around2_to1_short_right__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_4__l_pick4_around2_to1_short_right__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_4__r_pick2_via4_to6_long_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_4__r_pick2_via4_to6_long_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_4__r_pick2_via4_to6_long_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_4__r_pick2_via4_to6_long_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_4__r_pick2_via4_to6_short_front__rw_route0_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_4__r_pick2_via4_to6_short_front__rw_route0_ori1"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_4__r_pick2_via4_to6_short_front__rw_route1_ori0"
+    },
+    {
+      "scene": "scene3",
+      "task": "L3_scene3_4__r_pick2_via4_to6_short_front__rw_route1_ori1"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s41_if_blue_right_of_red_then_l_pick_else_r_stack"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s41_if_bowl_nonempty_then_l_pick_blue_else_r_stack"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s41_if_object_on_right_cube_then_r_stack_else_l_pick_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s41_if_yellow_right_of_green_then_r_stack_else_l_pick_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s41_l_pick_ball_not_leftmost"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s41_l_pick_blue_not_cube"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s41_l_pick_blue_sphere"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s41_l_pick_cube_in_bowl"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s41_l_pick_red_not_in_bowl"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s41_l_pick_red_sphere"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s41_l_pick_yellow_cylinder"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s41_r_pick_green_cylinder_top"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s41_r_stack_green_cylinder_on_yellow"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s41_r_unstack_green_cylinder_to_slot6"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s41_seq_l_bowl_then_r_green_cylinder"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s41_seq_r_green_cylinder_then_l_bowl"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s42_if_blue_right_of_red_then_l_pick_blue_else_r_stack"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s42_if_bowl_nonempty_then_l_pick_blue_else_r_stack"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s42_l_pick_yellow_cylinder"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s42_r_stack_green_cylinder_on_yellow"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s42_r_unstack_green_cylinder_to_slot6"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s42_seq_l_red_ball_then_r_green_cylinder"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s42_seq_r_green_cylinder_then_l_red_ball"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s43_if_bowl_nonempty_then_l_pick_blue_else_r_pick_red"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s43_r_pick_object_not_touching_table"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s43_r_stack_blue_cube_on_right_cylinder"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s43_r_unstack_blue_cube_from_yellow_to_slot5"
+    },
+    {
+      "scene": "scene4",
+      "task": "L1_scene4_4_01_l1_s44_if_bowl_nonempty_then_l_pick_blue_else_r_stack"
+    },
+    {
+      "scene": "scene4",
+      "task": "L1_scene4_4_02_l1_s44_if_bowl_nonempty_then_r_stack_else_l_pick_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L1_scene4_4_03_l1_s44_r_pick_object_not_touching_table"
+    },
+    {
+      "scene": "scene4",
+      "task": "L1_scene4_5_04_l1_s45_if_blue_right_of_red_then_l_pick_blue_else_r_stack"
+    },
+    {
+      "scene": "scene4",
+      "task": "L1_scene4_5_05_l1_s45_if_blue_right_of_red_then_r_stack_else_l_pick_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L1_scene4_6_06_l1_s46_if_object_on_right_cube_then_r_stack_else_l_pick_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L1_scene4_6_08_l1_s46_seq_l_bowl_then_r_green"
+    },
+    {
+      "scene": "scene4",
+      "task": "L1_scene4_6_09_l1_s46_seq_r_green_then_l_bowl"
+    },
+    {
+      "scene": "scene4",
+      "task": "L1_scene4_6_10_l1_s46_seq_l_red_then_r_green"
+    },
+    {
+      "scene": "scene4",
+      "task": "L1_scene4_6_11_l1_s46_seq_r_green_then_l_red"
+    },
+    {
+      "scene": "scene4",
+      "task": "L1_scene4_7_12_l1_s47_if_yellow_right_of_green_then_r_stack_else_l_pick_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L1_scene4_7_13_l1_s47_if_yellow_right_of_green_then_l_pick_blue_else_r_stack"
+    },
+    {
+      "scene": "scene4",
+      "task": "L1_scene4_8_14_l1_s48_if_bowl_nonempty_then_l_pick_blue_else_r_pick_red"
+    },
+    {
+      "scene": "scene4",
+      "task": "L1_scene4_8_15_l1_s48_if_bowl_nonempty_then_r_pick_red_else_l_pick_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_1_01_l2_s41_l_pick_ball_not_red"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_1_02_l2_s41_l_pick_ball_not_rightmost"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_1_03_l2_s41_l_pick_cube_not_touching_table"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_1_04_l2_s41_l_pick_ball_not_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_1_05_l2_s41_l_pick_cylinder_not_green"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_1_06_l2_s41_seq_l_blue_then_r_green"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_1_07_l2_s41_seq_r_green_then_l_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_1_08_l2_s41_if_red_right_of_blue_then_r_pick_green_else_l_pick_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_1_09_l2_s41_if_yellow_left_of_bowl_then_r_pick_green_else_l_pick_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_1_10_l2_s41_if_right_cube_under_green_then_r_pick_green_else_l_pick_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_2_11_l2_s42_l_pick_ball_not_red"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_2_12_l2_s42_l_pick_ball_not_rightmost"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_2_13_l2_s42_l_pick_object_not_touching_table"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_2_14_l2_s42_l_pick_ball_not_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_2_15_l2_s42_l_pick_cylinder_not_green"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_2_16_l2_s42_seq_l_blue_then_r_green"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_2_17_l2_s42_seq_r_green_then_l_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_2_18_l2_s42_if_red_right_of_blue_then_r_pick_green_else_l_pick_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_2_19_l2_s42_if_yellow_left_of_bowl_then_r_pick_green_else_l_pick_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_2_20_l2_s42_if_right_cube_under_green_then_r_pick_green_else_l_pick_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_3_21_l2_s43_l_pick_ball_not_red"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_3_22_l2_s43_l_pick_ball_not_rightmost"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_3_23_l2_s43_r_pick_cylinder_not_yellow"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_3_24_l2_s43_if_no_cube_on_yellow_then_r_pick_not_touch_else_l_pick_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L2_scene4_3_25_l2_s43_if_yellow_below_blue_cube_then_l_pick_blue_else_r_pick_not_touch"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_4_01_l3_s44_l_pick_ball_not_red"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_4_02_l3_s44_l_pick_ball_not_rightmost"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_4_03_l3_s44_l_pick_ball_not_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_4_04_l3_s44_l_pick_cylinder_not_green"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_4_05_l3_s44_if_bowl_nonempty_then_pick_not_red_else_pick_red"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_4_06_l3_s44_if_bowl_nonempty_then_pick_red_else_pick_not_red"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_5_07_l3_s45_l_pick_ball_not_red"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_5_08_l3_s45_l_pick_ball_not_rightmost"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_5_09_l3_s45_l_pick_cube_not_touching_table"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_5_10_l3_s45_l_pick_ball_not_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_5_11_l3_s45_l_pick_cylinder_not_green"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_5_12_l3_s45_if_red_right_of_blue_then_l_pick_not_blue_else_r_pick_not_touch_cyl"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_5_13_l3_s45_if_red_right_of_blue_then_r_pick_not_touch_cyl_else_l_pick_not_blue"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_5_14_l3_s45_seq_l_left_ball_then_r_right_ball"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_5_15_l3_s45_seq_r_right_ball_then_l_left_ball"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_6_16_l3_s46_l_pick_cylinder_not_yellow"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_6_17_l3_s46_if_object_on_right_cube_then_l_pick_left_ball_else_pick_not_left_ball"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_6_18_l3_s46_if_object_on_right_cube_then_pick_not_left_ball_else_l_pick_left_ball"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_6_19_l3_s46_seq_r_pick_not_touch_cyl_then_l_pick_not_touch_cube"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_6_20_l3_s46_seq_l_pick_not_touch_cube_then_r_pick_not_touch_cyl"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_7_21_l3_s47_if_yellow_right_of_green_then_l_pick_not_red_else_r_pick_not_green"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_7_22_l3_s47_if_yellow_right_of_green_then_r_pick_not_blue_else_l_pick_not_red"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_7_23_l3_s47_seq_r_right_ball_then_l_left_ball"
+    },
+    {
+      "scene": "scene4",
+      "task": "L3_scene4_7_24_l3_s47_seq_l_left_ball_then_r_right_ball"
+    }
+  ],
+  "arguments": {
+    "rounds": 10,
+    "base_seed": 42,
+    "max_steps": 10,
+    "actions_per_step": 50,
+    "runtime": "fixed",
+    "sim_steps": 15,
+    "direct_step": false
+  },
+  "instruction_modes": [
+    "correct"
+  ],
+  "metric_version": "strict",
+  "completion_aggregation": "task-macro",
+  "official_code_sha256": "97d9cf651645864220035ef37757eef7b2854f086e49f83c0c94430d7b6f956a",
+  "manifest_sha256": "6b58422521484620b3083fcf8be22b90ea6235722761e25e41d0e2c0401e65d1",
+  "expected_trials": 5540,
+  "hash": "cb2e85439954cfad8dcd72fd38de7e665e9902abfeb373f5244c073df7d75f1b"
+}
