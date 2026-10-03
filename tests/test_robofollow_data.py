@@ -110,3 +110,10 @@ def test_same_trajectory_with_other_instruction_cannot_cross_split(tmp_path):
     episode(tmp_path/'scene1'/'other'/'data'/'episode1.hdf5',instruction='pick blue')
     m=build_manifest(tmp_path,tmp_path/'manifest.json')
     assert len(m['episodes'])==2 and len({r['split'] for r in m['episodes']})==1
+
+def test_trajectory_alias_components_are_transitive():
+    from autoresearch.preflight import assign_splits
+    rows=[dict(scene='scene4',task=task,instructions=[task],trajectory_hash=h) for task,h in [('a','one'),('b','one'),('b','two'),('c','two')]]
+    assign_splits(rows,42)
+    assert len({r['split_group'] for r in rows})==1
+    assert len({r['split'] for r in rows})==1

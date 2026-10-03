@@ -209,3 +209,16 @@ def test_corrected_data_and_smaller_timeout_reservation(tmp_path):
     assert candidate_reservation(dict(id='R0',variant='text',steps=300,timeout_seconds=4500,data_version='complete-v3'))==2.5
     with pytest.raises(ValueError,match='superseded'):
         prepare_run(dict(id='R0',variant='text',steps=300,timeout_seconds=4500,data_version='frozen-v1'),tmp_path)
+
+def test_registered_full_data_paths_keep_storage_root():
+    from pathlib import Path
+    import yaml
+    root=Path(__file__).resolve().parents[1]
+    for version in ['complete_v2','complete_v3']:
+        for variant in ['text','planner','mix','joint']:
+            cfg=yaml.safe_load((root/f'ge_act/configs/ltx_model/robofollow/action_model_{variant}_{version}.yaml').read_text())
+            for split in ['train','val']:
+                for key in ['manifest_path','stat_file']:
+                    path=Path(cfg['data'][split][key])
+                    assert path.parts[:3]==('/','data','users')
+                    assert path.parent.name=='data_'+version

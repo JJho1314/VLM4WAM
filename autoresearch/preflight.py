@@ -37,7 +37,7 @@ def assign_splits(episodes, seed):
         row['split']='dev' if int(hashlib.sha256(f'{seed}:{key}'.encode()).hexdigest()[:8],16)%5==0 else 'train'
 
 def build_manifest(root: Path, output: Path, seed: int=42, training_registry=None) -> dict:
-    result={'version':1,'seed':seed,'root':str(Path(root).resolve()),'camera_order':CAMERA_ORDER,'joint_order':JOINT_ORDER,'episodes':[],'duplicates':[],'quarantine':[]}
+    result={'version':2,'split_policy':'connected task/instruction and joint-trajectory groups','seed':seed,'root':str(Path(root).resolve()),'camera_order':CAMERA_ORDER,'joint_order':JOINT_ORDER,'episodes':[],'duplicates':[],'quarantine':[]}
     seen={}; identities={}
     for p in sorted(Path(root).glob('**/data/episode*.hdf5')):
         try:
