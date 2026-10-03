@@ -6,9 +6,10 @@
 
 ## 数据和协议
 
-- `frozen-v1`：首轮启动时冻结的 3,536 条有效 episode。当前 R0 与第一轮 R1/R2/R3 使用此版本。
-- `complete-v2`：下载完成后核对 3,750 条原始 episode、75 个训练任务；4 条重复轨迹排除后 3,746 条有效数据，train 2,846 / dev 900，0 quarantine。下载 receipt 和各场景覆盖见 `configs/data_complete_v2.json`。
-- 数据及统计：`/data/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_autoresearch/{data,data_complete_v2}`。按 scene/task/instruction 组划分，统计量仅来自 train；绝对关节动作和 state 为 14 维，三相机 head/left_wrist/right_wrist。
+- `complete-v3`：当前默认版本，3,750条原始episode、全部75个训练任务；排除4条重复轨迹后3,746条有效示范，train2,896/dev850，0 quarantine。
+- 完整清单审计发现同一图像/动作轨迹存在不同指令版本；旧v1有3组、v2有48组跨划分副本。v3按task/instruction组与joint-trajectory的连通分量划分，保留语言改写示范，跨划分轨迹重复为0。审计路径在研究输出data*/trajectory_leakage_audit.json。
+- `frozen-v1`和`complete-v2`保留作历史诊断，新prepare/train/review拒绝这两个被取代的版本；旧best/thresholds/baseline归档于runs/superseded_frozen_v1，不能作为能力验收或与v3混比。
+- 数据及统计：`/data/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_autoresearch/data_complete_v3/{manifest,stats}.json`。统计仅来自train；14维双臂绝对关节动作，三相机head/left_wrist/right_wrist。数据文件、下载receipt和全部任务覆盖保持可核验，见configs/data_complete_v3.json。
 - `configs/robofollow_eval*.json`：固定四个训练域 held-out L0 任务，每任务 2 round，每 round 5 个 50-action chunk，correct/shuffle 共 16 trials。采样历史 stride=50；simulation timestep 按现有默认 1/250、sim_steps15 配置，原始数据没有时间属性。
 - `configs/robofollow_official*.json`：完整 554 任务、L0–L3、10 round、10 step，共 5,540 trials 的独立验收清单。首轮开发控制器只接受四任务配对协议；完整官方验收需单独安排预算和执行，不通过开发入口冒充完成。
 
@@ -20,7 +21,7 @@
 cd /data/users/junjie/workspace/VLM4WAM_baton_robofollow_autoresearch
 /data/users/junjie/.pixi/bin/pixi run --manifest-path autoresearch/runtime/pixi.toml research -m autoresearch.controller status
 # 顺序执行：prepare → train → paired evaluate → review；自动跳过已冻结 R0
-/data/users/junjie/.pixi/bin/pixi run --manifest-path autoresearch/runtime/pixi.toml research -m autoresearch.controller loop --candidates R0 R1 R2 R3
+/data/users/junjie/.pixi/bin/pixi run --manifest-path autoresearch/runtime/pixi.toml research -m autoresearch.controller --data-version complete-v3 loop --candidates R0 R1 R2 R3 --timeout-seconds 4500
 ```
 
 也可分别执行，方便检查失败：
@@ -35,13 +36,11 @@ cd /data/users/junjie/workspace/VLM4WAM_baton_robofollow_autoresearch
 /data/users/junjie/.pixi/bin/pixi run --manifest-path autoresearch/runtime/pixi.toml research -m autoresearch.controller recover --run-id ID
 ```
 
-使用完整数据版本时需要新的、明确分配预算的 registry，并重新建立 R0；不能复用 v1 的 best/阈值：
+当前活动阶段就在原registry继续，累计账本未清空。只有改变划分/协议才重建独立基线；旧结果归档并标作不可准入。不要通过新root绕过本阶段预算。新阶段必须有明确的资源分配，并重新建立R0及阈值。
 
-```bash
-/data/users/junjie/.pixi/bin/pixi run --manifest-path autoresearch/runtime/pixi.toml research -m autoresearch.controller --root /data/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_autoresearch/runs_complete_v2 --data-version complete-v2 loop --candidates R0 R1 R2 R3
-```
+首阶段累计上限 8 GPUh、最多 GPU0/1 两张、每候选从训练启动计总 wall time ≤2h；本次清洁对照设为75分钟（4500秒）以保留原8GPUh预算、最多 300 optimizer steps。控制器持排他锁，按实际进程 wall time × 分配 GPU 数计费；评测含 policy server 和 simulator，按两 GPU 计。新 root 是新实验阶段，不能用来绕过本阶段累计预算。增大预算需要明确新的资源授权后修改 Registry 的上限，不能清空 budget.json。
 
-首阶段累计上限 8 GPUh、最多 GPU0/1 两张、每候选从训练启动计总 wall time ≤2h、最多 300 optimizer steps。控制器持排他锁，按实际进程 wall time × 分配 GPU 数计费；评测含 policy server 和 simulator，按两 GPU 计。新 root 是新实验阶段，不能用来绕过本阶段累计预算。增大预算需要明确新的资源授权后修改 Registry 的上限，不能清空 budget.json。
+启动前按候选timeout×两GPU预留最坏费用。若候选Intent和Execution同时为0，停止自动扩展并给出动作基线诊断建议。
 
 候选模板固定在 `configs/robofollow_candidates.json`：R0文本、R1预测 planner、R2训练时 50% teacher mixing、R3联合 Query Tower/Sem MLP 加 .01 anchor。Qwen 冻结；推理只有当前三视角图像和指令，不接入 teacher future features。三视角是明确的旧双视角逐视角共享头迁移，尚需 RoboFollow 评测证明效果。
 
@@ -51,7 +50,7 @@ cd /data/users/junjie/workspace/VLM4WAM_baton_robofollow_autoresearch
 
 R0完整配对评测结束后先冻结阈值；R1/R2/R3 随后才允许 prepare。best 初始指向 baseline，仅表示对照起点。只有完整、有限、协议一致且 Intent 提升达到冻结阈值，Execution/CR 不退化的候选才可替换 best。无收益标为 inconclusive，不完整/超时/NaN 不选优。语言 uncertainty 按配对任务均值估算；仅四个任务，不能据此推断 L1–L3 泛化。
 
-历史经验见 `EXPERIENCE.md`，首轮实际结果见 `REPORT.md`。300 步是有限预算探索，存在未收敛风险；GPU 单步 smoke 仅证明工程链路。
+历史经验见 `EXPERIENCE.md`，首轮实际状态和结果见 `REPORT.md`。300 步是有限预算探索，存在未收敛风险；GPU 单步 smoke 仅证明工程链路。
 
 ## 复现和验证
 
