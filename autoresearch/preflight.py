@@ -16,6 +16,26 @@ def write_json(path,data):
     path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
     tmp=path.with_suffix(path.suffix+'.tmp');tmp.write_text(json.dumps(data,indent=2,allow_nan=False)+'\n');tmp.replace(path)
 
+def assign_splits(episodes, seed):
+    """Keep task/instruction groups and all trajectory aliases in one component."""
+    parents={};trajectory_group={}
+    def root(group):
+        parents.setdefault(group,group)
+        while parents[group]!=group:
+            parents[group]=parents[parents[group]];group=parents[group]
+        return group
+    def group_of(row):
+        return f"{row['scene']}:{row['task']}:"+json.dumps(sorted(row['instructions']))
+    for row in episodes:
+        group=group_of(row);root(group)
+        previous=trajectory_group.setdefault(row['trajectory_hash'],group)
+        x,y=root(group),root(previous)
+        if x!=y:parents[max(x,y)]=min(x,y)
+    for row in episodes:
+        key=root(group_of(row))
+        row['split_group']=key
+        row['split']='dev' if int(hashlib.sha256(f'{seed}:{key}'.encode()).hexdigest()[:8],16)%5==0 else 'train'
+
 def build_manifest(root: Path, output: Path, seed: int=42, training_registry=None) -> dict:
     result={'version':1,'seed':seed,'root':str(Path(root).resolve()),'camera_order':CAMERA_ORDER,'joint_order':JOINT_ORDER,'episodes':[],'duplicates':[],'quarantine':[]}
     seen={}; identities={}
@@ -28,7 +48,8 @@ def build_manifest(root: Path, output: Path, seed: int=42, training_registry=Non
             if training_registry is not None:
                 expected=training_registry[scene][task]
                 if e.instructions!=expected:raise ValueError('instructions differ from official training registry')
-            # Same joints+instructions conservatively count as one trajectory even if JPEG encoding differs.
+            # Preserve instruction aliases, but connect their complete task groups before splitting.
+            trajectory=hashlib.sha256(e.states.tobytes()+e.actions.tobytes()).hexdigest()
             content=hashlib.sha256(e.states.tobytes()+e.actions.tobytes()+json.dumps(e.instructions).encode()).hexdigest()
             identity=':'.join(e.identity)
             if content in seen or identity in identities:
@@ -36,12 +57,13 @@ def build_manifest(root: Path, output: Path, seed: int=42, training_registry=Non
             seen[content]=str(p);identities[identity]=str(p)
             group=f'{scene}:{task}:'+json.dumps(sorted(e.instructions))
             split='dev' if int(hashlib.sha256(f'{seed}:{group}'.encode()).hexdigest()[:8],16)%5==0 else 'train'
-            result['episodes'].append({'path':str(p.resolve()),'identity':identity,'scene':scene,'task':task,'instructions':e.instructions,'schema':e.schema,'length':len(e.states),'content_hash':content,'file_hash':digest(p),'split':split,'sample_indices':[0,len(e.states)//2,len(e.states)-1]})
+            result['episodes'].append({'path':str(p.resolve()),'identity':identity,'scene':scene,'task':task,'instructions':e.instructions,'schema':e.schema,'length':len(e.states),'content_hash':content,'trajectory_hash':trajectory,'file_hash':digest(p),'split':split,'sample_indices':[0,len(e.states)//2,len(e.states)-1]})
         except (OSError,ValueError,KeyError,TypeError) as error:
             result['quarantine'].append({'path':str(p),'reason':str(error)})
         if (len(result['episodes'])+len(result['quarantine'])+len(result['duplicates']))%100==0:
             print(f"scanned {len(result['episodes'])} usable episodes",flush=True)
     if not result['episodes']:raise ValueError('no usable episodes')
+    assign_splits(result['episodes'],seed)
     write_json(output,result)
     return result
 

@@ -102,3 +102,11 @@ def test_loader_rejects_stats_from_another_manifest(tmp_path):
     m=build_manifest(tmp_path,mp);m['episodes'][0]['split']='train';mp.write_text(json.dumps(m));compute_statistics(mp,sp)
     m['seed']=123;mp.write_text(json.dumps(m))
     with pytest.raises(ValueError):RoboFollowHDF5Dataset(mp,sp)
+
+def test_same_trajectory_with_other_instruction_cannot_cross_split(tmp_path):
+    from autoresearch.preflight import build_manifest
+    # These instruction groups would ordinarily hash to different partitions.
+    episode(tmp_path/'scene1'/'task'/'data'/'episode0.hdf5',instruction='pick yellow')
+    episode(tmp_path/'scene1'/'other'/'data'/'episode1.hdf5',instruction='pick blue')
+    m=build_manifest(tmp_path,tmp_path/'manifest.json')
+    assert len(m['episodes'])==2 and len({r['split'] for r in m['episodes']})==1

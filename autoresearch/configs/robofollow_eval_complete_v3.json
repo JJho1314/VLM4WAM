@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "purpose": "bounded development selection; training-domain held-out tasks; full official acceptance remains max_steps=10",
+  "selected_tasks": [
+    {
+      "scene": "scene1",
+      "task": "L0_place_yellow_block_1_behind_red_sphere"
+    },
+    {
+      "scene": "scene2",
+      "task": "L0_pickup_blue_cylinder"
+    },
+    {
+      "scene": "scene3",
+      "task": "L0_l_pick4_around2_to1_short_right"
+    },
+    {
+      "scene": "scene4",
+      "task": "L0_s41_r_unstack_green_cylinder_to_slot6"
+    }
+  ],
+  "arguments": {
+    "rounds": 2,
+    "base_seed": 42,
+    "max_steps": 5,
+    "actions_per_step": 50,
+    "runtime": "fixed",
+    "sim_steps": 15,
+    "direct_step": false
+  },
+  "instruction_modes": [
+    "correct",
+    "shuffle"
+  ],
+  "metric_version": "strict",
+  "completion_aggregation": "task-macro",
+  "official_code_sha256": "97d9cf651645864220035ef37757eef7b2854f086e49f83c0c94430d7b6f956a",
+  "manifest_sha256": "84d6b935cc371a5c8213c7e06da5150e8655f3f68b3ed6de21131a54ed785871",
+  "calibration": {
+    "version": 1,
+    "min_intent_gain_floor": 0.01,
+    "non_regression_floor": 0.02,
+    "z": 1.96,
+    "min_tasks": 2,
+    "min_rounds": 2
+  },
+  "hash": "a846b4e5a978fe8213aa2932d0ef5b49a838711e4bbaf98ceb63544f42bed61a"
+}

@@ -17,8 +17,8 @@ DEFAULT_OUTPUT=Path('/data/users/junjie/workspace/hpc3_jhe724/outputs/robofollow
 def candidate_config(variant,data_version='frozen-v1'):
     configs={'text':'action_model_text.yaml','predicted':'action_model_planner.yaml','mix':'action_model_mix.yaml','joint':'action_model_joint.yaml'}
     if variant not in configs:raise ValueError('unregistered variant')
-    if data_version not in ('frozen-v1','complete-v2'):raise ValueError('unregistered data version')
-    return configs[variant].replace('.yaml','_complete_v2.yaml') if data_version=='complete-v2' else configs[variant]
+    if data_version not in ('frozen-v1','complete-v2','complete-v3'):raise ValueError('unregistered data version')
+    return configs[variant] if data_version=='frozen-v1' else configs[variant].replace('.yaml','_'+data_version.replace('-','_')+'.yaml')
 
 def require_admission(variant,root,marker=None,protocol_hash=None):
     if variant=='text':return
@@ -51,7 +51,7 @@ def provenance(config):
 def validate_candidate(c):
     if set(c)-{'id','variant','steps','timeout_seconds','data_version'} or c.get('id') not in ('R0','R1','R2','R3') or c.get('variant') not in ('text','predicted','mix','joint'):
         raise ValueError('unregistered candidate')
-    if c.get('data_version','frozen-v1') not in ('frozen-v1','complete-v2'):raise ValueError('unregistered data version')
+    if c.get('data_version','frozen-v1') not in ('frozen-v1','complete-v2','complete-v3'):raise ValueError('unregistered data version')
     if {'R0':'text','R1':'predicted','R2':'mix','R3':'joint'}[c['id']]!=c['variant']:raise ValueError('candidate variant mismatch')
     if not isinstance(c.get('steps'),int) or not 1<=c['steps']<=300 or not 0<c.get('timeout_seconds',0)<=7200:raise ValueError('candidate exceeds limits')
 
@@ -120,8 +120,9 @@ def run_process(argv,directory,registry,timeout_seconds,gpus,env=None,cwd=None):
 
 def prepare_run(candidate,root):
     validate_candidate(candidate)
-    version=candidate.get('data_version','frozen-v1')
-    protocol_name='robofollow_eval_complete_v2.json' if version=='complete-v2' else 'robofollow_eval.json'
+    version=candidate.get('data_version','complete-v3')
+    if version!='complete-v3':raise ValueError('superseded split: new runs require complete-v3')
+    protocol_name='robofollow_eval_complete_v3.json'
     protocol_hash=json.loads((ROOT/'autoresearch/configs'/protocol_name).read_text())['hash']
     require_admission(candidate['variant'],root,protocol_hash=protocol_hash)
     if candidate['id']=='R0' and (Path(root)/'baseline.json').exists():raise ValueError('baseline already frozen; use a separately budgeted registry for a new data version')
@@ -202,6 +203,7 @@ def review_run(run,registry):
     from autoresearch.evaluation import calibrate_thresholds,compare_candidate
     state=json.loads((run/'run.json').read_text())
     if state['status']!='completed':raise ValueError('review requires complete paired development evaluations')
+    if state['candidate'].get('data_version','frozen-v1')!='complete-v3':raise ValueError('superseded split: metrics are diagnostic only')
     protocol=json.loads((run/state.get('active_evaluation_code','evaluation_code')/'autoresearch/configs'/state.get('protocol_name','robofollow_eval.json')).read_text())
     metrics,rows=collect_pair(run/state.get('active_evaluation_directory','paired_eval'),protocol)
     # Validate the complete payload before freezing any baseline or best artifact.
@@ -239,6 +241,7 @@ def train_run(run,registry):
     state=json.loads((run/'run.json').read_text())
     if state['status']!='prepared':raise ValueError('run is not prepared; retries require a new run')
     c=state['candidate'];validate_candidate(c);code=run/'code'
+    if c.get('data_version','frozen-v1')!='complete-v3':raise ValueError('superseded split: new training requires complete-v3')
     import yaml
     config=yaml.safe_load((code/'ge_act/configs/ltx_model/robofollow'/candidate_config(c['variant'],c.get('data_version','frozen-v1'))).read_text())
     config['output_dir']=str(run/'checkpoints')
@@ -266,14 +269,18 @@ def run_cycle(candidate,root,registry):
     if state['status']!='completed':return dict(run_id=run.name,status=state['status'])
     return review_run(run,registry)
 
+def candidate_reservation(candidate):
+    validate_candidate(candidate)
+    return 2*candidate['timeout_seconds']/3600
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',type=Path,default=DEFAULT_OUTPUT)
-    p.add_argument('--data-version',choices=['frozen-v1','complete-v2'],default='frozen-v1')
+    p.add_argument('--data-version',choices=['frozen-v1','complete-v2','complete-v3'],default='complete-v3')
     sub=p.add_subparsers(dest='command',required=True)
-    prep=sub.add_parser('prepare');prep.add_argument('--candidate',choices=['R0','R1','R2','R3'],default='R0');prep.add_argument('--steps',type=int,default=300)
+    prep=sub.add_parser('prepare');prep.add_argument('--candidate',choices=['R0','R1','R2','R3'],default='R0');prep.add_argument('--steps',type=int,default=300);prep.add_argument('--timeout-seconds',type=int,default=7200)
     for name in ('run','recover','review','evaluate'):
         s=sub.add_parser(name);s.add_argument('--run-id',required=True)
-    loop=sub.add_parser('loop');loop.add_argument('--candidates',nargs='+',choices=['R0','R1','R2','R3'],default=['R0','R1','R2','R3']);loop.add_argument('--steps',type=int,default=300)
+    loop=sub.add_parser('loop');loop.add_argument('--candidates',nargs='+',choices=['R0','R1','R2','R3'],default=['R0','R1','R2','R3']);loop.add_argument('--steps',type=int,default=300);loop.add_argument('--timeout-seconds',type=int,default=7200)
     sub.add_parser('status');a=p.parse_args();registry=Registry(a.root)
     if a.command=='status':
         print(json.dumps(dict(used_gpu_hours=registry.used_gpu_hours(),max_gpu_hours=registry.max_gpu_hours,runs=[json.loads(x.read_text()) for x in a.root.glob('*/run.json')]),indent=2));return
@@ -283,10 +290,11 @@ def main():
             for name in a.candidates:
                 if name=='R0' and (a.root/'baseline.json').exists():continue
                 variant={'R0':'text','R1':'predicted','R2':'mix','R3':'joint'}[name]
-                try:registry.check_budget(4)
+                candidate=dict(id=name,variant=variant,steps=a.steps,timeout_seconds=a.timeout_seconds,data_version=a.data_version)
+                try:registry.check_budget(candidate_reservation(candidate))
                 except RuntimeError:
-                    reports.append(dict(status='budget_stop',next_candidate=name,used_gpu_hours=registry.used_gpu_hours(),reason='cannot reserve two-hour/two-GPU worst-case candidate'));atomic_json(a.root/'loop_summary.json',reports);break
-                report=run_cycle(dict(id=name,variant=variant,steps=a.steps,timeout_seconds=7200,data_version=a.data_version),a.root,registry)
+                    reports.append(dict(status='budget_stop',next_candidate=name,used_gpu_hours=registry.used_gpu_hours(),reason='cannot reserve candidate timeout times two GPUs'));atomic_json(a.root/'loop_summary.json',reports);break
+                report=run_cycle(candidate,a.root,registry)
                 reports.append(report);atomic_json(a.root/'loop_summary.json',reports)
                 if report.get('status') in ('failed','interrupted'):break
                 if name!='R0' and report['metrics']['correct']['mean_intent_score']==0 and report['metrics']['correct']['mean_exec_score']==0:
@@ -294,7 +302,7 @@ def main():
             print(json.dumps(reports,indent=2));return
         if a.command=='prepare':
             variant={'R0':'text','R1':'predicted','R2':'mix','R3':'joint'}[a.candidate]
-            print(prepare_run(dict(id=a.candidate,variant=variant,steps=a.steps,timeout_seconds=7200,data_version=a.data_version),a.root));return
+            print(prepare_run(dict(id=a.candidate,variant=variant,steps=a.steps,timeout_seconds=a.timeout_seconds,data_version=a.data_version),a.root));return
         if a.command=='status':
             print(json.dumps(dict(used_gpu_hours=registry.used_gpu_hours(),max_gpu_hours=registry.max_gpu_hours,runs=[json.loads(x.read_text()) for x in a.root.glob('*/run.json')]),indent=2));return
         run=(a.root/a.run_id).resolve()

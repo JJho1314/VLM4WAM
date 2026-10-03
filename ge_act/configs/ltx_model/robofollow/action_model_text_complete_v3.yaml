@@ -1,0 +1,157 @@
+model_name: ltx_train
+is_i2v: true
+report_to: none
+tracker_name: ltx_trainer
+logging_dir: logs
+output_dir: /data/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_autoresearch/R0_initial
+pretrained_model_name_or_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/weights/LTX-Video
+train_data_class_path: data/robofollow_hdf5_dataset.py
+train_data_class: RoboFollowHDF5Dataset
+val_data_class_path: data/robofollow_hdf5_dataset.py
+val_data_class: RoboFollowHDF5Dataset
+tokenizer_class_path: transformers
+tokenizer_class: T5Tokenizer
+textenc_class_path: transformers
+textenc_class: T5EncoderModel
+vae_class_path: models/ltx_models/autoencoder_kl_ltx.py
+vae_class: AutoencoderKLLTXVideo
+diffusion_model_class_path: models/ltx_models/transformer_ltx_multiview.py
+diffusion_model_class: LTXVideoTransformer3DModel
+diffusion_scheduler_class_path: diffusers
+diffusion_scheduler_class: FlowMatchEulerDiscreteScheduler
+pipeline_class_path: models/pipeline/custom_pipeline.py
+pipeline_class: CustomPipeline
+return_action: true
+return_video: false
+train_mode: action_full
+action_loss_scale: 1.0
+train_steps: 300
+train_epochs: 10000
+steps_to_save: 100
+steps_to_log: 10
+steps_to_val: 1000000
+mixed_precision: bf16
+allow_tf32: false
+nccl_timeout: 600
+seed: 42
+enable_slicing: true
+enable_tiling: true
+add_state: true
+caption_dropout_p: 0.0
+batch_size: 1
+dataloader_num_workers: 2
+pin_memory: true
+gradient_checkpointing: true
+noise_to_first_frame: 0.1
+optimizer: adamw
+lr: 3e-5
+beta1: 0.9
+beta2: 0.95
+beta3: 0.999
+epsilon: 1e-8
+weight_decay: 1e-5
+optimizer_8bit: false
+optimizer_torchao: false
+scale_lr: false
+max_grad_norm: 1.0
+gradient_accumulation_steps: 1
+lr_scheduler: constant_with_warmup
+lr_warmup_steps: 20
+lr_num_cycles: 1
+lr_power: 1.0
+flow_weighting_scheme: none
+flow_logit_mean: 0.0
+flow_logit_std: 1.0
+flow_mode_scale: 1.29
+pixel_wise_timestep: true
+diffusion_model:
+  model_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/weights/Genie-Envisioner/GE_base_fast_actinterp.safetensors
+  config:
+    activation_fn: gelu-approximate
+    attention_bias: true
+    attention_head_dim: 64
+    attention_out_bias: true
+    caption_channels: 4096
+    cross_attention_dim: 2048
+    in_channels: 128
+    norm_elementwise_affine: false
+    norm_eps: 1.0e-06
+    num_attention_heads: 32
+    num_layers: 28
+    out_channels: 128
+    patch_size: 1
+    patch_size_t: 1
+    qk_norm: rms_norm_across_heads
+    action_expert: true
+    action_in_channels: 14
+    action_num_attention_heads: 16
+    action_attention_head_dim: 32
+    action_out_channels: 14
+data:
+  train:
+    manifest_path: /data_complete_v3/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_autoresearch/data_complete_v3/manifest.json
+    stat_file: /data_complete_v3/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_autoresearch/data_complete_v3/stats.json
+    split: train
+    train_dataset: true
+    sample_size:
+    - 192
+    - 256
+    chunk: 9
+    action_chunk: 54
+    n_previous: 4
+    action_type: absolute
+    action_space: joint
+    source_fps: 16.666666666666668
+    valid_cam:
+    - head
+    - left_wrist
+    - right_wrist
+  val:
+    manifest_path: /data_complete_v3/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_autoresearch/data_complete_v3/manifest.json
+    stat_file: /data_complete_v3/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_autoresearch/data_complete_v3/stats.json
+    split: dev
+    train_dataset: false
+    sample_size:
+    - 192
+    - 256
+    chunk: 9
+    action_chunk: 54
+    n_previous: 4
+    action_type: absolute
+    action_space: joint
+    source_fps: 16.666666666666668
+    valid_cam:
+    - head
+    - left_wrist
+    - right_wrist
+use_color_jitter: false
+num_inference_step: 10
+noisy_video: true
+load_weights: true
+use_deepspeed: false
+deepspeed:
+  zero_optimization:
+    stage: 2
+  fp16:
+    enabled: false
+  bf16:
+    enabled: true
+  gradient_clipping: 1.0
+robofollow_allowed_new_keys:
+- action_proj_in.weight
+- action_proj_in.bias
+- action_proj_out.weight
+- action_proj_out.bias
+robofollow_metadata:
+  action_type: absolute
+  action_space: joint
+  camera_order:
+  - head
+  - left_wrist
+  - right_wrist
+  action_dim: 14
+  source_fps: 16.666666666666668
+  sim_steps: 15
+  timing_provenance: 'upstream defaults: simulation timestep 1/250, save_freq 15;
+    raw files have no timing attributes'
+  history_action_stride: 50

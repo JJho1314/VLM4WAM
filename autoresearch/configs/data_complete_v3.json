@@ -1,0 +1,32 @@
+{
+  "created_at": 1791027814.3938825,
+  "source_manifest_sha256": "1f4fe7f6d3f8026f7d15a8f7b28274380e7b5659ad08d2a98f4a693af6dad096",
+  "manifest_sha256": "84d6b935cc371a5c8213c7e06da5150e8655f3f68b3ed6de21131a54ed785871",
+  "usable": 3746,
+  "duplicates": 4,
+  "quarantine": 0,
+  "cross_split_trajectory_duplicates": 0,
+  "coverage": {
+    "scene1": {
+      "tasks": 16,
+      "train": 750,
+      "dev": 50
+    },
+    "scene2": {
+      "tasks": 16,
+      "train": 500,
+      "dev": 300
+    },
+    "scene3": {
+      "tasks": 16,
+      "train": 550,
+      "dev": 250
+    },
+    "scene4": {
+      "tasks": 27,
+      "train": 1096,
+      "dev": 250
+    }
+  },
+  "split_policy": "connected task/instruction and joint-trajectory groups"
+}

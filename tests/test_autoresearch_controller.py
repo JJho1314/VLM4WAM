@@ -121,7 +121,7 @@ def test_review_nan_cannot_create_best(tmp_path,monkeypatch):
     import autoresearch.evaluation as scoring
     run=tmp_path/'run';run.mkdir();code=run/'evaluation_code/autoresearch/configs';code.mkdir(parents=True)
     (code/'robofollow_eval.json').write_text(json.dumps({'hash':'p'}))
-    (run/'run.json').write_text(json.dumps(dict(status='completed',candidate={'id':'R0'})))
+    (run/'run.json').write_text(json.dumps(dict(status='completed',candidate={'id':'R0','data_version':'complete-v3'})))
     monkeypatch.setattr(evaluation,'collect_pair',lambda *a:({'correct':{'mean_intent_score':float('nan')}},{'correct':[]}))
     monkeypatch.setattr(scoring,'calibrate_thresholds',lambda *a:dict(version=1,min_intent_gain=.01))
     with pytest.raises(ValueError):review_run(run,Registry(tmp_path))
@@ -202,3 +202,10 @@ def test_failed_launcher_cleans_owned_orphan(tmp_path):
         from autoresearch.registry import safe_signal
         import signal
         safe_signal(identity,signal.SIGKILL)
+
+def test_corrected_data_and_smaller_timeout_reservation(tmp_path):
+    from autoresearch.controller import candidate_config,candidate_reservation,prepare_run
+    assert candidate_config('text','complete-v3')=='action_model_text_complete_v3.yaml'
+    assert candidate_reservation(dict(id='R0',variant='text',steps=300,timeout_seconds=4500,data_version='complete-v3'))==2.5
+    with pytest.raises(ValueError,match='superseded'):
+        prepare_run(dict(id='R0',variant='text',steps=300,timeout_seconds=4500,data_version='frozen-v1'),tmp_path)
