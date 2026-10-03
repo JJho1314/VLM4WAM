@@ -44,13 +44,18 @@ def test_mixing_extremes_and_joint_gradients():
 
 def test_text_runner_without_semantic_arguments(tmp_path,monkeypatch):
     from pathlib import Path
-    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'ge_act'))
-    from runner.robofollow_trainer import RoboFollowTrainer,Trainer
-    runner=object.__new__(RoboFollowTrainer)
+    import importlib.util,sys,types
+    class Base:
+        def prepare_models(self):pass
+    fake=types.ModuleType('runner.ge_trainer');fake.Trainer=Base
+    monkeypatch.setitem(sys.modules,'runner.ge_trainer',fake)
+    path=Path(__file__).resolve().parents[1]/'ge_act/runner/robofollow_trainer.py'
+    spec=importlib.util.spec_from_file_location('rf_runner_under_test',path)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    runner=object.__new__(module.RoboFollowTrainer)
     runner.args=SimpleNamespace(load_weights=False)
     runner.raw_config={}
     runner.vae=SimpleNamespace(config=SimpleNamespace(latent_channels=128))
-    monkeypatch.setattr(Trainer,'prepare_models',lambda self:None)
     runner.prepare_models()
     assert runner.args.semantic_plan=={}
     assert runner.args.load_diffusion_model_weights is True
