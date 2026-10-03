@@ -56,6 +56,25 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-03 Joint planner-head fine-tune (s3joint_A10k) and s2mix050 at 5k
+
+| from A@10k + 3k steps | oracle | disabled | planner | planner vs disabled |
+|---|---|---|---|---|
+| s3planA_p050_v2 (p=0.5, frozen head) | 0.0073 | 0.0143 | 0.0122 | -15% |
+| **s3joint_A10k (p=1, head trained, anchor 0.1)** | 0.0098 | 0.0125 | **0.0110** | -12% (win 0.76) |
+
+- Best planner-mode error so far (0.0110). The comparison confounds p (1 vs
+  0.5) with head training; p=1 also lowers the no-guidance error (0.0125)
+  and raises the oracle error (0.0098, oracle never seen in training).
+- Versus the control the comparison is approximate (C@10k 0.0225, C@15k 0.0074).
+- Masking either view still hurts (both views required).
+
+s2mix050_20k_v2 at 5k (from scratch, p=0.5): oracle 0.2226, disabled 0.2314,
+planner 0.2306, i.e. planner ~0 and ~20% worse than C@5k (0.1872). Mixing
+noisy planner tokens from the start slows early learning; the two-stage
+recipe (oracle first, then planner mixing) is so far the only one where
+planner guidance helps.
+
 ### 2026-10-03 S3b (fixed): A@10k + 3k steps with planner tokens p=0.5
 
 | s3planA_p050_v2 (13k total steps) | action_all | vs disabled |
