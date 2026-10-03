@@ -1,0 +1,11 @@
+[workspace]
+name = "baton-robofollow"
+version = "0.1.0"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tasks]
+test = { cmd = "/data/users/junjie/workspace/hpc3_jhe724/.conda/envs/qwen35/bin/python -m pytest", cwd = "../..", env = { PYTHONPATH = ".:/data/users/junjie/workspace/hpc3_jhe724/envs/overlay_peft_tf5", HDF5_USE_FILE_LOCKING = "FALSE" } }
+research = { cmd = "/data/users/junjie/workspace/hpc3_jhe724/.conda/envs/qwen35/bin/python", cwd = "../..", env = { PYTHONPATH = ".:ge_act:/data/users/junjie/workspace/hpc3_jhe724/envs/overlay_peft_tf5", HDF5_USE_FILE_LOCKING = "FALSE" } }
+sim = { cmd = "/data/users/junjie/workspace/robofollow/env/bin/python", cwd = "/data/users/junjie/workspace/robofollow/RoboTwin", env = { CUDA_HOME = "/usr/local/cuda-12.8", VK_ICD_FILENAMES = "/usr/share/vulkan/icd.d/nvidia_icd.json" } }
+train = { cmd = "/data/users/junjie/workspace/hpc3_jhe724/.conda/envs/qwen35/bin/python -m torch.distributed.run --standalone --nproc_per_node=1 main.py --runner_class_path runner/robofollow_trainer.py --runner_class RoboFollowTrainer", cwd = "../../ge_act", env = { PYTHONPATH = "..:/data/users/junjie/workspace/hpc3_jhe724/envs/overlay_peft_tf5", HDF5_USE_FILE_LOCKING = "FALSE", TOKENIZERS_PARALLELISM = "false", OMP_NUM_THREADS = "4" } }
