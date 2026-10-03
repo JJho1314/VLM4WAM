@@ -280,3 +280,31 @@ def test_controller_death_cleanup_and_launch_exclusion(tmp_path,kill_signal):
         refuse_unresolved(Registry(tmp_path))
     finally:
         if launcher.poll() is None:launcher.kill();launcher.wait()
+
+def test_prepare_then_binding_rejects_changed_source(tmp_path,monkeypatch):
+    from pathlib import Path
+    import shutil,yaml
+    import autoresearch.controller as c
+    repo=tmp_path/'repo';repo.mkdir()
+    models=repo/'source.safetensors';models.write_bytes(b'source')
+    manifest=repo/'manifest.json';manifest.write_text(json.dumps({'image_validation':'all usable frames, streaming RGB decode','episodes':[{}]}))
+    stats=repo/'stats.json';stats.write_text('{}')
+    folder=repo/'ge_act/configs/ltx_model/robofollow';folder.mkdir(parents=True)
+    cfg=folder/'action_model_text_complete_v3.yaml'
+    cfg.write_text(yaml.safe_dump(dict(diffusion_model={'model_path':str(models)},data={'train':{'manifest_path':str(manifest),'stat_file':str(stats)}},pretrained_model_name_or_path='unused')))
+    configs=repo/'autoresearch/configs';configs.mkdir(parents=True)
+    (configs/'robofollow_eval_complete_v3.json').write_text(json.dumps({'hash':'p'}))
+    (configs/'robofollow_candidates.json').write_text(json.dumps([{'id':'R0','hypothesis':'test'}]))
+    subprocess.run(['git','init',str(repo)],check=True,capture_output=True)
+    subprocess.run(['git','-C',str(repo),'add','.'],check=True)
+    subprocess.run(['git','-C',str(repo),'-c','user.name=Test','-c','user.email=test@local','commit','-m','fixture'],check=True,capture_output=True)
+    monkeypatch.setattr(c,'ROOT',repo)
+    root=tmp_path/'runs';root.mkdir()
+    run=c.prepare_run(dict(id='R0',variant='text',steps=1,timeout_seconds=20,data_version='complete-v3'),root)
+    assert json.loads((run/'run.json').read_text())['status']=='prepared'
+    assert json.loads((run/'provenance.json').read_text())['artifacts'][str(stats)]['sha256']==c.file_sha256(stats)
+    effective=run/'code/ge_act/configs/ltx_model/robofollow/run.yaml';shutil.copyfile(cfg,effective)
+    ck=run/'checkpoints/stamp/step_1/model.safetensors';ck.parent.mkdir(parents=True);ck.write_bytes(b'trained')
+    state=json.loads((run/'run.json').read_text());state.update(training={'status':'completed','process':{}},effective_config_sha256=c.file_sha256(effective));(run/'run.json').write_text(json.dumps(state))
+    stats.write_text('{"changed":true}')
+    with pytest.raises(ValueError,match='artifact changed'):c.bind_run_checkpoint(run,ck)

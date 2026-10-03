@@ -187,9 +187,6 @@ def prepare_run(candidate,root):
     snapshot_code(ROOT,run/'code')
     import yaml
     config_path=run/'code/ge_act/configs/ltx_model/robofollow'/candidate_config(candidate['variant'],version)
-    source=json.loads((run/'provenance.json').read_text())
-    for path,info in source['artifacts'].items():
-        if file_sha256(path)!=info['sha256']:raise ValueError('training artifact changed since preparation: '+path)
     config=yaml.safe_load(config_path.read_text())
     require_image_validation(config['data']['train']['manifest_path'])
     atomic_json(run/'provenance.json',dict(provenance(config),config_sha256=file_sha256(config_path)))
