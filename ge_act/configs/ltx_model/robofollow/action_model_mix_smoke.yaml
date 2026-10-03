@@ -1,0 +1,583 @@
+action_loss_scale: 1.0
+add_state: true
+allow_tf32: false
+batch_size: 1
+beta1: 0.9
+beta2: 0.95
+beta3: 0.999
+caption_dropout_p: 0.0
+data:
+  train:
+    action_chunk: 54
+    action_space: joint
+    action_type: absolute
+    chunk: 9
+    manifest_path: /data/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_autoresearch/data/manifest.json
+    n_previous: 4
+    sample_size:
+    - 192
+    - 256
+    source_fps: 16.666666666666668
+    split: train
+    stat_file: /data/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_autoresearch/data/stats.json
+    train_dataset: true
+    valid_cam:
+    - head
+    - left_wrist
+    - right_wrist
+  val:
+    action_chunk: 54
+    action_space: joint
+    action_type: absolute
+    chunk: 9
+    manifest_path: /data/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_autoresearch/data/manifest.json
+    n_previous: 4
+    sample_size:
+    - 192
+    - 256
+    source_fps: 16.666666666666668
+    split: dev
+    stat_file: /data/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_autoresearch/data/stats.json
+    train_dataset: false
+    valid_cam:
+    - head
+    - left_wrist
+    - right_wrist
+dataloader_num_workers: 2
+deepspeed:
+  bf16:
+    enabled: true
+  fp16:
+    enabled: false
+  gradient_clipping: 1.0
+  zero_optimization:
+    stage: 2
+diffusion_model:
+  config:
+    action_attention_head_dim: 32
+    action_expert: true
+    action_in_channels: 14
+    action_num_attention_heads: 16
+    action_out_channels: 14
+    activation_fn: gelu-approximate
+    attention_bias: true
+    attention_head_dim: 64
+    attention_out_bias: true
+    caption_channels: 4096
+    cross_attention_dim: 2048
+    in_channels: 128
+    norm_elementwise_affine: false
+    norm_eps: 1.0e-06
+    num_attention_heads: 32
+    num_layers: 28
+    out_channels: 128
+    patch_size: 1
+    patch_size_t: 1
+    qk_norm: rms_norm_across_heads
+    semantic_plan_adaln_rank: 256
+    semantic_plan_context: true
+    semantic_plan_coordinate_dim: 256
+    semantic_plan_cross_attention_blocks:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+    - 12
+    - 13
+    - 14
+    - 15
+    - 16
+    - 17
+    - 18
+    - 19
+    - 20
+    - 21
+    - 22
+    - 23
+    - 24
+    - 25
+    - 26
+    - 27
+    semantic_plan_in_dim: 1024
+    semantic_plan_num_keyframes: 4
+    semantic_plan_num_views: 3
+  model_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/weights/Genie-Envisioner/GE_base_fast_actinterp.safetensors
+diffusion_model_class: LTXVideoTransformer3DModel
+diffusion_model_class_path: models/ltx_models/transformer_ltx_multiview.py
+diffusion_scheduler_class: FlowMatchEulerDiscreteScheduler
+diffusion_scheduler_class_path: diffusers
+enable_slicing: true
+enable_tiling: true
+epsilon: 1e-8
+flow_logit_mean: 0.0
+flow_logit_std: 1.0
+flow_mode_scale: 1.29
+flow_weighting_scheme: none
+gradient_accumulation_steps: 1
+gradient_checkpointing: true
+is_i2v: true
+load_weights: true
+logging_dir: logs
+lr: 3e-5
+lr_num_cycles: 1
+lr_power: 1.0
+lr_scheduler: constant_with_warmup
+lr_warmup_steps: 20
+max_grad_norm: 1.0
+mixed_precision: bf16
+model_name: ltx_train
+nccl_timeout: 600
+noise_to_first_frame: 0.1
+noisy_video: true
+num_inference_step: 10
+optimizer: adamw
+optimizer_8bit: false
+optimizer_torchao: false
+output_dir: /data/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_autoresearch/probes/mix
+pin_memory: true
+pipeline_class: CustomPipeline
+pipeline_class_path: models/pipeline/custom_pipeline.py
+pixel_wise_timestep: true
+pretrained_model_name_or_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/weights/LTX-Video
+report_to: none
+return_action: true
+return_video: false
+robofollow_allowed_new_keys:
+- action_proj_in.bias
+- action_proj_in.weight
+- action_proj_out.bias
+- action_proj_out.weight
+- semantic_adapter.coordinate_projection.0.bias
+- semantic_adapter.coordinate_projection.0.weight
+- semantic_adapter.coordinate_projection.2.bias
+- semantic_adapter.coordinate_projection.2.weight
+- semantic_adapter.feature_projection.0.bias
+- semantic_adapter.feature_projection.0.weight
+- semantic_adapter.feature_projection.2.bias
+- semantic_adapter.feature_projection.2.weight
+- semantic_adapter.semantic_type_embedding
+- semantic_adapter.semantic_view_embedding
+- transformer_blocks.0.semantic_attn.norm_k.weight
+- transformer_blocks.0.semantic_attn.norm_q.weight
+- transformer_blocks.0.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.0.semantic_attn.to_k.bias
+- transformer_blocks.0.semantic_attn.to_k.weight
+- transformer_blocks.0.semantic_attn.to_out.0.bias
+- transformer_blocks.0.semantic_attn.to_out.0.weight
+- transformer_blocks.0.semantic_attn.to_q.bias
+- transformer_blocks.0.semantic_attn.to_q.weight
+- transformer_blocks.0.semantic_attn.to_v.bias
+- transformer_blocks.0.semantic_attn.to_v.weight
+- transformer_blocks.0.semantic_modulation.1.weight
+- transformer_blocks.0.semantic_modulation.2.weight
+- transformer_blocks.1.semantic_attn.norm_k.weight
+- transformer_blocks.1.semantic_attn.norm_q.weight
+- transformer_blocks.1.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.1.semantic_attn.to_k.bias
+- transformer_blocks.1.semantic_attn.to_k.weight
+- transformer_blocks.1.semantic_attn.to_out.0.bias
+- transformer_blocks.1.semantic_attn.to_out.0.weight
+- transformer_blocks.1.semantic_attn.to_q.bias
+- transformer_blocks.1.semantic_attn.to_q.weight
+- transformer_blocks.1.semantic_attn.to_v.bias
+- transformer_blocks.1.semantic_attn.to_v.weight
+- transformer_blocks.1.semantic_modulation.1.weight
+- transformer_blocks.1.semantic_modulation.2.weight
+- transformer_blocks.10.semantic_attn.norm_k.weight
+- transformer_blocks.10.semantic_attn.norm_q.weight
+- transformer_blocks.10.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.10.semantic_attn.to_k.bias
+- transformer_blocks.10.semantic_attn.to_k.weight
+- transformer_blocks.10.semantic_attn.to_out.0.bias
+- transformer_blocks.10.semantic_attn.to_out.0.weight
+- transformer_blocks.10.semantic_attn.to_q.bias
+- transformer_blocks.10.semantic_attn.to_q.weight
+- transformer_blocks.10.semantic_attn.to_v.bias
+- transformer_blocks.10.semantic_attn.to_v.weight
+- transformer_blocks.10.semantic_modulation.1.weight
+- transformer_blocks.10.semantic_modulation.2.weight
+- transformer_blocks.11.semantic_attn.norm_k.weight
+- transformer_blocks.11.semantic_attn.norm_q.weight
+- transformer_blocks.11.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.11.semantic_attn.to_k.bias
+- transformer_blocks.11.semantic_attn.to_k.weight
+- transformer_blocks.11.semantic_attn.to_out.0.bias
+- transformer_blocks.11.semantic_attn.to_out.0.weight
+- transformer_blocks.11.semantic_attn.to_q.bias
+- transformer_blocks.11.semantic_attn.to_q.weight
+- transformer_blocks.11.semantic_attn.to_v.bias
+- transformer_blocks.11.semantic_attn.to_v.weight
+- transformer_blocks.11.semantic_modulation.1.weight
+- transformer_blocks.11.semantic_modulation.2.weight
+- transformer_blocks.12.semantic_attn.norm_k.weight
+- transformer_blocks.12.semantic_attn.norm_q.weight
+- transformer_blocks.12.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.12.semantic_attn.to_k.bias
+- transformer_blocks.12.semantic_attn.to_k.weight
+- transformer_blocks.12.semantic_attn.to_out.0.bias
+- transformer_blocks.12.semantic_attn.to_out.0.weight
+- transformer_blocks.12.semantic_attn.to_q.bias
+- transformer_blocks.12.semantic_attn.to_q.weight
+- transformer_blocks.12.semantic_attn.to_v.bias
+- transformer_blocks.12.semantic_attn.to_v.weight
+- transformer_blocks.12.semantic_modulation.1.weight
+- transformer_blocks.12.semantic_modulation.2.weight
+- transformer_blocks.13.semantic_attn.norm_k.weight
+- transformer_blocks.13.semantic_attn.norm_q.weight
+- transformer_blocks.13.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.13.semantic_attn.to_k.bias
+- transformer_blocks.13.semantic_attn.to_k.weight
+- transformer_blocks.13.semantic_attn.to_out.0.bias
+- transformer_blocks.13.semantic_attn.to_out.0.weight
+- transformer_blocks.13.semantic_attn.to_q.bias
+- transformer_blocks.13.semantic_attn.to_q.weight
+- transformer_blocks.13.semantic_attn.to_v.bias
+- transformer_blocks.13.semantic_attn.to_v.weight
+- transformer_blocks.13.semantic_modulation.1.weight
+- transformer_blocks.13.semantic_modulation.2.weight
+- transformer_blocks.14.semantic_attn.norm_k.weight
+- transformer_blocks.14.semantic_attn.norm_q.weight
+- transformer_blocks.14.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.14.semantic_attn.to_k.bias
+- transformer_blocks.14.semantic_attn.to_k.weight
+- transformer_blocks.14.semantic_attn.to_out.0.bias
+- transformer_blocks.14.semantic_attn.to_out.0.weight
+- transformer_blocks.14.semantic_attn.to_q.bias
+- transformer_blocks.14.semantic_attn.to_q.weight
+- transformer_blocks.14.semantic_attn.to_v.bias
+- transformer_blocks.14.semantic_attn.to_v.weight
+- transformer_blocks.14.semantic_modulation.1.weight
+- transformer_blocks.14.semantic_modulation.2.weight
+- transformer_blocks.15.semantic_attn.norm_k.weight
+- transformer_blocks.15.semantic_attn.norm_q.weight
+- transformer_blocks.15.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.15.semantic_attn.to_k.bias
+- transformer_blocks.15.semantic_attn.to_k.weight
+- transformer_blocks.15.semantic_attn.to_out.0.bias
+- transformer_blocks.15.semantic_attn.to_out.0.weight
+- transformer_blocks.15.semantic_attn.to_q.bias
+- transformer_blocks.15.semantic_attn.to_q.weight
+- transformer_blocks.15.semantic_attn.to_v.bias
+- transformer_blocks.15.semantic_attn.to_v.weight
+- transformer_blocks.15.semantic_modulation.1.weight
+- transformer_blocks.15.semantic_modulation.2.weight
+- transformer_blocks.16.semantic_attn.norm_k.weight
+- transformer_blocks.16.semantic_attn.norm_q.weight
+- transformer_blocks.16.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.16.semantic_attn.to_k.bias
+- transformer_blocks.16.semantic_attn.to_k.weight
+- transformer_blocks.16.semantic_attn.to_out.0.bias
+- transformer_blocks.16.semantic_attn.to_out.0.weight
+- transformer_blocks.16.semantic_attn.to_q.bias
+- transformer_blocks.16.semantic_attn.to_q.weight
+- transformer_blocks.16.semantic_attn.to_v.bias
+- transformer_blocks.16.semantic_attn.to_v.weight
+- transformer_blocks.16.semantic_modulation.1.weight
+- transformer_blocks.16.semantic_modulation.2.weight
+- transformer_blocks.17.semantic_attn.norm_k.weight
+- transformer_blocks.17.semantic_attn.norm_q.weight
+- transformer_blocks.17.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.17.semantic_attn.to_k.bias
+- transformer_blocks.17.semantic_attn.to_k.weight
+- transformer_blocks.17.semantic_attn.to_out.0.bias
+- transformer_blocks.17.semantic_attn.to_out.0.weight
+- transformer_blocks.17.semantic_attn.to_q.bias
+- transformer_blocks.17.semantic_attn.to_q.weight
+- transformer_blocks.17.semantic_attn.to_v.bias
+- transformer_blocks.17.semantic_attn.to_v.weight
+- transformer_blocks.17.semantic_modulation.1.weight
+- transformer_blocks.17.semantic_modulation.2.weight
+- transformer_blocks.18.semantic_attn.norm_k.weight
+- transformer_blocks.18.semantic_attn.norm_q.weight
+- transformer_blocks.18.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.18.semantic_attn.to_k.bias
+- transformer_blocks.18.semantic_attn.to_k.weight
+- transformer_blocks.18.semantic_attn.to_out.0.bias
+- transformer_blocks.18.semantic_attn.to_out.0.weight
+- transformer_blocks.18.semantic_attn.to_q.bias
+- transformer_blocks.18.semantic_attn.to_q.weight
+- transformer_blocks.18.semantic_attn.to_v.bias
+- transformer_blocks.18.semantic_attn.to_v.weight
+- transformer_blocks.18.semantic_modulation.1.weight
+- transformer_blocks.18.semantic_modulation.2.weight
+- transformer_blocks.19.semantic_attn.norm_k.weight
+- transformer_blocks.19.semantic_attn.norm_q.weight
+- transformer_blocks.19.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.19.semantic_attn.to_k.bias
+- transformer_blocks.19.semantic_attn.to_k.weight
+- transformer_blocks.19.semantic_attn.to_out.0.bias
+- transformer_blocks.19.semantic_attn.to_out.0.weight
+- transformer_blocks.19.semantic_attn.to_q.bias
+- transformer_blocks.19.semantic_attn.to_q.weight
+- transformer_blocks.19.semantic_attn.to_v.bias
+- transformer_blocks.19.semantic_attn.to_v.weight
+- transformer_blocks.19.semantic_modulation.1.weight
+- transformer_blocks.19.semantic_modulation.2.weight
+- transformer_blocks.2.semantic_attn.norm_k.weight
+- transformer_blocks.2.semantic_attn.norm_q.weight
+- transformer_blocks.2.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.2.semantic_attn.to_k.bias
+- transformer_blocks.2.semantic_attn.to_k.weight
+- transformer_blocks.2.semantic_attn.to_out.0.bias
+- transformer_blocks.2.semantic_attn.to_out.0.weight
+- transformer_blocks.2.semantic_attn.to_q.bias
+- transformer_blocks.2.semantic_attn.to_q.weight
+- transformer_blocks.2.semantic_attn.to_v.bias
+- transformer_blocks.2.semantic_attn.to_v.weight
+- transformer_blocks.2.semantic_modulation.1.weight
+- transformer_blocks.2.semantic_modulation.2.weight
+- transformer_blocks.20.semantic_attn.norm_k.weight
+- transformer_blocks.20.semantic_attn.norm_q.weight
+- transformer_blocks.20.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.20.semantic_attn.to_k.bias
+- transformer_blocks.20.semantic_attn.to_k.weight
+- transformer_blocks.20.semantic_attn.to_out.0.bias
+- transformer_blocks.20.semantic_attn.to_out.0.weight
+- transformer_blocks.20.semantic_attn.to_q.bias
+- transformer_blocks.20.semantic_attn.to_q.weight
+- transformer_blocks.20.semantic_attn.to_v.bias
+- transformer_blocks.20.semantic_attn.to_v.weight
+- transformer_blocks.20.semantic_modulation.1.weight
+- transformer_blocks.20.semantic_modulation.2.weight
+- transformer_blocks.21.semantic_attn.norm_k.weight
+- transformer_blocks.21.semantic_attn.norm_q.weight
+- transformer_blocks.21.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.21.semantic_attn.to_k.bias
+- transformer_blocks.21.semantic_attn.to_k.weight
+- transformer_blocks.21.semantic_attn.to_out.0.bias
+- transformer_blocks.21.semantic_attn.to_out.0.weight
+- transformer_blocks.21.semantic_attn.to_q.bias
+- transformer_blocks.21.semantic_attn.to_q.weight
+- transformer_blocks.21.semantic_attn.to_v.bias
+- transformer_blocks.21.semantic_attn.to_v.weight
+- transformer_blocks.21.semantic_modulation.1.weight
+- transformer_blocks.21.semantic_modulation.2.weight
+- transformer_blocks.22.semantic_attn.norm_k.weight
+- transformer_blocks.22.semantic_attn.norm_q.weight
+- transformer_blocks.22.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.22.semantic_attn.to_k.bias
+- transformer_blocks.22.semantic_attn.to_k.weight
+- transformer_blocks.22.semantic_attn.to_out.0.bias
+- transformer_blocks.22.semantic_attn.to_out.0.weight
+- transformer_blocks.22.semantic_attn.to_q.bias
+- transformer_blocks.22.semantic_attn.to_q.weight
+- transformer_blocks.22.semantic_attn.to_v.bias
+- transformer_blocks.22.semantic_attn.to_v.weight
+- transformer_blocks.22.semantic_modulation.1.weight
+- transformer_blocks.22.semantic_modulation.2.weight
+- transformer_blocks.23.semantic_attn.norm_k.weight
+- transformer_blocks.23.semantic_attn.norm_q.weight
+- transformer_blocks.23.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.23.semantic_attn.to_k.bias
+- transformer_blocks.23.semantic_attn.to_k.weight
+- transformer_blocks.23.semantic_attn.to_out.0.bias
+- transformer_blocks.23.semantic_attn.to_out.0.weight
+- transformer_blocks.23.semantic_attn.to_q.bias
+- transformer_blocks.23.semantic_attn.to_q.weight
+- transformer_blocks.23.semantic_attn.to_v.bias
+- transformer_blocks.23.semantic_attn.to_v.weight
+- transformer_blocks.23.semantic_modulation.1.weight
+- transformer_blocks.23.semantic_modulation.2.weight
+- transformer_blocks.24.semantic_attn.norm_k.weight
+- transformer_blocks.24.semantic_attn.norm_q.weight
+- transformer_blocks.24.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.24.semantic_attn.to_k.bias
+- transformer_blocks.24.semantic_attn.to_k.weight
+- transformer_blocks.24.semantic_attn.to_out.0.bias
+- transformer_blocks.24.semantic_attn.to_out.0.weight
+- transformer_blocks.24.semantic_attn.to_q.bias
+- transformer_blocks.24.semantic_attn.to_q.weight
+- transformer_blocks.24.semantic_attn.to_v.bias
+- transformer_blocks.24.semantic_attn.to_v.weight
+- transformer_blocks.24.semantic_modulation.1.weight
+- transformer_blocks.24.semantic_modulation.2.weight
+- transformer_blocks.25.semantic_attn.norm_k.weight
+- transformer_blocks.25.semantic_attn.norm_q.weight
+- transformer_blocks.25.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.25.semantic_attn.to_k.bias
+- transformer_blocks.25.semantic_attn.to_k.weight
+- transformer_blocks.25.semantic_attn.to_out.0.bias
+- transformer_blocks.25.semantic_attn.to_out.0.weight
+- transformer_blocks.25.semantic_attn.to_q.bias
+- transformer_blocks.25.semantic_attn.to_q.weight
+- transformer_blocks.25.semantic_attn.to_v.bias
+- transformer_blocks.25.semantic_attn.to_v.weight
+- transformer_blocks.25.semantic_modulation.1.weight
+- transformer_blocks.25.semantic_modulation.2.weight
+- transformer_blocks.26.semantic_attn.norm_k.weight
+- transformer_blocks.26.semantic_attn.norm_q.weight
+- transformer_blocks.26.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.26.semantic_attn.to_k.bias
+- transformer_blocks.26.semantic_attn.to_k.weight
+- transformer_blocks.26.semantic_attn.to_out.0.bias
+- transformer_blocks.26.semantic_attn.to_out.0.weight
+- transformer_blocks.26.semantic_attn.to_q.bias
+- transformer_blocks.26.semantic_attn.to_q.weight
+- transformer_blocks.26.semantic_attn.to_v.bias
+- transformer_blocks.26.semantic_attn.to_v.weight
+- transformer_blocks.26.semantic_modulation.1.weight
+- transformer_blocks.26.semantic_modulation.2.weight
+- transformer_blocks.27.semantic_attn.norm_k.weight
+- transformer_blocks.27.semantic_attn.norm_q.weight
+- transformer_blocks.27.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.27.semantic_attn.to_k.bias
+- transformer_blocks.27.semantic_attn.to_k.weight
+- transformer_blocks.27.semantic_attn.to_out.0.bias
+- transformer_blocks.27.semantic_attn.to_out.0.weight
+- transformer_blocks.27.semantic_attn.to_q.bias
+- transformer_blocks.27.semantic_attn.to_q.weight
+- transformer_blocks.27.semantic_attn.to_v.bias
+- transformer_blocks.27.semantic_attn.to_v.weight
+- transformer_blocks.27.semantic_modulation.1.weight
+- transformer_blocks.27.semantic_modulation.2.weight
+- transformer_blocks.3.semantic_attn.norm_k.weight
+- transformer_blocks.3.semantic_attn.norm_q.weight
+- transformer_blocks.3.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.3.semantic_attn.to_k.bias
+- transformer_blocks.3.semantic_attn.to_k.weight
+- transformer_blocks.3.semantic_attn.to_out.0.bias
+- transformer_blocks.3.semantic_attn.to_out.0.weight
+- transformer_blocks.3.semantic_attn.to_q.bias
+- transformer_blocks.3.semantic_attn.to_q.weight
+- transformer_blocks.3.semantic_attn.to_v.bias
+- transformer_blocks.3.semantic_attn.to_v.weight
+- transformer_blocks.3.semantic_modulation.1.weight
+- transformer_blocks.3.semantic_modulation.2.weight
+- transformer_blocks.4.semantic_attn.norm_k.weight
+- transformer_blocks.4.semantic_attn.norm_q.weight
+- transformer_blocks.4.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.4.semantic_attn.to_k.bias
+- transformer_blocks.4.semantic_attn.to_k.weight
+- transformer_blocks.4.semantic_attn.to_out.0.bias
+- transformer_blocks.4.semantic_attn.to_out.0.weight
+- transformer_blocks.4.semantic_attn.to_q.bias
+- transformer_blocks.4.semantic_attn.to_q.weight
+- transformer_blocks.4.semantic_attn.to_v.bias
+- transformer_blocks.4.semantic_attn.to_v.weight
+- transformer_blocks.4.semantic_modulation.1.weight
+- transformer_blocks.4.semantic_modulation.2.weight
+- transformer_blocks.5.semantic_attn.norm_k.weight
+- transformer_blocks.5.semantic_attn.norm_q.weight
+- transformer_blocks.5.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.5.semantic_attn.to_k.bias
+- transformer_blocks.5.semantic_attn.to_k.weight
+- transformer_blocks.5.semantic_attn.to_out.0.bias
+- transformer_blocks.5.semantic_attn.to_out.0.weight
+- transformer_blocks.5.semantic_attn.to_q.bias
+- transformer_blocks.5.semantic_attn.to_q.weight
+- transformer_blocks.5.semantic_attn.to_v.bias
+- transformer_blocks.5.semantic_attn.to_v.weight
+- transformer_blocks.5.semantic_modulation.1.weight
+- transformer_blocks.5.semantic_modulation.2.weight
+- transformer_blocks.6.semantic_attn.norm_k.weight
+- transformer_blocks.6.semantic_attn.norm_q.weight
+- transformer_blocks.6.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.6.semantic_attn.to_k.bias
+- transformer_blocks.6.semantic_attn.to_k.weight
+- transformer_blocks.6.semantic_attn.to_out.0.bias
+- transformer_blocks.6.semantic_attn.to_out.0.weight
+- transformer_blocks.6.semantic_attn.to_q.bias
+- transformer_blocks.6.semantic_attn.to_q.weight
+- transformer_blocks.6.semantic_attn.to_v.bias
+- transformer_blocks.6.semantic_attn.to_v.weight
+- transformer_blocks.6.semantic_modulation.1.weight
+- transformer_blocks.6.semantic_modulation.2.weight
+- transformer_blocks.7.semantic_attn.norm_k.weight
+- transformer_blocks.7.semantic_attn.norm_q.weight
+- transformer_blocks.7.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.7.semantic_attn.to_k.bias
+- transformer_blocks.7.semantic_attn.to_k.weight
+- transformer_blocks.7.semantic_attn.to_out.0.bias
+- transformer_blocks.7.semantic_attn.to_out.0.weight
+- transformer_blocks.7.semantic_attn.to_q.bias
+- transformer_blocks.7.semantic_attn.to_q.weight
+- transformer_blocks.7.semantic_attn.to_v.bias
+- transformer_blocks.7.semantic_attn.to_v.weight
+- transformer_blocks.7.semantic_modulation.1.weight
+- transformer_blocks.7.semantic_modulation.2.weight
+- transformer_blocks.8.semantic_attn.norm_k.weight
+- transformer_blocks.8.semantic_attn.norm_q.weight
+- transformer_blocks.8.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.8.semantic_attn.to_k.bias
+- transformer_blocks.8.semantic_attn.to_k.weight
+- transformer_blocks.8.semantic_attn.to_out.0.bias
+- transformer_blocks.8.semantic_attn.to_out.0.weight
+- transformer_blocks.8.semantic_attn.to_q.bias
+- transformer_blocks.8.semantic_attn.to_q.weight
+- transformer_blocks.8.semantic_attn.to_v.bias
+- transformer_blocks.8.semantic_attn.to_v.weight
+- transformer_blocks.8.semantic_modulation.1.weight
+- transformer_blocks.8.semantic_modulation.2.weight
+- transformer_blocks.9.semantic_attn.norm_k.weight
+- transformer_blocks.9.semantic_attn.norm_q.weight
+- transformer_blocks.9.semantic_attn.processor.raw_semantic_bias_gate
+- transformer_blocks.9.semantic_attn.to_k.bias
+- transformer_blocks.9.semantic_attn.to_k.weight
+- transformer_blocks.9.semantic_attn.to_out.0.bias
+- transformer_blocks.9.semantic_attn.to_out.0.weight
+- transformer_blocks.9.semantic_attn.to_q.bias
+- transformer_blocks.9.semantic_attn.to_q.weight
+- transformer_blocks.9.semantic_attn.to_v.bias
+- transformer_blocks.9.semantic_attn.to_v.weight
+- transformer_blocks.9.semantic_modulation.1.weight
+- transformer_blocks.9.semantic_modulation.2.weight
+robofollow_metadata:
+  action_dim: 14
+  action_space: joint
+  action_type: absolute
+  camera_order:
+  - head
+  - left_wrist
+  - right_wrist
+  history_action_stride: 50
+  sim_steps: 15
+  source_fps: 16.666666666666668
+  timing_provenance: 'upstream defaults: simulation timestep 1/250, save_freq 15;
+    raw files have no timing attributes'
+robofollow_planner:
+  anchor_weight: 0.0
+  checkpoint: /data/users/junjie/workspace/hpc3_jhe724/outputs/qwen35_baton_strict_acd1_18_ddp_30k/step_020000
+  enabled: true
+  joint: false
+  predicted_probability: 0.5
+  qwen_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/weights/Qwen3.5-2B-baton-v1
+  siglip_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/weights/siglip2-large-patch16-256
+scale_lr: false
+seed: 42
+semantic_plan:
+  dropout: 0.0
+  enabled: true
+  keyframe_indices:
+  - 0
+  - 3
+  - 5
+  - 8
+  source: robofollow_research
+steps_to_log: 10
+steps_to_save: 100
+steps_to_val: 1000000
+textenc_class: T5EncoderModel
+textenc_class_path: transformers
+tokenizer_class: T5Tokenizer
+tokenizer_class_path: transformers
+tracker_name: ltx_trainer
+train_data_class: RoboFollowHDF5Dataset
+train_data_class_path: data/robofollow_hdf5_dataset.py
+train_epochs: 10000
+train_mode: action_full
+train_steps: 300
+use_color_jitter: false
+use_deepspeed: false
+vae_class: AutoencoderKLLTXVideo
+vae_class_path: models/ltx_models/autoencoder_kl_ltx.py
+val_data_class: RoboFollowHDF5Dataset
+val_data_class_path: data/robofollow_hdf5_dataset.py
+weight_decay: 1e-5

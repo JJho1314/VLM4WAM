@@ -1,0 +1,55 @@
+{
+  "validated_variants": [
+    "predicted",
+    "mix",
+    "joint"
+  ],
+  "three_view_migration": "shared independent per-view rows; source checkpoint remains dual-view",
+  "source_checkpoint": "/data/users/junjie/workspace/hpc3_jhe724/outputs/qwen35_baton_strict_acd1_18_ddp_30k/step_020000",
+  "probes": {
+    "predicted": {
+      "log": "/data/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_autoresearch/integration_logs/rf-planner-smoke2.log",
+      "loss": 2.05,
+      "log_sha256": "8467f0826f92cba35d82c9ccfa535199582276efcbe518077338809ac09b13c8"
+    },
+    "teacher": {
+      "log": "/data/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_autoresearch/integration_logs/rf-teacher-smoke.log",
+      "loss": 1.93,
+      "log_sha256": "b84ab20af678b6f8f04da0699b44c906b03b9dcbdb8a780dff2503e910d020a3"
+    },
+    "mix": {
+      "log": "/data/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_autoresearch/integration_logs/rf-mix-smoke2.log",
+      "loss": 1.93,
+      "log_sha256": "1897a6434af5d337c16618e3f96ac03782343f18b4f5f1ca82dd799cb6ab10f6"
+    },
+    "joint": {
+      "log": "/data/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_autoresearch/integration_logs/rf-joint-smoke.log",
+      "loss": 2.09,
+      "gradient_report": {
+        "qwen_frozen": true,
+        "head_gradients": {
+          "sem_mlp.2.weight": {
+            "finite": true,
+            "norm": 0.06817232072353363
+          },
+          "sem_mlp.0.weight": {
+            "finite": true,
+            "norm": 0.054178398102521896
+          },
+          "query_tower.cross_attention.out_proj.weight": {
+            "finite": true,
+            "norm": 0.03425530716776848
+          },
+          "query_tower.cross_attention.in_proj_weight": {
+            "finite": true,
+            "norm": 0.06861483305692673
+          }
+        }
+      },
+      "head_parameters": 25177088,
+      "optimizer_group": "base_ltx",
+      "learning_rate": 3e-05,
+      "log_sha256": "92659d707f76241bb3e94669ee69baf8243503ef4c4ef083c1383b7f1297f0b4"
+    }
+  }
+}

@@ -1,0 +1,25 @@
+--- a/ge_act/runner/ge_trainer.py
++++ b/ge_act/runner/ge_trainer.py
+@@ -3447,7 +3447,9 @@
+                     planner_semantic_times = None
+                     planner_aux_loss = None
+                     research_planner_loss = None
+-                    if self.semantic_encoder is not None:
++                    if hasattr(self, "robofollow_condition"):
++                        planner_semantic_plan, planner_semantic_times, research_planner_loss = self.robofollow_condition(video, batch["caption"], mem_size)
++                    elif self.semantic_encoder is not None:
+                         semantic_config = self.args.semantic_plan
+                         semantic_future = rearrange(
+                             video[:, :, :, mem_size:],
+@@ -3498,7 +3500,10 @@
+                     semantic_plan_mask = None
+                     semantic_plan_relevance = None
+                     semantic_condition_mask = None
+-                    if self.baton_components is not None:
++                    if planner_semantic_plan is not None and hasattr(self, "robofollow_condition"):
++                        semantic_plan = planner_semantic_plan
++                        semantic_plan_times = planner_semantic_times
++                    elif self.baton_components is not None:
+                         baton_condition = build_baton_semantic_condition(
+                             self.baton_components,
+                             self.args.semantic_plan,
