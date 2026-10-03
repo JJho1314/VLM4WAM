@@ -56,6 +56,21 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-03 s2planner20k_v2 at 10k (from GE base, p=1)
+
+| at 10k steps | oracle | disabled | planner | planner vs disabled |
+|---|---|---|---|---|
+| C (control) | 0.0225 | 0.0234 | - | - |
+| s2mix050_20k_v2 (p=0.5) | 0.0257 | 0.0276 | 0.0270 | -2% |
+| s2planner20k_v2 (p=1) | 0.0266 | 0.0236 | **0.0228** | -3.4% (-0.0008 +- 0.0003, win 0.69) |
+
+- The 12% lead at 5k is gone: planner mode now ties C (0.0228 vs 0.0225).
+  The planner still helps its own model (-3.4%, win 0.69) and the gain
+  comes from the wrist view (masking it costs +0.0014). Oracle tokens,
+  never seen in training, hurt (+0.0030).
+- So far the two-stage recipe (oracle-trained A, then planner fine-tune)
+  is the only one that clearly beats C; the 15k/20k points will confirm.
+
 ### 2026-10-03 s2mix050_20k_v2 at 10k (from GE base, p=0.5)
 
 | at 10k steps | oracle | disabled | planner | planner vs disabled |
