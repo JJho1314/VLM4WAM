@@ -56,6 +56,17 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-03 s2mix050_20k_v2 at 10k (from GE base, p=0.5)
+
+| at 10k steps | oracle | disabled | planner | planner vs disabled |
+|---|---|---|---|---|
+| C (control) | 0.0225 | 0.0234 | - | - |
+| s2mix050_20k_v2 (p=0.5) | 0.0257 | 0.0276 | 0.0270 | -2% (-0.0006 +- 0.0004, win 0.60) |
+
+- Still 14-20% worse than C at the same step (5k gap was ~20%), and the
+  planner gain is within noise. Mixing oracle and planner tokens from the
+  start keeps hurting; s2planner20k_v2 (p=1) at 10k is the comparison.
+
 ### 2026-10-03 s2planner20k_v2 at 5k (from GE base, p=1, frozen head)
 
 | at 5k steps | oracle | disabled | planner | planner vs disabled |
