@@ -59,3 +59,11 @@ R0完整配对评测结束后先冻结阈值；R1/R2/R3 随后才允许 prepare�
 ```
 
 generic trainer 的两个 callback 接入 hunk 保存在 `patches/generic_condition_hook.patch`，当前 worktree 已应用。原 dirty baseline 归档在 `/tmp/robofollow-baseline.patch` 与 `/tmp/robofollow-untracked.tar`；运行快照包含有效 ge_trainer.py，单独 checkout 本分支还不能替代这些用户 baseline 内容。`provenance.json` 的环境白名单及 package 版本、checkpoint/data 哈希与 runtime 配置共同记录外部依赖；权重目录路径标识不等于把全部模型权重打包进 Git。
+
+### 研究边界验收（2026-10-03）
+
+独立审查及处置见 `REVIEW.md`。新增与相关集成测试119项通过；整个项目的广泛测试仍有未分诊失败，见报告。完整-v3图像补充审计2031975帧通过，receipt与manifest hash绑定，未改变冻结划分。
+
+部署必须提供 `<checkpoint>.contract.json`：控制器只为已完成的注册训练、未改变的effective YAML和其checkpoint建立SHA绑定，标记为post-training audited binding。服务在加载模型前验证camera/joint/absolute action/statistics/manifest/history/planner语义；任意旧checkpoint不能仅凭相同形状直接部署。预训练源权重显式允许的四个action projection迁移不属于部署验收。
+
+训练/评测移除继承的 `BATON_RESEARCH_*` 开关，caption dropout固定0，学习率来自YAML，effective环境纳入provenance。SIGHUP/SIGTERM触发拥有进程清理；独立CPU watchdog在控制器消失或超时时终止所拥有的组并计费。未解决的running记录阻止新GPU任务，先使用 `recover --run-id ...` 进行PID身份核对恢复。

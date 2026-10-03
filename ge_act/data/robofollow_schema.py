@@ -93,8 +93,10 @@ def denormalize(x,stats,kind):
     return np.asarray(x,dtype=np.float32)*np.asarray(stats[f'{kind}_std'],dtype=np.float32)+np.asarray(stats[f'{kind}_mean'],dtype=np.float32)
 
 
-def validate_all_frames(path, batch_size=32):
+def validate_all_frames(path, batch_size=32, return_digest=False):
     """Stream every usable frame; retain only one decoded image in memory."""
+    import hashlib
+    digest=hashlib.sha256()
     e=read_episode(path,decode_images=False)
     with h5py.File(path,'r') as f:
         cams=[f[f'observation/{c}/rgb'] for c in RAW_CAMERAS] if e.schema=='robofollow-raw-v1' else [f[f'vision/{c}/colors'] for c in PAIRED_CAMERAS]
@@ -108,6 +110,9 @@ def validate_all_frames(path, batch_size=32):
                         if image.dtype!=np.uint8 or image.ndim!=3 or image.shape[-1]!=3:raise ValueError('invalid RGB')
                         if expected is None:expected=image.shape
                         if image.shape!=expected:raise ValueError(f'image shape {image.shape} differs from {expected}')
+                        if return_digest:
+                            digest.update(f'{name}:{i}:{image.shape}'.encode());digest.update(image.tobytes())
                     except Exception as error:
                         raise ValueError(f'camera {name} frame {i}: {error}') from error
-    return len(e.states)*len(cams)
+    count=len(e.states)*len(cams)
+    return (count,digest.hexdigest()) if return_digest else count

@@ -129,3 +129,13 @@ def test_preflight_quarantines_corrupt_middle_frame(tmp_path,bad_shape):
     m=build_manifest(tmp_path,tmp_path/'m.json')
     assert len(m['quarantine'])==1
     assert 'left_wrist' in m['quarantine'][0]['reason'] and '2' in m['quarantine'][0]['reason']
+
+def test_same_motion_different_images_are_not_duplicates(tmp_path):
+    from autoresearch.preflight import build_manifest
+    a=episode(tmp_path/'scene1'/'a'/'data'/'episode0.hdf5',n=5)
+    b=episode(tmp_path/'scene1'/'b'/'data'/'episode0.hdf5',n=5)
+    payload=cv2.imencode('.jpg',np.full((8,10,3),130,np.uint8))[1].tobytes()
+    with h5py.File(b,'a') as f:f['observation/left_camera/rgb'][2]=payload
+    m=build_manifest(tmp_path,tmp_path/'m.json')
+    assert len(m['episodes'])==2 and not m['duplicates']
+    assert len({r['split'] for r in m['episodes']})==1

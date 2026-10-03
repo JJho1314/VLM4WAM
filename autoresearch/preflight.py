@@ -42,7 +42,7 @@ def build_manifest(root: Path, output: Path, seed: int=42, training_registry=Non
     for p in sorted(Path(root).glob('**/data/episode*.hdf5')):
         try:
             e=read_episode(p,decode_images=False)
-            validate_all_frames(p)
+            _,image_hash=validate_all_frames(p,return_digest=True)
             scene,task,ep=e.identity
             if scene not in ('scene1','scene2','scene3','scene4'):raise ValueError('unknown scene')
             if training_registry is not None:
@@ -50,14 +50,14 @@ def build_manifest(root: Path, output: Path, seed: int=42, training_registry=Non
                 if e.instructions!=expected:raise ValueError('instructions differ from official training registry')
             # Preserve instruction aliases, but connect their complete task groups before splitting.
             trajectory=hashlib.sha256(e.states.tobytes()+e.actions.tobytes()).hexdigest()
-            content=hashlib.sha256(e.states.tobytes()+e.actions.tobytes()+json.dumps(e.instructions).encode()).hexdigest()
+            content=hashlib.sha256(e.states.tobytes()+e.actions.tobytes()+json.dumps(e.instructions).encode()+image_hash.encode()).hexdigest()
             identity=':'.join(e.identity)
             if content in seen or identity in identities:
                 result['duplicates'].append({'path':str(p),'same_as':seen.get(content,identities.get(identity))});continue
             seen[content]=str(p);identities[identity]=str(p)
             group=f'{scene}:{task}:'+json.dumps(sorted(e.instructions))
             split='dev' if int(hashlib.sha256(f'{seed}:{group}'.encode()).hexdigest()[:8],16)%5==0 else 'train'
-            result['episodes'].append({'path':str(p.resolve()),'identity':identity,'scene':scene,'task':task,'instructions':e.instructions,'schema':e.schema,'length':len(e.states),'content_hash':content,'trajectory_hash':trajectory,'file_hash':digest(p),'split':split,'sample_indices':[0,len(e.states)//2,len(e.states)-1]})
+            result['episodes'].append({'path':str(p.resolve()),'identity':identity,'scene':scene,'task':task,'instructions':e.instructions,'schema':e.schema,'length':len(e.states),'content_hash':content,'trajectory_hash':trajectory,'file_hash':digest(p),'image_hash':image_hash,'split':split,'sample_indices':[0,len(e.states)//2,len(e.states)-1]})
         except (OSError,ValueError,KeyError,TypeError) as error:
             result['quarantine'].append({'path':str(p),'reason':str(error)})
         if (len(result['episodes'])+len(result['quarantine'])+len(result['duplicates']))%100==0:
