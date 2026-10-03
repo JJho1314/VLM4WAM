@@ -723,8 +723,18 @@ def apply_research_planner_mixing(trainer, tokens, video, captions, n_previous):
         if anchor > 0:
             teacher = tokens[pick.to(tokens.device)].to(predicted.device).float()
             extra_loss = extra_loss + anchor * (predicted.float() - teacher).pow(2).mean()
+    teacher_rows = tokens[pick.to(tokens.device)]
     tokens = tokens.clone()
     tokens[pick.to(tokens.device)] = predicted.to(device=tokens.device, dtype=tokens.dtype)
+    if not getattr(trainer, "_research_planner_logged", False):
+        # One-time evidence that planner tokens, not the teacher, reach the model.
+        delta = (tokens[pick.to(tokens.device)].float() - teacher_rows.float()).abs().mean()
+        print(
+            f"[planner mixing] replaced {int(pick.sum())}/{pick.numel()} samples; "
+            f"mean |planner - teacher| = {float(delta):.4f}",
+            flush=True,
+        )
+        trainer._research_planner_logged = True
     return tokens, extra_loss
 
 
