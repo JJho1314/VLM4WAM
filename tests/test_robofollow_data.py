@@ -117,3 +117,15 @@ def test_trajectory_alias_components_are_transitive():
     assign_splits(rows,42)
     assert len({r['split_group'] for r in rows})==1
     assert len({r['split'] for r in rows})==1
+
+@pytest.mark.parametrize('bad_shape',[False,True])
+def test_preflight_quarantines_corrupt_middle_frame(tmp_path,bad_shape):
+    from autoresearch.preflight import build_manifest
+    p=episode(tmp_path/'scene1'/'bad'/'data'/'episode0.hdf5',n=5)
+    episode(tmp_path/'scene2'/'good'/'data'/'episode0.hdf5',n=5,offset=2)
+    with h5py.File(p,'a') as f:
+        payload=cv2.imencode('.jpg',np.zeros((6,10,3),np.uint8))[1].tobytes() if bad_shape else b'broken'
+        f['observation/left_camera/rgb'][2]=payload
+    m=build_manifest(tmp_path,tmp_path/'m.json')
+    assert len(m['quarantine'])==1
+    assert 'left_wrist' in m['quarantine'][0]['reason'] and '2' in m['quarantine'][0]['reason']

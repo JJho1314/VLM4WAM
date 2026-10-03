@@ -91,3 +91,23 @@ def normalize(x,stats,kind):
 def denormalize(x,stats,kind):
     validate_stats(stats)
     return np.asarray(x,dtype=np.float32)*np.asarray(stats[f'{kind}_std'],dtype=np.float32)+np.asarray(stats[f'{kind}_mean'],dtype=np.float32)
+
+
+def validate_all_frames(path, batch_size=32):
+    """Stream every usable frame; retain only one decoded image in memory."""
+    e=read_episode(path,decode_images=False)
+    with h5py.File(path,'r') as f:
+        cams=[f[f'observation/{c}/rgb'] for c in RAW_CAMERAS] if e.schema=='robofollow-raw-v1' else [f[f'vision/{c}/colors'] for c in PAIRED_CAMERAS]
+        expected=None
+        for start in range(0,len(e.states),batch_size):
+            for name,c in zip(CAMERA_ORDER,cams):
+                for offset,payload in enumerate(c[start:min(start+batch_size,len(e.states))]):
+                    i=start+offset
+                    try:
+                        image=codec().decode_image_bit(payload)
+                        if image.dtype!=np.uint8 or image.ndim!=3 or image.shape[-1]!=3:raise ValueError('invalid RGB')
+                        if expected is None:expected=image.shape
+                        if image.shape!=expected:raise ValueError(f'image shape {image.shape} differs from {expected}')
+                    except Exception as error:
+                        raise ValueError(f'camera {name} frame {i}: {error}') from error
+    return len(e.states)*len(cams)

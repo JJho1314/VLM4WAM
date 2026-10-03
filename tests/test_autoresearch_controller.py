@@ -141,6 +141,7 @@ def test_evaluation_retry_preserves_prior_attempt(tmp_path,monkeypatch,record_ex
     state=dict(status='failed',candidate=dict(variant='text',steps=1,timeout_seconds=7200),training=dict(status='completed',started_at=time.time()))
     if record_exists:state['evaluation']=old
     (run/'run.json').write_text(json.dumps(state))
+    monkeypatch.setattr(c,'bind_run_checkpoint',lambda *a:None)
     monkeypatch.setattr(c,'snapshot_code',lambda src,dst:dst.mkdir())
     seen=[]
     def execute(argv,directory,*a,**kw):
@@ -234,3 +235,48 @@ def test_paired_workers_overlap_and_stop_on_failure(tmp_path):
     start=time.monotonic()
     with pytest.raises(subprocess.CalledProcessError):run_mode_workers([['false'],['sleep','30']],tmp_path/'failed')
     assert time.monotonic()-start<3
+
+def test_research_environment_sanitized(monkeypatch):
+    from autoresearch.controller import launch_environment
+    monkeypatch.setenv('BATON_RESEARCH_CAPTION_DROPOUT','1')
+    monkeypatch.setenv('BATON_RESEARCH_JOINT_HEAD_LR','99')
+    env=launch_environment()
+    assert env['BATON_RESEARCH_CAPTION_DROPOUT']=='0'
+    assert 'BATON_RESEARCH_JOINT_HEAD_LR' not in env
+
+def test_unresolved_gpu_phase_prevents_new_launch(tmp_path):
+    from autoresearch.controller import refuse_unresolved
+    from autoresearch.registry import Registry,atomic_json
+    atomic_json(tmp_path/'old/train/process.json',{'status':'running'})
+    with pytest.raises(RuntimeError,match='unresolved'):refuse_unresolved(Registry(tmp_path))
+
+@pytest.mark.parametrize('kill_signal',[15,9])
+def test_controller_death_cleanup_and_launch_exclusion(tmp_path,kill_signal):
+    import signal,time
+    from pathlib import Path
+    from autoresearch.controller import PIX,ROOT,refuse_unresolved
+    from autoresearch.registry import Registry,process_identity
+    script="from pathlib import Path; from autoresearch.controller import run_process,termination_cleanup; from autoresearch.registry import Registry; import sys; root=Path(sys.argv[1]); guard=termination_cleanup(); guard.__enter__(); run_process(['sleep','60'],root/'run/train',Registry(root),5,1)"
+    source=tmp_path/'controller_child.py';source.write_text(script)
+    log=(tmp_path/'controller.log').open('w')
+    launcher=subprocess.Popen([PIX,'run','--manifest-path',str(ROOT/'autoresearch/runtime/pixi.toml'),'research',str(source),str(tmp_path)],stdout=log,stderr=subprocess.STDOUT)
+    path=tmp_path/'run/train/process.json'
+    deadline=time.monotonic()+15
+    try:
+        while not path.exists() and time.monotonic()<deadline:time.sleep(.05)
+        assert path.exists(),(tmp_path/'controller.log').read_text()
+        record=json.loads(path.read_text());target=record['process']
+        os.kill(record['controller']['pid'],kill_signal)
+        launcher.wait(timeout=10)
+        # SIGKILL may leave a running record until independent owner-loss enforcement.
+        if json.loads(path.read_text())['status']=='running':
+            with pytest.raises(RuntimeError,match='unresolved'):refuse_unresolved(Registry(tmp_path))
+        while json.loads(path.read_text())['status']=='running' and time.monotonic()<deadline:time.sleep(.1)
+        assert json.loads(path.read_text())['status']=='interrupted'
+        assert Registry(tmp_path).used_gpu_hours()>0
+        current=process_identity(target['pid'])
+        if current==target:
+            assert Path(f"/proc/{target['pid']}/stat").read_text().rsplit(')',1)[1].split()[0]=='Z'
+        refuse_unresolved(Registry(tmp_path))
+    finally:
+        if launcher.poll() is None:launcher.kill();launcher.wait()

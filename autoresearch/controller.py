@@ -1,4 +1,5 @@
 """Bounded runner. Candidate commands are constructed from registered templates."""
+from contextlib import contextmanager
 import argparse
 import hashlib
 import json
@@ -36,6 +37,46 @@ def file_sha256(path):
         for block in iter(lambda:f.read(8*1024*1024),b''):h.update(block)
     return h.hexdigest()
 
+def launch_environment(**overrides):
+    # Registered YAML is authoritative; inherited experimental knobs are forbidden.
+    env={k:v for k,v in os.environ.items() if not k.startswith('BATON_RESEARCH_')}
+    env['BATON_RESEARCH_CAPTION_DROPOUT']='0'
+    env.update(overrides)
+    return env
+
+def refuse_unresolved(registry):
+    pending=[str(p) for p in registry.root.glob('*/*/process.json') if json.loads(p.read_text()).get('status')=='running']
+    if pending:raise RuntimeError(f'unresolved GPU process records; recover before launch: {pending}')
+
+@contextmanager
+def termination_cleanup():
+    def handler(signum,frame):raise KeyboardInterrupt(f'controller signal {signum}')
+    previous={sig:signal.signal(sig,handler) for sig in (signal.SIGTERM,signal.SIGHUP)}
+    try:yield
+    finally:
+        for sig,value in previous.items():signal.signal(sig,value)
+
+def require_image_validation(manifest):
+    manifest=Path(manifest);data=json.loads(manifest.read_text())
+    if data.get('image_validation')=='all usable frames, streaming RGB decode':return
+    receipt=manifest.parent/'all_frames_validation.json'
+    result=json.loads(receipt.read_text()) if receipt.exists() else {}
+    if result.get('status')!='complete' or result.get('manifest_sha256')!=file_sha256(manifest) or result.get('episodes')!=len(data['episodes']):
+        raise ValueError('complete image validation required before GPU admission')
+
+def bind_run_checkpoint(run,checkpoint):
+    import yaml
+    from ge_act.experiments.robofollow_loading import semantic_contract,write_contract
+    state=json.loads((run/'run.json').read_text())
+    config_path=run/'code/ge_act/configs/ltx_model/robofollow/run.yaml'
+    if state.get('training',{}).get('status')!='completed':raise ValueError('contract requires completed registered training')
+    if file_sha256(config_path)!=state['effective_config_sha256']:raise ValueError('effective training config changed')
+    expected=run/'checkpoints'
+    if expected.resolve() not in checkpoint.resolve().parents:raise ValueError('checkpoint outside registered run')
+    config=yaml.safe_load(config_path.read_text())
+    require_image_validation(config['data']['train']['manifest_path'])
+    write_contract(checkpoint,semantic_contract(config,config['data']['train']['stat_file']),dict(capture_phase='post-training audited binding',run_id=run.name,effective_config_sha256=state['effective_config_sha256'],training_process=state['training']['process']))
+
 def provenance(config):
     import importlib.metadata
     paths=[config['diffusion_model']['model_path'],config['data']['train']['manifest_path'],config['data']['train']['stat_file']]
@@ -43,7 +84,8 @@ def provenance(config):
     if planner.get('enabled'):
         paths.extend(str(p) for p in Path(planner['checkpoint']).rglob('*') if p.is_file())
     artifacts={str(p):dict(sha256=file_sha256(p),bytes=Path(p).stat().st_size) for p in paths}
-    env={key:os.environ[key] for key in ('CUDA_VISIBLE_DEVICES','HDF5_USE_FILE_LOCKING','PYTHONPATH','TOKENIZERS_PARALLELISM','OMP_NUM_THREADS','VK_ICD_FILENAMES','CUDA_HOME') if key in os.environ}
+    effective=launch_environment()
+    env={key:effective[key] for key in ('CUDA_VISIBLE_DEVICES','HDF5_USE_FILE_LOCKING','PYTHONPATH','TOKENIZERS_PARALLELISM','OMP_NUM_THREADS','VK_ICD_FILENAMES','CUDA_HOME','BATON_RESEARCH_CAPTION_DROPOUT') if key in effective}
     packages={d.metadata['Name']:d.version for d in importlib.metadata.distributions() if d.metadata['Name']}
     return dict(captured_at=time.time(),artifacts=artifacts,environment=env,packages=packages,external_models=dict(pretrained=config['pretrained_model_name_or_path'],qwen=planner.get('qwen_path'),siglip=planner.get('siglip_path')),runtime_note='See captured Pixi manifest for separate simulator interpreter and environment')
 
@@ -84,12 +126,17 @@ def snapshot_code(src,dst):
 
 def run_process(argv,directory,registry,timeout_seconds,gpus,env=None,cwd=None):
     directory=Path(directory);directory.mkdir(parents=True,exist_ok=False)
+    refuse_unresolved(registry)
     registry.check_budget(timeout_seconds*gpus/3600)
-    start=time.time();clock_start=time.monotonic();record=dict(status='running',argv=argv,started_at=start,started_monotonic=clock_start,gpus=gpus,timeout_seconds=timeout_seconds)
+    start=time.time();clock_start=time.monotonic();record=dict(status='running',argv=argv,started_at=start,started_monotonic=clock_start,gpus=gpus,timeout_seconds=timeout_seconds,controller=process_identity(os.getpid()))
     with (directory/'process.log').open('w') as log:
-        proc=subprocess.Popen(argv,stdout=log,stderr=subprocess.STDOUT,start_new_session=True,env=env,cwd=cwd)
-        record['process']=process_identity(proc.pid);record['owned_processes']=descendant_identities(proc.pid);atomic_json(directory/'process.json',record)
+        proc=subprocess.Popen(argv,stdout=log,stderr=subprocess.STDOUT,start_new_session=True,env=env if env is not None else launch_environment(),cwd=cwd)
+        watch=None;watch_identity=None;watch_log=None
         try:
+            record['process']=process_identity(proc.pid);record['owned_processes']=descendant_identities(proc.pid);atomic_json(directory/'process.json',record)
+            watch_log=(directory/'watchdog.log').open('w')
+            watch=subprocess.Popen([PIX,'run','--manifest-path',str(ROOT/'autoresearch/runtime/pixi.toml'),'research','-m','autoresearch.watchdog','--record',str(directory/'process.json'),'--owner',json.dumps(process_identity(os.getpid())),'--root',str(registry.root),'--maximum',str(registry.max_gpu_hours)],start_new_session=True,stdout=watch_log,stderr=subprocess.STDOUT,env=launch_environment(),cwd=ROOT)
+            watch_identity=process_identity(watch.pid)
             while proc.poll() is None:
                 if process_identity(proc.pid)==record['process']:
                     known={json.dumps(x,sort_keys=True):x for x in record['owned_processes']}
@@ -110,6 +157,11 @@ def run_process(argv,directory,registry,timeout_seconds,gpus,env=None,cwd=None):
             except subprocess.TimeoutExpired:safe_signal(record['process'],signal.SIGKILL,group=True);proc.wait()
             raise
         finally:
+            if watch is not None:
+                safe_signal(watch_identity,signal.SIGTERM,group=True)
+                try:watch.wait(timeout=10)
+                except subprocess.TimeoutExpired:safe_signal(watch_identity,signal.SIGKILL,group=True);watch.wait()
+            if watch_log is not None:watch_log.close()
             record['owned_processes']+=owned_group_identities(record['process'])
             cleanup_owned_group(proc.pid,record['owned_processes'])
             record.update(returncode=proc.returncode,ended_at=time.time(),wall_seconds=time.monotonic()-clock_start)
@@ -131,6 +183,7 @@ def prepare_run(candidate,root):
     import yaml
     config_path=run/'code/ge_act/configs/ltx_model/robofollow'/candidate_config(candidate['variant'],version)
     config=yaml.safe_load(config_path.read_text())
+    require_image_validation(config['data']['train']['manifest_path'])
     atomic_json(run/'provenance.json',dict(provenance(config),config_sha256=file_sha256(config_path)))
     entries=json.loads((ROOT/'autoresearch/configs/robofollow_candidates.json').read_text())
     hypothesis=next(x['hypothesis'] for x in entries if x['id']==candidate['id'])
@@ -180,6 +233,7 @@ def evaluate_run(run,registry):
     if len(checkpoints)!=1:raise ValueError('ambiguous or missing final checkpoint')
     remaining=state['candidate']['timeout_seconds']-elapsed_record(state['training'])
     if remaining<=0:raise RuntimeError('candidate total wall-time limit exhausted')
+    bind_run_checkpoint(run,checkpoints[0])
     state['checkpoint_sha256']=file_sha256(checkpoints[0])
     snapshot_code(ROOT,run/code_name)
     code=run/code_name
@@ -189,7 +243,7 @@ def evaluate_run(run,registry):
     if remaining<=0:raise RuntimeError('candidate total wall-time limit exhausted during evaluation preparation')
     state['status']='evaluating';atomic_json(run/'run.json',state)
     try:
-        result=run_process(argv,run/phase_name,registry,remaining,2,cwd=code)
+        result=run_process(argv,run/phase_name,registry,remaining,2,env=launch_environment(),cwd=code)
         state['evaluation']=result
         state['status']='completed' if result['status']=='completed' else result['status']
     except BaseException:
@@ -244,13 +298,14 @@ def train_run(run,registry):
     if c.get('data_version','frozen-v1')!='complete-v3':raise ValueError('superseded split: new training requires complete-v3')
     import yaml
     config=yaml.safe_load((code/'ge_act/configs/ltx_model/robofollow'/candidate_config(c['variant'],c.get('data_version','frozen-v1'))).read_text())
+    require_image_validation(config['data']['train']['manifest_path'])
     config['output_dir']=str(run/'checkpoints')
     config_path=code/'ge_act/configs/ltx_model/robofollow/run.yaml'
     config_path.write_text(yaml.safe_dump(config,sort_keys=False))
     state['effective_config_sha256']=file_sha256(config_path)
     argv=[PIX,'run','--manifest-path',str(code/'autoresearch/runtime/pixi.toml'),'train','--config_file','configs/ltx_model/robofollow/run.yaml','--max_train_steps',str(c['steps'])]
     state['status']='running';atomic_json(run/'run.json',state)
-    env=dict(os.environ,CUDA_VISIBLE_DEVICES='0')
+    env=launch_environment(CUDA_VISIBLE_DEVICES='0')
     try:
         result=run_process(argv,run/'train',registry,c['timeout_seconds'],1,env=env,cwd=code)
         state['status']='trained' if result['status']=='completed' else result['status']
@@ -284,7 +339,7 @@ def main():
     sub.add_parser('status');a=p.parse_args();registry=Registry(a.root)
     if a.command=='status':
         print(json.dumps(dict(used_gpu_hours=registry.used_gpu_hours(),max_gpu_hours=registry.max_gpu_hours,runs=[json.loads(x.read_text()) for x in a.root.glob('*/run.json')]),indent=2));return
-    with registry.lock():
+    with registry.lock(),termination_cleanup():
         if a.command=='loop':
             reports=[]
             for name in a.candidates:

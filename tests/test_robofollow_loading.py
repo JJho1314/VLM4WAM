@@ -25,3 +25,16 @@ def test_ltx_latent_channel_compatibility():
     ensure_vae_channels(vae)
     assert vae.z_dim==128
     with pytest.raises(ValueError):ensure_vae_channels(SimpleNamespace(config=SimpleNamespace(latent_channels=0)))
+
+@pytest.mark.parametrize('field',['camera_order','joint_order','action_type','statistics_sha256','manifest_sha256','planner'])
+def test_same_shape_wrong_semantics_rejected(tmp_path,field):
+    import json
+    from ge_act.experiments.robofollow_loading import write_contract,validate_contract
+    ck=tmp_path/'m.safetensors';save_file(torch.nn.Linear(3,14).state_dict(),str(ck))
+    expected={'camera_order':['head','left_wrist','right_wrist'],'joint_order':list(range(14)),'action_type':'absolute','statistics_sha256':'s','manifest_sha256':'m','planner':None}
+    write_contract(ck,expected,{'capture_phase':'test'})
+    validate_contract(ck,expected)
+    wrong=dict(expected);wrong[field]='wrong'
+    with pytest.raises(ValueError,match='semantic'):validate_contract(ck,wrong)
+    ck.write_bytes(b'changed')
+    with pytest.raises(ValueError,match='weights'):validate_contract(ck,expected)

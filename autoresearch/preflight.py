@@ -4,7 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import numpy as np
-from ge_act.data.robofollow_schema import CAMERA_ORDER,JOINT_ORDER,read_episode
+from ge_act.data.robofollow_schema import CAMERA_ORDER,JOINT_ORDER,read_episode,validate_all_frames
 
 def digest(path):
     h=hashlib.sha256()
@@ -37,12 +37,12 @@ def assign_splits(episodes, seed):
         row['split']='dev' if int(hashlib.sha256(f'{seed}:{key}'.encode()).hexdigest()[:8],16)%5==0 else 'train'
 
 def build_manifest(root: Path, output: Path, seed: int=42, training_registry=None) -> dict:
-    result={'version':2,'split_policy':'connected task/instruction and joint-trajectory groups','seed':seed,'root':str(Path(root).resolve()),'camera_order':CAMERA_ORDER,'joint_order':JOINT_ORDER,'episodes':[],'duplicates':[],'quarantine':[]}
+    result={'image_validation':'all usable frames, streaming RGB decode','version':2,'split_policy':'connected task/instruction and joint-trajectory groups','seed':seed,'root':str(Path(root).resolve()),'camera_order':CAMERA_ORDER,'joint_order':JOINT_ORDER,'episodes':[],'duplicates':[],'quarantine':[]}
     seen={}; identities={}
     for p in sorted(Path(root).glob('**/data/episode*.hdf5')):
         try:
             e=read_episode(p,decode_images=False)
-            read_episode(p,image_indices=[0,len(e.states)-1])
+            validate_all_frames(p)
             scene,task,ep=e.identity
             if scene not in ('scene1','scene2','scene3','scene4'):raise ValueError('unknown scene')
             if training_registry is not None:

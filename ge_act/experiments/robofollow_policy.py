@@ -58,11 +58,14 @@ def make_policy(config_path,checkpoint_path,stats_path,planner_mode='disabled',i
     from ge_act.models.ltx_models.transformer_ltx_multiview import LTXVideoTransformer3DModel
     from ge_act.models.pipeline.custom_pipeline import CustomPipeline
     from ge_act.utils.model_utils import load_condition_models,load_latent_models,resolve_checkpoint_files
-    from ge_act.experiments.robofollow_loading import load_robofollow_weights,ensure_vae_channels
+    from ge_act.experiments.robofollow_loading import load_robofollow_weights,ensure_vae_channels,semantic_contract,validate_contract
     if planner_mode not in ('disabled','predicted'):raise ValueError('deployment cannot request teacher plans')
     c=yaml.safe_load(Path(config_path).read_text());s=json.loads(Path(stats_path).read_text());validate_stats(s)
     md=c['robofollow_metadata']
     if md['action_type']!='absolute' or md['action_dim']!=14 or md['camera_order']!=s['camera_order']:raise ValueError('policy config metadata mismatch')
+    files=resolve_checkpoint_files(checkpoint_path)
+    if len(files)!=1:raise ValueError('one explicit checkpoint required')
+    validate_contract(files[0],semantic_contract(c,stats_path))
     dtype=torch.bfloat16;weights=c['pretrained_model_name_or_path']
     cond=load_condition_models(T5Tokenizer,T5EncoderModel,weights,load_weights=True)
     textenc=cond['text_encoder'].to(device,dtype=dtype).eval().requires_grad_(False)
