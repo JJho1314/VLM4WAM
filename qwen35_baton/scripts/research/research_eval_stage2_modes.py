@@ -2,7 +2,8 @@
 
 For each validation window the same inputs and noise are run under several
 semantic modes (teacher guidance on, off, wrist-only masked, main-only masked;
-``planner*`` modes use frozen Qwen3.5 baton planner predictions instead),
+``planner*`` modes use frozen Qwen3.5 baton planner predictions instead, through
+the checkpoint's jointly fine-tuned ``research_planner_head`` when it has one),
 recording action MSE per horizon and future-video MSE. Paired differences
 against ``semantic_disabled`` test H1 (does oracle guidance help) and H8 (is
 wrist guidance useful). Shardable across 1-GPU jobs; merge with --merge.
@@ -176,6 +177,43 @@ def _run_mode(runner, pipe, batch, condition, mode: str, seed: int) -> dict:
     return result
 
 
+def _planner_head(runner, planner):
+    """The loaded checkpoint's jointly fine-tuned planner head, or None.
+
+    Joint-KI checkpoints store ``research_planner_head.*`` inside the diffusion
+    safetensors; it is attached here (initialized from ``planner``, then
+    restored) unless the trainer already attached it.
+    """
+
+    from runner.ge_trainer import (
+        attach_research_planner_head,
+        checkpoint_has_research_planner_head,
+    )
+
+    model = runner._unwrapped_diffusion_model(runner.state.accelerator)
+    model_path = runner.args.diffusion_model["model_path"]
+    if getattr(model, "research_planner_head", None) is None and (
+        checkpoint_has_research_planner_head(model_path)
+    ):
+        restored = attach_research_planner_head(model, planner, model_path)
+        print(json.dumps({"research_planner_head_restored": restored}), flush=True)
+    head = getattr(model, "research_planner_head", None)
+    if head is not None:
+        head.eval()
+    return head
+
+
+@torch.no_grad()
+def _planner_tokens(planner, planner_head, current, captions) -> torch.Tensor:
+    """Planner grids: the frozen planner, or its backbone plus the fine-tuned head."""
+
+    if planner_head is None:
+        return planner.predict(current, captions).tokens
+    from qwen35_baton.research_provider import predict_with_research_head
+
+    return predict_with_research_head(planner, planner_head, current, captions)
+
+
 def _evaluate(args: argparse.Namespace) -> None:
     import dataclasses
 
@@ -233,6 +271,7 @@ def _evaluate(args: argparse.Namespace) -> None:
         )
     if any(mode.startswith("planner") for mode in MODES) and planner is None:
         raise ValueError("planner modes need E3_PLANNER_CHECKPOINT and E3_PLANNER_QWEN_PATH")
+    planner_head = _planner_head(runner, planner) if planner is not None else None
     dataset = runner.val_dataset
     indices = np.linspace(0, len(dataset) - 1, args.num_samples).round().astype(int).tolist()
     mine = indices[args.shard_index :: args.num_shards]
@@ -261,8 +300,9 @@ def _evaluate(args: argparse.Namespace) -> None:
             if planner is not None:
                 current = batch["video"][:1, :, :, n_prev - 1].permute(0, 2, 1, 3, 4)
                 current = _normalized_video_to_uint8(current).contiguous()
-                with torch.no_grad():
-                    predicted = planner.predict(current, tuple(batch["caption"][:1])).tokens
+                predicted = _planner_tokens(
+                    planner, planner_head, current, tuple(batch["caption"][:1])
+                )
                 planner_condition = dataclasses.replace(
                     condition,
                     tokens=predicted.to(device=condition.tokens.device, dtype=condition.tokens.dtype),

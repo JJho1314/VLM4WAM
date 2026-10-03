@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from copy import deepcopy
 import json
 from pathlib import Path
 from typing import Any, Sequence
@@ -122,3 +123,59 @@ class ResearchBatonPlanner(FrozenBatonPlanner):
         with autocast:
             output = self.planner.forward_rows(qwen_inputs, plan_positions, **kwargs)
         return output.flat.reshape(self.geometry.output_shape(batch_size)).float()
+
+
+class ResearchPlannerHead(nn.Module):
+    """Trainable copy of a planner's Query Tower + Sem-MLP (joint KI research).
+
+    The Qwen backbone stays in the frozen provider; this head maps its
+    ``[rows,4,256,qwen_dim]`` plan states to ``[rows,4,256,1024]`` grids so the
+    GE-Act loss can fine-tune the planner output without touching the VLM.
+    """
+
+    def __init__(self, planner: nn.Module) -> None:
+        super().__init__()
+        if getattr(planner, "current_context", False) or getattr(planner, "residual", False):
+            raise ValueError("joint planner head supports only current_mode 'none'")
+        self.query_tower = deepcopy(planner.query_tower)
+        self.sem_mlp = deepcopy(planner.sem_mlp)
+        self.requires_grad_(True)
+        self.train()
+
+    def forward(self, plan_states: torch.Tensor) -> torch.Tensor:
+        dtype = next(self.sem_mlp.parameters()).dtype
+        hidden = self.query_tower(plan_states.to(dtype)).hidden_states
+        return self.sem_mlp(hidden)
+
+
+@torch.no_grad()
+def research_plan_states(
+    provider: FrozenBatonPlanner,
+    current_images: torch.Tensor,
+    instructions: Sequence[str],
+) -> torch.Tensor:
+    """Frozen backbone pass for ``[B,2,3,H,W]`` uint8 images; ``[B*2,4,256,D]``."""
+
+    _, positive = provider._validate_inputs(current_images, instructions)
+    provider._freeze_for_inference()
+    qwen_inputs, plan_positions = provider._build_rows(current_images, positive)
+    with provider._autocast_context():
+        return provider.planner.plan_states_rows(qwen_inputs, plan_positions)
+
+
+def predict_with_research_head(
+    provider: FrozenBatonPlanner,
+    head: ResearchPlannerHead,
+    current_images: torch.Tensor,
+    instructions: Sequence[str],
+) -> torch.Tensor:
+    """``[B,2,4,256,1024]`` grids from the frozen backbone and a trainable head.
+
+    Gradients reach only ``head``; the backbone pass runs under no_grad.
+    """
+
+    batch_size = int(current_images.shape[0])
+    states = research_plan_states(provider, current_images, instructions)
+    head_device = next(head.parameters()).device
+    predicted = head(states.to(head_device))
+    return predicted.reshape(provider.geometry.output_shape(batch_size))

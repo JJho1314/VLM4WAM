@@ -277,25 +277,13 @@ class BatonQwen35Planner(nn.Module):
             forwarded[name] = value
         return forwarded, positions
 
-    def forward_rows(
+    def plan_states_rows(
         self,
         qwen_inputs: Mapping[str, torch.Tensor],
         plan_positions: torch.Tensor,
-        *,
-        current_features: torch.Tensor | None = None,
-        return_attention_maps: bool = False,
-    ) -> BatonPlannerOutput:
-        """Run one causal Qwen pass and predict one continuous grid per row.
+    ) -> torch.Tensor:
+        """Run one causal Qwen pass; return the ``[rows,4,256,qwen_dim]`` plan states."""
 
-        ``current_features`` are the rows' current-frame SigLIP2 grids
-        ``[rows,256,1024]``; required exactly when the planner uses them.
-        """
-
-        if self.current_context != (current_features is not None):
-            raise ValueError(
-                "current_features must be given if and only if the planner "
-                "uses current context"
-            )
         forwarded, positions = self._validate_rows(
             qwen_inputs,
             plan_positions,
@@ -322,13 +310,34 @@ class BatonQwen35Planner(nn.Module):
                 -1, -1, last_hidden.shape[-1]
             ),
         )
-        qwen_plan_states = gathered.reshape(
+        return gathered.reshape(
             last_hidden.shape[0],
             _NUM_FRAMES,
             _TOKENS_PER_FRAME,
             last_hidden.shape[-1],
         )
-        rows = last_hidden.shape[0]
+
+    def forward_rows(
+        self,
+        qwen_inputs: Mapping[str, torch.Tensor],
+        plan_positions: torch.Tensor,
+        *,
+        current_features: torch.Tensor | None = None,
+        return_attention_maps: bool = False,
+    ) -> BatonPlannerOutput:
+        """Run one causal Qwen pass and predict one continuous grid per row.
+
+        ``current_features`` are the rows' current-frame SigLIP2 grids
+        ``[rows,256,1024]``; required exactly when the planner uses them.
+        """
+
+        if self.current_context != (current_features is not None):
+            raise ValueError(
+                "current_features must be given if and only if the planner "
+                "uses current context"
+            )
+        qwen_plan_states = self.plan_states_rows(qwen_inputs, plan_positions)
+        rows = qwen_plan_states.shape[0]
         tower_kwargs: dict[str, torch.Tensor] = {}
         if self.current_context:
             if (
@@ -338,7 +347,7 @@ class BatonQwen35Planner(nn.Module):
             ):
                 raise ValueError("current_features must be [rows,256,1024]")
             current_features = current_features.to(
-                device=last_hidden.device,
+                device=qwen_plan_states.device,
                 dtype=self.current_projection.weight.dtype,
             )
             tower_kwargs["extra_context"] = self.current_projection(current_features)
