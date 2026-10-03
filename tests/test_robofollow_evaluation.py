@@ -60,3 +60,18 @@ def test_official_one_based_rounds_accepted(tmp_path):
     rows=json.loads((tmp_path/'results.json').read_text())
     (tmp_path/'results.json').write_text(json.dumps(rows))
     assert read_complete_metrics(tmp_path,'fixed')['episodes']==2
+def test_paired_language_uncertainty_clusters_by_task():
+    from autoresearch.evaluation import paired_language_uncertainty
+    correct=[dict(scene='scene1',task=t,round=r,seed=r,intent_score=score) for t,score in [('a',1.),('b',0.)] for r in (1,2)]
+    shuffled=[dict(row,intent_score=0.) for row in correct]
+    result=paired_language_uncertainty(correct,shuffled)
+    assert result['mean']==.5 and result['standard_error']==.5
+    assert result['tasks']==2 and result['episodes']==4
+    with pytest.raises(ValueError):paired_language_uncertainty(correct,list(reversed(shuffled)))
+
+def test_candidate_runtime_mismatch_rejected():
+    from autoresearch.evaluation import compare_candidate
+    b=dict(protocol_hash='p',runtime_fingerprint='a',mean_intent_score=.2,mean_exec_score=.5,completion_rate=.5)
+    c=dict(b,runtime_fingerprint='b',mean_intent_score=.4)
+    thresholds=dict(frozen=True,min_intent_gain=.01,exec_margin=.02,completion_margin=.02)
+    with pytest.raises(ValueError,match='runtime'):compare_candidate(b,c,thresholds)

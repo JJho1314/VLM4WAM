@@ -14,6 +14,7 @@ class RoboFollowHDF5Dataset(Dataset):
         if chunk!=9 or action_chunk!=54 or n_previous!=4:raise ValueError('initial RoboFollow temporal contract is 4 history + 54 actions / 9 future frames')
         self.manifest_path=Path(manifest_path);self.manifest=json.loads(self.manifest_path.read_text())
         self.stats=json.loads(Path(stat_file).read_text());validate_stats(self.stats)
+        if self.stats.get('manifest_hash')!=hashlib.sha256(self.manifest_path.read_bytes()).hexdigest():raise ValueError('statistics belong to a different manifest')
         self.records=[r for r in self.manifest['episodes'] if r['split']==(split or ('train' if train_dataset else 'dev'))]
         if not self.records:raise ValueError('empty selected split')
         self.train_dataset=train_dataset;self.sample_size=tuple(sample_size);self.fix_sidx=fix_sidx;self.epoch=0;self.source_fps=source_fps

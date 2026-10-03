@@ -1,0 +1,30 @@
+[
+  {
+    "id": "R0",
+    "variant": "text",
+    "steps": 300,
+    "timeout_seconds": 7200,
+    "hypothesis": "calibrate real action and language baseline"
+  },
+  {
+    "id": "R1",
+    "variant": "predicted",
+    "steps": 300,
+    "timeout_seconds": 7200,
+    "hypothesis": "current image and language predicted plan improve Intent"
+  },
+  {
+    "id": "R2",
+    "variant": "mix",
+    "steps": 300,
+    "timeout_seconds": 7200,
+    "hypothesis": "50% training teacher reduces predicted conditioning distribution gap"
+  },
+  {
+    "id": "R3",
+    "variant": "joint",
+    "steps": 300,
+    "timeout_seconds": 7200,
+    "hypothesis": "joint query tower/MLP with .01 training anchor improves predicted plan"
+  }
+]

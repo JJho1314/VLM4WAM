@@ -154,3 +154,4 @@ robofollow_metadata:
   sim_steps: 15
   timing_provenance: 'upstream defaults: simulation timestep 1/250, save_freq 15;
     raw files have no timing attributes'
+  history_action_stride: 50

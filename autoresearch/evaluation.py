@@ -5,6 +5,18 @@ from collections import defaultdict
 from pathlib import Path
 from statistics import mean, stdev
 
+def paired_language_uncertainty(correct,shuffled):
+    identity=lambda r:(r['scene'],r['task'],r['round'],r['seed'])
+    if [identity(r) for r in correct]!=[identity(r) for r in shuffled]:raise ValueError('language trials are not paired')
+    tasks=defaultdict(list)
+    for a,b in zip(correct,shuffled):
+        delta=a['intent_score']-b['intent_score']
+        if not math.isfinite(delta):raise ValueError('nonfinite paired metric')
+        tasks[(a['scene'],a['task'])].append(delta)
+    if len(tasks)<2:raise ValueError('language uncertainty needs multiple tasks')
+    values=[mean(v) for v in tasks.values()];average=mean(values);se=stdev(values)/math.sqrt(len(values))
+    return dict(mean=average,standard_error=se,ci95=[max(-1.,average-1.96*se),min(1.,average+1.96*se)],tasks=len(tasks),episodes=len(correct),method='approximate normal interval over task means; small fixed development subset, no benchmark generalization')
+
 
 def read_complete_metrics(directory, protocol_hash):
     p=Path(directory)
@@ -62,6 +74,7 @@ def compare_candidate(baseline,candidate,thresholds):
     keys=('min_intent_gain','exec_margin','completion_margin')
     if thresholds.get('frozen') is not True or any(k not in thresholds or not math.isfinite(thresholds[k]) or thresholds[k]<0 for k in keys):raise ValueError('frozen calibrated thresholds required')
     if baseline['protocol_hash']!=candidate['protocol_hash']:raise ValueError('protocol mismatch')
+    if baseline.get('runtime_fingerprint')!=candidate.get('runtime_fingerprint'):raise ValueError('runtime or asset fingerprint mismatch')
     deltas={k:candidate[k]-baseline[k] for k in ('mean_intent_score','mean_exec_score','completion_rate')}
     if any(not math.isfinite(v) for v in deltas.values()):raise ValueError('nonfinite metrics')
     if deltas['mean_exec_score'] < -thresholds['exec_margin'] or deltas['completion_rate'] < -thresholds['completion_margin'] or deltas['mean_intent_score']<0:

@@ -93,3 +93,12 @@ def test_loader_returns_generic_batch_and_repeat_history(tmp_path):
 def test_history_matches_fifty_action_rollout_stride():
     from ge_act.data.robofollow_hdf5_dataset import RoboFollowHDF5Dataset
     assert RoboFollowHDF5Dataset.frame_indices(200,400)[0][:4]==[50,100,150,200]
+
+def test_loader_rejects_stats_from_another_manifest(tmp_path):
+    from autoresearch.preflight import build_manifest,compute_statistics
+    from ge_act.data.robofollow_hdf5_dataset import RoboFollowHDF5Dataset
+    episode(tmp_path/'scene1'/'task'/'data'/'episode0.hdf5',n=60)
+    mp=tmp_path/'manifest.json';sp=tmp_path/'stats.json'
+    m=build_manifest(tmp_path,mp);m['episodes'][0]['split']='train';mp.write_text(json.dumps(m));compute_statistics(mp,sp)
+    m['seed']=123;mp.write_text(json.dumps(m))
+    with pytest.raises(ValueError):RoboFollowHDF5Dataset(mp,sp)

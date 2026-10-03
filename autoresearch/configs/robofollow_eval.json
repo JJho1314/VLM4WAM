@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "purpose": "development selection; training-domain held-out tasks only",
+  "purpose": "bounded development selection; training-domain held-out tasks; full official acceptance remains max_steps=10",
   "selected_tasks": [
     {
       "scene": "scene1",
@@ -22,7 +22,7 @@
   "arguments": {
     "rounds": 2,
     "base_seed": 42,
-    "max_steps": 10,
+    "max_steps": 5,
     "actions_per_step": 50,
     "runtime": "fixed",
     "sim_steps": 15,
@@ -44,5 +44,5 @@
     "min_tasks": 2,
     "min_rounds": 2
   },
-  "hash": "7e49c40b693de1db676cd799bd5a5e8eee390f00ae3b81927fec20fedf121e0a"
+  "hash": "f2c8803979fc3d18bf5b064ecc904914c8cc984639da46ff3c241456fb6d9b1f"
 }
