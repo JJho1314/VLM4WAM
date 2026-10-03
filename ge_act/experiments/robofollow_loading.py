@@ -42,9 +42,12 @@ def semantic_contract(config,stats_path):
     pc=config.get('robofollow_planner',{})
     planner=None
     if pc.get('enabled'):
-        root=Path(pc['checkpoint'])
-        artifacts={str(x.relative_to(root)):weight_digest(x) for x in sorted(root.rglob('*')) if x.is_file()}
-        if not artifacts:raise ValueError('empty planner checkpoint')
+        artifacts={}
+        for label in ('checkpoint','qwen_path','siglip_path'):
+            root=Path(pc[label])
+            files=[root] if root.is_file() else sorted(x for x in root.rglob('*') if x.is_file())
+            if not files:raise ValueError('empty planner artifact '+label)
+            artifacts[label]={str(x.relative_to(root)) if root.is_dir() else x.name:weight_digest(x) for x in files}
         planner=dict(config=pc,artifacts=artifacts)
     return dict(camera_order=CAMERA_ORDER,joint_order=JOINT_ORDER,action_type='absolute',action_space='joint',action_dim=14,statistics_sha256=weight_digest(stats_path),manifest_sha256=stats['manifest_hash'],history_action_stride=md['history_action_stride'],planner=planner)
 

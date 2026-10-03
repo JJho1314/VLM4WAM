@@ -38,3 +38,20 @@ def test_same_shape_wrong_semantics_rejected(tmp_path,field):
     with pytest.raises(ValueError,match='semantic'):validate_contract(ck,wrong)
     ck.write_bytes(b'changed')
     with pytest.raises(ValueError,match='weights'):validate_contract(ck,expected)
+
+def test_planner_contract_binds_frozen_encoder_weights(tmp_path):
+    import json
+    from ge_act.data.robofollow_schema import CAMERA_ORDER,JOINT_ORDER
+    from ge_act.experiments.robofollow_loading import semantic_contract,weight_digest,write_contract,validate_contract
+    manifest=tmp_path/'manifest.json';manifest.write_text('{}')
+    stats=dict(action_type='absolute',action_space='joint',camera_order=CAMERA_ORDER,joint_order=JOINT_ORDER,manifest_hash=weight_digest(manifest),state_mean=[0]*14,state_std=[1]*14,action_mean=[0]*14,action_std=[1]*14)
+    sp=tmp_path/'stats.json';sp.write_text(json.dumps(stats))
+    pc={'enabled':True}
+    for name in ['checkpoint','qwen_path','siglip_path']:
+        folder=tmp_path/name;folder.mkdir();(folder/'weights.bin').write_bytes(b'original');pc[name]=str(folder)
+    c=dict(data={'train':{'manifest_path':str(manifest)}},robofollow_metadata=dict(action_type='absolute',action_space='joint',camera_order=CAMERA_ORDER,action_dim=14,history_action_stride=50),robofollow_planner=pc)
+    ck=tmp_path/'weights.safetensors';ck.write_bytes(b'weights')
+    before=semantic_contract(c,sp);write_contract(ck,before,{'capture_phase':'test'})
+    (tmp_path/'qwen_path/weights.bin').write_bytes(b'changed frozen encoder')
+    after=semantic_contract(c,sp)
+    with pytest.raises(ValueError,match='semantic'):validate_contract(ck,after)

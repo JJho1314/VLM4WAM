@@ -73,6 +73,9 @@ def bind_run_checkpoint(run,checkpoint):
     if file_sha256(config_path)!=state['effective_config_sha256']:raise ValueError('effective training config changed')
     expected=run/'checkpoints'
     if expected.resolve() not in checkpoint.resolve().parents:raise ValueError('checkpoint outside registered run')
+    source=json.loads((run/'provenance.json').read_text())
+    for path,info in source['artifacts'].items():
+        if file_sha256(path)!=info['sha256']:raise ValueError('training artifact changed since preparation: '+path)
     config=yaml.safe_load(config_path.read_text())
     require_image_validation(config['data']['train']['manifest_path'])
     write_contract(checkpoint,semantic_contract(config,config['data']['train']['stat_file']),dict(capture_phase='post-training audited binding',run_id=run.name,effective_config_sha256=state['effective_config_sha256'],training_process=state['training']['process']))
@@ -82,7 +85,9 @@ def provenance(config):
     paths=[config['diffusion_model']['model_path'],config['data']['train']['manifest_path'],config['data']['train']['stat_file']]
     planner=config.get('robofollow_planner',{})
     if planner.get('enabled'):
-        paths.extend(str(p) for p in Path(planner['checkpoint']).rglob('*') if p.is_file())
+        for label in ('checkpoint','qwen_path','siglip_path'):
+            base=Path(planner[label])
+            paths.extend([str(base)] if base.is_file() else (str(p) for p in base.rglob('*') if p.is_file()))
     artifacts={str(p):dict(sha256=file_sha256(p),bytes=Path(p).stat().st_size) for p in paths}
     effective=launch_environment()
     env={key:effective[key] for key in ('CUDA_VISIBLE_DEVICES','HDF5_USE_FILE_LOCKING','PYTHONPATH','TOKENIZERS_PARALLELISM','OMP_NUM_THREADS','VK_ICD_FILENAMES','CUDA_HOME','BATON_RESEARCH_CAPTION_DROPOUT') if key in effective}
@@ -182,6 +187,9 @@ def prepare_run(candidate,root):
     snapshot_code(ROOT,run/'code')
     import yaml
     config_path=run/'code/ge_act/configs/ltx_model/robofollow'/candidate_config(candidate['variant'],version)
+    source=json.loads((run/'provenance.json').read_text())
+    for path,info in source['artifacts'].items():
+        if file_sha256(path)!=info['sha256']:raise ValueError('training artifact changed since preparation: '+path)
     config=yaml.safe_load(config_path.read_text())
     require_image_validation(config['data']['train']['manifest_path'])
     atomic_json(run/'provenance.json',dict(provenance(config),config_sha256=file_sha256(config_path)))
