@@ -56,6 +56,21 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-03 s2planner20k_v2 at 5k (from GE base, p=1, frozen head)
+
+| at 5k steps | oracle | disabled | planner | planner vs disabled |
+|---|---|---|---|---|
+| C (control) | 0.1872 | 0.1889 | - | - |
+| s2mix050_20k_v2 (p=0.5) | 0.2226 | 0.2314 | 0.2306 | ~0 |
+| **s2planner20k_v2 (p=1)** | 0.1682 | 0.1700 | **0.1644** | -3.2% (-0.0055 +- 0.0012, win 0.68) |
+
+- Training only on planner tokens from the start is 12% better than C's
+  oracle at the same step (0.1644 vs 0.1872), unlike p=0.5 which was 20%
+  worse. Mixing oracle and planner tokens appears to hurt more than either
+  pure source. Masking the wrist view removes the gain (0.1715); masking
+  the main view keeps part of it (0.1672).
+- Still early (5k steps, errors ~0.17); the 10k-20k checkpoints decide it.
+
 ### 2026-10-03 Joint planner-head fine-tune (s3joint_A10k) and s2mix050 at 5k
 
 | from A@10k + 3k steps | oracle | disabled | planner | planner vs disabled |
