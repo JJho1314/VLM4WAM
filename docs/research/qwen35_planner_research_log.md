@@ -56,6 +56,21 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-04 s2mix050_20k_v2 at 20k (final, from GE base, p=0.5)
+
+| at 20k steps | oracle | disabled | planner | planner vs disabled |
+|---|---|---|---|---|
+| C (control) | 0.0050 | 0.0064 | - | - |
+| s2mix050_20k_v2 (p=0.5) | 0.0060 | 0.0072 | 0.0064 | -11% (-0.0009 +- 0.0002, win 0.77) |
+
+- Final: planner mode only matches C without guidance (0.0064) and is 28%
+  behind C with oracle tokens; even oracle tokens are 20% behind C.
+  Mixing from scratch is dropped. Masking either view now hurts (both
+  views used at 20k).
+- The first E3 attempt OOMed because another process held the Ola_2208
+  GPUs and wrote an empty summary (num_samples 0); rerun after the GPUs
+  were free. E3 summaries are now checked for num_samples > 0.
+
 ### 2026-10-04 s2planner20k_v2 at 15k (from GE base, p=1)
 
 | at 15k steps | oracle | disabled | planner | planner vs disabled |
