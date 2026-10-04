@@ -1,6 +1,6 @@
 # RoboFollow 首阶段实验报告
 
-状态：2026-10-03，清洁完整数据 complete-v3 上的 R0 文本基线与 R1 预测 planner 对照已完整完成，首阶段有界实验已停止。最终指标以本目录后续更新和研究输出 evidence.json 为准。本报告不宣称已经提升指令遵循能力，不把历史诊断分数作为 held-out 能力结果。
+状态：2026-10-04，清洁完整数据 complete-v3 上的 R0 文本基线与 R1 预测 planner 对照已完整完成，首阶段有界实验已停止。10月4日继续完成动作更新精度诊断，见[TRAINING_PRECISION_DIAGNOSTIC.md](TRAINING_PRECISION_DIAGNOSTIC.md)，未新增官方rollout或提升分数。最终指标以本目录后续更新和研究输出 evidence.json 为准。本报告不宣称已经提升指令遵循能力，不把历史诊断分数作为 held-out 能力结果。
 
 ## 数据与协议
 
@@ -59,7 +59,7 @@ R1 `20261003_131008_R1`，仅增加predicted planner条件，训练300步。最�
 
 ## 预算与复现
 
-首阶段累计已记账6.816886/8GPUh（其中pre-controller smoke按1GPUh保守估计，其余由phase wall×GPU记录；包含失效数据划分、中止、OOM及重试），最多GPU0/1两张H800，最多300steps。清洁候选的总wall time从训练启动计75分钟；启动前按timeout×2GPU预留。正确/打乱指令使用各自服务和8999/9000端口，可并行运行，历史和prompt缓存互不混用；仍按两张GPU计费。并行worker任一个失败时停止另一个，partial结果不选优。
+截至10月3日累计已记账6.816886/8GPUh（其中pre-controller smoke按1GPUh保守估计，其余由phase wall×GPU记录；包含失效数据划分、中止、OOM及重试），最多GPU0/1两张H800，最多300steps。清洁候选的总wall time从训练启动计75分钟；启动前按timeout×2GPU预留。正确/打乱指令使用各自服务和8999/9000端口，可并行运行，历史和prompt缓存互不混用；仍按两张GPU计费。并行worker任一个失败时停止另一个，partial结果不选优。
 
 研究输出：/data/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_autoresearch。状态、实际费用、代码/配置/权重hash、每run假设及next suggestion保存在runs目录。旧失败不覆盖；CPU prepare失败目录、所有中止及无收益结果保留。清洁阶段沿用原budget.json，没有以换root重置预算。
 
@@ -76,3 +76,7 @@ cd /data/users/junjie/workspace/VLM4WAM_baton_robofollow_autoresearch
 预测/teacher/mix/joint单GPU步与joint梯度均实际验证，见configs/planner_validation.json。最初新增47项测试通过；加入别名连通划分后相关104项通过，路径修复及文本runner/并行worker又加入实际故障回归，最后独立审查四项Important均修复，回归122项通过（34.96秒）。包括相同shape的错误checkpoint语义拒绝、全部可用帧校验、继承研究环境开关隔离和控制器SIGTERM/SIGKILL后清理/计费/新任务阻拦。见REVIEW.md及validation日志。
 
 广泛项目tests曾1046通过、37失败、1跳过、10错误；其中3个静态失败在原baseline复现，其余有环境/共享状态与未分诊问题。不是整个项目测试通过。原始日志在outputs/robofollow_autoresearch/validation。原项目dirty代码保持未提交，generic trainer两个接入hunk单独保存，运行快照包括有效源码。
+
+## 2026-10-04 延续诊断
+
+训练集运动片段400步对照中，FP32投影层相对BF16的新噪声velocity MSE从2.188414降为1.141095；解冻动作专家并保留全部动作参数/状态FP32后为1.073823，仍未充分拟合。不是新的benchmark成绩。完整backbone对照因显存竞争未完成。累计费用更新为7.121416/8GPUh，剩余0.878584GPUh；本次GPU和等待队列均已结束。细节、失败与单样本限制见[诊断报告](TRAINING_PRECISION_DIAGNOSTIC.md)。

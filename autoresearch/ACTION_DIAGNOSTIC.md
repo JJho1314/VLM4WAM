@@ -17,3 +17,7 @@
 任何新数据版本（包括补回4条视觉不同的示范）必须重建manifest/stats与R0，旧v3阈值不沿用。新实验需先登记单因素假设、验证代码和GPU预算，不能通过新root重置本阶段账本。
 
 R1 first scene diagnostic: `20261003_131008_R1/paired_eval/correct/scene1/results.json` round1 source select0, closest yellow_block_2 while target is yellow_block_1, source_xy23.9cm, wrong arm participated; subsequent relative-place/finish stages gated. Both scene1 rounds and language modes have Intent/Execution0. R1 training reached300 steps, final batch loss1.97, phasewall542.738seconds including model loading, peak allocated37.805GB. These are actual observations, not proof of a normalization bug or planner effectiveness.
+
+## 2026-10-04 已执行的诊断
+
+固定train样本的静止目标、有效运动片段和投影/动作专家FP32对照已经实际完成，结果见[TRAINING_PRECISION_DIAGNOSTIC.md](TRAINING_PRECISION_DIAGNOSTIC.md)。FP32投影有明确局部收益，但400步仍未充分拟合；完整backbone比较缺失，不认为第2项所有诊断完成。下一假设优先检验FP32动作warm-up能否在多个运动片段学会采样动作，再讨论语言条件的效果。官方dev结果仍全0，累计7.121416/8GPUh，无存活诊断任务。

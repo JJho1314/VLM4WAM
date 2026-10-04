@@ -69,3 +69,5 @@ generic trainer 的两个 callback 接入 hunk 保存在 `patches/generic_condit
 训练/评测移除继承的 `BATON_RESEARCH_*` 开关，caption dropout固定0，学习率来自YAML，effective环境纳入provenance。SIGHUP/SIGTERM触发拥有进程清理；独立CPU watchdog在控制器消失或超时时终止所拥有的组并计费。未解决的running记录阻止新GPU任务，先使用 `recover --run-id ...` 进行PID身份核对恢复。
 
 首阶段实测完成：R0/R1各16个配对L0开发trials，指标全部0，没有已证明收益。控制器evidence_stop，累计6.816886/8GPUh，best保留基线。完整结果、环境限制和下一轮动作拟合诊断见REPORT.md及ACTION_DIAGNOSTIC.md。
+
+2026-10-04继续完成train-only动作精度诊断：累计7.121416/8GPUh，剩余0.878584GPUh，无诊断任务在运行。运动样本中FP32投影相对BF16误差明显下降，但仍未充分拟合；官方开发结果和best没有更新。见[TRAINING_PRECISION_DIAGNOSTIC.md](TRAINING_PRECISION_DIAGNOSTIC.md)。
