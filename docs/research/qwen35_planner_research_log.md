@@ -56,6 +56,28 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-04 s2planner20k_v2 at 20k (final) and summary of planner-token training
+
+| at 20k steps | oracle | disabled | planner | planner vs disabled |
+|---|---|---|---|---|
+| C (control, oracle-trained) | 0.0050 | 0.0064 | - | - |
+| A (additive, oracle-trained) | 0.0031 | 0.0165 | - | - |
+| s2mix050_20k_v2 (p=0.5) | 0.0060 | 0.0072 | 0.0064 | -11% |
+| **s2planner20k_v2 (p=1)** | 0.0086 | 0.0063 | **0.0051** | **-20% (-0.0012 +- 0.0002, win 0.90)** |
+
+- With predicted tokens only (no oracle at inference), s2planner20k_v2 ties
+  C with oracle tokens (0.0051 vs 0.0050) and beats C without guidance by
+  20% (0.0064). Its gain over its own no-guidance mode grew steadily:
+  -3.4% (10k), -13% (15k), -20% (20k), win rate 0.69 -> 0.83 -> 0.90.
+- Both views are needed (masking either loses most of the gain); oracle
+  tokens, never seen in training, hurt (+0.0023).
+- Ranking of recipes for planner-mode inference: p=1 from scratch (0.0051
+  at 20k) > two-stage A@10k + 3k planner steps (0.0110 at 13k, not
+  step-matched) > p=0.5 from scratch (0.0064). Mixing oracle and planner
+  tokens is consistently the worst.
+- This E3 ran as an 8-GPU ACP job (pt-knwglw8b, NUM_SHARDS=8) because the
+  Ola_2208 GPUs were held by another container.
+
 ### 2026-10-04 s2mix050_20k_v2 at 20k (final, from GE base, p=0.5)
 
 | at 20k steps | oracle | disabled | planner | planner vs disabled |
