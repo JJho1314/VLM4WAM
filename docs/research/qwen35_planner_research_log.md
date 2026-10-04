@@ -56,6 +56,25 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-04 s3joint_P20k: joint planner-head fine-tune from s2planner20k_v2@20k (+3k steps)
+
+| model | steps | oracle | disabled | planner | planner vs disabled |
+|---|---|---|---|---|---|
+| C (control) | 20k | 0.0050 | 0.0064 | - | - |
+| s2planner20k_v2 (frozen head) | 20k | 0.0086 | 0.0063 | 0.0051 | -20% (win 0.90) |
+| **s3joint_P20k (head trained)** | 23k | 0.0055 | 0.0055 | **0.0049** | -12% (-0.0007 +- 0.0001, win 0.77) |
+
+- Planner mode improves only slightly (0.0051 -> 0.0049, ~4%) and now edges
+  C with oracle tokens (0.0050), but the run has 3k more steps than C and
+  the gain is within what extra training alone could give.
+- Most of the change is elsewhere: no-guidance error drops 0.0063 -> 0.0055
+  and oracle tokens stop hurting (0.0086 -> 0.0055), so the head moves its
+  outputs toward the teacher space (anchor 0.1) and the planner's relative
+  gain shrinks (-20% -> -12%). Both views are still needed.
+- The E3 loaded the fine-tuned head from the checkpoint (9 tensors).
+- Not a clear win for head training; a step-matched check would be
+  s2planner20k_v2 continued 3k steps with the head frozen.
+
 ### 2026-10-04 s2planner20k_v2 at 20k (final) and summary of planner-token training
 
 | at 20k steps | oracle | disabled | planner | planner vs disabled |
