@@ -56,6 +56,21 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-04 s2planner20k_v2 at 15k (from GE base, p=1)
+
+| at 15k steps | oracle | disabled | planner | planner vs disabled |
+|---|---|---|---|---|
+| C (control) | 0.0074 | 0.0088 | - | - |
+| s2mix050_20k_v2 (p=0.5) | 0.0086 | 0.0104 | 0.0095 | -8.7% |
+| s2planner20k_v2 (p=1) | 0.0109 | 0.0091 | **0.0079** | -13% (-0.0012 +- 0.0002, win 0.83) |
+
+- Planner guidance now helps its own model clearly (-13%, win 0.83), all
+  of it from the wrist view (masking it gives 0.0097). Planner mode is 7%
+  behind C with oracle tokens (0.0074) and 10% ahead of C without
+  guidance (0.0088), so it does not beat the oracle-guided control at
+  inference time with predicted tokens only.
+- p=1 beats p=0.5 at 10k and 15k.
+
 ### 2026-10-04 s2mix050_20k_v2 at 15k (from GE base, p=0.5)
 
 | at 15k steps | oracle | disabled | planner | planner vs disabled |
