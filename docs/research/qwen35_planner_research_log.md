@@ -56,6 +56,18 @@ LIBERO-Plus, and why has it not reliably done so far?
 
 (append newest first)
 
+### 2026-10-04 s2mix050_20k_v2 at 15k (from GE base, p=0.5)
+
+| at 15k steps | oracle | disabled | planner | planner vs disabled |
+|---|---|---|---|---|
+| C (control) | 0.0074 | 0.0088 | - | - |
+| s2mix050_20k_v2 (p=0.5) | 0.0086 | 0.0104 | 0.0095 | -8.7% (-0.0009 +- 0.0002, win 0.69) |
+
+- Guidance now helps its own model clearly (planner -8.7%, oracle -17%;
+  masking the wrist view erases the planner gain), but the model is still
+  16-28% behind C at the same step. The gap to C narrows only slowly
+  (~20% at 5k/10k).
+
 ### 2026-10-03 s2planner20k_v2 at 10k (from GE base, p=1)
 
 | at 10k steps | oracle | disabled | planner | planner vs disabled |
