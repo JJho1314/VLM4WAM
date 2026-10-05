@@ -22,7 +22,7 @@ yaml.safe_dump(c,open('$OUT/run.yaml','w'),sort_keys=False)
 print('[acp] effective overrides',os.environ.get('EXTRA_YAML','{}'))
 PY
 export PYTHONPATH="$W:$D/envs/overlay_peft_tf5" HDF5_USE_FILE_LOCKING=FALSE TOKENIZERS_PARALLELISM=false
-export OMP_NUM_THREADS=4 PYTHONUNBUFFERED=1 CC=/usr/bin/gcc CXX=/usr/bin/g++
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True OMP_NUM_THREADS=4 PYTHONUNBUFFERED=1 CC=/usr/bin/gcc CXX=/usr/bin/g++
 export TRITON_CACHE_DIR=/tmp/triton-$RUN_ID; mkdir -p "$TRITON_CACHE_DIR"
 cd "$W/ge_act"
 exec "$P" -m torch.distributed.run --standalone --nproc_per_node=$NGPU main.py \
