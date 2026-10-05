@@ -102,7 +102,7 @@ pixel_wise_timestep: False
 
 diffusion_model:
   # 视频适配 step_10000 + FastWAM 插值初始化动作专家 (scripts/interp_init_cosmos_action_expert.py)
-  model_path: /data/user/jhe724/junjie/weights/GE_cosmos_vadapt10k_actinterp.safetensors
+  model_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/weights/GE_cosmos_vadapt10k_actinterp.safetensors
   config:
     in_channels: 17   # 16 (Wan VAE latent) + 1 (condition mask); +1 padding auto -> 18 into patch_embed
     out_channels: 16
@@ -130,7 +130,7 @@ diffusion_model:
 
 data:
   train:
-    data_roots: ["/data/user/jhe724/junjie/datasets/LIBERO-fastwam", "/data/user/jhe724/junjie/datasets/LIBERO-fastwam", "/data/user/jhe724/junjie/datasets/LIBERO-fastwam", "/data/user/jhe724/junjie/datasets/LIBERO-fastwam"]
+    data_roots: ["/data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam", "/data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam", "/data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam", "/data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam"]
     domains: ["libero_10_no_noops_lerobot", "libero_goal_no_noops_lerobot", "libero_object_no_noops_lerobot", "libero_spatial_no_noops_lerobot"]
     sample_size: [256, 256]
     sample_n_frames: 500
@@ -149,7 +149,7 @@ data:
     state_key: observation.state
     action_key: action
   val:
-    data_roots: ["/data/user/jhe724/junjie/datasets/LIBERO-fastwam", "/data/user/jhe724/junjie/datasets/LIBERO-fastwam", "/data/user/jhe724/junjie/datasets/LIBERO-fastwam", "/data/user/jhe724/junjie/datasets/LIBERO-fastwam"]
+    data_roots: ["/data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam", "/data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam", "/data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam", "/data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam"]
     domains: ["libero_10_no_noops_lerobot", "libero_goal_no_noops_lerobot", "libero_object_no_noops_lerobot", "libero_spatial_no_noops_lerobot"]
     sample_size: [256, 256]
     sample_n_frames: 500

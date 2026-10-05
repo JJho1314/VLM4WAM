@@ -27,10 +27,10 @@ scripts/train_ltx_siglip2.sh
 
 Runtime assets are intentionally not vendored:
 
-- LTX components: `/data/user/jhe724/junjie/weights/LTX-Video`
-- GE-Act base: `/data/user/jhe724/junjie/weights/Genie-Envisioner/GE_base_fast_v0.1.safetensors`
-- SigLIP2: `/data/user/jhe724/junjie/weights/siglip2-large-patch16-256`
-- LIBERO FastWAM data: `/data/user/jhe724/junjie/datasets/LIBERO-fastwam`
+- LTX components: `/data/users/junjie/workspace/hpc3_jhe724/junjie/weights/LTX-Video`
+- GE-Act base: `/data/users/junjie/workspace/hpc3_jhe724/junjie/weights/Genie-Envisioner/GE_base_fast_v0.1.safetensors`
+- SigLIP2: `/data/users/junjie/workspace/hpc3_jhe724/junjie/weights/siglip2-large-patch16-256`
+- LIBERO FastWAM data: `/data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam`
 
 Run `scripts/preflight_ltx_siglip2.py` before training. The committed recipe is
 8 GPUs, batch 2/GPU, accumulation 8 (global batch 128), bf16, gradient

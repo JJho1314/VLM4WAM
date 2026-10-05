@@ -4,8 +4,8 @@ report_to: None
 tracker_name: ltx_baton_stage2_hdf5_trainer
 
 logging_dir: logs
-output_dir: /data/user/jhe724/junjie/outputs/libero_ltx_baton_stage2_hdf5
-pretrained_model_name_or_path: /data/user/jhe724/junjie/weights/LTX-Video
+output_dir: /data/users/junjie/workspace/hpc3_jhe724/junjie/outputs/libero_ltx_baton_stage2_hdf5
+pretrained_model_name_or_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/weights/LTX-Video
 
 train_data_class_path: data/libero_fastwam_hdf5_dataset.py
 train_data_class: LiberoFastWAMHDF5Dataset
@@ -84,7 +84,7 @@ semantic_plan:
   enabled: true
   source: qwen35_baton_teacher
   # Deployment launchers replace every artifact/hash below from BATON_* env.
-  siglip2_model_path: /data/user/jhe724/junjie/weights/siglip2-large-patch16-256
+  siglip2_model_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/weights/siglip2-large-patch16-256
   siglip2_config_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   siglip2_artifact_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   teacher_preprocessing_hash: "0000000000000000000000000000000000000000000000000000000000000000"
@@ -98,7 +98,7 @@ semantic_plan:
 
 diffusion_model:
   # Deployment launcher requires BATON_GE_BASE_CHECKPOINT.
-  model_path: /data/user/jhe724/junjie/weights/Genie-Envisioner/GE_base_fast_actinterp.safetensors
+  model_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/weights/Genie-Envisioner/GE_base_fast_actinterp.safetensors
   config:
     activation_fn: gelu-approximate
     attention_bias: true
@@ -130,7 +130,7 @@ diffusion_model:
 
 data:
   train:
-    manifest_path: /data/user/jhe724/junjie/datasets/LIBERO-fastwam-hdf5/manifest.json
+    manifest_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam-hdf5/manifest.json
     stat_file: configs/ltx_model/libero/libero_fastwam_mix.json
     source_fps: 20
     sample_n_frames: 500
@@ -146,7 +146,7 @@ data:
     action_space: eef
     train_dataset: true
   val:
-    manifest_path: /data/user/jhe724/junjie/datasets/LIBERO-fastwam-hdf5/manifest.json
+    manifest_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam-hdf5/manifest.json
     stat_file: configs/ltx_model/libero/libero_fastwam_mix.json
     source_fps: 20
     sample_n_frames: 500

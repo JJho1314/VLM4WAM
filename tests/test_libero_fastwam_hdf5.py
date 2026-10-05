@@ -77,7 +77,7 @@ HDF5_LAUNCHER = GE_ACT_ROOT / "scripts/train_ltx_siglip2_hdf5.sh"
 
 HDF5_DATA_BLOCK = {
     "manifest_path": (
-        "/data/user/jhe724/junjie/datasets/LIBERO-fastwam-hdf5/manifest.json"
+        "/data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam-hdf5/manifest.json"
     ),
     "stat_file": "configs/ltx_model/libero/libero_fastwam_mix.json",
     "source_fps": 20,
@@ -1998,7 +1998,7 @@ def test_hdf5_yaml_only_changes_allowed_active_config_sections():
         {
             "tracker_name": "ltx_siglip2_hdf5_trainer",
             "output_dir": (
-                "/data/user/jhe724/junjie/outputs/libero_fastwam_ltx_siglip2_hdf5"
+                "/data/users/junjie/workspace/hpc3_jhe724/junjie/outputs/libero_fastwam_ltx_siglip2_hdf5"
             ),
             "train_data_class_path": "data/libero_fastwam_hdf5_dataset.py",
             "train_data_class": "LiberoFastWAMHDF5Dataset",

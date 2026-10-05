@@ -4,8 +4,8 @@ report_to: None
 tracker_name: ltx_baton_stage3_hdf5_trainer
 
 logging_dir: logs
-output_dir: /data/user/jhe724/junjie/outputs/libero_ltx_baton_stage3_hdf5
-pretrained_model_name_or_path: /data/user/jhe724/junjie/weights/LTX-Video
+output_dir: /data/users/junjie/workspace/hpc3_jhe724/junjie/outputs/libero_ltx_baton_stage3_hdf5
+pretrained_model_name_or_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/weights/LTX-Video
 
 train_data_class_path: data/libero_fastwam_hdf5_dataset.py
 train_data_class: LiberoFastWAMHDF5Dataset
@@ -89,12 +89,12 @@ stage2_init_topology_hash: __BATON_STAGE2_INIT_TOPOLOGY_HASH_REQUIRED__
 semantic_plan:
   enabled: true
   source: qwen35_baton_prediction
-  planner_checkpoint: /data/user/jhe724/junjie/outputs/qwen35_baton_stage1/step_030000
-  expected_planner_topology: /data/user/jhe724/junjie/outputs/qwen35_baton_stage1/planner_topology.json
-  qwen_model_path: /data/user/jhe724/junjie/weights/Qwen3.5-2B
-  qwen_tokenizer_path: /data/user/jhe724/junjie/weights/Qwen3.5-2B
-  qwen_processor_path: /data/user/jhe724/junjie/weights/Qwen3.5-2B
-  siglip2_model_path: /data/user/jhe724/junjie/weights/siglip2-large-patch16-256
+  planner_checkpoint: /data/users/junjie/workspace/hpc3_jhe724/junjie/outputs/qwen35_baton_stage1/step_030000
+  expected_planner_topology: /data/users/junjie/workspace/hpc3_jhe724/junjie/outputs/qwen35_baton_stage1/planner_topology.json
+  qwen_model_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/weights/Qwen3.5-2B
+  qwen_tokenizer_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/weights/Qwen3.5-2B
+  qwen_processor_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/weights/Qwen3.5-2B
+  siglip2_model_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/weights/siglip2-large-patch16-256
   tokens_per_frame: 256
   feature_dim: 1024
   keyframe_indices: [0, 3, 5, 8]
@@ -135,7 +135,7 @@ diffusion_model:
 
 data:
   train:
-    manifest_path: /data/user/jhe724/junjie/datasets/LIBERO-fastwam-hdf5/manifest.json
+    manifest_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam-hdf5/manifest.json
     stat_file: configs/ltx_model/libero/libero_fastwam_mix.json
     source_fps: 20
     sample_n_frames: 500
@@ -151,7 +151,7 @@ data:
     action_space: eef
     train_dataset: true
   val:
-    manifest_path: /data/user/jhe724/junjie/datasets/LIBERO-fastwam-hdf5/manifest.json
+    manifest_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam-hdf5/manifest.json
     stat_file: configs/ltx_model/libero/libero_fastwam_mix.json
     source_fps: 20
     sample_n_frames: 500

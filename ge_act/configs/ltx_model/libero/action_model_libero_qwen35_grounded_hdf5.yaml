@@ -4,8 +4,8 @@ report_to: None
 tracker_name: ltx_qwen35_grounded_hdf5_trainer
 
 logging_dir: logs
-output_dir: /data/user/jhe724/junjie/outputs/libero_ltx_qwen35_grounded_hdf5
-pretrained_model_name_or_path: /data/user/jhe724/junjie/weights/LTX-Video
+output_dir: /data/users/junjie/workspace/hpc3_jhe724/junjie/outputs/libero_ltx_qwen35_grounded_hdf5
+pretrained_model_name_or_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/weights/LTX-Video
 
 train_data_class_path: data/libero_hindsight_hdf5_dataset.py
 train_data_class: LiberoHindsightHDF5Dataset
@@ -87,7 +87,7 @@ pixel_wise_timestep: true
 semantic_plan:
   enabled: true
   source: qwen35_grounded
-  planner_checkpoint: /data/user/jhe724/junjie/outputs/qwen35_grounded_planner/step_030000
+  planner_checkpoint: /data/users/junjie/workspace/hpc3_jhe724/junjie/outputs/qwen35_grounded_planner/step_030000
   num_keyframes: 4
   tokens_per_frame: 96
   keyframe_indices: [0, 3, 5, 8]
@@ -95,7 +95,7 @@ semantic_plan:
   validation_mode: planner
 
 diffusion_model:
-  model_path: /data/user/jhe724/junjie/weights/Genie-Envisioner/GE_base_fast_actinterp.safetensors
+  model_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/weights/Genie-Envisioner/GE_base_fast_actinterp.safetensors
   config:
     activation_fn: gelu-approximate
     attention_bias: true
@@ -127,8 +127,8 @@ diffusion_model:
 
 data:
   train:
-    manifest_path: /data/user/jhe724/junjie/datasets/LIBERO-fastwam-hdf5/manifest.json
-    hindsight_cache: /data/user/jhe724/junjie/datasets/LIBERO-qwen35-hindsight-cache
+    manifest_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam-hdf5/manifest.json
+    hindsight_cache: /data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-qwen35-hindsight-cache
     stat_file: configs/ltx_model/libero/libero_fastwam_mix.json
     source_fps: 20
     sample_n_frames: 500
@@ -141,8 +141,8 @@ data:
     action_space: eef
     train_dataset: true
   val:
-    manifest_path: /data/user/jhe724/junjie/datasets/LIBERO-fastwam-hdf5/manifest.json
-    hindsight_cache: /data/user/jhe724/junjie/datasets/LIBERO-qwen35-hindsight-cache
+    manifest_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam-hdf5/manifest.json
+    hindsight_cache: /data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-qwen35-hindsight-cache
     stat_file: configs/ltx_model/libero/libero_fastwam_mix.json
     source_fps: 20
     sample_n_frames: 500

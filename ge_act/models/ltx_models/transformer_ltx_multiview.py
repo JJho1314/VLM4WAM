@@ -16,6 +16,8 @@
 import math
 from typing import Any, Dict, Optional, Tuple
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,6 +42,61 @@ from models.ltx_models.semantic_conditioning import SemanticContextAdapter
 from models.action_patches.patches import preprocessing_action_states, add_action_expert
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+# Research trace: when BATON_RESEARCH_TRACE_SEMANTIC=1, each semantic block
+# appends ||semantic residual|| / ||hidden states|| here.
+_SEMANTIC_TRACE = [] if os.environ.get("BATON_RESEARCH_TRACE_SEMANTIC") == "1" else None
+
+
+
+def _semantic_additive_residual(
+    module: nn.Module,
+    plan: torch.Tensor,
+    positions: torch.Tensor,
+    condition_mask: Optional[torch.Tensor],
+    *,
+    num_frames: int,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    """Pool each keyframe grid to the latent grid and add it at its latent frame.
+
+    ``plan`` is ``[B,V,K,P,D]`` with a square ``P``; ``positions`` holds the
+    adapter's raw ``(t, y, x)`` per token, ``t`` in latent-frame units. Returns
+    ``[B*V, F*H*W, C]`` to be added to the projected input tokens.
+    """
+
+    rows = plan.shape[0] * plan.shape[1]
+    keyframes, patches, dim = plan.shape[2:]
+    grid = int(round(patches ** 0.5))
+    pooled = torch.nn.functional.adaptive_avg_pool2d(
+        plan.reshape(rows * keyframes, grid, grid, dim).permute(0, 3, 1, 2).float(),
+        (height, width),
+    )
+    pooled = pooled.permute(0, 2, 3, 1).reshape(rows, keyframes, height * width, dim)
+    projected = module(pooled.to(module[-1].weight.dtype))
+    channels = projected.shape[-1]
+    frames = (
+        positions.reshape(rows, keyframes, patches, -1)[:, :, 0, 0]
+        .round()
+        .long()
+        .clamp(0, num_frames - 1)
+    )
+    out = projected.new_zeros(rows, num_frames, height * width, channels)
+    out.scatter_add_(
+        1, frames[:, :, None, None].expand(-1, -1, height * width, channels), projected
+    )
+    counts = projected.new_zeros(rows, num_frames, 1, 1)
+    counts.scatter_add_(
+        1,
+        frames[:, :, None, None],
+        torch.ones(rows, keyframes, 1, 1, device=projected.device, dtype=projected.dtype),
+    )
+    out = out / counts.clamp_min(1)
+    if condition_mask is not None:
+        out = out * condition_mask.to(out.dtype).view(rows, 1, 1, 1)
+    return out.reshape(rows, num_frames * height * width, channels)
 
 
 class _AttachZeroForwardSurrogate(torch.autograd.Function):
@@ -551,6 +608,10 @@ class LTXVideoTransformerBlock(nn.Module):
                 nn.Linear(semantic_adaln_rank, 3 * dim, bias=False),
             )
             nn.init.zeros_(self.semantic_modulation[-1].weight)
+        # "zero_gate" multiplies the output by a zero-initialized gate, which
+        # starves both factors of gradient; "zero_out" (research) zeroes the
+        # output projection instead and uses a (1 + gate) scale.
+        self.semantic_gate_mode = "zero_gate"
 
         self.scale_shift_table = nn.Parameter(torch.randn(6, dim) / dim**0.5)
 
@@ -634,6 +695,8 @@ class LTXVideoTransformerBlock(nn.Module):
                 semantic_output = semantic_output * semantic_mask
                 if semantic_bias_surrogate is not None:
                     semantic_bias_surrogate = semantic_bias_surrogate * semantic_mask
+            if self.semantic_gate_mode == "zero_out":
+                semantic_gate = 1 + semantic_gate
             semantic_residual = semantic_output * semantic_gate
             if semantic_bias_surrogate is not None:
                 residual_gate_is_initialized = bool(
@@ -648,6 +711,13 @@ class LTXVideoTransformerBlock(nn.Module):
                 semantic_residual = _AttachZeroForwardSurrogate.apply(
                     semantic_residual,
                     semantic_bias_surrogate,
+                )
+            if _SEMANTIC_TRACE is not None:
+                _SEMANTIC_TRACE.append(
+                    float(
+                        semantic_residual.detach().float().norm()
+                        / hidden_states.detach().float().norm().clamp_min(1e-12)
+                    )
                 )
             hidden_states = hidden_states + semantic_residual
 
@@ -946,6 +1016,15 @@ class LTXVideoTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin
                         semantic_condition_mask = semantic_condition_mask.repeat_interleave(n_view, dim=0)
                     if semantic_condition_mask.shape[0] != hidden_states.shape[0]:
                         raise ValueError("semantic_condition_mask batch must be B or B*V")
+                if os.environ.get("BATON_RESEARCH_SEMANTIC_VIEWS") == "main":
+                    # Research opt-in (H8): condition only the main view; rows are (b v).
+                    keep = torch.arange(hidden_states.shape[0], device=hidden_states.device) % n_view == 0
+                    if semantic_condition_mask is None:
+                        semantic_condition_mask = keep
+                    elif semantic_condition_mask.dtype == torch.bool:
+                        semantic_condition_mask = semantic_condition_mask & keep
+                    else:
+                        semantic_condition_mask = semantic_condition_mask * keep.to(semantic_condition_mask.dtype)
 
             # convert encoder_attention_mask to a bias the same way we do for attention_mask
             if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
@@ -957,6 +1036,17 @@ class LTXVideoTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin
 
             batch_size = hidden_states.size(0)
             hidden_states = self.proj_in(hidden_states)
+            additive = getattr(self, "semantic_additive", None)
+            if additive is not None and semantic_plan is not None:
+                hidden_states = hidden_states + _semantic_additive_residual(
+                    additive,
+                    semantic_plan,
+                    semantic_positions,
+                    semantic_condition_mask,
+                    num_frames=num_frames,
+                    height=height,
+                    width=width,
+                ).to(hidden_states.dtype)
 
             temb, embedded_timestep = self.time_embed(
                 timestep.flatten(),

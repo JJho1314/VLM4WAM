@@ -22,7 +22,7 @@ if [[ ! -f "$GE_ACT_ROOT/main.py" ]]; then
     echo "GE_ACT_ROOT does not contain main.py: $GE_ACT_ROOT" >&2
     exit 2
 fi
-CONDA_ENV="${CONDA_ENV:-/data/user/jhe724/.conda/envs/genie_envisioner}"
+CONDA_ENV="${CONDA_ENV:-/data/users/junjie/workspace/hpc3_jhe724/.conda/envs/genie_envisioner}"
 CONFIG="${CONFIG:-$GE_ACT_ROOT/configs/ltx_model/libero/video_model_libero_fastwam_siglip2.yaml}"
 
 export PATH="$CONDA_ENV/bin:$PATH"

@@ -6,6 +6,7 @@ import stat
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -301,6 +302,11 @@ def prepare_baton_conditioning(
             ),
         )
         freeze_conditioning_modules(teacher)
+        # Research opt-in: rescale/normalize already-sized frames on GPU
+        # (checked once against the processor) instead of per-frame PIL work.
+        teacher.gpu_preprocess = (
+            os.environ.get("BATON_TEACHER_GPU_PREPROCESS") == "1"
+        )
         return BatonConditioningComponents(
             source=source,
             teacher=teacher,
@@ -571,6 +577,242 @@ def build_deepspeed_batch_config(
     return config
 
 
+
+
+def _load_research_planner(trainer):
+    """Lazily load the frozen Qwen3.5 baton planner once per rank (bf16, no grad)."""
+
+    planner = getattr(trainer, "_research_planner", None)
+    if planner is None:
+        from qwen35_baton.provider import FrozenBatonPlanner
+
+        qwen = os.environ["BATON_RESEARCH_PLANNER_QWEN_PATH"]
+        planner = FrozenBatonPlanner.from_checkpoint(
+            os.environ["BATON_RESEARCH_PLANNER_CHECKPOINT"],
+            qwen_model_path=qwen,
+            qwen_tokenizer_path=qwen,
+            qwen_processor_path=qwen,
+            siglip2_model_path=trainer.args.semantic_plan["siglip2_model_path"],
+            device=trainer.state.accelerator.device,
+        )
+        trainer._research_planner = planner
+    return planner
+
+
+def research_planner_joint_enabled() -> bool:
+    return os.environ.get("BATON_RESEARCH_PLANNER_JOINT") == "1"
+
+
+def checkpoint_has_research_planner_head(model_path: str | None) -> bool:
+    """Whether a diffusion checkpoint carries ``research_planner_head.*`` tensors."""
+
+    if not model_path:
+        return False
+    from safetensors import safe_open
+    from utils.model_utils import resolve_checkpoint_files
+
+    for checkpoint_file in resolve_checkpoint_files(model_path):
+        with safe_open(str(checkpoint_file), framework="pt") as handle:
+            if any(key.startswith("research_planner_head.") for key in handle.keys()):
+                return True
+    return False
+
+
+def attach_research_planner_head(
+    diffusion_model: torch.nn.Module, planner, model_path: str | None
+) -> int:
+    """Attach a trainable copy of the planner head as ``research_planner_head``.
+
+    The copy starts from the planner checkpoint and is overwritten by the
+    ``research_planner_head.*`` tensors of ``model_path`` when present
+    (checkpoints load non-strictly), so it is optimized, sharded and saved
+    with the diffusion model while the Qwen backbone stays outside.
+    Returns the number of restored tensors.
+    """
+
+    from qwen35_baton.research_provider import ResearchPlannerHead
+
+    proj_in = getattr(diffusion_model, "proj_in", None)
+    if proj_in is None:
+        raise ValueError("research planner head needs an LTX transformer")
+    head = ResearchPlannerHead(planner.planner)
+    head.to(device=proj_in.weight.device, dtype=proj_in.weight.dtype)
+    diffusion_model.research_planner_head = head
+    restored = 0
+    if model_path:
+        from safetensors.torch import load_file
+        from utils.model_utils import resolve_checkpoint_files
+
+        for checkpoint_file in resolve_checkpoint_files(model_path):
+            state = load_file(str(checkpoint_file))
+            extra = {
+                key[len("research_planner_head."):]: value
+                for key, value in state.items()
+                if key.startswith("research_planner_head.")
+            }
+            if extra:
+                head.load_state_dict(extra, strict=True)
+                restored += len(extra)
+    return restored
+
+
+def apply_research_planner_head(trainer, diffusion_model, model_path) -> None:
+    """Research opt-in (joint KI): BATON_RESEARCH_PLANNER_JOINT=1.
+
+    Loads the frozen planner eagerly (the head must exist before the optimizer
+    is built) and attaches its trainable head to ``diffusion_model``.
+    """
+
+    if not research_planner_joint_enabled():
+        return
+    if float(os.environ.get("BATON_RESEARCH_PLANNER_PROB", "0")) <= 0:
+        raise ValueError("BATON_RESEARCH_PLANNER_JOINT=1 needs BATON_RESEARCH_PLANNER_PROB > 0")
+    if getattr(trainer, "baton_components", None) is None:
+        raise ValueError("BATON_RESEARCH_PLANNER_JOINT=1 needs Baton conditioning")
+    planner = _load_research_planner(trainer)
+    restored = attach_research_planner_head(diffusion_model, planner, model_path)
+    trainer._research_planner_head = diffusion_model.research_planner_head
+    logger.info(f"research planner head attached (restored {restored} tensors)")
+
+
+def apply_research_planner_mixing(trainer, tokens, video, captions, n_previous):
+    """Research opt-in (Stage-3 style): swap teacher tokens for planner predictions.
+
+    With BATON_RESEARCH_PLANNER_PROB=p > 0, each sample's teacher grids are
+    replaced with probability p by the frozen Qwen3.5 baton planner's
+    prediction from the last memory frame and the instruction, so the model
+    learns to use the guidance it will actually receive at deployment.
+    Needs BATON_RESEARCH_PLANNER_CHECKPOINT and BATON_RESEARCH_PLANNER_QWEN_PATH.
+
+    With BATON_RESEARCH_PLANNER_JOINT=1 the predictions come from the trainable
+    ``research_planner_head`` on top of the frozen backbone and keep their
+    graph, so the GE-Act loss fine-tunes the head; BATON_RESEARCH_PLANNER_ANCHOR=w
+    adds w * MSE(prediction, teacher). Returns ``(tokens, extra_loss)`` where
+    ``extra_loss`` is None outside joint mode.
+    """
+
+    prob = float(os.environ.get("BATON_RESEARCH_PLANNER_PROB", "0"))
+    if prob <= 0:
+        return tokens, None
+    joint = research_planner_joint_enabled()
+    if getattr(trainer, "_research_planner", None) is None:
+        logger.info(f"research planner mixing enabled (p={prob}, joint={joint})")
+    planner = _load_research_planner(trainer)
+    head = getattr(trainer, "_research_planner_head", None) if joint else None
+    if joint and head is None:
+        raise RuntimeError("joint planner mixing needs apply_research_planner_head")
+    pick = torch.rand(tokens.shape[0]) < prob
+    if not bool(pick.any()):
+        if head is None:
+            return tokens, None
+        # Every head parameter still gets a (zero) gradient this step.
+        return tokens, sum(parameter.sum() for parameter in head.parameters()) * 0.0
+    current = video[pick.to(video.device), :, :, n_previous - 1].permute(0, 2, 1, 3, 4)
+    current = _normalized_video_to_uint8(current).contiguous()
+    chosen = tuple(caption for caption, keep in zip(captions, pick.tolist()) if keep)
+    extra_loss = None
+    if head is None:
+        with torch.no_grad():
+            predicted = planner.predict(current, chosen).tokens
+    else:
+        from qwen35_baton.research_provider import predict_with_research_head
+
+        predicted = predict_with_research_head(planner, head, current, chosen)
+        extra_loss = sum(parameter.sum() for parameter in head.parameters()) * 0.0
+        anchor = float(os.environ.get("BATON_RESEARCH_PLANNER_ANCHOR", "0"))
+        if anchor > 0:
+            teacher = tokens[pick.to(tokens.device)].to(predicted.device).float()
+            extra_loss = extra_loss + anchor * (predicted.float() - teacher).pow(2).mean()
+    teacher_rows = tokens[pick.to(tokens.device)]
+    tokens = tokens.clone()
+    tokens[pick.to(tokens.device)] = predicted.to(device=tokens.device, dtype=tokens.dtype)
+    if not getattr(trainer, "_research_planner_logged", False):
+        # One-time evidence that planner tokens, not the teacher, reach the model.
+        delta = (tokens[pick.to(tokens.device)].float() - teacher_rows.float()).abs().mean()
+        print(
+            f"[planner mixing] replaced {int(pick.sum())}/{pick.numel()} samples; "
+            f"mean |planner - teacher| = {float(delta):.4f}",
+            flush=True,
+        )
+        trainer._research_planner_logged = True
+    return tokens, extra_loss
+
+
+def apply_research_semantic_additive(
+    diffusion_model: torch.nn.Module, model_path: str | None
+) -> None:
+    """Research opt-in (E7): add a zero-initialized additive semantic projection.
+
+    BATON_RESEARCH_SEMANTIC_ADDITIVE=1 attaches ``semantic_additive`` (LayerNorm
+    + Linear to the model width) and restores its weights from ``model_path``
+    when the checkpoint contains them (checkpoints load non-strictly).
+    """
+
+    if os.environ.get("BATON_RESEARCH_SEMANTIC_ADDITIVE") != "1":
+        return
+    proj_in = getattr(diffusion_model, "proj_in", None)
+    if proj_in is None:
+        raise ValueError("semantic additive injection needs an LTX transformer")
+    semantic_dim = int(getattr(diffusion_model.config, "semantic_plan_in_dim", 1024))
+    module = torch.nn.Sequential(
+        torch.nn.LayerNorm(semantic_dim, elementwise_affine=False),
+        torch.nn.Linear(semantic_dim, proj_in.out_features),
+    )
+    torch.nn.init.zeros_(module[-1].weight)
+    torch.nn.init.zeros_(module[-1].bias)
+    module.to(device=proj_in.weight.device, dtype=proj_in.weight.dtype)
+    diffusion_model.semantic_additive = module
+    restored = 0
+    if model_path:
+        from safetensors.torch import load_file
+        from utils.model_utils import resolve_checkpoint_files
+
+        for checkpoint_file in resolve_checkpoint_files(model_path):
+            state = load_file(str(checkpoint_file))
+            extra = {
+                key[len("semantic_additive."):]: value
+                for key, value in state.items()
+                if key.startswith("semantic_additive.")
+            }
+            if extra:
+                module.load_state_dict(extra, strict=True)
+                restored += len(extra)
+    logger.info(f"semantic additive injection attached (restored {restored} tensors)")
+
+
+def apply_research_semantic_gate_mode(diffusion_model: torch.nn.Module) -> None:
+    """Research opt-in for the semantic residual (see LTX block gate modes).
+
+    BATON_RESEARCH_SEMANTIC_GATE_MODE=zero_out switches every semantic block to
+    the (1 + gate) scale; BATON_RESEARCH_SEMANTIC_REZERO_OUT=1 additionally
+    zeroes the semantic output projections, which is only valid when starting
+    a run (it would erase trained weights at evaluation).
+    """
+
+    mode = os.environ.get("BATON_RESEARCH_SEMANTIC_GATE_MODE")
+    if not mode:
+        return
+    if mode not in ("zero_gate", "zero_out"):
+        raise ValueError(f"unknown semantic gate mode: {mode}")
+    rezero = os.environ.get("BATON_RESEARCH_SEMANTIC_REZERO_OUT") == "1"
+    blocks = [
+        module
+        for module in diffusion_model.modules()
+        if hasattr(module, "semantic_gate_mode") and hasattr(module, "semantic_attn")
+    ]
+    if not blocks:
+        raise ValueError("semantic gate mode requested but no semantic blocks exist")
+    for block in blocks:
+        block.semantic_gate_mode = mode
+        if rezero:
+            with torch.no_grad():
+                block.semantic_attn.to_out[0].weight.zero_()
+                if block.semantic_attn.to_out[0].bias is not None:
+                    block.semantic_attn.to_out[0].bias.zero_()
+    logger.info(
+        f"semantic gate mode {mode} on {len(blocks)} blocks (rezero_out={rezero})"
+    )
+
 def compute_ltx_latent_frames(
     raw_future_frames: int,
     temporal_compression_ratio: int,
@@ -679,8 +921,13 @@ def build_optimizer_parameter_groups(
     qwen_vision_lr: float | None = None,
     qwen_ownership: Any | None = None,
     baton_source: str | None = None,
+    planner_head_lr: float | None = None,
 ) -> List[Dict[str, Any]]:
-    """Apply GE-Act train-mode filtering and split semantic parameters by LR."""
+    """Apply GE-Act train-mode filtering and split semantic parameters by LR.
+
+    A research ``research_planner_head`` (joint KI) gets its own Baton group
+    at ``planner_head_lr``.
+    """
 
     if baton_source is not None:
         if baton_source not in BATON_SOURCES:
@@ -699,7 +946,9 @@ def build_optimizer_parameter_groups(
         except TypeError:
             aliases = named_parameters()
         for name, parameter in aliases:
-            if "action_" in name:
+            if name.startswith("research_planner_head."):
+                owner = "research_planner_head"
+            elif "action_" in name:
                 owner = "action_expert"
             elif _is_semantic_parameter(name):
                 owner = "semantic_adapter"
@@ -718,9 +967,15 @@ def build_optimizer_parameter_groups(
             "ltx_video": [],
             "action_expert": [],
             "semantic_adapter": [],
+            "research_planner_head": [],
         }
         for owner, parameter in by_identifier.values():
             grouped_parameters[owner].append(parameter)
+        head_parameters = grouped_parameters.pop("research_planner_head")
+        if head_parameters:
+            if planner_head_lr is None:
+                raise ValueError("research planner head requires planner_head_lr")
+            grouped_parameters["research_planner_head"] = head_parameters
         empty = [
             name
             for name, parameters in grouped_parameters.items()
@@ -752,17 +1007,15 @@ def build_optimizer_parameter_groups(
             "action_expert": float(action_lr),
             "semantic_adapter": float(semantic_lr),
         }
+        if head_parameters:
+            learning_rates["research_planner_head"] = float(planner_head_lr)
         return [
             {
                 "name": name,
                 "params": grouped_parameters[name],
                 "lr": learning_rates[name],
             }
-            for name in (
-                "ltx_video",
-                "action_expert",
-                "semantic_adapter",
-            )
+            for name in grouped_parameters
         ]
 
     if provider is None:
@@ -1096,6 +1349,26 @@ class JointGroundedTrainingModel(torch.nn.Module):
             planner_loss=planner_loss,
             semantic_condition=aligned_condition,
         )
+
+
+def _timed_batches(iterable, stats: dict):
+    """Yield batches while recording how long each one took to arrive.
+
+    ``stats`` accumulates ``data_wait`` (seconds blocked in the loader) and
+    ``wall`` (seconds per micro-step, including the training body).
+    """
+
+    import time
+
+    last = time.perf_counter()
+    for batch in iterable:
+        arrived = time.perf_counter()
+        stats["data_wait"] += arrived - stats.pop("_resume", last)
+        stats["wall"] += arrived - last
+        stats["n"] += 1
+        last = arrived
+        yield batch
+        stats["_resume"] = time.perf_counter()
 
 
 class EpochSeededRandomSampler(torch.utils.data.Sampler[int]):
@@ -2082,15 +2355,28 @@ def load_baton_training_checkpoint(
     )
     if loaded.training_provenance != expected_provenance:
         raise ValueError("Baton checkpoint training provenance mismatch")
-    if (
-        loaded.cursor.microbatches_per_epoch
-        != expected_microbatches_per_epoch
-        or loaded.cursor.sampler_seed != expected_sampler_seed
-    ):
+    cursor = loaded.cursor
+    if cursor.sampler_seed != expected_sampler_seed:
         raise ValueError("Baton checkpoint data cursor mismatch")
+    if cursor.microbatches_per_epoch != expected_microbatches_per_epoch:
+        # Research opt-in for resuming at a different per-device batch with the
+        # same global batch: keep step/epoch and map the in-epoch position.
+        if os.environ.get("BATON_RESEARCH_RESCALE_CURSOR") != "1":
+            raise ValueError("Baton checkpoint data cursor mismatch")
+        cursor = TrainingCursor(
+            global_step=cursor.global_step,
+            epoch=cursor.epoch,
+            consumed_microbatches=(
+                cursor.consumed_microbatches
+                * expected_microbatches_per_epoch
+                // cursor.microbatches_per_epoch
+            ),
+            microbatches_per_epoch=expected_microbatches_per_epoch,
+            sampler_seed=cursor.sampler_seed,
+        )
     accelerator.load_state(str(loaded.checkpoint))
     accelerator.wait_for_everyone()
-    return loaded.cursor
+    return cursor
 
 
 def _validate_loaded_baton_stage2_checkpoint(
@@ -2359,6 +2645,13 @@ class Trainer:
         args = argparse.Namespace(**cd)
         args.lr = float(args.lr)
         args.semantic_lr = float(getattr(args, "semantic_lr", args.lr))
+        # Research opt-in: probe whether the semantic branch is learning-rate bound.
+        # Research opt-in: drop the instruction so semantic guidance is the
+        # only task cue (tests whether redundancy with text hides its value).
+        if os.environ.get("BATON_RESEARCH_CAPTION_DROPOUT"):
+            args.caption_dropout_p = float(os.environ["BATON_RESEARCH_CAPTION_DROPOUT"])
+        if os.environ.get("BATON_RESEARCH_SEMANTIC_LR"):
+            args.semantic_lr = float(os.environ["BATON_RESEARCH_SEMANTIC_LR"])
         args.action_lr = float(getattr(args, "action_lr", args.lr))
         args.qwen_top_lr = float(getattr(args, "qwen_top_lr", 1e-6))
         args.qwen_vision_lr = float(getattr(args, "qwen_vision_lr", 5e-7))
@@ -2535,6 +2828,11 @@ class Trainer:
         )
         self.train_dataloader_generator = torch.Generator()
         self.train_dataloader_generator.manual_seed(self.sampler_seed)
+        # Research opt-in: override loader parallelism without touching the config.
+        if os.environ.get("BATON_RESEARCH_NUM_WORKERS"):
+            self.args.dataloader_num_workers = int(os.environ["BATON_RESEARCH_NUM_WORKERS"])
+        if os.environ.get("BATON_RESEARCH_PREFETCH"):
+            self.args.dataloader_prefetch_factor = int(os.environ["BATON_RESEARCH_PREFETCH"])
         self.train_dataloader = torch.utils.data.DataLoader(
             dataset=self.train_dataset,
             sampler=self.train_sampler,
@@ -2791,6 +3089,13 @@ class Trainer:
             self.scheduler = diffusion_scheduler_class()
 
         ### Import Inference Pipeline Class
+        apply_research_semantic_gate_mode(self.diffusion_model)
+        apply_research_semantic_additive(
+            self.diffusion_model, self.args.diffusion_model.get("model_path")
+        )
+        apply_research_planner_head(
+            self, self.diffusion_model, self.args.diffusion_model.get("model_path")
+        )
         self.pipeline_class = import_custom_class(
             self.args.pipeline_class, getattr(self.args, "pipeline_class_path", "diffusers")
         )
@@ -2862,6 +3167,11 @@ class Trainer:
         action_learning_rate = self.args.action_lr
         qwen_top_learning_rate = self.args.qwen_top_lr
         qwen_vision_learning_rate = self.args.qwen_vision_lr
+        planner_head_learning_rate = (
+            float(os.environ.get("BATON_RESEARCH_PLANNER_HEAD_LR", "1e-5"))
+            if research_planner_joint_enabled()
+            else None
+        )
         if self.args.scale_lr:
             lr_scale = (
                 self.args.gradient_accumulation_steps
@@ -2873,6 +3183,8 @@ class Trainer:
             action_learning_rate *= lr_scale
             qwen_top_learning_rate *= lr_scale
             qwen_vision_learning_rate *= lr_scale
+            if planner_head_learning_rate is not None:
+                planner_head_learning_rate *= lr_scale
 
         params_to_optimize = build_optimizer_parameter_groups(
             self.diffusion_model,
@@ -2889,6 +3201,7 @@ class Trainer:
                 if self.baton_components is not None
                 else None
             ),
+            planner_head_lr=planner_head_learning_rate,
         )
         trainable_params = [
             parameter for group in params_to_optimize for parameter in group["params"]
@@ -3100,7 +3413,19 @@ class Trainer:
                 self.train_dataloader,
                 num_batches=skipped_microbatches,
             )
-            for step, batch in enumerate(epoch_dataloader):
+            loader_stats = {"data_wait": 0.0, "wall": 0.0, "n": 0}
+            for step, batch in enumerate(_timed_batches(epoch_dataloader, loader_stats)):
+                if loader_stats["n"] >= 50 and accelerator.is_main_process:
+                    wait = loader_stats["data_wait"] / loader_stats["n"]
+                    wall = loader_stats["wall"] / loader_stats["n"]
+                    count = loader_stats["n"]
+                    print(
+                        f"[loader timing] over {count} microbatches: "
+                        f"data_wait {wait:.3f}s / microstep {wall:.3f}s "
+                        f"({100 * wait / max(wall, 1e-9):.1f}% waiting)",
+                        flush=True,
+                    )
+                    loader_stats.update(data_wait=0.0, wall=0.0, n=0)
                 absolute_microbatch = skipped_microbatches + step + 1
                 logger.debug(f"Starting step {step + 1}")
                 logs = {}
@@ -3121,7 +3446,10 @@ class Trainer:
                     planner_semantic_plan = None
                     planner_semantic_times = None
                     planner_aux_loss = None
-                    if self.semantic_encoder is not None:
+                    research_planner_loss = None
+                    if hasattr(self, "robofollow_condition"):
+                        planner_semantic_plan, planner_semantic_times, research_planner_loss = self.robofollow_condition(video, batch["caption"], mem_size)
+                    elif self.semantic_encoder is not None:
                         semantic_config = self.args.semantic_plan
                         semantic_future = rearrange(
                             video[:, :, :, mem_size:],
@@ -3172,7 +3500,10 @@ class Trainer:
                     semantic_plan_mask = None
                     semantic_plan_relevance = None
                     semantic_condition_mask = None
-                    if self.baton_components is not None:
+                    if planner_semantic_plan is not None and hasattr(self, "robofollow_condition"):
+                        semantic_plan = planner_semantic_plan
+                        semantic_plan_times = planner_semantic_times
+                    elif self.baton_components is not None:
                         baton_condition = build_baton_semantic_condition(
                             self.baton_components,
                             self.args.semantic_plan,
@@ -3184,7 +3515,18 @@ class Trainer:
                             device=accelerator.device,
                             dtype=weight_dtype,
                         )
-                        semantic_plan = baton_condition.tokens
+                        semantic_plan, research_planner_loss = apply_research_planner_mixing(
+                            self,
+                            baton_condition.tokens,
+                            baton_video,
+                            batch["caption"],
+                            mem_size,
+                        )
+                        if semantic_plan is not baton_condition.tokens:
+                            # The Baton forward reads the condition, not semantic_plan.
+                            baton_condition = dataclasses.replace(
+                                baton_condition, tokens=semantic_plan
+                            )
                         semantic_plan_times = baton_condition.times
                         semantic_plan_positions = baton_condition.positions
                         semantic_plan_mask = baton_condition.mask
@@ -3431,6 +3773,8 @@ class Trainer:
                             planner_aux_weight=self.args.planner_aux_weight,
                         )
 
+                    if research_planner_loss is not None:
+                        loss = loss + research_planner_loss
                     assert not torch.isnan(loss), "NaN loss detected"
                     accelerator.backward(loss)
                     if accelerator.sync_gradients and accelerator.distributed_type != DistributedType.DEEPSPEED:

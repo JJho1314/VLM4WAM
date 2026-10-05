@@ -4,8 +4,8 @@ report_to: None
 tracker_name: ltx_trainer
 
 logging_dir: logs
-output_dir: /data/user/jhe724/junjie/outputs/libero_fastwam_mix_videoadapt
-pretrained_model_name_or_path: /data/user/jhe724/junjie/weights/LTX-Video
+output_dir: /data/users/junjie/workspace/hpc3_jhe724/junjie/outputs/libero_fastwam_mix_videoadapt
+pretrained_model_name_or_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/weights/LTX-Video
 
 ###
 train_data_class_path: data/lerobot_like_dataset.py
@@ -95,7 +95,7 @@ flow_mode_scale: 1.29
 pixel_wise_timestep: True
 
 diffusion_model:
-  model_path: /data/user/jhe724/junjie/weights/Genie-Envisioner/GE_base_fast_v0.1.safetensors
+  model_path: /data/users/junjie/workspace/hpc3_jhe724/junjie/weights/Genie-Envisioner/GE_base_fast_v0.1.safetensors
   config:
     activation_fn: gelu-approximate
     attention_bias: true
@@ -116,7 +116,7 @@ diffusion_model:
 
 data:
   train:
-    data_roots: ["/data/user/jhe724/junjie/datasets/LIBERO-fastwam", "/data/user/jhe724/junjie/datasets/LIBERO-fastwam", "/data/user/jhe724/junjie/datasets/LIBERO-fastwam", "/data/user/jhe724/junjie/datasets/LIBERO-fastwam"]
+    data_roots: ["/data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam", "/data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam", "/data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam", "/data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam"]
     domains: ["libero_10_no_noops_lerobot", "libero_goal_no_noops_lerobot", "libero_object_no_noops_lerobot", "libero_spatial_no_noops_lerobot"]
     sample_size: [256, 256]
     sample_n_frames: 500
@@ -134,7 +134,7 @@ data:
     state_key: observation.state
     action_key: action
   val:
-    data_roots: ["/data/user/jhe724/junjie/datasets/LIBERO-fastwam", "/data/user/jhe724/junjie/datasets/LIBERO-fastwam", "/data/user/jhe724/junjie/datasets/LIBERO-fastwam", "/data/user/jhe724/junjie/datasets/LIBERO-fastwam"]
+    data_roots: ["/data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam", "/data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam", "/data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam", "/data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam"]
     domains: ["libero_10_no_noops_lerobot", "libero_goal_no_noops_lerobot", "libero_object_no_noops_lerobot", "libero_spatial_no_noops_lerobot"]
     sample_size: [256, 256]
     sample_n_frames: 500
