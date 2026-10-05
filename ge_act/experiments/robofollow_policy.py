@@ -91,7 +91,13 @@ def make_policy(config_path,checkpoint_path,stats_path,planner_mode='disabled',i
     @torch.no_grad()
     def infer(history,state,text):
         x=torch.from_numpy(history).to(device).permute(1,4,0,2,3).float()/127.5-1
-        x=F.interpolate(x.permute(0,2,1,3,4).reshape(12,3,*x.shape[-2:]),size=(height,width),mode='bilinear',align_corners=False).reshape(3,4,3,height,width).permute(0,2,1,3,4).to(dtype)
+        flat=x.permute(0,2,1,3,4).reshape(12,3,*x.shape[-2:])
+        if c['data']['train'].get('resize_mode','resize')=='pad':
+            from ge_act.data.robofollow_schema import pad_frames
+            if tuple(flat.shape[-2:])!=tuple(c['data']['train'].get('native_size',(240,320))):raise ValueError('observation size differs from training native_size')
+            flat=pad_frames(flat,(height,width))
+        else:flat=F.interpolate(flat,size=(height,width),mode='bilinear',align_corners=False)
+        x=flat.reshape(3,4,3,height,width).permute(0,2,1,3,4).to(dtype)
         args={}
         if planner is not None:
             current=torch.from_numpy(history[-1:]).to(device)

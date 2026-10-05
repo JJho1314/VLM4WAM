@@ -42,6 +42,10 @@ class RoboFollowTrainer(Trainer):
         from ge_act.models.ltx_models.semantic_conditioning import build_semantic_plan_times
         pc=self.raw_config.get('robofollow_planner',{})
         if not pc.get('enabled',False):return None,None,None
+        dc=self.args.data['train']
+        if dc.get('resize_mode','resize')=='pad':
+            from ge_act.data.robofollow_schema import crop_padding
+            video=crop_padding(video,tuple(dc.get('native_size',(240,320))),tuple(dc['sample_size']))
         current=((video[:,:,:,n_previous-1].permute(0,2,3,4,1)+1)*127.5).round().clamp(0,255).to(torch.uint8)
         pred=self.rf_planner.predict_tokens(current,instructions)
         teacher=None

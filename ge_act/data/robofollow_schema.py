@@ -116,3 +116,22 @@ def validate_all_frames(path, batch_size=32, return_digest=False):
                         raise ValueError(f'camera {name} frame {i}: {error}') from error
     count=len(e.states)*len(cams)
     return (count,digest.hexdigest()) if return_digest else count
+
+
+def pad_offsets(native,size):
+    """Top/left offsets that centre a native (h,w) frame inside a padded (H,W) canvas."""
+    (h,w),(H,W)=native,size
+    if h>H or w>W:raise ValueError(f'cannot pad {native} into {size}')
+    return (H-h)//2,(W-w)//2
+
+def pad_frames(x,size,value=-1.0):
+    """Pad [...,h,w] frames (normalized to [-1,1]) symmetrically to size; -1 is black."""
+    import torch.nn.functional as F
+    top,left=pad_offsets(tuple(x.shape[-2:]),tuple(size))
+    H,W=size
+    return F.pad(x,(left,W-x.shape[-1]-left,top,H-x.shape[-2]-top),value=value)
+
+def crop_padding(x,native,size):
+    """Inverse of pad_frames on the last two axes."""
+    top,left=pad_offsets(tuple(native),tuple(size))
+    return x[...,top:top+native[0],left:left+native[1]]
