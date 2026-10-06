@@ -25,16 +25,20 @@ class RoboFollowResearchPlanner:
         b=images.shape[0]
         rgb=images.permute(0,1,4,2,3).reshape(b*3,3,*images.shape[2:4])
         rgb=F.interpolate(rgb.float(),size=(256,256),mode='bilinear',align_corners=False).round().clamp(0,255).to(torch.uint8)
-        pair=rgb[:,None].expand(-1,2,-1,-1,-1).contiguous()
-        texts=[t for t in instructions for _ in range(3)]
+        # Qwen rows are independent, so pack (head,left) and (right,right) per sample:
+        # 4 rows instead of 6 duplicated ones, with bitwise-identical outputs.
+        rgb=rgb.reshape(b,3,3,*rgb.shape[-2:])
+        pair=torch.stack([rgb[:,0:2],torch.stack([rgb[:,2],rgb[:,2]],1)],1).reshape(b*2,2,3,*rgb.shape[-2:])
+        texts=[t for t in instructions for _ in range(2)]
         if self.head is None:
             with torch.no_grad():pred=self.base.predict(pair,texts).tokens
         else:
             from qwen35_baton.research_provider import predict_with_research_head
             pred=predict_with_research_head(self.base,self.head,pair,texts)
-        expected=(b*3,2,4,256,1024)
+        expected=(b*2,2,4,256,1024)
         if tuple(pred.shape)!=expected or not torch.isfinite(pred).all():raise ValueError('invalid migrated planner output')
-        return pred[:,0].reshape(b,3,4,256,1024)
+        pred=pred.reshape(b,2,2,4,256,1024)
+        return torch.cat([pred[:,0],pred[:,1,:1]],1)
 
 
 def mix_training_plans(predicted,teacher,predicted_probability,anchor_weight):

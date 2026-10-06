@@ -25,7 +25,7 @@ class RoboFollowTrainer(Trainer):
                 self.rf_planner.head=self.diffusion_model.research_planner_head
             if pc['predicted_probability']<1 or pc['anchor_weight']>0:
                 from ge_act.models.ltx_models.semantic_conditioning import OnlineSiglip2SemanticEncoder
-                self.rf_teacher=OnlineSiglip2SemanticEncoder(pc['siglip_path'],device=self.state.accelerator.device,frame_microbatch_size=3)
+                self.rf_teacher=OnlineSiglip2SemanticEncoder(pc['siglip_path'],device=self.state.accelerator.device,frame_microbatch_size=48)
             if self.state.accelerator.is_main_process:
                 (Path(self.save_folder)/'planner_metadata.json').write_text(json.dumps(self.rf_planner.metadata,indent=2)+'\n')
         ensure_vae_channels(self.vae)
@@ -47,11 +47,15 @@ class RoboFollowTrainer(Trainer):
             from ge_act.data.robofollow_schema import crop_padding
             video=crop_padding(video,tuple(dc.get('native_size',(240,320))),tuple(dc['sample_size']))
         current=((video[:,:,:,n_previous-1].permute(0,2,3,4,1)+1)*127.5).round().clamp(0,255).to(torch.uint8)
+        from runner.ge_trainer import _rf_mark
+        _rf_mark('cond_prep')
         pred=self.rf_planner.predict_tokens(current,instructions)
+        _rf_mark('qwen_planner')
         teacher=None
         if self.rf_teacher is not None:
             future=video[:,:,:,n_previous:].permute(0,2,3,1,4,5)[:,:,list((0,3,5,8))]
             teacher=self.rf_teacher.encode(future)
+            _rf_mark('siglip_teacher')
         tokens,loss=mix_training_plans(pred,teacher,pc['predicted_probability'],pc['anchor_weight'])
         times=build_semantic_plan_times(batch_size=len(video),n_view=3,n_previous=n_previous,num_future_frames=9,num_latent_frames=6,indices=(0,3,5,8),device=video.device)
         return tokens.to(video.dtype),times,loss

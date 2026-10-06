@@ -1,6 +1,7 @@
 import hashlib
 import math
 import os
+import time
 import random
 import stat
 
@@ -1349,6 +1350,27 @@ class JointGroundedTrainingModel(torch.nn.Module):
             planner_loss=planner_loss,
             semantic_condition=aligned_condition,
         )
+
+
+_RF_PROFILE = os.environ.get("RF_PROFILE") == "1"
+_RF_PROF_STATE = {"last": None, "sums": {}, "n": 0}
+
+
+def _rf_mark(name=None, report=False):
+    """Accumulate synchronized wall time since the previous mark under ``name``."""
+    if not _RF_PROFILE:
+        return
+    torch.cuda.synchronize()
+    now = time.perf_counter()
+    state = _RF_PROF_STATE
+    if name is not None and state["last"] is not None:
+        state["sums"][name] = state["sums"].get(name, 0.0) + now - state["last"]
+    state["last"] = now
+    if report:
+        state["n"] += 1
+        if state["n"] % 20 == 0 and int(os.environ.get("RANK", "0")) == 0:
+            parts = ", ".join(f"{k} {v / state['n']:.3f}s" for k, v in state["sums"].items())
+            print(f"[rf profile] mean over {state['n']} microsteps: {parts}", flush=True)
 
 
 def _timed_batches(iterable, stats: dict):
@@ -3434,7 +3456,9 @@ class Trainer:
                     video = batch['video']
 
                     # shape: {b, c, v, t, h, w}; ranging from -1 to 1
+                    _rf_mark(None)
                     video = video.to(accelerator.device, dtype=weight_dtype).contiguous()
+                    _rf_mark("to_gpu")
                     batch_size, c, n_view, _, h, w = video.shape
                     mem_size = self.args.data['train']['n_previous']
                     baton_video = (
@@ -3449,6 +3473,7 @@ class Trainer:
                     research_planner_loss = None
                     if hasattr(self, "robofollow_condition"):
                         planner_semantic_plan, planner_semantic_times, research_planner_loss = self.robofollow_condition(video, batch["caption"], mem_size)
+                        _rf_mark("planner+teacher")
                     elif self.semantic_encoder is not None:
                         semantic_config = self.args.semantic_plan
                         semantic_future = rearrange(
@@ -3590,6 +3615,7 @@ class Trainer:
                         self.vae, mem, future_video, encode_future=not _skip_future_encode
                     )
 
+                    _rf_mark("vae")
                     mem_latents = rearrange(mem_latents, '(b v m) (h w) c -> (b v) c m h w', b=batch_size, m=mem_size, h=latent_height)
                     future_video_latents = rearrange(future_video_latents, '(b v) (f h w) c -> (b v) c f h w',b=batch_size,h=latent_height,w=latent_width)
                     latents = torch.cat((mem_latents, future_video_latents), dim=2)
@@ -3601,6 +3627,7 @@ class Trainer:
                     text_conds = get_text_conditions(self.tokenizer,self.text_encoder,captions)
                     prompt_embeds = text_conds['prompt_embeds']
                     prompt_attention_mask = text_conds['prompt_attention_mask']
+                    _rf_mark("t5")
                     prompt_embeds = self.uncond_prompt_embeds.repeat(batch_size,1,1)*dropout_mask_prompt + \
                                     prompt_embeds*~dropout_mask_prompt
 
@@ -3776,13 +3803,16 @@ class Trainer:
                     if research_planner_loss is not None:
                         loss = loss + research_planner_loss
                     assert not torch.isnan(loss), "NaN loss detected"
+                    _rf_mark("dit_forward")
                     accelerator.backward(loss)
+                    _rf_mark("backward")
                     if accelerator.sync_gradients and accelerator.distributed_type != DistributedType.DEEPSPEED:
                         grad_norm = accelerator.clip_grad_norm_(self.diffusion_model.parameters(), self.args.max_grad_norm)
                         logs["grad_norm"] = grad_norm
                     self.optimizer.step()
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad()
+                    _rf_mark("optim", report=True)
                 
 
                 loss = accelerator.reduce(loss.detach(), reduction='mean')
