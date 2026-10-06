@@ -67,6 +67,17 @@ L1–L3 are on par with the other world-action models (FAST-WAM, Motus). The gap
 
 Larger batch mostly improves execution and completion; intent barely moves. Part of the L0 gain may be eval noise: a second text_p256 run on L0 (seed 1042, 2 rounds) reached completion 0.433 instead of 0.373. L0 failures at bs128 are still dominated by "arm left home again" (26/75 first intent failures).
 
+## End-of-episode hold samples (text_p256_bs128_hold vs text_p256_bs128, L0)
+
+`rf_text_p256_bs128_hold` is `rf_text_p256_bs128` plus `hold_pad: 80`: training start frames are drawn up to 80 frames past the episode end, where frames and actions repeat the final state (about 35% of samples). It targets the "arm leaves home again" failures.
+
+| L0, n=75 | intent | exec | completion |
+|---|---|---|---|
+| correct: hold / no hold (diff) | 0.512 / 0.503 (+0.009 [−0.065, +0.089]) | 0.457 / 0.483 (−0.025 [−0.104, +0.059]) | 0.413 / 0.507 (−0.093 [−0.200, +0.027]) |
+| shuffled: hold / bs32 text_p256 | 0.060 / 0.072 | 0.035 / 0.056 | 0.027 / 0.013 |
+
+First intent failures: "left/right arm left home again" 22 with hold vs 26 without. Wrong-arm participation rose from 3 to 12. Hold padding does not fix the restart failures and does not help L0. L1–L3 hold evals are still running.
+
 ## Why L0 is low: first failing stage on text_p256 (75 trials)
 
 - 17 (23%): the arm leaves home again after finishing (`stage3_finish: left arm left home again; gripper re-closed`). The evaluator always runs 10 calls × 50 actions = 500 steps, while training episodes have median length 190, so the policy restarts after completing.
@@ -79,6 +90,5 @@ Training budget is also small: 640k samples, an AgiBot-pretrained base and a fre
 ## Follow-ups running
 
 - `rf_joint_p256_bs128`: global batch 128 on 2 nodes, lr 3e-5, 20k steps (text_p256_bs128 is done, see above).
-- `rf_text_p256_bs128_hold`: identical to `rf_text_p256_bs128` except end-of-episode hold samples (`hold_pad: 80`). This targets the "leaves home again" failures.
 - Extra rounds for text_p256 and joint_p256 on L0 and L2 (seed 1042, 2 rounds, correct instruction) to tighten the CIs.
 - Speed: joint steps cost 1.03 s per microstep at 2 samples/GPU. Qwen planner forward takes 38%, DiT backward 41%, DiT forward 13%, SigLIP2 teacher 4%, VAE + T5 3%. Packing the three views into two Qwen rows (bitwise-identical outputs) removed a third of the Qwen rows.
