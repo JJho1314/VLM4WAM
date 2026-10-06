@@ -9,7 +9,7 @@ from torch.utils.data import Dataset
 from ge_act.data.robofollow_schema import CAMERA_ORDER,read_episode,normalize,validate_stats,pad_frames
 
 class RoboFollowHDF5Dataset(Dataset):
-    def __init__(self,manifest_path,stat_file,split=None,train_dataset=True,sample_size=(192,256),chunk=9,action_chunk=54,n_previous=4,action_type='absolute',action_space='joint',valid_cam=CAMERA_ORDER,source_fps=30,fix_sidx=None,resize_mode='resize',native_size=(240,320),**kwargs):
+    def __init__(self,manifest_path,stat_file,split=None,train_dataset=True,sample_size=(192,256),chunk=9,action_chunk=54,n_previous=4,action_type='absolute',action_space='joint',valid_cam=CAMERA_ORDER,source_fps=30,fix_sidx=None,resize_mode='resize',native_size=(240,320),hold_pad=0,**kwargs):
         if action_type!='absolute' or action_space!='joint' or list(valid_cam)!=CAMERA_ORDER:raise ValueError('RoboFollow requires ordered three cameras and absolute joints')
         if chunk!=9 or action_chunk!=54 or n_previous!=4:raise ValueError('initial RoboFollow temporal contract is 4 history + 54 actions / 9 future frames')
         self.manifest_path=Path(manifest_path);self.manifest=json.loads(self.manifest_path.read_text())
@@ -19,6 +19,9 @@ class RoboFollowHDF5Dataset(Dataset):
         if not self.records:raise ValueError('empty selected split')
         if resize_mode not in ('resize','pad'):raise ValueError('resize_mode must be resize or pad')
         self.resize_mode=resize_mode;self.native_size=tuple(native_size)
+        # Training windows may start up to hold_pad steps past the last frame; frame_indices clamps
+        # them to the final pose, which teaches the policy to hold still after finishing.
+        self.hold_pad=int(hold_pad)
         self.train_dataset=train_dataset;self.sample_size=tuple(sample_size);self.fix_sidx=fix_sidx;self.epoch=0;self.source_fps=source_fps
         self.n_previous=n_previous;self.chunk=chunk;self.action_chunk=action_chunk;self.action_dim=14
         self.action_mean={'robofollow':torch.tensor(self.stats['action_mean'])};self.action_std={'robofollow':torch.tensor(self.stats['action_std'])}
@@ -34,7 +37,7 @@ class RoboFollowHDF5Dataset(Dataset):
         r=self.records[index];length=r['length']
         seed=int(hashlib.sha256(f"{self.manifest.get('seed',42)}:{self.epoch}:{r['identity']}".encode()).hexdigest()[:16],16)
         rng=np.random.default_rng(seed)
-        t=self.fix_sidx if self.fix_sidx is not None else (int(rng.integers(length)) if self.train_dataset else length//2)
+        t=self.fix_sidx if self.fix_sidx is not None else (int(rng.integers(length+self.hold_pad)) if self.train_dataset else length//2)
         frames,actions=self.frame_indices(t,length)
         e=read_episode(Path(r['path']),image_indices=frames)
         if e.schema!=r['schema'] or len(e.states)!=length or e.instructions!=r['instructions']:raise ValueError('episode no longer matches manifest')
