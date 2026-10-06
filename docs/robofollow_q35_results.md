@@ -52,6 +52,21 @@ Language dependence was measured as correct minus shuffled completion. Joint doe
 
 L1–L3 are on par with the other world-action models (FAST-WAM, Motus). The gap is in-distribution (L0).
 
+## Global batch 128 (text_p256_bs128 vs text_p256, correct instruction)
+
+`rf_text_p256_bs128`: same as `text_p256` but global batch 128 (4 per GPU × 16 GPUs × grad-accum 2, 2 nodes), lr 3e-5 unchanged, 20k optimizer steps (4× the samples). Same eval protocol (seed 42, 1 round, correct instruction only). Paired by task, 95% task-bootstrap CI on bs128 − bs32.
+
+| Level | n | intent bs128 / bs32 (diff) | exec bs128 / bs32 (diff) | completion bs128 / bs32 (diff) |
+|---|---|---|---|---|
+| L0 | 75 | 0.503 / 0.516 (−0.013 [−0.079, +0.049]) | 0.483 / 0.403 (**+0.080** [+0.001, +0.160]) | 0.507 / 0.373 (**+0.133** [+0.027, +0.240]) |
+| L1 | 86 | 0.234 / 0.248 (−0.014 [−0.076, +0.049]) | 0.160 / 0.193 (−0.033 [−0.085, +0.016]) | 0.128 / 0.116 (+0.012 [−0.047, +0.070]) |
+| L2 | 173 | 0.274 / 0.240 (+0.034 [−0.009, +0.076]) | 0.201 / 0.184 (+0.017 [−0.023, +0.057]) | 0.116 / 0.098 (+0.017 [−0.029, +0.064]) |
+| L3 | 220 | 0.225 / 0.196 (**+0.029** [+0.001, +0.057]) | 0.181 / 0.139 (**+0.043** [+0.014, +0.071]) | 0.091 / 0.059 (+0.032 [+0.000, +0.064]) |
+| L1–L3 | 479 | 0.244 / 0.221 (**+0.023** [+0.001, +0.046]) | 0.185 / 0.165 (+0.020 [−0.001, +0.041]) | 0.106 / 0.084 (+0.023 [−0.002, +0.048]) |
+| all | 554 | 0.279 / 0.261 (+0.018 [−0.003, +0.039]) | 0.225 / 0.197 (**+0.028** [+0.006, +0.049]) | 0.161 / 0.123 (**+0.038** [+0.011, +0.065]) |
+
+Larger batch mostly improves execution and completion; intent barely moves. Part of the L0 gain may be eval noise: a second text_p256 run on L0 (seed 1042, 2 rounds) reached completion 0.433 instead of 0.373. L0 failures at bs128 are still dominated by "arm left home again" (26/75 first intent failures).
+
 ## Why L0 is low: first failing stage on text_p256 (75 trials)
 
 - 17 (23%): the arm leaves home again after finishing (`stage3_finish: left arm left home again; gripper re-closed`). The evaluator always runs 10 calls × 50 actions = 500 steps, while training episodes have median length 190, so the policy restarts after completing.
@@ -63,7 +78,7 @@ Training budget is also small: 640k samples, an AgiBot-pretrained base and a fre
 
 ## Follow-ups running
 
-- `rf_text_p256_bs128` and `rf_joint_p256_bs128`: global batch 128 on 2 nodes, lr 3e-5, 20k steps.
+- `rf_joint_p256_bs128`: global batch 128 on 2 nodes, lr 3e-5, 20k steps (text_p256_bs128 is done, see above).
 - `rf_text_p256_bs128_hold`: identical to `rf_text_p256_bs128` except end-of-episode hold samples (`hold_pad: 80`). This targets the "leaves home again" failures.
 - Extra rounds for text_p256 and joint_p256 on L0 and L2 (seed 1042, 2 rounds, correct instruction) to tighten the CIs.
 - Speed: joint steps cost 1.03 s per microstep at 2 samples/GPU. Qwen planner forward takes 38%, DiT backward 41%, DiT forward 13%, SigLIP2 teacher 4%, VAE + T5 3%. Packing the three views into two Qwen rows (bitwise-identical outputs) removed a third of the Qwen rows.
