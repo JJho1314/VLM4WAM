@@ -66,7 +66,7 @@ def worker(slot, gpu, port, mode, args, tasks, out, failures, lock):
                     if dest.exists():
                         subprocess.run(['rm', '-rf', str(dest)])
                     cmd = [SIM_PY, '-m', 'robofollow.evaluate', '--scene', scene, '--tasks', task, '--rounds', str(args.rounds),
-                           '--base-seed', '42', '--max-steps', str(args.max_steps), '--actions-per-step', '50',
+                           '--base-seed', str(args.base_seed), '--max-steps', str(args.max_steps), '--actions-per-step', '50',
                            '--runtime', 'fixed', '--sim-steps', '15', '--gpu', str(gpu), '--remote', '--host', '127.0.0.1',
                            '--port', str(port), '--output', str(dest)]
                     with open(logdir / f'sim_{mode}_{scene}_{task}.log', 'w') as elog:
@@ -110,7 +110,7 @@ def main():
     p.add_argument('--levels', default='L0,L1,L2,L3'); p.add_argument('--scenes', default=','.join(SCENES))
     p.add_argument('--rounds', type=int, default=10); p.add_argument('--max-steps', type=int, default=10)
     p.add_argument('--slots-per-gpu', type=int, default=3); p.add_argument('--gpus', type=int, default=0)
-    p.add_argument('--limit', type=int, default=0)
+    p.add_argument('--limit', type=int, default=0); p.add_argument('--base-seed', type=int, default=42)
     args = p.parse_args()
     import yaml
     c = yaml.safe_load(open(args.config))
