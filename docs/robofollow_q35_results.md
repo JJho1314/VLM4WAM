@@ -67,17 +67,22 @@ L1–L3 are on par with the other world-action models (FAST-WAM, Motus). The gap
 
 Larger batch mostly improves execution and completion; intent barely moves. Part of the L0 gain may be eval noise: a second text_p256 run on L0 (seed 1042, 2 rounds) reached completion 0.433 instead of 0.373. L0 failures at bs128 are still dominated by "arm left home again" (26/75 first intent failures).
 
-## Joint vs text at global batch 128 (L0, L1)
+## Joint vs text at global batch 128 (L0–L3)
 
-`rf_joint_p256_bs128`: `joint_p256` trained like `rf_text_p256_bs128` (global batch 128 on 2 nodes, lr 3e-5, 20k steps). Correct instruction, seed 42, 1 round. Paired by task, 95% task-bootstrap CI on joint − text. L2 and L3 are still running.
+`rf_joint_p256_bs128`: `joint_p256` trained like `rf_text_p256_bs128` (global batch 128 on 2 nodes, lr 3e-5, 20k steps). All 554 tasks, correct instruction, seed 42, 1 round. Paired by task, 95% task-bootstrap CI on joint − text (both at batch 128).
 
 | Level | n | intent joint / text (diff) | exec joint / text (diff) | completion joint / text (diff) |
 |---|---|---|---|---|
 | L0 | 75 | 0.608 / 0.503 (**+0.105** [+0.029, +0.184]) | 0.505 / 0.483 (+0.023 [−0.068, +0.109]) | 0.493 / 0.507 (−0.013 [−0.133, +0.093]) |
 | L1 | 86 | 0.249 / 0.234 (+0.015 [−0.045, +0.073]) | 0.199 / 0.160 (+0.038 [−0.014, +0.090]) | 0.151 / 0.128 (+0.023 [−0.035, +0.081]) |
-| L0+L1 | 161 | 0.416 / 0.359 (**+0.057** [+0.009, +0.108]) | 0.342 / 0.311 (+0.031 [−0.018, +0.081]) | 0.311 / 0.304 (+0.006 [−0.056, +0.068]) |
+| L2 | 173 | 0.318 / 0.274 (**+0.045** [+0.004, +0.087]) | 0.268 / 0.201 (**+0.067** [+0.027, +0.108]) | 0.139 / 0.116 (+0.023 [−0.023, +0.069]) |
+| L3 | 220 | 0.228 / 0.225 (+0.003 [−0.030, +0.036]) | 0.204 / 0.181 (+0.022 [−0.010, +0.055]) | 0.086 / 0.091 (−0.005 [−0.036, +0.027]) |
+| L1–L3 | 479 | 0.265 / 0.244 (+0.020 [−0.003, +0.044]) | 0.226 / 0.185 (**+0.041** [+0.019, +0.064]) | 0.117 / 0.106 (+0.010 [−0.013, +0.035]) |
+| all | 554 | 0.311 / 0.279 (**+0.032** [+0.009, +0.054]) | 0.264 / 0.225 (**+0.039** [+0.017, +0.062]) | 0.168 / 0.161 (+0.007 [−0.018, +0.032]) |
 
-Against joint at batch 32 on L0+L1: intent +0.069 [+0.020, +0.120], exec +0.075 [+0.022, +0.129], completion +0.043 [−0.019, +0.106].
+Against joint at batch 32 (all 554 tasks): intent +0.041 [+0.017, +0.065], exec +0.062 [+0.039, +0.084], completion +0.020 [−0.007, +0.047].
+
+At batch 128 the semantic planner improves intent (which object, which arm, which target) and execution on L0 and L2, and over all tasks. Completion is unchanged: the extra correct intents do not turn into more fully finished tasks. Partial results during the run showed a significant L3 intent drop (−0.071 with 76 L3 tasks); it disappeared once all 220 L3 tasks were in (+0.003).
 
 L0 failure structure (75 trials each):
 - Wrong object at first close (first exec failure): joint 8, text 14. This matches the intent gain.
@@ -106,6 +111,6 @@ Training budget is also small: 640k samples, an AgiBot-pretrained base and a fre
 
 ## Follow-ups running
 
-- `rf_joint_p256_bs128`: L2 and L3 eval running.
-- Extra rounds for text_p256 and joint_p256 on L0 and L2 (seed 1042, 2 rounds, correct instruction) to tighten the CIs.
+- Extra rounds for text_p256 (done) and joint_p256 (running) on L0 and L2 (seed 1042, 2 rounds, correct instruction) to tighten the CIs.
+- Hold-sample L2 and L3 eval (paused at 208/393).
 - Speed: joint steps cost 1.03 s per microstep at 2 samples/GPU. Qwen planner forward takes 38%, DiT backward 41%, DiT forward 13%, SigLIP2 teacher 4%, VAE + T5 3%. Packing the three views into two Qwen rows (bitwise-identical outputs) removed a third of the Qwen rows.
