@@ -67,6 +67,23 @@ L1–L3 are on par with the other world-action models (FAST-WAM, Motus). The gap
 
 Larger batch mostly improves execution and completion; intent barely moves. Part of the L0 gain may be eval noise: a second text_p256 run on L0 (seed 1042, 2 rounds) reached completion 0.433 instead of 0.373. L0 failures at bs128 are still dominated by "arm left home again" (26/75 first intent failures).
 
+## Joint vs text at global batch 128 (L0, L1)
+
+`rf_joint_p256_bs128`: `joint_p256` trained like `rf_text_p256_bs128` (global batch 128 on 2 nodes, lr 3e-5, 20k steps). Correct instruction, seed 42, 1 round. Paired by task, 95% task-bootstrap CI on joint − text. L2 and L3 are still running.
+
+| Level | n | intent joint / text (diff) | exec joint / text (diff) | completion joint / text (diff) |
+|---|---|---|---|---|
+| L0 | 75 | 0.608 / 0.503 (**+0.105** [+0.029, +0.184]) | 0.505 / 0.483 (+0.023 [−0.068, +0.109]) | 0.493 / 0.507 (−0.013 [−0.133, +0.093]) |
+| L1 | 86 | 0.249 / 0.234 (+0.015 [−0.045, +0.073]) | 0.199 / 0.160 (+0.038 [−0.014, +0.090]) | 0.151 / 0.128 (+0.023 [−0.035, +0.081]) |
+| L0+L1 | 161 | 0.416 / 0.359 (**+0.057** [+0.009, +0.108]) | 0.342 / 0.311 (+0.031 [−0.018, +0.081]) | 0.311 / 0.304 (+0.006 [−0.056, +0.068]) |
+
+Against joint at batch 32 on L0+L1: intent +0.069 [+0.020, +0.120], exec +0.075 [+0.022, +0.129], completion +0.043 [−0.019, +0.106].
+
+L0 failure structure (75 trials each):
+- Wrong object at first close (first exec failure): joint 8, text 14. This matches the intent gain.
+- Wrong-arm participation: 3 for both. It was 19 for joint at batch 32.
+- Most remaining joint failures come after the task is done: gripper re-closed after completion (12) and an arm leaving home again (13). Text has 26 "left home again".
+
 ## End-of-episode hold samples (text_p256_bs128_hold vs text_p256_bs128, L0)
 
 `rf_text_p256_bs128_hold` is `rf_text_p256_bs128` plus `hold_pad: 80`: training start frames are drawn up to 80 frames past the episode end, where frames and actions repeat the final state (about 35% of samples). It targets the "arm leaves home again" failures.
@@ -89,6 +106,6 @@ Training budget is also small: 640k samples, an AgiBot-pretrained base and a fre
 
 ## Follow-ups running
 
-- `rf_joint_p256_bs128`: global batch 128 on 2 nodes, lr 3e-5, 20k steps (text_p256_bs128 is done, see above).
+- `rf_joint_p256_bs128`: L2 and L3 eval running.
 - Extra rounds for text_p256 and joint_p256 on L0 and L2 (seed 1042, 2 rounds, correct instruction) to tighten the CIs.
 - Speed: joint steps cost 1.03 s per microstep at 2 samples/GPU. Qwen planner forward takes 38%, DiT backward 41%, DiT forward 13%, SigLIP2 teacher 4%, VAE + T5 3%. Packing the three views into two Qwen rows (bitwise-identical outputs) removed a third of the Qwen rows.
