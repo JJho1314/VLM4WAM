@@ -45,9 +45,9 @@ The seed-42 round was extended with two more rounds per task (seed 1042) for joi
 | Level | n | intent joint / text (diff) | exec joint / text (diff) | completion joint / text (diff) |
 |---|---|---|---|---|
 | L0 | 75 | 0.484 / 0.507 (−0.023 [−0.063, +0.016]) | 0.414 / 0.434 (−0.020 [−0.069, +0.028]) | 0.431 / 0.413 (+0.018 [−0.049, +0.084]) |
-| L2 | 173 | 0.266 / 0.240 (+0.026 [+0.000, +0.053]) | 0.203 / 0.186 (+0.017 [−0.008, +0.044]) | 0.115 / 0.096 (+0.018 [−0.016, +0.054]) |
+| L2 | 173 | 0.268 / 0.240 (+0.028 [+0.002, +0.055]) | 0.203 / 0.186 (+0.017 [−0.008, +0.044]) | 0.115 / 0.096 (+0.018 [−0.016, +0.054]) |
 
-The seed-42 round alone overstated the batch-32 effect: the L2 intent gain shrinks from +0.050 to +0.026 (borderline), and the L0 completion gain from +0.067 to +0.018. The seed-1042 rounds alone give L2 intent +0.015 [−0.016, +0.047]. At batch 32 the semantic planner gives at most a small L2 intent gain; the clearer evidence is at batch 128 (below).
+The seed-42 round alone overstated the batch-32 effect: the L2 intent gain shrinks from +0.050 to +0.028 (borderline), and the L0 completion gain from +0.067 to +0.018. The seed-1042 rounds alone give L2 intent +0.015 [−0.016, +0.047]. At batch 32 the semantic planner gives at most a small L2 intent gain; the clearer evidence is at batch 128 (below).
 
 ## Comparison with the official Intent Score (IS, %)
 
