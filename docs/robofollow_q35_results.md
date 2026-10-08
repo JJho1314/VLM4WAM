@@ -38,6 +38,17 @@ Language dependence was measured as correct minus shuffled completion. Joint doe
 - Completion gains are positive but not significant with one round. Execution (grasp/place), not target choice, limits completion.
 - The two resolutions are equivalent for the text baseline. 256×320 was kept for the bs128 runs because joint's completion gain looked larger there.
 
+### Three rounds per task (p256, L0 and L2)
+
+The seed-42 round was extended with two more rounds per task (seed 1042) for joint_p256 and text_p256 on L0 and L2. Each task is averaged over its 3 rounds before pairing.
+
+| Level | n | intent joint / text (diff) | exec joint / text (diff) | completion joint / text (diff) |
+|---|---|---|---|---|
+| L0 | 75 | 0.484 / 0.507 (−0.023 [−0.063, +0.016]) | 0.414 / 0.434 (−0.020 [−0.069, +0.028]) | 0.431 / 0.413 (+0.018 [−0.049, +0.084]) |
+| L2 | 173 | 0.266 / 0.240 (+0.026 [+0.000, +0.053]) | 0.203 / 0.186 (+0.017 [−0.008, +0.044]) | 0.115 / 0.096 (+0.018 [−0.016, +0.054]) |
+
+The seed-42 round alone overstated the batch-32 effect: the L2 intent gain shrinks from +0.050 to +0.026 (borderline), and the L0 completion gain from +0.067 to +0.018. The seed-1042 rounds alone give L2 intent +0.015 [−0.016, +0.047]. At batch 32 the semantic planner gives at most a small L2 intent gain; the clearer evidence is at batch 128 (below).
+
 ## Comparison with the official Intent Score (IS, %)
 
 | Policy | L0 | L1 | L2 | L3 |
@@ -111,6 +122,6 @@ Training budget is also small: 640k samples, an AgiBot-pretrained base and a fre
 
 ## Follow-ups running
 
-- Extra rounds for text_p256 (done) and joint_p256 (running) on L0 and L2 (seed 1042, 2 rounds, correct instruction) to tighten the CIs.
+- Shuffled-instruction L0 and L2 evals for text_p256_bs128 and joint_p256_bs128, to compare their language dependence.
 - Hold-sample L2 and L3 eval (paused at 208/393).
 - Speed: joint steps cost 1.03 s per microstep at 2 samples/GPU. Qwen planner forward takes 38%, DiT backward 41%, DiT forward 13%, SigLIP2 teacher 4%, VAE + T5 3%. Packing the three views into two Qwen rows (bitwise-identical outputs) removed a third of the Qwen rows.
