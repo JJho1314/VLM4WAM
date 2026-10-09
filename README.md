@@ -5,7 +5,7 @@
 - **权威工作目录**：`/data/user/jhe724/workspace/VLM4WAM_robofollow_official3750`
 - **登录**：`ssh jhe724@hpc3login.hpc.hkust-gz.edu.cn`，使用域名，不固定旧 IP。
 - **当前配置**：3,750 episodes / 75 tasks × 50，53,000 optimizer steps，global batch 128，action chunk 32，2 nodes / 16 GPUs，`acd_u`。
-- **2026-10-09 状态快照**：作业 `704659` 已提交，最后核验为 `PENDING (Resources)`；没有该次训练的新 benchmark 结果。实时状态以 `squeue` 为准。
+- **2026-10-09 状态快照**：作业 `704659` 已提交，最后核验为 `PENDING (Priority)`；没有该次训练的新 benchmark 结果。实时状态以 `squeue` 为准。
 
 ## 从这里开始
 

@@ -20,8 +20,8 @@
 ## Tasks
 - [x] Capture Git history and source inventories from all three Ola worktrees and HPC3.
 - [x] Assemble active code, archive divergent old source, summarize results and operational lessons.
-- [ ] Restore independent repository on HPC3; run relevant tests and compare deployed training files.
-- [ ] Review publication contents, commit and push a dedicated GitHub branch; verify remote commit.
+- [x] Restore independent repository on HPC3; run relevant tests and compare deployed training files.
+- [x] Review publication contents, commit and push a dedicated GitHub branch; verify remote commit.
 
 ## Execution evidence
 
@@ -33,3 +33,5 @@
 - Common credential/private-key pattern scan clean; archival whitespace preserved byte-for-byte.
 - Reviewer verified source recovery, frozen hashes and honest result/status documentation; archive test collection finding fixed.
 - Existing tracked reference PDFs remain in their existing history; no new datasets, weights, runtime environments or secrets added.
+
+- HPC3 independent .git installed; clean tracked working tree, frozen deployment hashes and 6,351 source mappings verified remotely. GitHub consolidation branch published successfully. Job 704659 remains pending (Priority).
