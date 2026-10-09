@@ -1,5 +1,6 @@
 """Build immutable training-domain manifests and train-only statistics."""
 import argparse
+from collections import Counter
 import hashlib
 import json
 from pathlib import Path
@@ -36,7 +37,9 @@ def assign_splits(episodes, seed):
         row['split_group']=key
         row['split']='dev' if int(hashlib.sha256(f'{seed}:{key}'.encode()).hexdigest()[:8],16)%5==0 else 'train'
 
-def build_manifest(root: Path, output: Path, seed: int=42, training_registry=None) -> dict:
+def build_manifest(root: Path, output: Path, seed: int=42, training_registry=None, official_full_train=False) -> dict:
+    if official_full_train and training_registry is None:
+        raise ValueError('official full training requires the official training registry')
     result={'image_validation':'all usable frames, streaming RGB decode','version':2,'split_policy':'connected task/instruction and joint-trajectory groups','seed':seed,'root':str(Path(root).resolve()),'camera_order':CAMERA_ORDER,'joint_order':JOINT_ORDER,'episodes':[],'duplicates':[],'quarantine':[]}
     seen={}; identities={}
     for p in sorted(Path(root).glob('**/data/episode*.hdf5')):
@@ -53,7 +56,9 @@ def build_manifest(root: Path, output: Path, seed: int=42, training_registry=Non
             content=hashlib.sha256(e.states.tobytes()+e.actions.tobytes()+json.dumps(e.instructions).encode()+image_hash.encode()).hexdigest()
             identity=':'.join(e.identity)
             if content in seen or identity in identities:
-                result['duplicates'].append({'path':str(p),'same_as':seen.get(content,identities.get(identity))});continue
+                result['duplicates'].append({'path':str(p),'same_as':seen.get(content,identities.get(identity))})
+                if not official_full_train:continue
+                if identity in identities:raise ValueError('duplicate official episode identity')
             seen[content]=str(p);identities[identity]=str(p)
             group=f'{scene}:{task}:'+json.dumps(sorted(e.instructions))
             split='dev' if int(hashlib.sha256(f'{seed}:{group}'.encode()).hexdigest()[:8],16)%5==0 else 'train'
@@ -63,7 +68,16 @@ def build_manifest(root: Path, output: Path, seed: int=42, training_registry=Non
         if (len(result['episodes'])+len(result['quarantine'])+len(result['duplicates']))%100==0:
             print(f"scanned {len(result['episodes'])} usable episodes",flush=True)
     if not result['episodes']:raise ValueError('no usable episodes')
-    assign_splits(result['episodes'],seed)
+    if official_full_train:
+        expected=Counter({(scene,task):50 for scene,tasks in training_registry.items() for task in tasks})
+        actual=Counter((row['scene'],row['task']) for row in result['episodes'])
+        if result['quarantine'] or actual!=expected:
+            raise ValueError(f'official training requires exactly 50 valid episodes per registered task: missing={dict(expected-actual)}, extra={dict(actual-expected)}, quarantine={len(result["quarantine"])}')
+        # Official episode membership is preserved even when two files contain identical demonstrations.
+        for row in result['episodes']:row['split']='train'
+        result['split_policy']='official full training: 50 episodes per task; no internal holdout'
+        result['duplicates_policy']='retained official episode files; duplicates are audit records only'
+    else:assign_splits(result['episodes'],seed)
     write_json(output,result)
     return result
 
@@ -88,9 +102,9 @@ def official_training_registry(root):
     return {scene:training(scene)[1] for scene in ('scene1','scene2','scene3','scene4')}
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--root',required=True);p.add_argument('--output',required=True);p.add_argument('--robofollow-root',default='/data/users/junjie/workspace/robofollow/RoboTwin');p.add_argument('--stats-only',action='store_true');a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--root',required=True);p.add_argument('--output',required=True);p.add_argument('--robofollow-root',default='/data/users/junjie/workspace/robofollow/RoboTwin');p.add_argument('--stats-only',action='store_true');p.add_argument('--official-full-train',action='store_true');a=p.parse_args()
     out=Path(a.output)
-    if not a.stats_only:build_manifest(Path(a.root),out/'manifest.json',training_registry=official_training_registry(a.robofollow_root))
+    if not a.stats_only:build_manifest(Path(a.root),out/'manifest.json',training_registry=official_training_registry(a.robofollow_root),official_full_train=a.official_full_train)
     compute_statistics(out/'manifest.json',out/'stats.json')
     print('manifest and train-only statistics ready',flush=True)
 if __name__=='__main__':main()

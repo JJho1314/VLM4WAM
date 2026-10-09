@@ -5,7 +5,8 @@ from types import SimpleNamespace
 class Probe:
     def predict(self,images,instructions):
         assert len(instructions)==len(images)
-        assert instructions==['left']*3+['right']*3
+        assert instructions==['left']*2+['right']*2
+        torch.testing.assert_close(images[:,:,0,0,0],torch.tensor([[11,22],[33,33],[44,55],[66,66]],dtype=torch.uint8))
         v=images[:,:,0,0,0].float()
         return SimpleNamespace(tokens=v[:,:,None,None,None].expand(-1,-1,4,256,1024))
 

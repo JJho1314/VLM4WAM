@@ -125,3 +125,61 @@ Training budget is also small: 640k samples, an AgiBot-pretrained base and a fre
 - Shuffled-instruction L0 and L2 evals for text_p256_bs128 and joint_p256_bs128, to compare their language dependence.
 - Hold-sample L2 and L3 eval (paused at 208/393).
 - Speed: joint steps cost 1.03 s per microstep at 2 samples/GPU. Qwen planner forward takes 38%, DiT backward 41%, DiT forward 13%, SigLIP2 teacher 4%, VAE + T5 3%. Packing the three views into two Qwen rows (bitwise-identical outputs) removed a third of the Qwen rows.
+
+## Official full training protocol (2026-10-08)
+
+The next baseline uses all 75 official L0 training tasks, 50 demonstrations per task (3,750 episodes). The old internal development set is now included in training; L1–L3 benchmark evaluation episodes remain evaluation-only. The previous 2,896-train / 850-dev manifest remains unchanged for old-run reproducibility.
+
+Four scene4 yellow-cylinder episodes excluded by an earlier action-only duplicate check were restored: their actions match another task's episodes but their images differ. Full manifests preserve all official episode identities and fail if any task has fewer than 50 valid demonstrations. All retained files match the previously completed all-frame audit, and all frames of the four restored files were independently decoded. Normalization statistics were recomputed from all 3,750 episodes (677,823 joint state/action pairs).
+
+Source manifest: `/data/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_q35/data_official3750/manifest.json`, SHA256 `a52284ae05690089b680aad57226f3ab50051dc2fd94bebd961598f4321b4a8a`. Coverage and image-audit provenance are saved alongside it.
+
+The Accelerate skipped-loader epoch reset was reproduced and fixed in the shared trainer: the newly created epoch loader now receives the current epoch before iteration. Related data, loading and epoch tests passed (27 tests).
+
+Planned baseline: `q35_text_p256_official3750_30k_hpc3.yaml`, fresh base initialization, 30,000 optimizer updates, 1 node / 8 GPUs, 4 samples/GPU and accumulation 4 (global batch 128), LR 3e-5. HPC3 snapshot: `/data/user/jhe724/workspace/VLM4WAM_robofollow_official3750`. Full data destination: `/data/user/jhe724/datasets/RoboFollow-official3750`; hashes are verified for every HDF5 and instruction JSON file before publishing `DATA_READY`.
+
+At preparation time both HPC3 Slurm controllers were DOWN, so no new training job or result exists yet. Background data transfer and a guarded submission waiter run on the Mac as LaunchAgents; after data/config verification and scheduler recovery the waiter resolves jhe724's live Slurm default account and submits exactly one baseline. Live state is in the snapshot's `.agent/official3750/jobid` and the Mac logs under `~/.local/state/robofollow-official3750/`.
+
+Update during preparation: the primary controller returned UP, but live `sinfo` exposes only the CPU management partition `mgt`. GPU partition `acd_u` remains absent, so training is still blocked. The submission waiter explicitly requires an UP GPU partition plus successful `sbatch --test-only`; it never submits GPU training to management nodes. The first migrated task (50 HDF5 + 50 instruction JSON files) passed target SHA256 verification. HPC3 CPU runtime imports and the vendored RGB codec passed verification.
+
+Additional source-data smoke check passed: five real padded batches, one from each scene plus restored yellow-cylinder episode2, have video shape `[3,3,13,256,320]`, actions `[58,14]`, state `[1,14]`, finite values and nonempty captions. Offline submission guard checks passed for missing data, scheduler outage, missing GPU partition, unavailable account, rejected resources and existing job ID. Transfer/submission logs must be checked for current completion; setup does not mean training has started.
+
+## Two-node / 32-action baseline revision (2026-10-08)
+
+The user requested two nodes and a shorter action chunk. Both new full-data configs now predict and execute 32 absolute-joint actions per observation, with four history frames/actions spaced by 32 actions. The loader yields 36 action rows; only the last 32 are future targets. Nine future visual samples are retained for the existing six-latent-frame VAE/planner contract and selected at action offsets 3, 7, 10, 14, 17, 21, 24, 28, 31. Effective sampled-video FPS is 4.6875 from the 250/15 source control rate. Action statistics and the 3,750 raw episodes are unchanged.
+
+The fresh text baseline uses 2 nodes / 16 GPUs, per-device batch 4, accumulation 2, global batch 128 and 30,000 optimizer steps. Each Slurm node launches eight workers with its own node rank and a shared master endpoint. Output: `/data/user/jhe724/outputs/robofollow_q35/official3750_text_30k_ac32_bs128`. The joint configuration receives the same timing/batch changes but is not submitted as an additional concurrent job.
+
+For this campaign use the official evaluator with `--max-steps 16 --actions-per-step 32`; the policy's configured 500-action budget returns 32 actions for the first 15 calls and 20 on the final call. The evaluator already accepts variable-length action sequences; scoring code is unchanged. Ten 32-action calls would shorten the episode budget to 320 and must not be compared as an equivalent run. Old 54-action checkpoints have a different history-stride contract and cannot be silently used with this configuration. The existing complete-v3 autoresearch ledger/evaluation manifest is unchanged; these full-data baselines are a separate campaign.
+
+No GPU training or benchmark gain is claimed by this configuration change. Live job/data status remains authoritative in `.agent/official3750/jobid` and the transfer/submission logs.
+
+Verification for this revision: 36 data/policy/checkpoint/epoch/FPS tests passed on both Ola and the HPC3 snapshot. Two valid node ranks, three invalid allocation guards and six guarded submission paths passed without starting workers or submitting a job. Full 16-GPU distributed training and benchmark rollout remain unverified until GPU resources return.
+
+Five real 32-action padded samples also passed: one from each scene and restored scene4 yellow-cylinder episode2; video `[3,3,13,256,320]`, actions `[36,14]`, state `[1,14]`, finite values and nonempty captions.
+
+## Direct HPC3 data download (2026-10-08)
+
+The user requested direct downloading instead of relaying all HDF5 data through the Mac/VPN. HPC3 cannot reach huggingface.co reliably and hf-mirror file downloads timed out. Official Hugging Face file CDN `us.aws.cdn.hf.co` is reachable: eight pinned-revision files totaling 105,137,222 bytes downloaded directly on HPC3 in 82.1 seconds (1.28 MB/s aggregate), with all SHA256 values matching the independently audited source manifest. This small probe does not establish the sustained full-dataset speed. HPC3 curl 7.61.1 rejected `--retry-all-errors`; removing that unsupported flag fixed the network probe.
+
+The background transfer LaunchAgent now runs `transfer_direct.py`, resolving temporary CDN URLs for revision `bbb1e266ed585f1557773de5a3f1e3b4cd944f97`. HPC3's `.agent/official3750/download_task.py` downloads eight HDF5 files concurrently, reuses valid existing files, resumes partial downloads, checks SHA256 and atomically publishes each verified file. Only small instruction JSON files and control messages pass through the Mac. All 3,750 HDF5 and instruction files must pass verification before the existing `DATA_READY` guard can enable submission. Three downloader checks passed (reuse, corruption/atomic replacement, and path/URL boundary).
+
+The old relay job was stopped and its script/log retained. Current download log: `~/.local/state/robofollow-official3750/transfer-direct.log`. The Mac must still stay online for link resolution, tiny annotation transfers and the existing guarded submitter; this is not a fully Mac-independent downloader. Training code fingerprints remain unchanged. Live GPU partition recovery is still required before the two-node/16-GPU baseline can start.
+
+## HPC3 download concurrency tuning (2026-10-08)
+
+In response to the request for faster download, the live download worker was atomically updated from 8 to 24 connections; the Mac coordinator and training code were not restarted. Recent 8-worker complete batches measured 3.79, 5.68 and 3.99 MB/s. The first 24-worker batch measured 592,131,835 bytes in 302.6 seconds (1.96 MB/s): three slow connections dominated completion time, so concurrency alone has not established a speedup. An initial 64KB/s / 15-second cutoff caused curl timeout on a few files; the existing task retry retained 47 verified files and recovered the remaining files.
+
+The final worker uses separate curl invocations for up to five attempts, recalculating the resume offset each time, with a 60-second request limit and a 16KB/s / 20-second slow-connection threshold. This avoids curl internal retries discarding new partial progress. SHA256 and atomic publication remain required. A regression test reproducing timeout followed by resumed completion failed before the fix and passed afterward; all four downloader checks pass on Mac and HPC3. The final retry policy takes effect at the next worker invocation. Sustained throughput improvement is still unverified. Background transfer continues; 31 tasks / 1,550 episodes were fully verified at recording time.
+
+## Official3750 baseline extended to 53,000 steps (2026-10-09)
+
+The user requested 53,000 optimizer steps, approximately ten equivalent passes over 677,823 time-start positions at nominal global batch 128. The active text baseline now uses `q35_text_p256_official3750_53k_hpc3.yaml` and output `/data/user/jhe724/outputs/robofollow_q35/official3750_text_53k_ac32_bs128`. The old 30k configurations remain historical; the joint configuration was not changed. The launcher, Slurm job/log names, data preflight, submission message and code fingerprints were updated together. Two nodes / 16 GPUs, action chunk 32 and checkpoint interval 2,500 remain configured; the trainer also saves the final step 53,000 checkpoint.
+
+The existing submission service was stopped during the update after confirming no job ID or submission intent. All prior code fingerprints matched. Launcher and six submission-guard checks passed; HPC3 verified new fingerprints, full manifest/statistics and five real training samples with the 53k configuration. The Mac automatic submission service was restarted and repeats preflight before waiting for GPU availability. The dataset is fully verified; GPU execution is not yet validated.
+
+## HPC3-native automatic submission (2026-10-09)
+
+The submission watcher now runs entirely on HPC3 / jhe724 in `/data/user/jhe724/workspace/VLM4WAM_robofollow_official3750`, using tmux session `rf3750-submit` on ACD-Manage-2. It invokes local Slurm commands, not SSH through Mac. The Mac LaunchAgent `com.junjie.robofollow.official3750.submit` was removed. The watcher is protected by `watcher.lock`; existing `submit.lock`, durable SUBMITTING intent and jobid guards prevent duplicate submission.
+
+Log: `.agent/official3750/submit-hpc3.log`. The watcher checks every 300 seconds for partition `acd_u`; after code/data preflight and resource validation it submits the 53,000-step baseline using two nodes / 16 GPUs, global batch 128 and action chunk 32. Both local and HPC3 runs passed all six submission-guard checks. Detached tmux process ancestry was verified; it does not require the Mac, VPN or SSH session to stay alive. A login-host restart would terminate tmux and require restarting the watcher; a successfully submitted Slurm job is managed by Slurm independently.

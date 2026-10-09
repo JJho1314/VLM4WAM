@@ -1,0 +1,11 @@
+BATON_TEACHER_PREPROCESSING_HASH=fe8ffab6303ce1cf1a1f8aa8a965ff604045004cd3c2d3a6cb53e0f75d201d17
+BATON_OUTPUT_DIR=/data/users/junjie/workspace/hpc3_jhe724/outputs/qwen35dual_stage2_teacher
+BATON_HDF5_MANIFEST_PATH=/data/users/junjie/workspace/hpc3_jhe724/junjie/datasets/LIBERO-fastwam-hdf5/manifest.json
+BATON_SIGLIP2_ARTIFACT_HASH=fe8ffab6303ce1cf1a1f8aa8a965ff604045004cd3c2d3a6cb53e0f75d201d17
+BATON_SIGLIP2_MODEL_PATH=/data/users/junjie/workspace/hpc3_jhe724/junjie/weights/siglip2-large-patch16-256
+BATON_STAT_FILE=/data/users/junjie/workspace/VLM4WAM_baton/ge_act/configs/ltx_model/libero/libero_fastwam_mix.json
+BATON_GRADIENT_ACCUMULATION_STEPS=16
+BATON_SIGLIP2_CONFIG_HASH=172e39dbf0143b8fe22d2f08921730eb8c397967e58cb37d133161e28aa34104
+BATON_PER_DEVICE_BATCH=1
+BATON_GE_BASE_CHECKPOINT=/data/users/junjie/workspace/hpc3_jhe724/junjie/weights/Genie-Envisioner/GE_base_fast_actinterp.safetensors
+BATON_LTX_PRETRAINED_PATH=/data/users/junjie/workspace/hpc3_jhe724/junjie/weights/LTX-Video

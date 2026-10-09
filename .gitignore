@@ -91,3 +91,12 @@ scratch_*/
 
 # Isolated implementation worktrees
 .worktrees/
+
+# Local Pixi environments and OS metadata
+.pixi/
+.DS_Store
+._*
+.env
+.env.*
+*.pem
+*.key

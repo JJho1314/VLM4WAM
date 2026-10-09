@@ -1,3 +1,5 @@
+> **2026-10-09 汇总说明：以下为历史开发协议。** 当前权威目录已迁入 HPC3；官方全量 53k baseline、资源约束与实际状态见 [项目 README](../README.md) 和 [研究总结](../docs/HPC3_ROBOFOLLOW_SUMMARY.md)。下文 Ola 路径、内部 train/dev、短步数和预算保留作历史证据；不要据此启动旧循环。
+
 # RoboFollow 优先的 autoresearch
 
 目标是提高真实部署时的指令遵循能力。以官方严格 Intent 为主指标，Execution 和 task-macro CR 为非退化约束；正确/打乱指令使用相同任务、round、seed 和 scorer 目标，语言差值作为诊断。局部开发分数不能称为完整 benchmark 分数。

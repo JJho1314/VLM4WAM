@@ -67,6 +67,31 @@ def test_statistics_train_only_roundtrip(tmp_path):
     np.testing.assert_allclose(denormalize(normalize(x,s,'action'),s,'action'),x,atol=1e-5)
     assert s['action_type']=='absolute' and s['camera_order']==['head','left_wrist','right_wrist']
 
+def test_official_training_keeps_all_fifty_episodes_per_task(tmp_path):
+    import shutil
+    from autoresearch.preflight import build_manifest, compute_statistics
+    registry={'scene1': {'a': ['pick yellow'], 'b': ['pick blue']}}
+    for task, instructions in registry['scene1'].items():
+        first=episode(tmp_path/'scene1'/task/'data'/'episode0.hdf5',
+                      instruction=instructions[0],offset=0 if task=='a' else 10)
+        for i in range(1,50):shutil.copyfile(first,first.with_name(f'episode{i}.hdf5'))
+    mp=tmp_path/'manifest.json'
+    m=build_manifest(tmp_path,mp,training_registry=registry,official_full_train=True)
+    assert len(m['episodes'])==100
+    assert {r['split'] for r in m['episodes']}=={'train'}
+    assert len({r['identity'] for r in m['episodes']})==100
+    s=compute_statistics(mp,tmp_path/'stats.json')
+    assert s['num_pairs']==300 and s['state_mean'][0]==6
+
+def test_official_training_rejects_incomplete_task(tmp_path):
+    from autoresearch.preflight import build_manifest
+    episode(tmp_path/'scene1'/'a'/'data'/'episode0.hdf5')
+    with pytest.raises(ValueError,match='50'):
+        build_manifest(tmp_path,tmp_path/'manifest.json',
+                       training_registry={'scene1':{'a':['pick yellow']}},
+                       official_full_train=True)
+    assert not (tmp_path/'manifest.json').exists()
+
 
 def test_missing_camera_rejected(tmp_path):
     from ge_act.data.robofollow_schema import read_episode
@@ -93,6 +118,24 @@ def test_loader_returns_generic_batch_and_repeat_history(tmp_path):
 def test_history_matches_fifty_action_rollout_stride():
     from ge_act.data.robofollow_hdf5_dataset import RoboFollowHDF5Dataset
     assert RoboFollowHDF5Dataset.frame_indices(200,400)[0][:4]==[50,100,150,200]
+
+def test_thirty_two_action_windows_keep_video_and_history_aligned(tmp_path):
+    from autoresearch.preflight import build_manifest,compute_statistics
+    from ge_act.data.robofollow_hdf5_dataset import RoboFollowHDF5Dataset
+    episode(tmp_path/'scene1'/'task'/'data'/'episode0.hdf5',n=240)
+    mp=tmp_path/'manifest.json';sp=tmp_path/'stats.json'
+    m=build_manifest(tmp_path,mp);m['episodes'][0]['split']='train'
+    mp.write_text(json.dumps(m));compute_statistics(mp,sp)
+    d=RoboFollowHDF5Dataset(mp,sp,action_chunk=32,fix_sidx=200,sample_size=[32,32])
+    frames,actions=d.frame_indices(200,239,action_chunk=32,history_action_stride=32)
+    assert frames[:4]==[104,136,168,200]
+    assert frames[4:]==[203,207,210,214,217,221,224,228,231]
+    assert actions==frames[:4]+list(range(200,232))
+    b=d[0]
+    assert b['video'].shape==(3,3,13,32,32) and b['actions'].shape==(36,14)
+    from ge_act.data.robofollow_schema import denormalize
+    target=denormalize(b['actions'].numpy(),d.stats,'action')
+    np.testing.assert_allclose(target[-32:,0],np.arange(201,233),atol=1e-4)
 
 def test_loader_rejects_stats_from_another_manifest(tmp_path):
     from autoresearch.preflight import build_manifest,compute_statistics

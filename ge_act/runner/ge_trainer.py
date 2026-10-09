@@ -556,9 +556,9 @@ def compute_effective_video_fps(data_config: Dict[str, Any], default_source_fps:
     source_fps = float(data_config.get("source_fps", default_source_fps))
     chunk = int(data_config["chunk"])
     action_chunk = int(data_config["action_chunk"])
-    if chunk <= 0 or action_chunk % chunk != 0:
-        raise ValueError("action_chunk must be an integer multiple of chunk")
-    return source_fps / (action_chunk // chunk)
+    if chunk <= 0 or action_chunk <= 0 or not 0 < source_fps < float("inf"):
+        raise ValueError("source_fps, chunk and action_chunk must be positive and finite")
+    return source_fps * chunk / action_chunk
 
 
 def build_deepspeed_batch_config(
@@ -3434,6 +3434,12 @@ class Trainer:
             epoch_dataloader = accelerator.skip_first_batches(
                 self.train_dataloader,
                 num_batches=skipped_microbatches,
+            )
+            # Accelerate creates a new loader whose iteration otherwise starts at zero.
+            set_dataloader_epoch(
+                epoch_dataloader,
+                epoch=epoch,
+                sampler_seed=cursor.sampler_seed,
             )
             loader_stats = {"data_wait": 0.0, "wall": 0.0, "n": 0}
             for step, batch in enumerate(_timed_batches(epoch_dataloader, loader_stats)):

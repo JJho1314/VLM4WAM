@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "status": "approved_not_yet_activated",
+  "prior_gpu_hours_limit": 8,
+  "additional_gpu_hours": 24,
+  "cumulative_gpu_hours_limit": 32,
+  "registry": "/data/users/junjie/workspace/hpc3_jhe724/outputs/robofollow_autoresearch/runs",
+  "authorization_date": "2026-10-05",
+  "authorization_basis": "User replied 继续 to explicit request to implement design and add 24 GPUh",
+  "prior_charges_preserved": true,
+  "agent_auth_copy_authorized": false
+}

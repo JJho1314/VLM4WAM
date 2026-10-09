@@ -9,9 +9,11 @@ from torch.utils.data import Dataset
 from ge_act.data.robofollow_schema import CAMERA_ORDER,read_episode,normalize,validate_stats,pad_frames
 
 class RoboFollowHDF5Dataset(Dataset):
-    def __init__(self,manifest_path,stat_file,split=None,train_dataset=True,sample_size=(192,256),chunk=9,action_chunk=54,n_previous=4,action_type='absolute',action_space='joint',valid_cam=CAMERA_ORDER,source_fps=30,fix_sidx=None,resize_mode='resize',native_size=(240,320),hold_pad=0,**kwargs):
+    def __init__(self,manifest_path,stat_file,split=None,train_dataset=True,sample_size=(192,256),chunk=9,action_chunk=54,n_previous=4,action_type='absolute',action_space='joint',valid_cam=CAMERA_ORDER,source_fps=30,fix_sidx=None,resize_mode='resize',native_size=(240,320),hold_pad=0,history_action_stride=None,**kwargs):
         if action_type!='absolute' or action_space!='joint' or list(valid_cam)!=CAMERA_ORDER:raise ValueError('RoboFollow requires ordered three cameras and absolute joints')
-        if chunk!=9 or action_chunk!=54 or n_previous!=4:raise ValueError('initial RoboFollow temporal contract is 4 history + 54 actions / 9 future frames')
+        if chunk!=9 or action_chunk not in (32,54) or n_previous!=4:raise ValueError('RoboFollow requires 4 history + 32 or 54 actions / 9 future frames')
+        self.history_action_stride=min(50,action_chunk) if history_action_stride is None else history_action_stride
+        if self.history_action_stride!=min(50,action_chunk):raise ValueError('history stride must match executed action chunk')
         self.manifest_path=Path(manifest_path);self.manifest=json.loads(self.manifest_path.read_text())
         self.stats=json.loads(Path(stat_file).read_text());validate_stats(self.stats)
         if self.stats.get('manifest_hash')!=hashlib.sha256(self.manifest_path.read_bytes()).hexdigest():raise ValueError('statistics belong to a different manifest')
@@ -29,16 +31,17 @@ class RoboFollowHDF5Dataset(Dataset):
     def __len__(self):return len(self.records)
     def set_epoch(self,epoch):self.epoch=int(epoch)
     @staticmethod
-    def frame_indices(t,length):
-        history=np.clip(np.array([-150,-100,-50,0])+t,0,length-1).tolist()
-        actions=np.clip(np.arange(54)+t,0,length-1).tolist()
-        return history+actions[5::6],history+actions
+    def frame_indices(t,length,action_chunk=54,history_action_stride=50):
+        history=np.clip(np.arange(-3,1)*history_action_stride+t,0,length-1).tolist()
+        actions=np.clip(np.arange(action_chunk)+t,0,length-1).tolist()
+        future=(np.ceil(np.arange(1,10)*action_chunk/9).astype(int)-1).tolist()
+        return history+[actions[i] for i in future],history+actions
     def __getitem__(self,index):
         r=self.records[index];length=r['length']
         seed=int(hashlib.sha256(f"{self.manifest.get('seed',42)}:{self.epoch}:{r['identity']}".encode()).hexdigest()[:16],16)
         rng=np.random.default_rng(seed)
         t=self.fix_sidx if self.fix_sidx is not None else (int(rng.integers(length+self.hold_pad)) if self.train_dataset else length//2)
-        frames,actions=self.frame_indices(t,length)
+        frames,actions=self.frame_indices(t,length,self.action_chunk,self.history_action_stride)
         e=read_episode(Path(r['path']),image_indices=frames)
         if e.schema!=r['schema'] or len(e.states)!=length or e.instructions!=r['instructions']:raise ValueError('episode no longer matches manifest')
         # No persistent file handle crosses worker boundaries; read_episode opens locally.

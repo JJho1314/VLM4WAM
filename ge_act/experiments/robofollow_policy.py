@@ -12,20 +12,27 @@ def pipeline_state(state):
     return state[None]
 
 class RoboFollowPolicy:
-    def __init__(self,infer,stats,instruction_mode='correct',instruction_pool=None):
+    def __init__(self,infer,stats,instruction_mode='correct',instruction_pool=None,actions_per_step=50,action_budget=None):
         validate_stats(stats)
+        if not isinstance(actions_per_step,int) or actions_per_step<=0:raise ValueError('actions_per_step must be a positive integer')
+        if action_budget is not None and (not isinstance(action_budget,int) or action_budget<=0):raise ValueError('action_budget must be a positive integer')
+        self.actions_per_step=actions_per_step;self.action_budget=action_budget
         if instruction_mode not in ('correct','shuffle','empty'):raise ValueError('unknown instruction mode')
         self.infer=infer;self.stats=stats;self.instruction_mode=instruction_mode;self.instruction_pool=sorted(set(instruction_pool or []))
         if instruction_mode=='shuffle' and len(self.instruction_pool)<2:raise ValueError('shuffle requires an independent training instruction pool')
         self.reset()
     def reset(self):
-        self.history=deque(maxlen=4);self.instruction=None
+        self.history=deque(maxlen=4);self.instruction=None;self.executed_actions=0
     def set_instruction(self,text):
         if not isinstance(text,str) or not text.strip():raise ValueError('instruction must be nonempty')
-        if text!=self.instruction:self.history.clear()
+        if text!=self.instruction:self.history.clear();self.executed_actions=0
         self.instruction=text
     def predict(self,observation):
         if self.instruction is None:raise ValueError('set_instruction required')
+        count=self.actions_per_step
+        if self.action_budget is not None:
+            count=min(count,self.action_budget-self.executed_actions)
+            if count<=0:raise ValueError('episode action budget exhausted')
         try:
             rgb=[np.asarray(observation['observation'][cam]['rgb']) for cam in ('head_camera','left_camera','right_camera')]
             state=np.asarray(observation['joint_action']['vector'],dtype=np.float32)
@@ -40,9 +47,10 @@ class RoboFollowPolicy:
             text=pool[int(hashlib.sha256(text.encode()).hexdigest()[:8],16)%len(pool)]
         pred=np.asarray(self.infer(np.stack(history),normalize(state[None],self.stats,'state'),text),dtype=np.float32)
         if pred.ndim!=2 or pred.shape[1]!=14 or not len(pred) or not np.isfinite(pred).all():raise ValueError('inference must return finite normalized [T,14]')
-        # Official evaluator executes 50 rows per observation; training history uses this stride.
-        result=denormalize(pred[:50],self.stats,'action').astype(np.float32)
+        # The final evaluation call is clipped to preserve the 500-action budget.
+        result=denormalize(pred[:count],self.stats,'action').astype(np.float32)
         if not np.isfinite(result).all():raise ValueError('nonfinite absolute targets')
+        self.executed_actions+=len(result)
         return result
     def close(self):
         self.history.clear()
@@ -62,6 +70,10 @@ def make_policy(config_path,checkpoint_path,stats_path,planner_mode='disabled',i
     if planner_mode not in ('disabled','predicted'):raise ValueError('deployment cannot request teacher plans')
     c=yaml.safe_load(Path(config_path).read_text());s=json.loads(Path(stats_path).read_text());validate_stats(s)
     md=c['robofollow_metadata']
+    dc=c['data']['train'];action_chunk=dc['action_chunk']
+    actions_per_step=md['history_action_stride']
+    if actions_per_step!=min(50,action_chunk):raise ValueError('policy history stride differs from action execution')
+    action_budget=c.get('robofollow_evaluation',{}).get('action_budget')
     if md['action_type']!='absolute' or md['action_dim']!=14 or md['camera_order']!=s['camera_order']:raise ValueError('policy config metadata mismatch')
     files=resolve_checkpoint_files(checkpoint_path)
     if len(files)!=1:raise ValueError('one explicit checkpoint required')
@@ -105,9 +117,9 @@ def make_policy(config_path,checkpoint_path,stats_path,planner_mode='disabled',i
             from ge_act.models.ltx_models.semantic_conditioning import build_semantic_plan_times
             args={'semantic_plan':tokens,'semantic_plan_times':build_semantic_plan_times(batch_size=1,n_view=3,n_previous=4,num_future_frames=9,num_latent_frames=6,indices=(0,3,5,8),device=device),'semantic_condition_mask':torch.ones(3,device=device,dtype=dtype)}
         model.eval()
-        pred=pipe.infer(image=x,n_prev=4,prompt=text,height=height,width=width,chunk=2,n_view=3,return_action=True,return_video=False,action_chunk=54,action_dim=14,history_action_state=torch.from_numpy(pipeline_state(state)).to(device,dtype=dtype),num_inference_steps=c['num_inference_step'],guidance_scale=1.0,noise_seed=42,n_chunk=1,frame_rate=c['data']['train']['source_fps']/6,**args)[0]['action']
+        pred=pipe.infer(image=x,n_prev=4,prompt=text,height=height,width=width,chunk=2,n_view=3,return_action=True,return_video=False,action_chunk=action_chunk,action_dim=14,history_action_state=torch.from_numpy(pipeline_state(state)).to(device,dtype=dtype),num_inference_steps=c['num_inference_step'],guidance_scale=1.0,noise_seed=42,n_chunk=1,frame_rate=dc['source_fps']*dc['chunk']/action_chunk,**args)[0]['action']
         return pred[0].float().cpu().numpy()
     pool=[]
     if manifest_path:
         m=json.loads(Path(manifest_path).read_text());pool=[t for r in m['episodes'] if r['split']=='train' for t in r['instructions']]
-    return RoboFollowPolicy(infer,s,instruction_mode,pool)
+    return RoboFollowPolicy(infer,s,instruction_mode,pool,actions_per_step,action_budget)

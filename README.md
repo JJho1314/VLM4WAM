@@ -1,79 +1,30 @@
-# VLM4WAM
+# VLM4WAM — HPC3 RoboFollow 汇总仓库
 
-Workspace for semantic-plan guided Cosmos Predict 2.5 robot video generation.
+当前主线：用官方完整 RoboFollow 训练集建立可复现基线，再验证预测 semantic planner 是否改善 instruction following。最终代码、历史经验、实验结论与 HPC3 启动入口集中在本仓库。
 
-The current Cosmos copy has been reset from the clean upstream checkout at:
+- **权威工作目录**：`/data/user/jhe724/workspace/VLM4WAM_robofollow_official3750`
+- **登录**：`ssh jhe724@hpc3login.hpc.hkust-gz.edu.cn`，使用域名，不固定旧 IP。
+- **当前配置**：3,750 episodes / 75 tasks × 50，53,000 optimizer steps，global batch 128，action chunk 32，2 nodes / 16 GPUs，`acd_u`。
+- **2026-10-09 状态快照**：作业 `704659` 已提交，最后核验为 `PENDING (Resources)`；没有该次训练的新 benchmark 结果。实时状态以 `squeue` 为准。
 
-```text
-/data/LFT-W02_data/junjie/VLA_WM/cosmos-predict2.5
-```
+## 从这里开始
 
-Old target-aware experiment switches, explicit mask paths, and prior
-branch-specific Cosmos paths have been removed from the active Cosmos tree. The
-active Stage-2 route is now only:
+| 内容 | 入口 |
+| --- | --- |
+| 最终研究结论、协议区别、下一步 | [研究总结](docs/HPC3_ROBOFOLLOW_SUMMARY.md) |
+| 登录、环境、数据、训练和恢复 | [HPC3 操作说明](docs/HPC3_RUNBOOK.md) |
+| 既有分层成绩与置信区间 | [完整结果记录](docs/robofollow_q35_results.md) |
+| 历史研究经验与失败案例 | [autoresearch/EXPERIENCE.md](autoresearch/EXPERIENCE.md) |
+| 旧 worktree 独有代码、设计和来源清单 | [归档说明](docs/archive/2026-10-09/README.md) |
+| 原始模型项目说明 | [原 README](docs/archive/2026-10-09/entry-documents/README.md) |
 
-```text
-semantic_plan [B, L, 1152]
--> SemanticPlanContextAdapter
--> semantic cross-attention in Cosmos DiT blocks
--> video prediction
-```
+## 核心目录
 
-## Semantic planner (Qwen3-VL)
+- `ge_act/`：RoboFollow dataset、policy、训练器与 text/joint 配置。
+- `qwen35_baton/`、`qwen35_planx/`：语义 planner 及研究模块。
+- `autoresearch/`：现有候选控制器、评测、经验、历史指标及 Pixi 入口。
+- `.agent/official3750/`：已版本化的 HPC3 训练脚本、数据检查和提交保护；运行状态文件不入 Git。
+- `.agent/robofollow_codec/`：训练读取 RGB 使用的 codec。
+- `docs/archive/2026-10-09/`：旧目录中与当前主线不同的源码和文档，仅供追溯，不自动覆盖新版。
 
-The `semantic_plan` fed to the world model is produced by a Qwen3-VL planner trained under
-[`qwen3_vl_semantic_planner/`](qwen3_vl_semantic_planner/README.md). Three independent
-lines: **CoVT·SigLIP·2B** (baseline), **tasktoken·SigLIP·2B** (rich-KV head variant), and
-**lingbot-DINO·4B** (`lingbot_dino_4b/`, aligns to DINO-video via the open `robbyant/lingbot-vla-v2-6b`
-weights — needs a matching DINO-conditioned WM). See that README for details.
-
-## World model (Cosmos)
-
-Main files:
-
-- `cosmos-predict2.5/cosmos_predict2/_src/predict2/networks/semantic_plan_conditioning.py`
-- `cosmos-predict2.5/cosmos_predict2/_src/predict2/networks/minimal_v4_dit.py`
-- `cosmos-predict2.5/cosmos_predict2/experiments/base/semantic_plan.py`
-- `cosmos-predict2.5/scripts/sbatch_train_semantic_plan_cosmos_2b_320x576_93f.sh`
-
-Training entry:
-
-```bash
-cd cosmos-predict2.5
-sbatch scripts/sbatch_train_semantic_plan_cosmos_2b_320x576_93f.sh
-```
-
-The script defaults to 93 frames, 320x576, SigLIP2 semantic plans with
-`k=6, grid=9`, and global batch size 128 on 8 GPUs. Override paths and
-hyperparameters with environment variables such as `DATASET_ROOT`,
-`SEMANTIC_PLAN_DIR`, `CHECKPOINT_LOAD_PATH`, `BATCH_SIZE`,
-`GRAD_ACCUM_ITER`, and `MAX_ITER`.
-
-Conditioning behavior:
-
-- `SEMANTIC_PLAN_DROPOUT_PROB` (default `0.15`): training-time probability of
-  dropping the semantic-plan conditioning for a micro-batch, so the CFG
-  unconditional branch (`semantic_plan=None` at inference) is a trained
-  configuration.
-- Keyframe times: the dataset reads `future_frame_indices` /
-  `video_frame_indices` from the semantic-plan manifest and passes normalized
-  keyframe times through to the DiT, so semantic-token RoPE/coord temporal
-  positions match the true keyframe locations (labels sample keyframes from
-  window positions `round(linspace(1, T-1, k))`, and k16->k8 selection is
-  non-uniform). Manifests without frame indices fall back to the previous
-  uniform-spacing assumption.
-- Native-grid plans: with `SEMANTIC_PLAN_SPATIAL_GRID=0` the per-keyframe
-  token count is inferred from `SEMANTIC_PLAN_SOURCE_NUM_KEYFRAMES`, so
-  keyframe selection also works for native SigLIP2 grids (27x27 = 729
-  tokens/frame) built with `--grid-size 0`.
-- Online encoding (`SEMANTIC_PLAN_ONLINE=1`): SigLIP2 plans are encoded on the
-  fly from the training video window by a frozen per-rank encoder
-  (`OnlineSemanticPlanEncoder`, outside state_dict/EMA/FSDP), Baton-style — no
-  .pt features are read, so native grids need no label storage. The manifest
-  under `SEMANTIC_PLAN_DIR` still defines windows and VAE-latent pairing.
-  Keyframe indices/times match the offline builder exactly; features match the
-  offline teacher space (token cosine ~0.999, difference is only the resize
-  implementation). Training-only: inference still takes
-  `--semantic-plan-path`. The dropout decision is broadcast from rank 0 —
-  per-rank divergence would desync FSDP all-gathers (the adapter is its own
-  FSDP unit) and hang NCCL.
+完整数据、模型权重、训练输出仍在仓库外。旧 autoresearch 文档中的 Ola 路径、8 GPUh/300-step 开发预算及内部划分是历史协议；不能代替当前 53k 全量训练配置。现有自动提交器不等于已运行的“自动改代码→训练→全量评测”闭环，HPC3 仿真环境和该闭环尚未完成端到端验收。

@@ -37,3 +37,19 @@ def test_state_batch_matches_action_transformer_contract():
     from ge_act.experiments.robofollow_policy import pipeline_state
     assert pipeline_state(np.zeros((1,14),np.float32)).shape==(1,1,14)
     with pytest.raises(ValueError):pipeline_state(np.zeros((14,),np.float32))
+
+def test_thirty_two_step_policy_preserves_five_hundred_action_budget():
+    from ge_act.experiments.robofollow_policy import RoboFollowPolicy
+    p=RoboFollowPolicy(lambda *args:np.zeros((32,14),np.float32),stats(),
+                       actions_per_step=32,action_budget=500)
+    p.set_instruction('left')
+    sizes=[len(p.predict(obs())) for _ in range(16)]
+    assert sizes==[32]*15+[20] and sum(sizes)==500
+    with pytest.raises(ValueError,match='budget'):p.predict(obs())
+    p.reset();p.set_instruction('left');assert p.predict(obs()).shape==(32,14)
+    p.set_instruction('right');assert p.predict(obs()).shape==(32,14)
+
+@pytest.mark.parametrize('kwargs',[{'actions_per_step':0},{'actions_per_step':2.5},{'action_budget':0}])
+def test_policy_rejects_invalid_execution_budget(kwargs):
+    from ge_act.experiments.robofollow_policy import RoboFollowPolicy
+    with pytest.raises(ValueError):RoboFollowPolicy(lambda *args:np.zeros((32,14)),stats(),**kwargs)
