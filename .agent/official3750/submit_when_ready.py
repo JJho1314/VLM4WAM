@@ -1,4 +1,4 @@
-"""Wait for verified data and Slurm, then submit one 16-GPU baseline as jhe724."""
+"""Wait for verified data and Slurm, then submit one 8-GPU baseline as jhe724."""
 import getpass
 import shlex
 import subprocess
@@ -71,7 +71,7 @@ while True:
             raise RuntimeError('Submission outcome needs inspection; durable SUBMITTING guard prevents duplicates: ' + submitted.stderr)
         jobid = submitted.stdout.strip().split(';')[0]
         assert jobid.isdigit(), submitted.stdout
-        print('SUBMITTED: HPC3 jhe724, job ' + jobid + ', 2 nodes / 16 GPUs, action chunk 32, 53000 steps', flush=True)
+        print('SUBMITTED: HPC3 jhe724, job ' + jobid + ', 1 node / 8 GPUs, action chunk 32, 53000 steps', flush=True)
         break
     except (subprocess.TimeoutExpired, OSError) as error:
         print('Transient connection failure: ' + str(error), flush=True)

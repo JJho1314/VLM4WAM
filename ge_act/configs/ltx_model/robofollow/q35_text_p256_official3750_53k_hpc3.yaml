@@ -54,7 +54,7 @@ optimizer_8bit: false
 optimizer_torchao: false
 scale_lr: false
 max_grad_norm: 1.0
-gradient_accumulation_steps: 2
+gradient_accumulation_steps: 4
 lr_scheduler: constant_with_warmup
 lr_warmup_steps: 500
 lr_num_cycles: 1

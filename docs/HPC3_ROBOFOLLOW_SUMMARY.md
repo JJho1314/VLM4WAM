@@ -16,9 +16,9 @@
 | 模型 | text_p256，三相机，14 维双臂绝对关节动作 |
 | 输入分辨率 | 原始 240×320 padding 到 256×320 |
 | 步数 | 53,000 optimizer steps |
-| Batch | 4/GPU × 16 GPU × accumulation 2 = 128 |
+| Batch | 4/GPU × 8 GPU × accumulation 4 = 128 |
 | Action chunk / history | 32 / 4 |
-| 资源 | HPC3 jhe724，acd_u，2 nodes / 16 GPUs；Slurm 单次时限 7 天 |
+| 资源 | HPC3 jhe724，acd_u，1 node / 8 GPUs；Slurm 单次时限 7 天 |
 | 作业 | 704659；2026-10-10 在 1,980 步因 DataLoader 句柄泄漏失败，尚无 checkpoint/新成绩；最新作业号见 jobid |
 
 53,000 × 128 / 677,823 ≈ 10.01 是按全部时间起点折算的采样遍数，不能叫 10 次无重复完整遍历。Dataset 长度是 3,750 条轨迹，每次取样随机选择窗口，所以日志中的 loader epoch 与这个口径不同。较早 30k 配置保留用于追溯，当前启动器明确使用 53k text 配置；joint 的历史 30k 配置尚未启动。

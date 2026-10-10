@@ -11,7 +11,7 @@ root = Path('/data/user/jhe724/workspace/VLM4WAM_robofollow_official3750')
 config = yaml.safe_load((root / 'ge_act/configs/ltx_model/robofollow/q35_text_p256_official3750_53k_hpc3.yaml').read_text())
 args = config['data']['train']
 assert config['train_steps'] == 53000
-assert config['batch_size'] * config['gradient_accumulation_steps'] * 16 == 128
+assert config['batch_size'] * config['gradient_accumulation_steps'] * 8 == 128
 assert args['action_chunk'] == args['history_action_stride'] == 32
 assert config['robofollow_metadata']['history_action_stride'] == 32
 assert set(config['data']) == {'train'}

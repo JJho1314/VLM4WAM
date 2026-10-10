@@ -59,7 +59,7 @@ sha256sum -c .agent/official3750/code.sha256
 
 修复验证：24 轮 CPU 回归从原版 FD 16→108、每轮 +4，变为固定 6；52 项 RoboFollow 测试通过。连同 BATON 扩展测试共 125 项通过、4 项失败：3 项引用不存在的旧工作站 Python 路径，1 项分布式 checkpoint 子进程超过 30 秒超时。官方数据预检再次通过（3,750 条、5 个真实样本）。这些检查不替代修复后 16 卡完整训练验证。
 
-- `train.sbatch`：两节点，每节点 8 GPU / 96 CPU / 1920G，7 天。
+- `train.sbatch`：单节点，8 GPU / 96 CPU / 1920G，7 天；每卡 batch 4、梯度累积 4，全局 batch 128，53,000 optimizer steps。2026-10-10 按用户要求取消尚未启动的两节点作业 706437，切换为此配置。
 - `train_node.sh`：使用 Slurm node rank 启动 torch distributed，每节点 8 进程。
 - `submit_when_ready.py`：检查 DATA_READY、CODE_READY、哈希、真实数据、分区、账号和 `sbatch --test-only`，持 submit.lock 写 SUBMITTING/jobid。
 - waiter 见到 jobid 后退出。不要将历史 tmux 日志当作训练进度。
