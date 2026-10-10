@@ -25,9 +25,9 @@ Pixi 复用以上既有 Python 与 overlay；仓库不是能在空白机器上�
 
 ```bash
 squeue -u jhe724
-scontrol show job 704659
-sacct -j 704659 --format=JobID,State,Elapsed,ExitCode
-cat .agent/official3750/jobid
+JOB_ID=$(cat .agent/official3750/jobid)
+scontrol show job "$JOB_ID"
+sacct -j "$JOB_ID" --format=JobID,State,Elapsed,ExitCode
 ```
 
 日志为输出目录下 `logs/slurm-704659.out` 和 `.err`，排队时文件可能尚未创建。实际 checkpoint 路径以训练日志为准；训练器含最终步保存，53,000 不必被周期保存间隔整除。
@@ -53,7 +53,11 @@ sha256sum -c .agent/official3750/code.sha256
 
 ## 提交与恢复
 
-作业 704659 已提交，**不要重复提交 baseline**。已有 `.agent/official3750/jobid` 是运行状态，不提交到 Git；新 clone 没有它，不代表 Slurm 没有该作业。
+作业 704659 在 2026-10-10 11:56 启动，12:34 失败，停在 1,980 步，尚未到 2,500 步首次 checkpoint。**重提前先核验旧作业已终止及队列无重复 baseline**。已有 `.agent/official3750/jobid` 是运行状态，不提交到 Git；新 clone 没有它，不代表 Slurm 没有该作业。
+
+失败原因：每轮 `skip_first_batches` 重建 DataLoader，持久 worker 与 pin_memory 触发 PyTorch atexit 引用保留，句柄随轮数增长。修复为 `persistent_workers=False`，保留 6 workers、pin_memory 和原训练配置。Linux CPU 回归保留真实进程、队列和锁页线程，仅替换张量 pin 操作，并验证 epoch 更新、恢复跳批和句柄稳定性：`test -q -s tests/test_robofollow_loader_fds.py`。重提时保留旧日志及 jobid 备份；无 checkpoint 则从初始权重重训。
+
+修复验证：24 轮 CPU 回归从原版 FD 16→108、每轮 +4，变为固定 6；52 项 RoboFollow 测试通过。连同 BATON 扩展测试共 125 项通过、4 项失败：3 项引用不存在的旧工作站 Python 路径，1 项分布式 checkpoint 子进程超过 30 秒超时。官方数据预检再次通过（3,750 条、5 个真实样本）。这些检查不替代修复后 16 卡完整训练验证。
 
 - `train.sbatch`：两节点，每节点 8 GPU / 96 CPU / 1920G，7 天。
 - `train_node.sh`：使用 Slurm node rank 启动 torch distributed，每节点 8 进程。

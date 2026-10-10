@@ -2861,7 +2861,8 @@ class Trainer:
             batch_size=self.args.batch_size,
             num_workers=self.args.dataloader_num_workers,
             pin_memory=getattr(self.args, "pin_memory", False),
-            persistent_workers=self.args.dataloader_num_workers > 0,
+            # Epoch loaders are recreated below; persistent pinned workers retain FDs via atexit.
+            persistent_workers=False,
             prefetch_factor=(
                 getattr(self.args, "dataloader_prefetch_factor", 2)
                 if self.args.dataloader_num_workers > 0
