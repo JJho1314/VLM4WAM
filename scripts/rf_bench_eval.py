@@ -48,37 +48,67 @@ def list_tasks(scenes, levels):
     return tasks
 
 
-def wait_port(proc, port, timeout=1200):
+def wait_server(proc, log, timeout=1200):
+    from robofollow.remote_policy import RemoteModelClient
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         if proc.poll() is not None:
-            raise RuntimeError(f'policy server on {port} exited with {proc.returncode}')
-        try:
-            with socket.create_connection(('127.0.0.1', port), timeout=0.5):
-                return
-        except OSError:
-            time.sleep(2)
-    raise TimeoutError(f'server {port} not ready')
+            raise RuntimeError(f'policy server exited with {proc.returncode}; see {log}')
+        for line in log.read_text().splitlines():
+            if line.startswith('Policy server: 127.0.0.1:'):
+                port = int(line.rsplit(':', 1)[1])
+                client = None
+                try:
+                    client = RemoteModelClient(port=port, timeout=10, connect_retries=1)
+                    client.call('reset')
+                except Exception as exc:
+                    raise RuntimeError(f'policy handshake failed on {port}') from exc
+                finally:
+                    if client is not None:
+                        client.close()
+                return port
+        time.sleep(1)
+    raise TimeoutError(f'policy server not ready; see {log}')
 
 
-def worker(slot, gpu, port, mode, args, tasks, out, failures, lock):
+def prepare_run(out, metadata):
+    previous = out / 'run.json'
+    if previous.exists():
+        old = json.loads(previous.read_text())
+        for key in ('checkpoint', 'config', 'stats', 'manifest', 'planner_mode', 'modes',
+                    'rounds', 'base_seed', 'max_steps', 'actions_per_step', 'scenes',
+                    'levels', 'limit', 'tasks'):
+            if old.get(key) != metadata[key]:
+                raise ValueError(f'Resume mismatch: {key}')
+        stamp = time.time_ns()
+        previous.rename(out / f'run.previous-{stamp}.json')
+        if (out / 'logs').exists():
+            (out / 'logs').rename(out / f'logs.previous-{stamp}')
+    (out / 'run.json').write_text(json.dumps(metadata, indent=1))
+
+
+def worker(slot, gpu, mode, args, tasks, out, failures, lock):
     kwargs = dict(config_path=args.config, checkpoint_path=args.checkpoint, stats_path=args.stats,
                   manifest_path=args.manifest, planner_mode=args.planner_mode, instruction_mode=mode)
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu), HDF5_USE_FILE_LOCKING='FALSE', TOKENIZERS_PARALLELISM='false',
                PYTHONPATH=f'{W}:{W}/ge_act:{RT}:{OVERLAY}')
     logdir = out / 'logs'; logdir.mkdir(parents=True, exist_ok=True)
-    with open(logdir / f'serve_{mode}_{slot}.log', 'w') as slog:
+    server_log = logdir / f'serve_{mode}_{slot}.log'
+    with open(server_log, 'w') as slog:
         server = subprocess.Popen(POLICY_CMD + ['-m', 'robofollow.serve', '--factory', 'ge_act.experiments.robofollow_policy:make_policy',
-                                   '--kwargs', json.dumps(kwargs), '--host', '127.0.0.1', '--port', str(port)],
+                                   '--kwargs', json.dumps(kwargs), '--host', '127.0.0.1', '--port', '0'],
                                   cwd=W, env=env, stdout=slog, stderr=subprocess.STDOUT, start_new_session=True)
         try:
-            wait_port(server, port)
+            port = wait_server(server, server_log)
+            print(f'[bench] ready slot={slot} mode={mode} port={port}', flush=True)
             sim_env = dict(os.environ)
             while True:
                 try:
                     scene, task = tasks.get_nowait()
                 except queue.Empty:
                     return
+                if server.poll() is not None:
+                    raise RuntimeError(f'policy server died; see {server_log}')
                 dest = out / mode / scene / task
                 if complete_result(dest, args.rounds):
                     continue
@@ -158,7 +188,7 @@ def main():
     slots = gpus * args.slots_per_gpu
     if not tasks or args.rounds < 1 or slots < len(modes) or len(set(modes)) != len(modes):
         raise ValueError('Nonempty tasks, positive rounds and at least one slot per distinct mode required')
-    json.dump(dict(vars(args), tasks=len(tasks), slots=slots, started=time.time()), open(out / 'run.json', 'w'), indent=1)
+    prepare_run(out, dict(vars(args), tasks=len(tasks), slots=slots, started=time.time()))
     print(f'[bench] {len(tasks)} tasks x {args.rounds} rounds x modes {modes}; {slots} slots on {gpus} GPUs', flush=True)
     queues = {m: queue.Queue() for m in modes}
     for m in modes:
@@ -167,12 +197,12 @@ def main():
     failures, lock, threads = [], threading.Lock(), []
     for i in range(slots):
         mode = modes[i % len(modes)]
-        th = threading.Thread(target=worker, args=(i, gpu_ids[i % gpus], 9100 + i, mode, args, queues[mode], out, failures, lock), daemon=True)
+        th = threading.Thread(target=worker, args=(i, gpu_ids[i % gpus], mode, args, queues[mode], out, failures, lock), daemon=True)
         th.start(); threads.append(th)
         time.sleep(5)
     while any(t.is_alive() for t in threads):
         time.sleep(60)
-        done = {m: len(list((out / m).glob('*/*/results.json'))) for m in modes}
+        done = {m: sum(complete_result(out / m / scene / task, args.rounds) for scene, task in tasks) for m in modes}
         print(f'[bench] {time.strftime("%H:%M:%S")} done {done} / {len(tasks)} failures {len(failures)}', flush=True)
     incomplete = [(m, scene, task) for m in modes for scene, task in tasks
                   if not complete_result(out / m / scene / task, args.rounds)]

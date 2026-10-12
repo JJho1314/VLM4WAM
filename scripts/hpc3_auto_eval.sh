@@ -42,7 +42,7 @@ case "${1:?smoke or full}" in
   test -s "$checkpoint"
   sha256sum "$checkpoint" > "$OUT/checkpoint-${SLURM_JOB_ID}.sha256"
   "$PIXI" run --manifest-path "$MANIFEST" research scripts/rf_bench_eval.py \
-   --config "$CONFIG" --checkpoint "$checkpoint" --out "$OUT/full-${SLURM_JOB_ID}" \
+   --config "$CONFIG" --checkpoint "$checkpoint" --out "${EVAL_RESUME_OUT:-$OUT/full-${SLURM_JOB_ID}}" \
    --rounds 10 --gpus 8 --slots-per-gpu 1 --modes correct,shuffle
   ;;
  *) exit 2 ;;

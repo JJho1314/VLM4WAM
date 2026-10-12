@@ -13,3 +13,9 @@
 - 单卡 smoke 编译 cuRobo 并验证四个场景；full 用 acd_u、jhe724、单节点 8 GPU / 96 CPU / 1920 GB，最长 7 天。提交记录在 `.agent/.superpowers/remote-jobs`。
 
 旧 `acp/robofollow_eval.sh` 为 Ola 历史入口，本评测不使用。首次 GPU smoke 通过前，环境兼容性仍待验证。
+
+## 2026-10-12 端口冲突恢复
+
+709872 的固定 9101/9102 端口被已有服务占用，旧 TCP 连通性检查误判就绪。策略服务现使用 `--port 0`，由内核原子分配端口；从本次服务日志读取实际端口后，必须通过 RoboFollow reset 协议握手才能消费任务。服务退出后该 worker 停止，遗漏任务会使整体评测失败。
+
+恢复时设置 `EVAL_RESUME_OUT` 指向已有 full 输出；核对 checkpoint、配置、种子、轮次与任务范围一致，保留旧 run.json 和 logs。完整任务跳过，不完整任务保留失败目录后重跑。进度仅计入完整任务。使用 Pixi research -m pytest 运行 tests/test_rf_bench_completion.py，包含真实 TCP 协议/HTTP 错误服务、进程退出和恢复兼容性检查。
