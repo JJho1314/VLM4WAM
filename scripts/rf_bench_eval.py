@@ -9,11 +9,12 @@ from pathlib import Path
 
 W = Path(__file__).resolve().parents[1]
 RT = Path(os.environ['ROBOFOLLOW_ROOT'])
-PIXI = '/data/user/jhe724/.pixi/bin/pixi'
-MANIFEST = str(W / 'autoresearch/runtime/pixi.toml')
+PIXI = os.environ.get('ROBOFOLLOW_PIXI', '/data/user/jhe724/.pixi/bin/pixi')
+MANIFEST = os.environ.get('ROBOFOLLOW_MANIFEST', str(W / 'autoresearch/runtime/pixi.toml'))
 POLICY_CMD = [PIXI, 'run', '--manifest-path', MANIFEST, 'research']
 SIM_CMD = [PIXI, 'run', '--manifest-path', MANIFEST, 'sim']
-OVERLAY = '/data/user/jhe724/envs/overlay_peft_tf5'
+SIM_MODULE = os.environ.get('ROBOFOLLOW_SIM_MODULE', 'robofollow.evaluate')
+OVERLAY = os.environ.get('ROBOFOLLOW_OVERLAY', '/data/user/jhe724/envs/overlay_peft_tf5')
 SCENES = ('scene1', 'scene2', 'scene3', 'scene4')
 
 
@@ -39,7 +40,7 @@ def complete_result(dest, rounds):
 def list_tasks(scenes, levels):
     tasks = []
     for scene in scenes:
-        out = subprocess.run(SIM_CMD + ['-m', 'robofollow.evaluate', '--scene', scene, '--list'], cwd=RT,
+        out = subprocess.run(SIM_CMD + ['-m', SIM_MODULE, '--scene', scene, '--list'], cwd=RT,
                              capture_output=True, text=True, check=True).stdout
         for line in out.splitlines():
             parts = line.split(' ', 2)
@@ -115,7 +116,7 @@ def worker(slot, gpu, mode, args, tasks, out, failures, lock):
                 for attempt in range(2):
                     if dest.exists():
                         dest.rename(dest.with_name(dest.name + f'.failed-{time.time_ns()}'))
-                    cmd = SIM_CMD + ['-m', 'robofollow.evaluate', '--scene', scene, '--tasks', task, '--rounds', str(args.rounds),
+                    cmd = SIM_CMD + ['-m', SIM_MODULE, '--scene', scene, '--tasks', task, '--rounds', str(args.rounds),
                            '--base-seed', str(args.base_seed), '--max-steps', str(args.max_steps), '--actions-per-step', str(args.actions_per_step),
                            '--runtime', 'fixed', '--sim-steps', '15', '--gpu', str(gpu), '--remote', '--host', '127.0.0.1',
                            '--port', str(port), '--output', str(dest)]

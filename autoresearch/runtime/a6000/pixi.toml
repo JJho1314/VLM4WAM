@@ -1,0 +1,10 @@
+[workspace]
+name = "robofollow-a6000-evaluation"
+version = "0.1.0"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tasks]
+research = { cmd = "/data/LFT-W02_data/junfeng/robofollow_eval/runtime/qwen35/bin/python", cwd = "../../..", env = { PYTHONPATH = ".:ge_act:/data/LFT-W02_data/junfeng/robofollow_eval/runtime/RoboTwin:/data/LFT-W02_data/junfeng/robofollow_eval/runtime/overlay_peft_tf5", HDF5_USE_FILE_LOCKING = "FALSE", ROBOFOLLOW_ROOT = "/data/LFT-W02_data/junfeng/robofollow_eval/runtime/RoboTwin" } }
+sim = { cmd = "/data/LFT-W02_data/junfeng/robofollow_eval/runtime/env/bin/python", cwd = "/data/LFT-W02_data/junfeng/robofollow_eval/runtime/RoboTwin", env = { PYTHONPATH = "/data/LFT-W02_data/junfeng/workspace/VLM4WAM_robofollow_a6000/scripts:/data/LFT-W02_data/junfeng/robofollow_eval/runtime/RoboTwin:/data/LFT-W02_data/junfeng/robofollow_eval/runtime/RoboTwin/envs/curobo/src" } }
+build-sim = { cmd = "/data/LFT-W02_data/junfeng/robofollow_eval/runtime/env/bin/python setup.py build_ext --inplace --force", cwd = "/data/LFT-W02_data/junfeng/robofollow_eval/runtime/RoboTwin/envs/curobo", env = { CUDA_HOME = "/usr/local/cuda-12.1", CC = "/usr/bin/gcc", CXX = "/usr/bin/g++", CUDAHOSTCXX = "/usr/bin/g++", CFLAGS = "", CXXFLAGS = "", CPPFLAGS = "", LDFLAGS = "", TORCH_CUDA_ARCH_LIST = "8.6", MAX_JOBS = "4", SETUPTOOLS_SCM_PRETEND_VERSION = "0.7.0" } }
