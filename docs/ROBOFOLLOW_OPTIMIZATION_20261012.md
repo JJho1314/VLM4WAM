@@ -15,3 +15,5 @@
 输出：`/data/user/jhe724/outputs/robofollow_q35/optimization_20261012`。入口 `scripts/hpc3_robofollow_optimize.sh`。每次训练固定独立目录，存在目录则停止，避免覆盖；中断后需检查已有产物，不能盲目重新提交。运行至脚本结束只产生结果，不自动根据未核实分数晋级。
 
 提交前验证：HPC3 上 planner/loading/policy/epoch/benchmark completion 共 27 项测试通过；meta-device 模型逐张量核对 53k checkpoint 的 1429 个已有参数，text 无新增参数，joint 模型新增 374 个白名单语义参数（planner head 在 trainer 内另行注册）。两组数据、seed、LR、steps、global batch、推理步数和评测预算一致；shell 语法通过。GPU smoke/效果增益须以实际作业日志为准。
+
+2026-10-13：作业 711963 在 joint smoke 第一次 planner 前向的 Triton l2norm 编译阶段失败（00:54:45–00:57:47），多个 rank 在共享 home cache 读取刚生成的 JSON/cubin 时报告 FileNotFoundError；检查时文件已存在。没有完成 optimizer step，head_gradients 为空，正式两组训练未开始。针对共享缓存可见性/并发风险，torchrun 每个 worker 在导入 Python 前创建独立的节点本地 /tmp Triton cache；不删除共享缓存。8 worker 环境隔离与子进程错误码传播检查通过。旧 smoke 目录归档保留，GPU 上是否消除该故障仍以重试 smoke 结果为准。
