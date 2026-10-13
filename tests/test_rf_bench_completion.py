@@ -77,3 +77,43 @@ def test_resume_preserves_logs_and_rejects_different_checkpoint(tmp_path):
     bench.prepare_run(tmp_path, meta)
     assert list(tmp_path.glob('logs.previous-*/old.log'))[0].read_text() == 'evidence'
     assert list(tmp_path.glob('run.previous-*.json'))
+
+
+def test_sequential_modes_finish_correct_before_shuffle(tmp_path, monkeypatch):
+    import queue
+    import sys
+    import yaml
+    from ge_act.experiments import robofollow_loading
+    config = tmp_path / 'config.yaml'
+    config.write_text(yaml.safe_dump(dict(
+        data={'train': {'stat_file': 'stats', 'manifest_path': 'manifest'}},
+        robofollow_evaluation={'actions_per_step': 32, 'max_steps': 16, 'action_budget': 500})))
+    out = tmp_path / 'out'
+    monkeypatch.setattr(sys, 'argv', ['bench', '--config', str(config), '--checkpoint', 'checkpoint',
+                                    '--out', str(out), '--rounds', '1', '--gpus', '1',
+                                    '--slots-per-gpu', '2', '--modes', 'correct,shuffle', '--sequential-modes'])
+    monkeypatch.setattr(robofollow_loading, 'semantic_contract', lambda *a: {})
+    monkeypatch.setattr(robofollow_loading, 'write_contract', lambda *a: None)
+    monkeypatch.setattr(bench, 'list_tasks', lambda *a: [('scene1', 'L0_task')])
+    sleep = bench.time.sleep
+    monkeypatch.setattr(bench.time, 'sleep', lambda _: sleep(0.001))
+    seen = []
+
+    def worker(slot, gpu, mode, args, tasks, output, failures, lock):
+        try:
+            scene, task = tasks.get_nowait()
+        except queue.Empty:
+            return
+        with lock:
+            seen.append((mode, bench.complete_result(output / 'correct' / scene / task, 1)))
+            dest = output / mode / scene / task
+            dest.mkdir(parents=True)
+            (dest / 'run.json').write_text(json.dumps(dict(status='complete', completed_trials=1, expected_trials=1)))
+            (dest / 'results.json').write_text(json.dumps([dict(round=1, task=task,
+                intent_score=1, exec_score=1, completion_ok=True)]))
+
+    monkeypatch.setattr(bench, 'worker', worker)
+    bench.main()
+    assert seen == [('correct', False), ('shuffle', True)]
+    assert json.loads((out / 'summary.json').read_text())['status'] == 'complete'
+    assert (out / 'partial-summary.json').exists()

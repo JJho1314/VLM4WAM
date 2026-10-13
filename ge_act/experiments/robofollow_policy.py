@@ -1,10 +1,21 @@
 """Official RoboFollow policy contract for trained GE Act absolute joints."""
 from collections import deque
+from functools import lru_cache
 from pathlib import Path
 import hashlib
 import json
+import os
+import time
 import numpy as np
 from ge_act.data.robofollow_schema import normalize,denormalize,validate_stats
+
+def cached_text_conditioning(pipe):
+    @lru_cache(maxsize=1)
+    def encode(text):
+        values = pipe.encode_prompt(prompt=text, do_classifier_free_guidance=False)
+        return dict(zip(('prompt_embeds', 'prompt_attention_mask',
+                         'negative_prompt_embeds', 'negative_prompt_attention_mask'), values))
+    return encode
 
 def pipeline_state(state):
     state=np.asarray(state,dtype=np.float32)
@@ -56,7 +67,7 @@ class RoboFollowPolicy:
         self.history.clear()
 
 
-def make_policy(config_path,checkpoint_path,stats_path,planner_mode='disabled',instruction_mode='correct',manifest_path=None,device='cuda'):
+def make_policy(config_path,checkpoint_path,stats_path,planner_mode='disabled',instruction_mode='correct',manifest_path=None,device='cuda',cache_text=True):
     import torch
     import torch.nn.functional as F
     import yaml
@@ -99,9 +110,12 @@ def make_policy(config_path,checkpoint_path,stats_path,planner_mode='disabled',i
     load_robofollow_weights(model,files[0],set());model.eval().requires_grad_(False)
     pipe=CustomPipeline(scheduler=FlowMatchEulerDiscreteScheduler(),vae=vae,text_encoder=textenc,tokenizer=cond['tokenizer'],transformer=model).to(device)
     pipe.set_progress_bar_config(disable=True)
+    encode_text=cached_text_conditioning(pipe)
+    profile=os.environ.get('ROBOFOLLOW_PROFILE')=='1'
     height,width=c['data']['train']['sample_size']
     @torch.no_grad()
     def infer(history,state,text):
+        started=time.perf_counter()
         x=torch.from_numpy(history).to(device).permute(1,4,0,2,3).float()/127.5-1
         flat=x.permute(0,2,1,3,4).reshape(12,3,*x.shape[-2:])
         if c['data']['train'].get('resize_mode','resize')=='pad':
@@ -110,15 +124,19 @@ def make_policy(config_path,checkpoint_path,stats_path,planner_mode='disabled',i
             flat=pad_frames(flat,(height,width))
         else:flat=F.interpolate(flat,size=(height,width),mode='bilinear',align_corners=False)
         x=flat.reshape(3,4,3,height,width).permute(0,2,1,3,4).to(dtype)
-        args={}
+        args=dict(encode_text(text)) if cache_text else {}
         if planner is not None:
             current=torch.from_numpy(history[-1:]).to(device)
             tokens=planner.predict_tokens(current,[text])
             from ge_act.models.ltx_models.semantic_conditioning import build_semantic_plan_times
-            args={'semantic_plan':tokens,'semantic_plan_times':build_semantic_plan_times(batch_size=1,n_view=3,n_previous=4,num_future_frames=9,num_latent_frames=6,indices=(0,3,5,8),device=device),'semantic_condition_mask':torch.ones(3,device=device,dtype=dtype)}
+            args.update({'semantic_plan':tokens,'semantic_plan_times':build_semantic_plan_times(batch_size=1,n_view=3,n_previous=4,num_future_frames=9,num_latent_frames=6,indices=(0,3,5,8),device=device),'semantic_condition_mask':torch.ones(3,device=device,dtype=dtype)})
         model.eval()
         pred=pipe.infer(image=x,n_prev=4,prompt=text,height=height,width=width,chunk=2,n_view=3,return_action=True,return_video=False,action_chunk=action_chunk,action_dim=14,history_action_state=torch.from_numpy(pipeline_state(state)).to(device,dtype=dtype),num_inference_steps=c['num_inference_step'],guidance_scale=1.0,noise_seed=42,n_chunk=1,frame_rate=dc['source_fps']*dc['chunk']/action_chunk,**args)[0]['action']
-        return pred[0].float().cpu().numpy()
+        result=pred[0].float().cpu().numpy()
+        if profile:
+            print('[policy timing] '+json.dumps(dict(seconds=time.perf_counter()-started,
+                  cache=encode_text.cache_info()._asdict())),flush=True)
+        return result
     pool=[]
     if manifest_path:
         m=json.loads(Path(manifest_path).read_text());pool=[t for r in m['episodes'] if r['split']=='train' for t in r['instructions']]

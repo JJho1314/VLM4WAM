@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT=/data/user/jhe724/workspace/VLM4WAM_robofollow_eval
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 RUNTIME=/data/user/jhe724/workspace/robofollow_eval_runtime
 export ROBOFOLLOW_ROOT="$RUNTIME/RoboTwin"
 PIXI=/data/user/jhe724/.pixi/bin/pixi
 MANIFEST="$ROOT/autoresearch/runtime/pixi.toml"
 TRAIN=/data/user/jhe724/outputs/robofollow_q35/official3750_text_53k_ac32_bs128/2026_10_10_21_42_18
 OUT=/data/user/jhe724/outputs/robofollow_q35/eval/official3750_text_53k_ac32_bs128
-CONFIG="$ROOT/ge_act/configs/ltx_model/robofollow/q35_text_p256_official3750_53k_hpc3.yaml"
+CONFIG="${EVAL_CONFIG:-$ROOT/ge_act/configs/ltx_model/robofollow/q35_text_p256_official3750_53k_hpc3.yaml}"
+export ROBOFOLLOW_PROFILE=1
 export CUDA_HOME=/usr/local/cuda-12.8
 export PATH="$CUDA_HOME/bin:/data/user/jhe724/envs/gcc11/bin:$PATH"
 export CC=/data/user/jhe724/envs/gcc11/bin/x86_64-conda-linux-gnu-gcc
@@ -43,7 +44,7 @@ case "${1:?smoke or full}" in
   sha256sum "$checkpoint" > "$OUT/checkpoint-${SLURM_JOB_ID}.sha256"
   "$PIXI" run --manifest-path "$MANIFEST" research scripts/rf_bench_eval.py \
    --config "$CONFIG" --checkpoint "$checkpoint" --out "${EVAL_RESUME_OUT:-$OUT/full-${SLURM_JOB_ID}}" \
-   --rounds 10 --gpus 8 --slots-per-gpu 1 --modes correct,shuffle
+   --rounds 10 --gpus 8 --slots-per-gpu "${EVAL_SLOTS_PER_GPU:-1}" --modes correct,shuffle --sequential-modes
   ;;
  *) exit 2 ;;
 esac

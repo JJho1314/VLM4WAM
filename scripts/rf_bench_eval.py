@@ -120,7 +120,10 @@ def worker(slot, gpu, mode, args, tasks, out, failures, lock):
                            '--runtime', 'fixed', '--sim-steps', '15', '--gpu', str(gpu), '--remote', '--host', '127.0.0.1',
                            '--port', str(port), '--output', str(dest)]
                     with open(logdir / f'sim_{mode}_{scene}_{task}_attempt{attempt}.log', 'w') as elog:
+                        started = time.perf_counter()
                         rc = subprocess.run(cmd, cwd=RT, env=sim_env, stdout=elog, stderr=subprocess.STDOUT).returncode
+                    print('[bench timing] '+json.dumps(dict(slot=slot, mode=mode, scene=scene, task=task,
+                          attempt=attempt, seconds=time.perf_counter()-started, returncode=rc)), flush=True)
                     if rc == 0 and complete_result(dest, args.rounds):
                         break
                 else:
@@ -163,6 +166,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--config', required=True); p.add_argument('--checkpoint', required=True); p.add_argument('--out', required=True)
     p.add_argument('--planner-mode', default='disabled'); p.add_argument('--modes', default='correct')
+    p.add_argument('--sequential-modes', action='store_true', help='Finish each mode before starting the next')
     p.add_argument('--levels', default='L0,L1,L2,L3'); p.add_argument('--scenes', default=','.join(SCENES))
     p.add_argument('--rounds', type=int, default=10); p.add_argument('--max-steps', type=int)
     p.add_argument('--slots-per-gpu', type=int, default=3); p.add_argument('--gpus', type=int, default=0)
@@ -194,16 +198,19 @@ def main():
     for m in modes:
         for t in tasks:
             queues[m].put(t)
-    failures, lock, threads = [], threading.Lock(), []
-    for i in range(slots):
-        mode = modes[i % len(modes)]
-        th = threading.Thread(target=worker, args=(i, gpu_ids[i % gpus], mode, args, queues[mode], out, failures, lock), daemon=True)
-        th.start(); threads.append(th)
-        time.sleep(5)
-    while any(t.is_alive() for t in threads):
-        time.sleep(60)
-        done = {m: sum(complete_result(out / m / scene / task, args.rounds) for scene, task in tasks) for m in modes}
-        print(f'[bench] {time.strftime("%H:%M:%S")} done {done} / {len(tasks)} failures {len(failures)}', flush=True)
+    failures, lock = [], threading.Lock()
+    for phase in ([[m] for m in modes] if args.sequential_modes else [modes]):
+        threads = []
+        for i in range(slots):
+            mode = phase[i % len(phase)]
+            th = threading.Thread(target=worker, args=(i, gpu_ids[i % gpus], mode, args, queues[mode], out, failures, lock), daemon=True)
+            th.start(); threads.append(th)
+            time.sleep(5)
+        while any(t.is_alive() for t in threads):
+            time.sleep(60)
+            done = {m: sum(complete_result(out / m / scene / task, args.rounds) for scene, task in tasks) for m in modes}
+            print(f'[bench] {time.strftime("%H:%M:%S")} done {done} / {len(tasks)} failures {len(failures)}', flush=True)
+        json.dump(summarize(out, modes, args.rounds), open(out / 'partial-summary.json', 'w'), indent=1)
     incomplete = [(m, scene, task) for m in modes for scene, task in tasks
                   if not complete_result(out / m / scene / task, args.rounds)]
     summary = summarize(out, modes, args.rounds)
