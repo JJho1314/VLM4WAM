@@ -1,8 +1,8 @@
-# VLM4WAM — HPC3 RoboFollow 汇总仓库
+# SG-WAM — HPC3 RoboFollow 汇总仓库
 
 当前主线：用官方完整 RoboFollow 训练集建立可复现基线，再验证预测 semantic planner 是否改善 instruction following。最终代码、历史经验、实验结论与 HPC3 启动入口集中在本仓库。
 
-- **权威工作目录**：`/data/user/jhe724/workspace/VLM4WAM_robofollow_official3750`
+- **权威工作目录**：`/data/user/jhe724/workspace/SG-WAM`
 - **登录**：`ssh jhe724@hpc3login.hpc.hkust-gz.edu.cn`，使用域名，不固定旧 IP。
 - **当前配置**：3,750 episodes / 75 tasks × 50，53,000 optimizer steps，global batch 128（每卡 4 × 8 卡 × 累积 4），action chunk 32，1 node / 8 GPUs，`acd_u`。
 - **2026-10-10 状态快照**：作业 `704659` 在 1,980/53,000 步因 DataLoader 句柄泄漏失败，尚无 checkpoint 或新 benchmark 结果。修复关闭每轮重建加载器中的持久 worker；最新作业号读取 `.agent/official3750/jobid`，实时状态以 `squeue` 为准。

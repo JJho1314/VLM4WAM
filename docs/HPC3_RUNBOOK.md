@@ -4,14 +4,14 @@
 
 ```bash
 ssh jhe724@hpc3login.hpc.hkust-gz.edu.cn
-cd /data/user/jhe724/workspace/VLM4WAM_robofollow_official3750
+cd /data/user/jhe724/workspace/SG-WAM
 ```
 
 macOS 的 `HPC3_jhe724` 别名已使用该域名，并通过容器校园 VPN 的 SOCKS5 转发。不要在服务器上配置 Mac 的代理端口。
 
 | 项目 | 位置 |
 | --- | --- |
-| 代码（独立 Git 仓库） | `/data/user/jhe724/workspace/VLM4WAM_robofollow_official3750` |
+| 代码（独立 Git 仓库） | `/data/user/jhe724/workspace/SG-WAM` |
 | Pixi | `/data/user/jhe724/.pixi/bin/pixi` |
 | 已有 Python 环境 | `/data/user/jhe724/.conda/envs/qwen35` |
 | 兼容 overlay | `/data/user/jhe724/envs/overlay_peft_tf5` |
